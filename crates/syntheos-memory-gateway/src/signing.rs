@@ -169,16 +169,27 @@ impl RequestSigner {
     /// so the gateway can still start in unauthenticated mode.
     ///
     /// Resolution order:
+    /// 0. `SYNTHEOS_SIGNING_KEY_STDIN` set -- read the key from stdin (the
+    ///    SD1-compliant path; `cred exec --stdin` pipes the secret here so it
+    ///    never appears in the environment or on disk).
     /// 1. `KLEOS_IDENTITY_KEY` env var -- 64-char hex encoding of the 32-byte scalar.
     /// 2. `SYNTHEOS_SIGNING_KEY_FILE` env var -- path to a key file.
     /// 3. `~/.kleos/identity.key` -- default location.
     ///
-    /// Accepted file formats: raw 32 bytes, 64-char hex (UTF-8), or PEM PKCS8.
+    /// Accepted formats: raw 32 bytes, 64-char hex (UTF-8), or PEM PKCS8.
     pub fn from_env_or_file(
         host: &str,
         agent: &str,
         model: &str,
     ) -> Result<Option<Self>, GatewayError> {
+        // 0. Key piped on stdin (preferred -- never touches env or disk).
+        if let Ok(flag) = std::env::var("SYNTHEOS_SIGNING_KEY_STDIN") {
+            if !flag.is_empty() && flag != "0" {
+                let secret = read_stdin_key()?;
+                return Ok(Some(Self::from_key_bytes(secret, host, agent, model)));
+            }
+        }
+
         // 1. Inline hex via env var.
         if let Ok(hex_val) = std::env::var("KLEOS_IDENTITY_KEY") {
             if !hex_val.is_empty() {
@@ -348,30 +359,49 @@ fn load_key_file(path: &PathBuf) -> Result<Option<[u8; 32]>, GatewayError> {
     }
     let raw = std::fs::read(path)
         .map_err(|e| GatewayError::Signing(format!("could not read key file {}: {e}", path.display())))?;
+    decode_key_material(&raw, &format!("key file {}", path.display())).map(Some)
+}
 
+/// Read an Ed25519 secret scalar from standard input, used when the key is
+/// piped in by `cred exec --stdin` so it never touches the environment or disk.
+///
+/// The full stdin contents are read to EOF and passed through the same format
+/// detection as key files.
+fn read_stdin_key() -> Result<[u8; 32], GatewayError> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut raw)
+        .map_err(|e| GatewayError::Signing(format!("could not read signing key from stdin: {e}")))?;
+    decode_key_material(&raw, "stdin")
+}
+
+/// Decode raw key bytes into a 32-byte Ed25519 secret scalar, accepting any of
+/// three formats: 32 raw bytes, 64-char hex (UTF-8), or PEM PKCS8.  `source`
+/// names the origin (file path or "stdin") for error messages.
+fn decode_key_material(raw: &[u8], source: &str) -> Result<[u8; 32], GatewayError> {
     // 32 raw bytes.
     if raw.len() == 32 {
         let arr: [u8; 32] = raw.try_into().expect("checked len == 32");
-        return Ok(Some(arr));
+        return Ok(arr);
     }
 
     // 64 hex chars (optionally with a trailing newline).
-    let trimmed = std::str::from_utf8(&raw)
-        .map_err(|e| GatewayError::Signing(format!("key file is not valid UTF-8: {e}")))?
+    let trimmed = std::str::from_utf8(raw)
+        .map_err(|e| GatewayError::Signing(format!("{source} is not valid UTF-8: {e}")))?
         .trim();
 
     if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(Some(parse_key_hex(trimmed)?));
+        return parse_key_hex(trimmed);
     }
 
     // PEM PKCS8 (very minimal parser: strip header/footer and base64-decode).
     if trimmed.starts_with("-----BEGIN PRIVATE KEY-----") {
-        return decode_pkcs8_pem(trimmed).map(Some);
+        return decode_pkcs8_pem(trimmed);
     }
 
     Err(GatewayError::Signing(format!(
-        "key file {} has an unrecognised format (expected 32 raw bytes, 64-char hex, or PEM PKCS8)",
-        path.display()
+        "{source} has an unrecognised format (expected 32 raw bytes, 64-char hex, or PEM PKCS8)"
     )))
 }
 
