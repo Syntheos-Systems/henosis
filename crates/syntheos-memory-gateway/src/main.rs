@@ -36,7 +36,7 @@ async fn main() {
         );
     }
 
-    // Load the Ed25519 signing key.
+    // Load the signing key (PIV YubiKey attempted first, Ed25519 software key as fallback).
     let signer = match RequestSigner::from_env_or_file(
         &config.signing_host,
         &config.signing_agent,
@@ -46,7 +46,8 @@ async fn main() {
             tracing::info!(
                 fingerprint = %s.fingerprint(),
                 identity = %s.identity_hash(),
-                "Ed25519 signing key loaded"
+                algo = %s.algo(),
+                "signing key loaded"
             );
             Some(Arc::new(s))
         }

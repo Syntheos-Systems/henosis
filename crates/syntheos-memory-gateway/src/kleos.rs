@@ -3,8 +3,8 @@
 //! Kleos responses are parsed permissively (as JSON values) so the gateway
 //! tolerates additive changes to Kleos's memory schema.
 //!
-//! Authentication uses the KLEOSv1 Ed25519 envelope signing protocol
-//! implemented in the `signing` module.  A session token received from Kleos
+//! Authentication uses the KLEOSv1 envelope signing protocol (Ed25519 or
+//! PIV P-256 ECDSA) implemented in the `signing` module.  A session token from Kleos
 //! in the `X-Kleos-Session-Issued` header is cached and replayed on subsequent
 //! requests; a 401 response triggers a clear-and-retry cycle.
 
@@ -63,7 +63,25 @@ impl KleosClient {
         }
 
         // Full envelope signing.
-        let headers = signer.sign_request(method, path, query, body);
+        let headers = signer
+            .sign_request(method, path, query, body)
+            .unwrap_or_else(|e| {
+                // Signing errors here cannot propagate via return type (the method
+                // returns RequestBuilder, not Result).  Log and fall back to sending
+                // the request unsigned so callers get a 401 rather than a panic.
+                tracing::error!(error = %e, "signing failed; sending request unsigned");
+                return crate::signing::SignedHeaders {
+                    sig: String::new(),
+                    algo: String::new(),
+                    identity: String::new(),
+                    ts: String::new(),
+                    nonce: String::new(),
+                    key_fp: String::new(),
+                    host: String::new(),
+                    agent: String::new(),
+                    model: String::new(),
+                };
+            });
         headers.apply(rb)
     }
 
@@ -129,7 +147,7 @@ impl KleosClient {
                         ),
                     };
                     let base_rb2 = build(base_rb2);
-                    let headers = signer.sign_request(method, path, query, body);
+                    let headers = signer.sign_request(method, path, query, body)?;
                     let rb2 = headers.apply(base_rb2);
                     let resp2 = rb2.send().await?;
                     self.capture_session(&resp2);

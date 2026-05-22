@@ -23,3 +23,5 @@ hex = "0.4"
 rand = "0.9"
 base64 = "0.22"
 zeroize = { version = "1", features = ["derive"] }
+yubikey = { version = "0.8" }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

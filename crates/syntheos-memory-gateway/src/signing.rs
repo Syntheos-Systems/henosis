@@ -1,4 +1,12 @@
-//! Ed25519 request signing for the KLEOSv1 envelope protocol.
+//! Request signing for the KLEOSv1 envelope protocol.
+//!
+//! Supports two backends:
+//!
+//! * **Ed25519** (software) -- 32-byte secret scalar loaded from the
+//!   environment, a file, or stdin.  This is the fallback path.
+//! * **PIV / YubiKey** (hardware, `piv` feature) -- P-256 ECDSA via the
+//!   YubiKey PIV slot 9A (AUTHENTICATION).  Tried first when the feature is
+//!   compiled in and a YubiKey is physically present.
 //!
 //! Every outbound request to Kleos is signed using a canonical envelope that
 //! covers the method, path, query, body hash, timestamp, nonce, and a
@@ -18,6 +26,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
+
+/// Standard-library `Mutex` used to wrap the YubiKey handle, which is not
+/// `Send` and must be accessed exclusively.
+#[cfg(feature = "piv")]
+use std::sync::Mutex as StdMutex;
 
 // ------------------------------------------------------------------
 // SPKI prefix for an Ed25519 public key (RFC 8410 / DER encoding).
@@ -50,9 +63,9 @@ struct KeyMaterial {
 
 /// All headers that must be added to an authenticated Kleos request.
 pub struct SignedHeaders {
-    /// Hex-encoded Ed25519 signature over the canonical envelope.
+    /// Hex-encoded signature over the canonical envelope (Ed25519 or ECDSA-P256).
     pub sig: String,
-    /// Algorithm identifier, always "ed25519".
+    /// Algorithm identifier: "ed25519" or "ecdsa-p256".
     pub algo: String,
     /// 32-hex-char identity hash for this key + label combination.
     pub identity: String,
@@ -87,28 +100,36 @@ impl SignedHeaders {
     }
 }
 
-/// Ed25519 request signer that implements the KLEOSv1 envelope protocol.
-///
-/// Holds the signing key (zeroized on drop), precomputed public-key metadata
-/// (identity hash, fingerprint, labels), and an in-memory session token cache.
+/// Which cryptographic backend signs the request envelope.
+enum SigningBackend {
+    /// Software Ed25519 key (loaded from env/file/stdin).
+    Ed25519(SigningKey),
+    /// YubiKey PIV slot 9A (P-256 ECDSA, hardware-bound).
+    #[cfg(feature = "piv")]
+    Piv(StdMutex<yubikey::YubiKey>),
+}
+
+/// Request signer that implements the KLEOSv1 envelope protocol.
+/// Supports Ed25519 (software) and P-256 ECDSA (PIV YubiKey hardware).
 pub struct RequestSigner {
-    /// Wrapped signing key; the raw bytes live inside `KeyMaterial` which is
-    /// zeroized on drop.
-    signing_key: SigningKey,
-    /// Storage for the secret scalar so it can be zeroized.
-    _key_material: KeyMaterial,
+    /// Signing backend (Ed25519 or PIV).
+    backend: SigningBackend,
+    /// Algorithm identifier for the X-Kleos-Algo header.
+    algo: &'static str,
+    /// Storage for the Ed25519 secret scalar so it can be zeroized on drop.
+    /// None when using PIV backend.
+    _key_material: Option<KeyMaterial>,
     /// 32-char hex identity hash (HKDF output).
     identity_hash: String,
     /// 64-char hex SHA-256 fingerprint of the SPKI DER.
     fingerprint: String,
-    /// Host label supplied at construction time.
+    /// Host label.
     host: String,
-    /// Agent label supplied at construction time.
+    /// Agent label.
     agent: String,
-    /// Model label supplied at construction time.
+    /// Model label.
     model: String,
-    /// Optional cached Kleos session token.  Wrapped in `Arc<Mutex<_>>` so
-    /// `RequestSigner` can be shared across async tasks via `Arc<RequestSigner>`.
+    /// Cached Kleos session token.
     session: Arc<Mutex<Option<String>>>,
 }
 
@@ -125,6 +146,7 @@ fn spki_der(vk: &VerifyingKey) -> [u8; 44] {
 }
 
 /// Compute hex(SHA-256(spki_der)) -- the 64-char key fingerprint.
+/// Accepts arbitrary-length DER so P-256 SPKI (different length than Ed25519) works too.
 fn fingerprint(der: &[u8]) -> String {
     hex::encode(Sha256::digest(der))
 }
@@ -132,6 +154,7 @@ fn fingerprint(der: &[u8]) -> String {
 /// Derive the 16-byte (32-char hex) identity hash via HKDF-SHA256.
 ///
 /// IKM = SPKI DER bytes; info = "{host}|{agent}|{model}".
+/// Accepts arbitrary-length DER so both Ed25519 and P-256 SPKI work.
 fn identity_hash(der: &[u8], host: &str, agent: &str, model: &str) -> String {
     let info = format!("{host}|{agent}|{model}");
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), der);
@@ -153,8 +176,9 @@ impl RequestSigner {
         let id_hash = identity_hash(&der, host, agent, model);
         let km = KeyMaterial { bytes: secret };
         Self {
-            signing_key,
-            _key_material: km,
+            backend: SigningBackend::Ed25519(signing_key),
+            algo: "ed25519",
+            _key_material: Some(km),
             identity_hash: id_hash,
             fingerprint: fp,
             host: host.to_string(),
@@ -164,25 +188,80 @@ impl RequestSigner {
         }
     }
 
+    /// Construct a signer from the YubiKey's PIV slot 9A (AUTHENTICATION).
+    /// Reads the P-256 public key from the slot's certificate and uses
+    /// hardware-backed ECDSA signing.
+    #[cfg(feature = "piv")]
+    pub fn from_yubikey(host: &str, agent: &str, model: &str) -> Result<Self, GatewayError> {
+        use yubikey::piv::SlotId;
+
+        let mut yk = yubikey::YubiKey::open()
+            .map_err(|e| GatewayError::Signing(format!("cannot open YubiKey: {e}")))?;
+
+        let cert = yubikey::certificate::Certificate::read(&mut yk, SlotId::Authentication)
+            .map_err(|e| GatewayError::Signing(format!("cannot read PIV slot 9a certificate: {e}")))?;
+
+        let spki = cert.subject_pki();
+        let pubkey_der = {
+            use p256::pkcs8::der::Encode;
+            spki.to_der()
+                .map_err(|e| GatewayError::Signing(format!("cannot encode SPKI to DER: {e}")))?
+        };
+
+        let fp = fingerprint(&pubkey_der);
+        let id_hash = identity_hash(&pubkey_der, host, agent, model);
+        let serial = yk.serial().to_string();
+
+        tracing::info!(
+            serial = %serial,
+            fingerprint = %fp,
+            "PIV signer initialized from YubiKey"
+        );
+
+        Ok(Self {
+            backend: SigningBackend::Piv(StdMutex::new(yk)),
+            algo: "ecdsa-p256",
+            _key_material: None,
+            identity_hash: id_hash,
+            fingerprint: fp,
+            host: host.to_string(),
+            agent: agent.to_string(),
+            model: model.to_string(),
+            session: Arc::new(Mutex::new(None)),
+        })
+    }
+
     /// Attempt to load a signing key from the environment or well-known file
     /// locations.  Returns `None` (with a warning log) when no key is found,
     /// so the gateway can still start in unauthenticated mode.
     ///
     /// Resolution order:
-    /// 0. `SYNTHEOS_SIGNING_KEY_STDIN` set -- read the key from stdin (the
+    /// 0. PIV YubiKey (highest auth tier, tried first when `piv` feature is enabled).
+    /// 1. `SYNTHEOS_SIGNING_KEY_STDIN` set -- read the key from stdin (the
     ///    SD1-compliant path; `cred exec --stdin` pipes the secret here so it
     ///    never appears in the environment or on disk).
-    /// 1. `KLEOS_IDENTITY_KEY` env var -- 64-char hex encoding of the 32-byte scalar.
-    /// 2. `SYNTHEOS_SIGNING_KEY_FILE` env var -- path to a key file.
-    /// 3. `~/.kleos/identity.key` -- default location.
+    /// 2. `KLEOS_IDENTITY_KEY` env var -- 64-char hex encoding of the 32-byte scalar.
+    /// 3. `SYNTHEOS_SIGNING_KEY_FILE` env var -- path to a key file.
+    /// 4. `~/.kleos/identity.key` -- default location.
     ///
-    /// Accepted formats: raw 32 bytes, 64-char hex (UTF-8), or PEM PKCS8.
+    /// Accepted formats for Ed25519 keys: raw 32 bytes, 64-char hex (UTF-8), or PEM PKCS8.
     pub fn from_env_or_file(
         host: &str,
         agent: &str,
         model: &str,
     ) -> Result<Option<Self>, GatewayError> {
-        // 0. Key piped on stdin (preferred -- never touches env or disk).
+        // T0: Try PIV YubiKey first (highest auth tier).
+        #[cfg(feature = "piv")]
+        {
+            match Self::from_yubikey(host, agent, model) {
+                Ok(signer) => return Ok(Some(signer)),
+                Err(e) => {
+                    tracing::debug!("PIV YubiKey not available, falling back to software key: {e}");
+                }
+            }
+        }
+
+        // 1. Key piped on stdin (preferred -- never touches env or disk).
         if let Ok(flag) = std::env::var("SYNTHEOS_SIGNING_KEY_STDIN") {
             if !flag.is_empty() && flag != "0" {
                 let secret = read_stdin_key()?;
@@ -190,7 +269,7 @@ impl RequestSigner {
             }
         }
 
-        // 1. Inline hex via env var.
+        // 2. Inline hex via env var.
         if let Ok(hex_val) = std::env::var("KLEOS_IDENTITY_KEY") {
             if !hex_val.is_empty() {
                 tracing::warn!(
@@ -204,7 +283,7 @@ impl RequestSigner {
             }
         }
 
-        // 2. File path from env var.
+        // 3. File path from env var.
         if let Ok(path_str) = std::env::var("SYNTHEOS_SIGNING_KEY_FILE") {
             if !path_str.is_empty() {
                 let path = PathBuf::from(&path_str);
@@ -222,7 +301,7 @@ impl RequestSigner {
             }
         }
 
-        // 3. Default file location.
+        // 4. Default file location.
         if let Some(home) = dirs_next(host) {
             let default_path = home.join(".kleos").join("identity.key");
             if default_path.exists() {
@@ -233,7 +312,7 @@ impl RequestSigner {
         }
 
         tracing::warn!(
-            "No Ed25519 signing key found. \
+            "No signing key found (neither PIV YubiKey nor Ed25519 software key). \
              Set KLEOS_IDENTITY_KEY, SYNTHEOS_SIGNING_KEY_FILE, \
              or place a key at ~/.kleos/identity.key. \
              Requests to Kleos will be unauthenticated."
@@ -251,14 +330,26 @@ impl RequestSigner {
         &self.fingerprint
     }
 
-    /// Build the KLEOSv1 canonical envelope, sign it, and return the set of
-    /// `X-Kleos-*` headers that must be attached to the outbound request.
+    /// Return the algorithm identifier string ("ed25519" or "ecdsa-p256").
+    pub fn algo(&self) -> &str {
+        self.algo
+    }
+
+    /// Build the KLEOSv1 canonical envelope, sign it with the active backend,
+    /// and return the set of `X-Kleos-*` headers that must be attached to the
+    /// outbound request.
     ///
     /// - `method`: HTTP verb, will be uppercased.
     /// - `path`: URL path component (e.g. "/store").
     /// - `query`: raw query string, may be empty.
     /// - `body`: serialized request body bytes; use `&[]` for GET requests.
-    pub fn sign_request(&self, method: &str, path: &str, query: &str, body: &[u8]) -> SignedHeaders {
+    pub fn sign_request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> Result<SignedHeaders, GatewayError> {
         let ts_ms = unix_ms();
         let nonce = random_nonce();
         let body_hash = hex::encode(Sha256::digest(body));
@@ -275,12 +366,43 @@ impl RequestSigner {
             self.identity_hash,
         );
 
-        use ed25519_dalek::Signer;
-        let sig_bytes = self.signing_key.sign(envelope.as_bytes());
+        let sig_hex = match &self.backend {
+            SigningBackend::Ed25519(sk) => {
+                use ed25519_dalek::Signer;
+                hex::encode(sk.sign(envelope.as_bytes()).to_bytes())
+            }
+            #[cfg(feature = "piv")]
+            SigningBackend::Piv(yk_mutex) => {
+                let digest = Sha256::digest(envelope.as_bytes());
+                let mut yk = yk_mutex.lock().expect("YubiKey mutex poisoned");
+                let result = piv_verify_and_sign(&mut yk, &digest);
+                let sig_der = match result {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // Release the lock before reconnecting.
+                        drop(yk);
+                        let mut fresh = yubikey::YubiKey::open().map_err(|e| {
+                            GatewayError::Signing(format!("YubiKey reconnect failed: {e}"))
+                        })?;
+                        let d = piv_verify_and_sign(&mut fresh, &digest).map_err(|e| {
+                            GatewayError::Signing(format!(
+                                "YubiKey PIV signing failed after reconnect: {e}"
+                            ))
+                        })?;
+                        *yk_mutex.lock().expect("YubiKey mutex poisoned") = fresh;
+                        d
+                    }
+                };
+                let sig = p256::ecdsa::Signature::from_der(&sig_der).map_err(|e| {
+                    GatewayError::Signing(format!("invalid ECDSA DER from YubiKey: {e}"))
+                })?;
+                hex::encode(sig.to_bytes())
+            }
+        };
 
-        SignedHeaders {
-            sig: hex::encode(sig_bytes.to_bytes()),
-            algo: "ed25519".to_string(),
+        Ok(SignedHeaders {
+            sig: sig_hex,
+            algo: self.algo.to_string(),
             identity: self.identity_hash.clone(),
             ts: ts_ms.to_string(),
             nonce,
@@ -288,7 +410,7 @@ impl RequestSigner {
             host: self.host.clone(),
             agent: self.agent.clone(),
             model: self.model.clone(),
-        }
+        })
     }
 
     /// Return a clone of the cached session token, if any is stored.
@@ -309,6 +431,45 @@ impl RequestSigner {
     pub fn clear_session(&self) {
         *self.session.lock().expect("session mutex poisoned") = None;
     }
+}
+
+// ------------------------------------------------------------------
+// PIV helpers (feature-gated)
+// ------------------------------------------------------------------
+
+/// Read the PIV PIN from the environment. Refuses the factory default.
+#[cfg(feature = "piv")]
+fn runtime_piv_pin() -> Result<String, GatewayError> {
+    match std::env::var("PIV_PIN") {
+        Ok(p) if p.is_empty() => {
+            Err(GatewayError::Signing("PIV_PIN is set but empty".into()))
+        }
+        Ok(p) if p == "123456" => Err(GatewayError::Signing(
+            "PIV_PIN equals the YubiKey factory-default; refusing to use it".into(),
+        )),
+        Ok(p) => Ok(p),
+        Err(_) => Err(GatewayError::Signing(
+            "PIV_PIN environment variable is not set".into(),
+        )),
+    }
+}
+
+/// Verify PIN then sign a SHA-256 digest with PIV slot 9A.
+#[cfg(feature = "piv")]
+fn piv_verify_and_sign(
+    yk: &mut yubikey::YubiKey,
+    digest: &[u8],
+) -> Result<Vec<u8>, yubikey::Error> {
+    let pin = runtime_piv_pin().map_err(|_| yubikey::Error::AuthenticationError)?;
+    yk.verify_pin(pin.as_bytes())
+        .map_err(|_| yubikey::Error::AuthenticationError)?;
+    yubikey::piv::sign_data(
+        yk,
+        digest,
+        yubikey::piv::AlgorithmId::EccP256,
+        yubikey::piv::SlotId::Authentication,
+    )
+    .map(|buf| buf.to_vec())
 }
 
 // ------------------------------------------------------------------
