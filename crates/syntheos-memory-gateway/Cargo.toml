@@ -25,6 +25,7 @@ hkdf.workspace = true
 hex.workspace = true
 rand.workspace = true
 base64.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 yubikey = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }

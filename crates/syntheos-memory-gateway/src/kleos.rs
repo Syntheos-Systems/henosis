@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Shared HTTP client for an upstream Kleos instance.
 #[derive(Clone)]
@@ -70,7 +71,7 @@ impl KleosClient {
                 // returns RequestBuilder, not Result).  Log and fall back to sending
                 // the request unsigned so callers get a 401 rather than a panic.
                 tracing::error!(error = %e, "signing failed; sending request unsigned");
-                return crate::signing::SignedHeaders {
+                crate::signing::SignedHeaders {
                     sig: String::new(),
                     algo: String::new(),
                     identity: String::new(),
@@ -80,7 +81,7 @@ impl KleosClient {
                     host: String::new(),
                     agent: String::new(),
                     model: String::new(),
-                };
+                }
             });
         headers.apply(rb)
     }
@@ -209,13 +210,13 @@ impl KleosClient {
         let id = v
             .get("id")
             .and_then(Value::as_i64)
-            .map(|i| i.to_string())
+            .map(|i| kleos_id_to_uuid(i).to_string())
             .ok_or(GatewayError::KleosStatus(StatusCode::BAD_GATEWAY))?;
         let created_at = v
             .get("created_at")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map(to_rfc3339)
+            .unwrap_or_default();
         Ok((id, created_at))
     }
 
@@ -315,10 +316,61 @@ impl KleosClient {
     }
 }
 
-/// Parse an opaque wire id back into the Kleos i64 it encodes.
+/// Fixed 6-byte prefix for syntheos-os Kleos ID mapping ("SYNT\x00\x01").
+/// Used in the upper bytes of the UUID v8 to identify syntheos-originated UUIDs.
+const KLEOS_UUID_PREFIX: [u8; 6] = [0x53, 0x59, 0x4E, 0x54, 0x00, 0x01];
+
+/// Convert a Kleos i64 memory ID to a deterministic UUID (v8 custom).
+///
+/// The i64 is encoded big-endian in bytes 8-15 of the UUID. Bytes 0-5 hold
+/// `KLEOS_UUID_PREFIX`. Bytes 6-7 and the upper bits of byte 8 are set by
+/// `Uuid::new_v8` for version (8) and variant (RFC 4122) compliance.
+/// Reversible via [`uuid_to_kleos_id`] for any non-negative Kleos ID.
+fn kleos_id_to_uuid(id: i64) -> Uuid {
+    let mut buf = [0u8; 16];
+    buf[..6].copy_from_slice(&KLEOS_UUID_PREFIX);
+    buf[8..16].copy_from_slice(&id.to_be_bytes());
+    Uuid::new_v8(buf)
+}
+
+/// Extract the Kleos i64 from a syntheos UUID, reversing [`kleos_id_to_uuid`].
+///
+/// Clears the variant bits (upper 2 bits of byte 8) that `Uuid::new_v8` sets,
+/// which is safe because Kleos auto-increment IDs are always small positive
+/// integers (well under 2^62).
+fn uuid_to_kleos_id(uuid: &Uuid) -> Result<i64, GatewayError> {
+    let bytes = uuid.as_bytes();
+    if bytes[..6] != KLEOS_UUID_PREFIX {
+        return Err(GatewayError::InvalidId(uuid.to_string()));
+    }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&bytes[8..16]);
+    // Clear variant bits set by new_v8 (upper 2 bits of byte 8 = id_bytes[0]).
+    id_bytes[0] &= 0x3F;
+    Ok(i64::from_be_bytes(id_bytes))
+}
+
+/// Parse an opaque wire UUID string back into the Kleos i64 it encodes.
 fn parse_id(id: &str) -> Result<i64, GatewayError> {
-    id.parse::<i64>()
-        .map_err(|_| GatewayError::InvalidId(id.to_string()))
+    let uuid = Uuid::parse_str(id).map_err(|_| GatewayError::InvalidId(id.to_string()))?;
+    uuid_to_kleos_id(&uuid)
+}
+
+/// Reformat a Kleos timestamp ("2026-05-22 18:20:44") to RFC3339 ("2026-05-22T18:20:44Z").
+///
+/// Kleos timestamps lack the ISO 8601 `T` separator and timezone. The gateway
+/// assumes UTC and performs a simple string substitution. Returns the original
+/// string unchanged if it does not match the expected Kleos format.
+fn to_rfc3339(kleos_ts: &str) -> String {
+    if kleos_ts.len() == 19 && kleos_ts.as_bytes().get(10) == Some(&b' ') {
+        let mut s = kleos_ts.to_string();
+        // Replace the space between date and time with 'T'.
+        s.replace_range(10..11, "T");
+        s.push('Z');
+        s
+    } else {
+        kleos_ts.to_string()
+    }
 }
 
 /// Pull the array under `key` from a Kleos response and map each element to a
@@ -331,12 +383,12 @@ fn extract_memories(v: &Value, key: &str) -> Vec<Memory> {
 }
 
 /// Translate one Kleos memory JSON object into the wire `Memory` shape,
-/// surfacing a few useful Kleos fields as flattened metadata.
+/// converting Kleos i64 IDs to UUID v8 and timestamps to RFC3339.
 fn memory_to_wire(v: &Value) -> Memory {
     let id = v
         .get("id")
         .and_then(Value::as_i64)
-        .map(|i| i.to_string())
+        .map(|i| kleos_id_to_uuid(i).to_string())
         .unwrap_or_default();
     let text = v
         .get("content")
@@ -352,8 +404,14 @@ fn memory_to_wire(v: &Value) -> Memory {
                 .collect()
         })
         .unwrap_or_default();
-    let created_at = v.get("created_at").and_then(Value::as_str).map(String::from);
-    let updated_at = v.get("updated_at").and_then(Value::as_str).map(String::from);
+    let created_at = v
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(to_rfc3339);
+    let updated_at = v
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .map(to_rfc3339);
     let mut metadata = BTreeMap::new();
     for field in ["category", "source", "importance"] {
         if let Some(val) = v.get(field) {
