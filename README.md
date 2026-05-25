@@ -1,4 +1,4 @@
-# Syntheos-OS
+# Henosis
 
 An autonomous agent operating system. One runtime, one authority model, one
 coordination plane, one tool/action path, one memory system, one operator
