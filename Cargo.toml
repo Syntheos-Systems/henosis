@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syntheos-memory-gateway"]
+members = ["crates/syntheos-memory-gateway", "crates/syntheos-contracts"]
 
 [workspace.package]
 edition = "2021"
@@ -22,7 +22,9 @@ hkdf = "0.12"
 hex = "0.4"
 rand = "0.9"
 base64 = "0.22"
-uuid = { version = "1", features = ["v8"] }
+uuid = { version = "1", features = ["v8", "serde"] }
+time = { version = "0.3", features = ["serde-well-known", "macros"] }
+async-trait = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
