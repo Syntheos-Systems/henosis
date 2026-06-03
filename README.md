@@ -4,9 +4,9 @@ An autonomous agent operating system. One runtime, one authority model, one
 coordination plane, one tool/action path, one memory system, one operator
 surface, one deployment story.
 
-Syntheos-OS unifies the independent Syntheos-Systems services -- Kleos, Phylax,
-Pistis, Rift, Synapse, Hephaestus, Hermes, and future Athena/Plutus -- into a
-single Cargo workspace that boots as one process. Services keep their domain
+Henosis unifies the independent services -- Kleos, Phylax, Pistis, Rift,
+Synapse, Hephaestus, Hermes, and future Athena/Plutus -- into a single Cargo
+workspace that boots as one process. Services keep their domain
 authority and behavior; the OS provides shared contracts, canonical identity,
 typed events, and a unified action dispatcher so they compose instead of
 collide.
@@ -20,12 +20,12 @@ Four internal layers:
         |
  Runtime Services      Rift (chat), Synapse (cognition), Hephaestus (execution), Hermes (tools)
         |
- Kernel Services       Engram (memory), Axon (events), Chiasm (coordination), Soma (presence),
+ Kernel Services       Kleos (memory), Axon (events), Chiasm (coordination), Soma (presence),
                         Broca (narration), Loom (workflows), Thymus (evaluation), Agent-Forge
                         (reasoning protocol), Eidolon (supervision), Phylax (secrets), Pistis
                         (identity/trust), Plutus (tenancy/billing)
         |
- Storage Engines        Postgres, SQLite (Engram), service-owned schemas
+ Storage Engines        Postgres, SQLite (Kleos), service-owned schemas
 ```
 
 Services share canonical contracts -- principal identity, tenant, event
@@ -37,7 +37,7 @@ Axon event subscriptions, not HTTP between old daemons.
 
 | Subsystem | Role |
 |-----------|------|
-| **Kleos/Engram** | Long-term memory: ingestion, dedup, embeddings, FSRS spaced repetition, search, context assembly, recall scheduling |
+| **Kleos** | Long-term memory: ingestion, dedup, embeddings, FSRS spaced repetition, search, context assembly, recall scheduling |
 | **Axon** | Pub/sub event fabric: channels, fanout, retention, subscriptions, replay cursors, typed envelopes |
 | **Chiasm** | Task coordination: status, assignment, claims, dependencies, heartbeats, queues, operator visibility |
 | **Soma** | Agent presence and registry: online/idle/offline, heartbeat, capability advertisement, health |
@@ -76,7 +76,7 @@ syntheos action dispatcher
   |-- Chiasm:      update task progress
   |-- Broca:       narrate for humans
   |-- Thymus:      evaluate if scored
-  |-- Engram:      promote if worth remembering
+  |-- Kleos:       promote if worth remembering
   |
   v
 result
@@ -101,7 +101,7 @@ They share the principal key and contract. They do not erase each other.
 
 ## Memory Model
 
-Engram stores what the OS should remember. Operational data is not
+Kleos stores what the OS should remember. Operational data is not
 automatically memory -- promotion is explicit and typed:
 
 | Type | Source | Meaning |
@@ -114,7 +114,7 @@ automatically memory -- promotion is explicit and typed:
 | `workflow_checkpoint` | Loom/Hephaestus | A checkpoint worth resuming or teaching from |
 
 Rift messages stay in Rift. Axon events stay in Axon. Phylax audit stays in
-Phylax. Engram stores what the OS should remember.
+Phylax. Kleos stores what the OS should remember.
 
 ## Autonomy Loop
 
