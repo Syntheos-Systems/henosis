@@ -47,3 +47,9 @@ pub use credential::CredentialHandle;
 pub mod gate;
 
 pub use gate::{Gate, GateDecision, GateRequest};
+
+pub mod lifecycle;
+
+pub use lifecycle::{
+    ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired,
+};

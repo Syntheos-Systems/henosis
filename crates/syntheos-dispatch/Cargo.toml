@@ -1,0 +1,29 @@
+[package]
+name = "syntheos-dispatch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified action dispatcher: runs the authorization gate chain, executes, and emits lifecycle events."
+
+[dependencies]
+# The canonical Gate/GateDecision/GateRequest/RequestContext + lifecycle events.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# The in-process bus the dispatcher narrates lifecycle events onto.
+syntheos-axon = { path = "../syntheos-axon" }
+# Object-safe async traits: the Executor seam and the stub Gate impls.
+async-trait.workspace = true
+# DispatchOutcome derives Serialize/Deserialize for logging/persistence.
+serde.workspace = true
+# Executor results and JSON payloads.
+serde_json.workspace = true
+# DispatchError / ExecutorError.
+thiserror.workspace = true
+# Best-effort warning when a lifecycle event fails to publish.
+tracing.workspace = true
+
+[dev-dependencies]
+# Workspace tokio is "full" -- macros + runtime for #[tokio::test].
+tokio = { workspace = true }
+# Test gates/executors derive nothing, but the workspace tokio test fixtures need it.
+serde = { workspace = true }

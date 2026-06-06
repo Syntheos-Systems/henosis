@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/syntheos-memory-gateway", "crates/syntheos-contracts", "crates/syntheos-axon"]
+members = [
+    "crates/syntheos-memory-gateway",
+    "crates/syntheos-contracts",
+    "crates/syntheos-axon",
+    "crates/syntheos-dispatch",
+]
 
 [workspace.package]
 edition = "2021"
