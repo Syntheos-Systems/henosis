@@ -6,6 +6,7 @@ members = [
     "crates/syntheos-axon",
     "crates/syntheos-dispatch",
     "crates/syntheos-identity",
+    "crates/syntheos-server",
 ]
 
 [workspace.package]

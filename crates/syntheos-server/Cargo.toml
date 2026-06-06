@@ -1,0 +1,33 @@
+[package]
+name = "syntheos-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The single HTTP entry point that boots the Henosis foundation."
+
+[dependencies]
+# The Phase 0 foundation this server wires together.
+syntheos-contracts = { path = "../syntheos-contracts" }
+syntheos-axon = { path = "../syntheos-axon" }
+syntheos-dispatch = { path = "../syntheos-dispatch" }
+syntheos-identity = { path = "../syntheos-identity" }
+# HTTP surface.
+axum.workspace = true
+# Full runtime: the binary needs rt, net, signal, and macros.
+tokio = { workspace = true }
+# EnrollRequest body.
+serde.workspace = true
+# JSON responses.
+serde_json.workspace = true
+# Structured logging.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the router in handler tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = []
+# Real service surfaces land here as they are absorbed (e.g. "rift", "synapse", "hermes").

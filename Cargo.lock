@@ -1787,6 +1787,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntheos-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "syntheos-dispatch",
+ "syntheos-identity",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
