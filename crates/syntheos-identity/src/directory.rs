@@ -1,6 +1,7 @@
 //! The principal directory trait gates resolve against, plus the Phase 0 in-memory
 //! implementation.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -55,6 +56,39 @@ impl Default for InMemoryDirectory {
     }
 }
 
+impl InMemoryDirectory {
+    /// Insert `principal` into the map, rejecting the insert if the id already exists.
+    ///
+    /// This is the single choke-point that enforces the "one record per `PrincipalId`"
+    /// invariant required by `PrincipalProjection`. All enrollment paths go through here.
+    fn insert_unique(&self, principal: Principal) -> Result<Principal, DirectoryError> {
+        let mut map = self.principals.write().unwrap_or_else(|e| e.into_inner());
+        match map.entry(principal.id) {
+            Entry::Vacant(v) => {
+                v.insert(principal.clone());
+                Ok(principal)
+            }
+            Entry::Occupied(_) => Err(DirectoryError::AlreadyExists(principal.id)),
+        }
+    }
+
+    /// Enroll a principal under a caller-supplied id.
+    ///
+    /// Gated behind `#[cfg(test)]` so that production callers are forced to go through the
+    /// minting path. This exists solely to let tests construct a collision deterministically
+    /// without exposing a public choose-your-own-id API.
+    #[cfg(test)]
+    fn enroll_with_id(
+        &self,
+        id: PrincipalId,
+        kind: PrincipalKind,
+        display: Option<String>,
+    ) -> Result<Principal, DirectoryError> {
+        let principal = Principal { id, kind, display };
+        self.insert_unique(principal)
+    }
+}
+
 #[async_trait]
 impl PrincipalDirectory for InMemoryDirectory {
     async fn enroll(
@@ -67,9 +101,7 @@ impl PrincipalDirectory for InMemoryDirectory {
             kind,
             display,
         };
-        let mut map = self.principals.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(principal.id, principal.clone());
-        Ok(principal)
+        self.insert_unique(principal)
     }
 
     async fn lookup(&self, id: PrincipalId) -> Result<Option<Principal>, DirectoryError> {
@@ -149,5 +181,33 @@ mod tests {
             .expect("enroll");
         let got = dir.lookup(p.id).await.expect("lookup").expect("present");
         assert_eq!(got, p);
+    }
+
+    /// Duplicate enrollment on the same `PrincipalId` must be rejected, not silently overwritten.
+    ///
+    /// This is the invariant `PrincipalProjection` relies on: exactly one record per id.
+    #[test]
+    fn duplicate_id_is_rejected() {
+        let dir = InMemoryDirectory::new();
+        let id = PrincipalId::new();
+
+        // First insert succeeds.
+        dir.enroll_with_id(id, PrincipalKind::Agent, Some("first".into()))
+            .expect("first enroll must succeed");
+
+        // Second insert on the same id must fail with AlreadyExists.
+        let err = dir
+            .enroll_with_id(id, PrincipalKind::Human, Some("collision".into()))
+            .expect_err("duplicate enroll must fail");
+
+        assert!(
+            matches!(err, DirectoryError::AlreadyExists(eid) if eid == id),
+            "expected AlreadyExists({id}), got {err:?}",
+        );
+
+        // The first record must not have been overwritten.
+        let map = dir.principals.read().unwrap();
+        assert_eq!(map[&id].display.as_deref(), Some("first"));
+        assert_eq!(map[&id].kind, PrincipalKind::Agent);
     }
 }
