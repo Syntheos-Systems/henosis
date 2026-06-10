@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{
-    ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired, Gate,
-    GateDecision, GateRequest, PrincipalId, TenantId, TypedEvent,
+    ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired, FilterDecision,
+    Gate, GateDecision, GateRequest, OutputFilter, PrincipalId, TenantId, TypedEvent,
 };
 
 use crate::error::DispatchError;
@@ -24,11 +24,17 @@ use crate::outcome::DispatchOutcome;
 pub const CANONICAL_GATE_ORDER: [&str; 5] = ["pistis", "plutus", "eidolon", "human", "phylax"];
 
 /// The single chokepoint every action passes through. Holds the ordered gate chain, the
-/// executor that runs an authorized action, and the bus it narrates lifecycle events onto.
+/// executor that runs an authorized action, an optional output filter, and the bus it narrates
+/// lifecycle events onto.
 ///
 /// Fail-closed BY CONSTRUCTION: [`Dispatcher::new`] is the only way to build one, and it rejects
 /// an empty or non-canonical gate chain, so a runnable dispatcher always carries the full
 /// canonical authority chain.
+///
+/// The output filter is the OUTPUT-direction counterpart to the input gate chain. It is optional
+/// (default `None` = pass results through unchanged) and set additively via
+/// [`Dispatcher::with_output_filter`], so the real Phase 2 policy filter wires in without any
+/// change to the construction API.
 ///
 /// Share it as `Arc<Dispatcher>`; all methods take `&self`.
 pub struct Dispatcher {
@@ -36,6 +42,9 @@ pub struct Dispatcher {
     gates: Vec<Box<dyn Gate>>,
     /// Runs the action once every gate has allowed it.
     executor: Box<dyn Executor>,
+    /// Optional redaction/transform applied to a successful result before it is returned. `None`
+    /// passes the result through unchanged.
+    output_filter: Option<Box<dyn OutputFilter>>,
     /// In-process bus the lifecycle events are published to.
     bus: Arc<AxonBus>,
 }
@@ -56,8 +65,19 @@ impl Dispatcher {
         Ok(Self {
             gates,
             executor,
+            output_filter: None,
             bus,
         })
+    }
+
+    /// Attach an output filter, applied to a successful result before it is returned.
+    ///
+    /// Additive and consuming: the construction/validation done by [`Dispatcher::new`] is
+    /// unchanged, so wiring the real Phase 2 policy filter is not a breaking change. Calling this
+    /// more than once keeps the last filter.
+    pub fn with_output_filter(mut self, filter: Box<dyn OutputFilter>) -> Self {
+        self.output_filter = Some(filter);
+        self
     }
 
     /// Reject a gate chain that is empty or is not *exactly* the canonical authority set, in
@@ -91,9 +111,10 @@ impl Dispatcher {
     /// Runs the gate chain in order; the first `Deny`/`RequireApproval` short-circuits and the
     /// executor is never called. An unrecognized (`#[non_exhaustive]`) gate decision, and a gate
     /// that returns `Err` (could not decide), are both treated as a denial -- fail-closed. On
-    /// full approval the executor runs; its result rides [`DispatchOutcome::Executed`], and an
-    /// execution failure becomes [`DispatchError`]. A lifecycle event is emitted at every branch
-    /// (best-effort; a publish failure is logged, never fatal).
+    /// full approval the executor runs; its result is passed through the output filter (if one is
+    /// wired) and rides [`DispatchOutcome::Executed`], and an execution failure becomes
+    /// [`DispatchError`]. A lifecycle event is emitted at every branch (best-effort; a publish
+    /// failure is logged, never fatal).
     pub async fn dispatch(&self, request: GateRequest) -> Result<DispatchOutcome, DispatchError> {
         let tenant = request.context.tenant;
         let principal = request.context.principal;
@@ -177,7 +198,27 @@ impl Dispatcher {
         }
 
         match self.executor.execute(&request.context, &request.invocation).await {
-            Ok(result) => {
+            Ok(mut result) => {
+                // Output-filter seam: redact/transform the result after execution. No filter wired
+                // = pass-through (the Phase 0 default). The real policy filter (the EidolonGate
+                // output side) lands in Phase 2 as an OutputFilter impl set via with_output_filter.
+                if let Some(filter) = &self.output_filter {
+                    match filter.filter(&mut result, &request.context).await {
+                        FilterDecision::Pass => {}
+                        FilterDecision::Replace(value) => result = value,
+                        FilterDecision::Redact { reason } => {
+                            result = serde_json::json!({ "redacted": true, "reason": reason });
+                        }
+                        // `FilterDecision` is `#[non_exhaustive]`: an unrecognized decision
+                        // withholds the result -- fail-closed, so output is never leaked unfiltered.
+                        _ => {
+                            result = serde_json::json!({
+                                "redacted": true,
+                                "reason": "unrecognized filter decision (fail-closed)",
+                            });
+                        }
+                    }
+                }
                 self.emit(&ActionCompleted { tool, action }, tenant, principal);
                 Ok(DispatchOutcome::Executed { result })
             }
@@ -519,6 +560,148 @@ mod tests {
             dispatcher.gate_names(),
             ["pistis", "plutus", "eidolon", "human", "phylax"]
         );
+    }
+
+    /// An output filter that always withholds the result with a fixed reason.
+    struct RedactFilter {
+        reason: &'static str,
+    }
+    #[async_trait]
+    impl OutputFilter for RedactFilter {
+        fn name(&self) -> &str {
+            "redact"
+        }
+        async fn filter(
+            &self,
+            _result: &mut serde_json::Value,
+            _ctx: &RequestContext,
+        ) -> FilterDecision {
+            FilterDecision::Redact {
+                reason: self.reason.to_string(),
+            }
+        }
+    }
+
+    /// An output filter that replaces the result wholesale with a fixed value.
+    struct ReplaceFilter {
+        value: serde_json::Value,
+    }
+    #[async_trait]
+    impl OutputFilter for ReplaceFilter {
+        fn name(&self) -> &str {
+            "replace"
+        }
+        async fn filter(
+            &self,
+            _result: &mut serde_json::Value,
+            _ctx: &RequestContext,
+        ) -> FilterDecision {
+            FilterDecision::Replace(self.value.clone())
+        }
+    }
+
+    /// An output filter that scrubs a top-level field in place, then passes the rest through.
+    struct ScrubFilter {
+        field: &'static str,
+    }
+    #[async_trait]
+    impl OutputFilter for ScrubFilter {
+        fn name(&self) -> &str {
+            "scrub"
+        }
+        async fn filter(
+            &self,
+            result: &mut serde_json::Value,
+            _ctx: &RequestContext,
+        ) -> FilterDecision {
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove(self.field);
+            }
+            FilterDecision::Pass
+        }
+    }
+
+    #[tokio::test]
+    async fn output_filter_redacts_result() {
+        let bus = Arc::new(AxonBus::new());
+        let dispatcher =
+            Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+                .expect("canonical chain")
+                .with_output_filter(Box::new(RedactFilter { reason: "pii" }));
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("dispatch");
+        match outcome {
+            DispatchOutcome::Executed { result } => {
+                assert_eq!(
+                    result,
+                    serde_json::json!({ "redacted": true, "reason": "pii" })
+                );
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_filter_replaces_result() {
+        let bus = Arc::new(AxonBus::new());
+        let replacement = serde_json::json!({ "minimised": true });
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+            .expect("canonical chain")
+            .with_output_filter(Box::new(ReplaceFilter {
+                value: replacement.clone(),
+            }));
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("dispatch");
+        match outcome {
+            DispatchOutcome::Executed { result } => assert_eq!(result, replacement),
+            other => panic!("expected Executed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_filter_passes_after_scrubbing_in_place() {
+        let bus = Arc::new(AxonBus::new());
+        // EchoExecutor returns { tool, action, echoed }; scrub the `echoed` field, pass the rest.
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+            .expect("canonical chain")
+            .with_output_filter(Box::new(ScrubFilter { field: "echoed" }));
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("dispatch");
+        match outcome {
+            DispatchOutcome::Executed { result } => {
+                assert_eq!(result["tool"], serde_json::json!("kleos"));
+                assert!(result.get("echoed").is_none(), "echoed must be scrubbed");
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_output_filter_passes_result_through() {
+        let bus = Arc::new(AxonBus::new());
+        // Default dispatcher (no filter) returns the executor result verbatim.
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+            .expect("canonical chain");
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("dispatch");
+        match outcome {
+            DispatchOutcome::Executed { result } => {
+                assert_eq!(result["echoed"], serde_json::json!(true));
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
     }
 
     #[test]

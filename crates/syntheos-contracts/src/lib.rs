@@ -48,6 +48,10 @@ pub mod gate;
 
 pub use gate::{Gate, GateDecision, GateError, GateRequest};
 
+pub mod output;
+
+pub use output::{FilterDecision, OutputFilter};
+
 pub mod lifecycle;
 
 pub use lifecycle::{ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired};
