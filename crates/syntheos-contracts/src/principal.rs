@@ -8,6 +8,7 @@ use crate::ids::PrincipalId;
 
 /// A canonical actor in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Principal {
     /// Stable identity of this actor.
     pub id: PrincipalId,
@@ -31,10 +32,12 @@ pub enum PrincipalKind {
     Integration,
 }
 
+/// Tests for principal wire contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Principal values roundtrip with the existing field shape.
     #[test]
     fn principal_roundtrip() {
         let p = Principal {
@@ -47,9 +50,21 @@ mod tests {
         assert_eq!(p, back);
     }
 
+    /// Principal kinds serialize in snake_case.
     #[test]
     fn kind_serializes_snake_case() {
         let json = serde_json::to_string(&PrincipalKind::Service).expect("serialize");
         assert_eq!(json, "\"service\"");
+    }
+
+    /// Principal values reject misspelled fields.
+    #[test]
+    fn principal_rejects_unknown_fields() {
+        let json = format!(
+            "{{\"id\":\"{}\",\"kind\":\"agent\",\"display\":null,\"dispaly\":\"bad\"}}",
+            PrincipalId::new().as_uuid()
+        );
+        let err = serde_json::from_str::<Principal>(&json).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
     }
 }

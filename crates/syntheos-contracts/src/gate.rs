@@ -10,6 +10,7 @@ use crate::action::{RequestContext, ToolInvocation};
 
 /// What the dispatcher hands to each gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GateRequest {
     /// The request context (tenant, principal, persona, etc.).
     pub context: RequestContext,
@@ -55,6 +56,7 @@ pub trait Gate: Send + Sync {
     async fn check(&self, req: &GateRequest) -> GateDecision;
 }
 
+/// Tests for gate trait object-safety and decision wire contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,17 +65,21 @@ mod tests {
     /// A gate that permits everything; exists only to prove the trait is usable.
     struct AllowAllGate;
 
+    /// Implement `Gate` for the test allow-all gate.
     #[async_trait::async_trait]
     impl Gate for AllowAllGate {
+        /// Return the stable test gate name.
         fn name(&self) -> &str {
             "allow-all"
         }
 
+        /// Permit every request in the object-safety test.
         async fn check(&self, _req: &GateRequest) -> GateDecision {
             GateDecision::Allow
         }
     }
 
+    /// Build a minimal gate request for tests.
     fn sample_request() -> GateRequest {
         GateRequest {
             context: RequestContext {
@@ -93,6 +99,7 @@ mod tests {
         }
     }
 
+    /// Boxed gates remain object-safe and callable.
     #[tokio::test]
     async fn boxed_gate_is_object_safe_and_allows() {
         let gate: Box<dyn Gate> = Box::new(AllowAllGate);
@@ -101,6 +108,7 @@ mod tests {
         assert_eq!(decision, GateDecision::Allow);
     }
 
+    /// Gate decision variants roundtrip without adding or removing variants.
     #[test]
     fn decision_variants_roundtrip() {
         for d in [
@@ -116,5 +124,15 @@ mod tests {
             let back: GateDecision = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(d, back);
         }
+    }
+
+    /// Gate requests reject misspelled or extra fields.
+    #[test]
+    fn gate_request_rejects_unknown_fields() {
+        let req = sample_request();
+        let mut value = serde_json::to_value(req).expect("serialize");
+        value["cotnext"] = serde_json::json!({});
+        let err = serde_json::from_value::<GateRequest>(value).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
     }
 }

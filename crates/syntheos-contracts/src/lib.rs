@@ -7,7 +7,7 @@
 //!
 //! ## Wire conventions
 //!
-//! - IDs are UUID v8, serialized as their canonical hyphenated string (serde transparent).
+//! - IDs are UUID v8, serialized as their canonical hyphenated string.
 //! - Timestamps are RFC3339 (e.g. `2026-06-02T13:40:07Z`).
 //!
 //! These match `syntheos-memory-gateway`'s wire-contract compliance, so the gateway and
@@ -18,7 +18,7 @@
 
 pub mod ids;
 
-pub use ids::{EventId, PrincipalId, TaskId, TenantId};
+pub use ids::{EventId, IdError, PrincipalId, TaskId, TenantId};
 
 pub mod time;
 
@@ -28,7 +28,7 @@ pub mod principal;
 pub mod tenant;
 
 pub use principal::{Principal, PrincipalKind};
-pub use tenant::Tenant;
+pub use tenant::{Tenant, TenantSlug, TenantSlugError};
 
 pub mod event;
 
@@ -50,6 +50,4 @@ pub use gate::{Gate, GateDecision, GateRequest};
 
 pub mod lifecycle;
 
-pub use lifecycle::{
-    ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired,
-};
+pub use lifecycle::{ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired};

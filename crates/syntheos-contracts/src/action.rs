@@ -7,6 +7,7 @@ use crate::task::TaskRef;
 
 /// A proposed action, resolved from skill/adapter registries before authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolInvocation {
     /// The tool or adapter being invoked (e.g. `kleos`).
     pub tool: String,
@@ -18,6 +19,7 @@ pub struct ToolInvocation {
 
 /// The context the dispatcher threads through every gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestContext {
     /// Tenant the request belongs to.
     pub tenant: TenantId,
@@ -35,10 +37,12 @@ pub struct RequestContext {
     pub workflow: Option<String>,
 }
 
+/// Tests for action request wire contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Tool invocation payloads roundtrip without changing field shape.
     #[test]
     fn tool_invocation_roundtrip() {
         let inv = ToolInvocation {
@@ -51,6 +55,7 @@ mod tests {
         assert_eq!(inv, back);
     }
 
+    /// Minimal request contexts roundtrip with optional fields absent.
     #[test]
     fn request_context_roundtrip_minimal() {
         let ctx = RequestContext {
@@ -65,5 +70,25 @@ mod tests {
         let json = serde_json::to_string(&ctx).expect("serialize");
         let back: RequestContext = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(ctx, back);
+    }
+
+    /// Tool invocation payloads reject misspelled fields.
+    #[test]
+    fn tool_invocation_rejects_unknown_fields() {
+        let json = r#"{"tool":"kleos","action":"memory_store","args":{},"argz":{}}"#;
+        let err = serde_json::from_str::<ToolInvocation>(json).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    /// Request contexts reject misspelled optional security context fields.
+    #[test]
+    fn request_context_rejects_unknown_fields() {
+        let json = format!(
+            "{{\"tenant\":\"{}\",\"principal\":\"{}\",\"persona\":null,\"session\":null,\"room\":null,\"task\":null,\"workflow\":null,\"sesion\":\"oops\"}}",
+            TenantId::new().as_uuid(),
+            PrincipalId::new().as_uuid()
+        );
+        let err = serde_json::from_str::<RequestContext>(&json).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
     }
 }
