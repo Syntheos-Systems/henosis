@@ -1,0 +1,57 @@
+[package]
+name = "agent-forge-lib"
+version = "0.1.0"
+edition.workspace = true
+# Copied code keeps its license (the rest of the workspace may differ).
+license = "Elastic-2.0"
+repository.workspace = true
+description = "Agent-Forge as a library: the structured-reasoning gate tools (spec/hypothesis/verify/challenge, Tree-sitter AST, skills), callable in-process, with a thin CLI wrapper."
+
+[features]
+# The CLI ships with the HTTP skills bridge; in-process consumers (syntheos-server) can opt out
+# and inject their own SkillsBridge.
+default = ["http-bridge"]
+# Blocking reqwest implementation of SkillsBridge against the Kleos skills API (KLEOS_URL +
+# KLEOS_API_KEY env). The phylax-broker keyless fallback stays in the Kleos repo's binary;
+# this workspace copy deliberately drops that cross-repo dependency.
+http-bridge = ["dep:reqwest"]
+
+[[bin]]
+name = "agent-forge"
+path = "src/bin/agent-forge.rs"
+required-features = ["http-bridge"]
+
+[dependencies]
+# CLI argument parsing (bin only; bins share the crate dependency list).
+clap = { version = "4", features = ["derive"] }
+# Tool input structs and the Output envelope.
+serde = { workspace = true }
+serde_json.workspace = true
+# The forge database (bundled = no system libsqlite, matching the kernel crates).
+rusqlite = { workspace = true, features = ["bundled"] }
+# Artifact ids (the upstream tool contract uses v4, unlike the v8 contracts ids).
+uuid = { workspace = true, features = ["v4"] }
+# Upstream timestamps are chrono-formatted TEXT; kept as-is to stay diffable against the
+# Kleos copy until retirement (crate-local dep, not workspace-wide).
+chrono = "0.4"
+# Repo walking for the AST tools.
+walkdir = "2"
+ignore = "0.4"
+# IoError/ToolError derives.
+thiserror.workspace = true
+# ~ expansion for the default DB path.
+dirs = "5"
+# Tree-sitter AST parsing per supported language.
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-json = "0.23"
+# The HTTP skills bridge (feature-gated).
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

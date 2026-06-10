@@ -12,6 +12,7 @@ members = [
     "crates/henosis-broca",
     "crates/henosis-loom",
     "crates/henosis-thymus",
+    "crates/agent-forge-lib",
 ]
 
 [workspace.package]
