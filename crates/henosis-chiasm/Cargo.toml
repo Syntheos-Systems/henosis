@@ -1,0 +1,26 @@
+[package]
+name = "henosis-chiasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chiasm: the task-coordination kernel service, extracted onto syntheos-contracts + in-process Axon."
+
+[dependencies]
+# Canonical ids (TaskId/TenantId/PrincipalId), Timestamp, and the TypedEvent trait.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# In-process bus the task lifecycle events are published onto.
+syntheos-axon = { path = "../syntheos-axon" }
+# SQLite backend (bundled = no system libsqlite). Migration convention: PRAGMA user_version.
+rusqlite = { workspace = true, features = ["bundled"] }
+# ChiasmError.
+thiserror.workspace = true
+# Status (de)serialization and event payloads.
+serde = { workspace = true }
+serde_json.workspace = true
+# Fire-and-forget event-emission failures are logged, never fatal.
+tracing.workspace = true
+
+[dev-dependencies]
+# Workspace tokio is "full" -- runtime + macros for #[tokio::test].
+tokio = { workspace = true }

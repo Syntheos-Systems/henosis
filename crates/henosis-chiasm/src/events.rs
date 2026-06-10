@@ -1,0 +1,77 @@
+//! The task-lifecycle events Chiasm publishes onto the Axon bus.
+//!
+//! They live here (a service crate) rather than in `syntheos-contracts` because they are Chiasm's
+//! domain events, but they implement the contracts' [`TypedEvent`] trait so any in-process reactor
+//! (narration, evaluation, the future durable audit path) can subscribe without depending on
+//! Chiasm. Payloads carry identifying strings only -- never task bodies or outputs -- so nothing
+//! sensitive lands on the ephemeral bus, matching the action-lifecycle convention.
+
+use serde::{Deserialize, Serialize};
+use syntheos_contracts::TypedEvent;
+
+/// The coarse channel every Chiasm task event travels on.
+pub const TASK_CHANNEL: &str = "task";
+
+/// A task was created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCreated {
+    /// The new task's id.
+    pub task_id: String,
+    /// The project it groups under.
+    pub project: String,
+    /// Its title.
+    pub title: String,
+    /// Its initial status token.
+    pub status: String,
+}
+
+/// Emit `TaskCreated` on the task channel.
+impl TypedEvent for TaskCreated {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.created";
+}
+
+/// A task changed status or fields (but did not complete).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskUpdated {
+    /// The task's id.
+    pub task_id: String,
+    /// Its status token after the update.
+    pub status: String,
+}
+
+/// Emit `TaskUpdated` on the task channel.
+impl TypedEvent for TaskUpdated {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.updated";
+}
+
+/// A task reached the `completed` terminal state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCompleted {
+    /// The completed task's id.
+    pub task_id: String,
+}
+
+/// Emit `TaskCompleted` on the task channel.
+impl TypedEvent for TaskCompleted {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.completed";
+}
+
+/// A task was deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDeleted {
+    /// The deleted task's id.
+    pub task_id: String,
+}
+
+/// Emit `TaskDeleted` on the task channel.
+impl TypedEvent for TaskDeleted {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.deleted";
+}
