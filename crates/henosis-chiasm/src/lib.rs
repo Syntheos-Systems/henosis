@@ -30,6 +30,11 @@ pub mod model;
 pub mod store;
 
 pub use error::ChiasmError;
-pub use events::{TaskCreated, TaskDeleted, TaskUpdated, TaskCompleted, TASK_CHANNEL};
-pub use model::{ChiasmStats, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate};
+pub use events::{
+    TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued, TaskStale, TaskUpdated,
+    TASK_CHANNEL,
+};
+pub use model::{
+    ChiasmStats, EnqueueTask, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
+};
 pub use store::ChiasmStore;

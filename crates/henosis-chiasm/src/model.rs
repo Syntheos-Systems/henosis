@@ -133,6 +133,23 @@ pub struct NewTask {
     pub heartbeat_interval_secs: Option<i64>,
 }
 
+/// The fields required to enqueue an unassigned task for an agent to claim. A queued task is
+/// minted with [`TaskStatus::Queued`] and no assignee; [`crate::ChiasmStore::claim_next`] later
+/// assigns it.
+#[derive(Debug, Clone)]
+pub struct EnqueueTask {
+    /// Tenant the task belongs to.
+    pub tenant: TenantId,
+    /// Owner principal (the enqueuer / queue scope).
+    pub principal_id: PrincipalId,
+    /// Project the task groups under.
+    pub project: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Optional summary.
+    pub summary: Option<String>,
+}
+
 /// A partial update to a task. Every field is optional; `None` leaves that column unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct TaskPatch {

@@ -75,3 +75,49 @@ impl TypedEvent for TaskDeleted {
     const CHANNEL: &'static str = TASK_CHANNEL;
     const KIND: &'static str = "task.deleted";
 }
+
+/// A task was enqueued, unassigned, for an agent to claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskQueued {
+    /// The queued task's id.
+    pub task_id: String,
+    /// The project it groups under.
+    pub project: String,
+}
+
+/// Emit `TaskQueued` on the task channel.
+impl TypedEvent for TaskQueued {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.queued";
+}
+
+/// A queued task was claimed by an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskClaimed {
+    /// The claimed task's id.
+    pub task_id: String,
+    /// The principal that claimed it.
+    pub assignee: String,
+}
+
+/// Emit `TaskClaimed` on the task channel.
+impl TypedEvent for TaskClaimed {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.claimed";
+}
+
+/// A task was marked stale because its heartbeat lapsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskStale {
+    /// The staled task's id.
+    pub task_id: String,
+}
+
+/// Emit `TaskStale` on the task channel.
+impl TypedEvent for TaskStale {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.stale";
+}

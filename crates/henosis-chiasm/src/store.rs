@@ -18,8 +18,12 @@ use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, TaskId, TenantId, Timestamp, TypedEvent};
 
 use crate::error::ChiasmError;
-use crate::events::{TaskCreated, TaskDeleted, TaskUpdated, TaskCompleted};
-use crate::model::{ChiasmStats, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate};
+use crate::events::{
+    TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued, TaskStale, TaskUpdated,
+};
+use crate::model::{
+    ChiasmStats, EnqueueTask, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
+};
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__chiasm_tasks.sql"))];
@@ -197,32 +201,7 @@ impl ChiasmStore {
         };
         {
             let conn = self.lock();
-            conn.execute(
-                "INSERT INTO chiasm_tasks (id, tenant, principal_id, assignee, project, title, \
-                 status, summary, expected_output, output_format, output, plan, feedback, \
-                 last_heartbeat, heartbeat_interval_secs, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                rusqlite::params![
-                    task.id.to_string(),
-                    task.tenant.to_string(),
-                    task.principal_id.to_string(),
-                    task.assignee.map(|a| a.to_string()),
-                    &task.project,
-                    &task.title,
-                    task.status.as_str(),
-                    &task.summary,
-                    &task.expected_output,
-                    &task.output_format,
-                    &task.output,
-                    &task.plan,
-                    &task.feedback,
-                    task.last_heartbeat.as_ref().map(ts_to_db).transpose()?,
-                    task.heartbeat_interval_secs,
-                    ts_to_db(&task.created_at)?,
-                    ts_to_db(&task.updated_at)?,
-                ],
-            )
-            .map_err(berr)?;
+            insert_task(&conn, &task)?;
         }
         self.emit(
             &TaskCreated {
@@ -471,6 +450,223 @@ impl ChiasmStore {
         }
         Ok(ChiasmStats { total, by_status })
     }
+
+    /// Enqueue an unassigned task ([`TaskStatus::Queued`], no assignee) for an agent to claim
+    /// later, and emit `task.queued`.
+    pub async fn enqueue(&self, new: EnqueueTask) -> Result<Task, ChiasmError> {
+        let now = Timestamp::now();
+        let task = Task {
+            id: TaskId::new(),
+            tenant: new.tenant,
+            principal_id: new.principal_id,
+            assignee: None,
+            project: new.project,
+            title: new.title,
+            status: TaskStatus::Queued,
+            summary: new.summary,
+            expected_output: None,
+            output_format: "raw".to_string(),
+            output: None,
+            plan: None,
+            feedback: None,
+            last_heartbeat: None,
+            heartbeat_interval_secs: 300,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let conn = self.lock();
+            insert_task(&conn, &task)?;
+        }
+        self.emit(
+            &TaskQueued {
+                task_id: task.id.to_string(),
+                project: task.project.clone(),
+            },
+            task.tenant,
+            task.principal_id,
+        );
+        Ok(task)
+    }
+
+    /// Atomically claim the oldest queued, unassigned task owned by `owner` (optionally filtered to
+    /// `project`), assigning it to `claimer`, flipping it to [`TaskStatus::Active`], and stamping a
+    /// first heartbeat. `Ok(None)` when the queue is empty. Emits `task.claimed` on success.
+    ///
+    /// The claim is a single `UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING`, so two
+    /// concurrent claimers can never grab the same task even without the connection `Mutex`.
+    pub async fn claim_next(
+        &self,
+        owner: PrincipalId,
+        claimer: PrincipalId,
+        project: Option<&str>,
+    ) -> Result<Option<Task>, ChiasmError> {
+        let now = ts_to_db(&Timestamp::now())?;
+        let project_clause = if project.is_some() {
+            "AND project = ?4"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE chiasm_tasks SET assignee = ?2, status = 'active', last_heartbeat = ?3, \
+             updated_at = ?3 WHERE id = (SELECT id FROM chiasm_tasks WHERE principal_id = ?1 \
+             AND assignee IS NULL AND status = 'queued' {project_clause} \
+             ORDER BY rowid ASC LIMIT 1) RETURNING {TASK_COLUMNS}"
+        );
+        let raw = {
+            let conn = self.lock();
+            let result = match project {
+                Some(p) => conn.query_row(
+                    &sql,
+                    rusqlite::params![owner.to_string(), claimer.to_string(), now, p],
+                    read_raw,
+                ),
+                None => conn.query_row(
+                    &sql,
+                    rusqlite::params![owner.to_string(), claimer.to_string(), now],
+                    read_raw,
+                ),
+            };
+            result.optional().map_err(berr)?
+        };
+        let task = raw.map(RawTask::into_task).transpose()?;
+        if let Some(task) = &task {
+            self.emit(
+                &TaskClaimed {
+                    task_id: task.id.to_string(),
+                    assignee: claimer.to_string(),
+                },
+                task.tenant,
+                task.principal_id,
+            );
+        }
+        Ok(task)
+    }
+
+    /// Record a liveness heartbeat for an owned task, refreshing `last_heartbeat`. Returns
+    /// [`ChiasmError::NotFound`] if the task does not exist or is owned by another principal.
+    ///
+    /// (Path-claim expiry refresh, which Kleos folds in here, lands with the claims slice.)
+    pub async fn record_heartbeat(
+        &self,
+        principal: PrincipalId,
+        id: TaskId,
+    ) -> Result<(), ChiasmError> {
+        let now = ts_to_db(&Timestamp::now())?;
+        let updated = {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE chiasm_tasks SET last_heartbeat = ?1, updated_at = ?1 \
+                 WHERE id = ?2 AND principal_id = ?3",
+                rusqlite::params![now, id.to_string(), principal.to_string()],
+            )
+            .map_err(berr)?
+        };
+        if updated == 0 {
+            return Err(ChiasmError::NotFound(id));
+        }
+        Ok(())
+    }
+
+    /// System-wide sweep (NOT owner-scoped -- a maintenance task) that marks every active/paused
+    /// task whose heartbeat is overdue as [`TaskStatus::Stale`], appends a history row, and emits
+    /// `task.stale`. A task is overdue when `now - last_heartbeat > heartbeat_interval_secs *
+    /// grace_multiplier`. Returns the tasks it staled.
+    ///
+    /// The overdue comparison is computed in Rust rather than SQL so it does not depend on SQLite
+    /// parsing nanosecond-precision RFC3339 timestamps.
+    pub async fn mark_stale(&self, grace_multiplier: f64) -> Result<Vec<Task>, ChiasmError> {
+        const STALE_SUMMARY: &str = "marked stale: heartbeat overdue";
+        let candidates: Vec<Task> = {
+            let conn = self.lock();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {TASK_COLUMNS} FROM chiasm_tasks \
+                     WHERE status IN ('active', 'paused') AND last_heartbeat IS NOT NULL"
+                ))
+                .map_err(berr)?;
+            let rows = stmt.query_map([], read_raw).map_err(berr)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(berr)?.into_task()?);
+            }
+            out
+        };
+        let now_odt = Timestamp::now().as_offset_date_time();
+        let mut staled = Vec::new();
+        for mut task in candidates {
+            let Some(hb) = task.last_heartbeat.as_ref().map(|t| t.as_offset_date_time()) else {
+                continue;
+            };
+            let elapsed = (now_odt - hb).as_seconds_f64();
+            let threshold = task.heartbeat_interval_secs as f64 * grace_multiplier;
+            if elapsed <= threshold {
+                continue;
+            }
+            let now_ts = Timestamp::now();
+            let now_db = ts_to_db(&now_ts)?;
+            {
+                let mut conn = self.lock();
+                let tx = conn.transaction().map_err(berr)?;
+                tx.execute(
+                    "UPDATE chiasm_tasks SET status = 'stale', summary = ?2, updated_at = ?3 \
+                     WHERE id = ?1",
+                    rusqlite::params![task.id.to_string(), STALE_SUMMARY, now_db],
+                )
+                .map_err(berr)?;
+                tx.execute(
+                    "INSERT INTO chiasm_task_updates (task_id, status, summary, created_at) \
+                     VALUES (?1, 'stale', ?2, ?3)",
+                    rusqlite::params![task.id.to_string(), STALE_SUMMARY, now_db],
+                )
+                .map_err(berr)?;
+                tx.commit().map_err(berr)?;
+            }
+            task.status = TaskStatus::Stale;
+            task.summary = Some(STALE_SUMMARY.to_string());
+            task.updated_at = now_ts;
+            self.emit(
+                &TaskStale {
+                    task_id: task.id.to_string(),
+                },
+                task.tenant,
+                task.principal_id,
+            );
+            staled.push(task);
+        }
+        Ok(staled)
+    }
+}
+
+/// Insert a fully-formed [`Task`] row. Shared by `create` and `enqueue`.
+fn insert_task(conn: &Connection, task: &Task) -> Result<(), ChiasmError> {
+    conn.execute(
+        "INSERT INTO chiasm_tasks (id, tenant, principal_id, assignee, project, title, status, \
+         summary, expected_output, output_format, output, plan, feedback, last_heartbeat, \
+         heartbeat_interval_secs, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        rusqlite::params![
+            task.id.to_string(),
+            task.tenant.to_string(),
+            task.principal_id.to_string(),
+            task.assignee.map(|a| a.to_string()),
+            &task.project,
+            &task.title,
+            task.status.as_str(),
+            &task.summary,
+            &task.expected_output,
+            &task.output_format,
+            &task.output,
+            &task.plan,
+            &task.feedback,
+            task.last_heartbeat.as_ref().map(ts_to_db).transpose()?,
+            task.heartbeat_interval_secs,
+            ts_to_db(&task.created_at)?,
+            ts_to_db(&task.updated_at)?,
+        ],
+    )
+    .map_err(berr)?;
+    Ok(())
 }
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
@@ -694,5 +890,151 @@ mod tests {
             assert_eq!(got.title, "durable");
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A minimal EnqueueTask for `principal` in `tenant` under `project`.
+    fn enqueue_task(tenant: TenantId, principal: PrincipalId, title: &str, project: &str) -> EnqueueTask {
+        EnqueueTask {
+            tenant,
+            principal_id: principal,
+            project: project.to_string(),
+            title: title.to_string(),
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_then_claim() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, owner) = (TenantId::new(), PrincipalId::new());
+        let claimer = PrincipalId::new();
+
+        let queued = store
+            .enqueue(enqueue_task(tenant, owner, "work", "henosis"))
+            .await
+            .expect("enqueue");
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert!(queued.assignee.is_none());
+        assert_eq!(drain_kinds(&mut rx), ["task.queued"]);
+
+        let claimed = store
+            .claim_next(owner, claimer, None)
+            .await
+            .expect("claim")
+            .expect("a task to claim");
+        assert_eq!(claimed.id, queued.id);
+        assert_eq!(claimed.status, TaskStatus::Active);
+        assert_eq!(claimed.assignee, Some(claimer));
+        assert!(claimed.last_heartbeat.is_some(), "claim stamps a first heartbeat");
+        assert_eq!(drain_kinds(&mut rx), ["task.claimed"]);
+
+        // Queue is now empty.
+        assert!(store.claim_next(owner, claimer, None).await.expect("claim").is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_is_fifo() {
+        let (store, _bus) = store();
+        let (tenant, owner) = (TenantId::new(), PrincipalId::new());
+        let first = store.enqueue(enqueue_task(tenant, owner, "first", "p")).await.expect("enqueue");
+        let _second = store.enqueue(enqueue_task(tenant, owner, "second", "p")).await.expect("enqueue");
+        let claimed = store
+            .claim_next(owner, PrincipalId::new(), None)
+            .await
+            .expect("claim")
+            .expect("task");
+        assert_eq!(claimed.id, first.id, "oldest-enqueued task is claimed first");
+    }
+
+    #[tokio::test]
+    async fn claim_respects_project_filter() {
+        let (store, _bus) = store();
+        let (tenant, owner) = (TenantId::new(), PrincipalId::new());
+        store.enqueue(enqueue_task(tenant, owner, "alpha-task", "alpha")).await.expect("enqueue");
+        let beta = store.enqueue(enqueue_task(tenant, owner, "beta-task", "beta")).await.expect("enqueue");
+        let claimed = store
+            .claim_next(owner, PrincipalId::new(), Some("beta"))
+            .await
+            .expect("claim")
+            .expect("task");
+        assert_eq!(claimed.id, beta.id, "only the beta-project task is claimable");
+    }
+
+    #[tokio::test]
+    async fn claim_is_owner_scoped() {
+        let (store, _bus) = store();
+        let tenant = TenantId::new();
+        let owner = PrincipalId::new();
+        let other_owner = PrincipalId::new();
+        store.enqueue(enqueue_task(tenant, owner, "t", "p")).await.expect("enqueue");
+        // A different owner's queue is empty.
+        assert!(store
+            .claim_next(other_owner, PrincipalId::new(), None)
+            .await
+            .expect("claim")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn record_heartbeat_updates_and_notfound() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        assert!(task.last_heartbeat.is_none());
+
+        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        let got = store.get(principal, task.id).await.expect("get").expect("present");
+        assert!(got.last_heartbeat.is_some(), "heartbeat sets last_heartbeat");
+
+        // Unknown task, or another principal's task, is NotFound.
+        let err = store
+            .record_heartbeat(principal, TaskId::new())
+            .await
+            .expect_err("unknown task");
+        assert!(matches!(err, ChiasmError::NotFound(_)));
+        let err = store
+            .record_heartbeat(PrincipalId::new(), task.id)
+            .await
+            .expect_err("wrong owner");
+        assert!(matches!(err, ChiasmError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn fresh_heartbeat_is_not_stale() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        // Just beaten, default 300s interval, grace 1.0 -> not overdue.
+        assert!(store.mark_stale(1.0).await.expect("sweep").is_empty());
+        let got = store.get(principal, task.id).await.expect("get").expect("present");
+        assert_eq!(got.status, TaskStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn overdue_heartbeat_marks_stale() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        let _ = drain_kinds(&mut rx);
+
+        // grace 0.0 -> threshold 0 -> any elapsed time is overdue.
+        let staled = store.mark_stale(0.0).await.expect("sweep");
+        assert_eq!(staled.len(), 1);
+        assert_eq!(staled[0].id, task.id);
+        assert_eq!(staled[0].status, TaskStatus::Stale);
+        assert_eq!(drain_kinds(&mut rx), ["task.stale"]);
+
+        let got = store.get(principal, task.id).await.expect("get").expect("present");
+        assert_eq!(got.status, TaskStatus::Stale);
+        let history = store.history(principal, task.id, 10).await.expect("history");
+        assert_eq!(history[0].status, TaskStatus::Stale, "stale recorded in history");
+
+        // A task with no heartbeat is never swept, even at grace 0.0.
+        let unbeaten = store.create(new_task(tenant, principal, "unbeaten")).await.expect("create");
+        assert!(store.mark_stale(0.0).await.expect("sweep").iter().all(|t| t.id != unbeaten.id));
     }
 }
