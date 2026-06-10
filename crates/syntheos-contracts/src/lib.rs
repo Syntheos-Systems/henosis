@@ -18,7 +18,7 @@
 
 pub mod ids;
 
-pub use ids::{EventId, IdError, PrincipalId, TaskId, TenantId};
+pub use ids::{EventId, IdError, PrincipalId, RunId, TaskId, TenantId, WorkflowId};
 
 pub mod time;
 

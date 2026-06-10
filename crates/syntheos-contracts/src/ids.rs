@@ -143,6 +143,14 @@ id_newtype!(
     /// Identifies an Axon event.
     EventId
 );
+id_newtype!(
+    /// Identifies a Loom workflow definition.
+    WorkflowId
+);
+id_newtype!(
+    /// Identifies one run of a Loom workflow.
+    RunId
+);
 
 /// Tests for ID generation, parsing, and serde validation.
 #[cfg(test)]
