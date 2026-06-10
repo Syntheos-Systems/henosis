@@ -10,6 +10,8 @@ use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_soma::SomaStore;
+use henosis_thymus::ThymusStore;
+use syntheos_server::SomaQualitySink;
 use syntheos_axon::AxonBus;
 use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
 use syntheos_dispatch::Dispatcher;
@@ -73,8 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(TransformExecutor)),
     );
     tracing::info!(path = %loom_db, "loom workflow engine open");
+    // Evaluations and drift propagate into the agents' Soma presence via the sink adapter.
+    let thymus_db = db_path("SYNTHEOS_THYMUS_DB", "data/thymus.sqlite")?;
+    let thymus = Arc::new(
+        ThymusStore::open(&thymus_db, bus.clone())?
+            .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
+    );
+    tracing::info!(path = %thymus_db, "thymus quality store open");
 
-    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom);
+    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus);
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.

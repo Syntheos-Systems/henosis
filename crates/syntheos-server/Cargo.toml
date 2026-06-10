@@ -17,6 +17,7 @@ henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
 henosis-loom = { path = "../henosis-loom" }
+henosis-thymus = { path = "../henosis-thymus" }
 # HTTP surface.
 axum.workspace = true
 # Global concurrency cap on the HTTP surface (resource-limit hardening).
@@ -29,6 +30,8 @@ tokio = { workspace = true }
 serde.workspace = true
 # JSON responses.
 serde_json.workspace = true
+# The QualitySink adapter (Thymus -> Soma) implements an async trait.
+async-trait.workspace = true
 # Structured logging.
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -16,9 +16,15 @@ use henosis_loom::{
     LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
     StepDef, Workflow,
 };
+use async_trait::async_trait;
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
+};
+use henosis_thymus::{
+    AgentScores, Criterion, DriftEvent, DriftSeverity, DriftType, Evaluation, EvaluationFilter,
+    MetricSummary, NewDriftEvent, NewEvaluation, NewMetric, NewRubric, QualityMetric, QualitySink,
+    Rubric, ThymusError, ThymusStats, ThymusStore,
 };
 use serde::Deserialize;
 use syntheos_contracts::{RunId, Timestamp, WorkflowId};
@@ -46,6 +52,34 @@ pub struct AppState {
     broca: Arc<BrocaStore>,
     /// The Loom workflow engine (Story 1.4).
     loom: Arc<LoomStore>,
+    /// The Thymus quality store (Story 1.5).
+    thymus: Arc<ThymusStore>,
+}
+
+/// Adapts [`SomaStore::update_quality`] to the Thymus [`QualitySink`] seam, closing the
+/// evaluation -> presence-projection loop without a kernel-crate-to-kernel-crate dependency.
+pub struct SomaQualitySink(pub Arc<SomaStore>);
+
+#[async_trait]
+impl QualitySink for SomaQualitySink {
+    async fn apply(
+        &self,
+        agent: PrincipalId,
+        quality_score: Option<f64>,
+        drift_flags: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        self.0
+            .update_quality(
+                agent,
+                QualityPatch {
+                    quality_score,
+                    drift_flags,
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 impl AppState {
@@ -58,6 +92,7 @@ impl AppState {
         soma: Arc<SomaStore>,
         broca: Arc<BrocaStore>,
         loom: Arc<LoomStore>,
+        thymus: Arc<ThymusStore>,
     ) -> Self {
         Self {
             dispatcher,
@@ -67,6 +102,7 @@ impl AppState {
             soma,
             broca,
             loom,
+            thymus,
         }
     }
 
@@ -106,6 +142,14 @@ pub fn router(state: AppState) -> Router {
         .route("/loom/steps/{id}/complete", post(loom_complete_step))
         .route("/loom/steps/{id}/fail", post(loom_fail_step))
         .route("/loom/stats", get(loom_stats))
+        .route("/thymus/rubrics", post(thymus_create_rubric).get(thymus_list_rubrics))
+        .route("/thymus/rubrics/{id}", get(thymus_get_rubric))
+        .route("/thymus/evaluations", post(thymus_evaluate).get(thymus_list_evaluations))
+        .route("/thymus/agents/{id}/scores", get(thymus_agent_scores))
+        .route("/thymus/metrics", post(thymus_record_metric))
+        .route("/thymus/metrics/summary", get(thymus_metric_summary))
+        .route("/thymus/drift", post(thymus_record_drift).get(thymus_list_drift))
+        .route("/thymus/stats", get(thymus_stats))
         .with_state(state)
 }
 
@@ -868,6 +912,323 @@ async fn loom_stats(
         .map_err(loom_error)
 }
 
+/// Map a [`ThymusError`] onto an HTTP status + message.
+fn thymus_error(e: ThymusError) -> (StatusCode, String) {
+    let status = match &e {
+        ThymusError::RubricNotFound(_) | ThymusError::EvaluationNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        ThymusError::RubricInUse(_) => StatusCode::CONFLICT,
+        ThymusError::InvalidInput(_) | ThymusError::InvalidToken(_) => StatusCode::BAD_REQUEST,
+        // Backend and any future variants are server-side failures.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Body for [`thymus_create_rubric`]. Identity is caller-asserted, the established posture.
+#[derive(Debug, Deserialize)]
+pub struct ThymusCreateRubric {
+    /// Tenant the rubric belongs to.
+    pub tenant: TenantId,
+    /// Owner principal.
+    pub principal_id: PrincipalId,
+    /// Rubric name, unique per owner.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// The scoring criteria (non-empty, unique names).
+    pub criteria: Vec<Criterion>,
+}
+
+/// Define a new evaluation rubric.
+async fn thymus_create_rubric(
+    State(state): State<AppState>,
+    Json(req): Json<ThymusCreateRubric>,
+) -> Result<Json<Rubric>, (StatusCode, String)> {
+    state
+        .thymus
+        .create_rubric(NewRubric {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            name: req.name,
+            description: req.description,
+            criteria: req.criteria,
+        })
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Query string asserting the owner principal for Thymus reads.
+#[derive(Debug, Deserialize)]
+pub struct ThymusOwnerQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+}
+
+/// List the asserted principal's rubrics.
+async fn thymus_list_rubrics(
+    State(state): State<AppState>,
+    Query(q): Query<ThymusOwnerQuery>,
+) -> Result<Json<Vec<Rubric>>, (StatusCode, String)> {
+    state
+        .thymus
+        .list_rubrics(q.principal_id)
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Fetch one of the asserted principal's rubrics by id.
+async fn thymus_get_rubric(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<ThymusOwnerQuery>,
+) -> Result<Json<Rubric>, (StatusCode, String)> {
+    state
+        .thymus
+        .get_rubric(q.principal_id, id)
+        .await
+        .map_err(thymus_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("rubric not found: {id}")))
+}
+
+/// Body for [`thymus_evaluate`].
+#[derive(Debug, Deserialize)]
+pub struct ThymusEvaluate {
+    /// Owner principal (must own the rubric).
+    pub principal_id: PrincipalId,
+    /// The rubric to score against.
+    pub rubric_id: i64,
+    /// The evaluated agent's principal.
+    pub agent: PrincipalId,
+    /// The evaluating principal.
+    pub evaluator: PrincipalId,
+    /// What was evaluated.
+    pub subject: String,
+    /// The work's input (defaults to `{}`).
+    pub input: Option<serde_json::Value>,
+    /// The work's output (defaults to `{}`).
+    pub output: Option<serde_json::Value>,
+    /// Raw per-criterion scores keyed by criterion name (every criterion required).
+    pub scores: std::collections::BTreeMap<String, f64>,
+    /// Optional notes.
+    pub notes: Option<String>,
+}
+
+/// Record an evaluation; the rolling average propagates to the agent's Soma presence.
+async fn thymus_evaluate(
+    State(state): State<AppState>,
+    Json(req): Json<ThymusEvaluate>,
+) -> Result<Json<Evaluation>, (StatusCode, String)> {
+    state
+        .thymus
+        .evaluate(NewEvaluation {
+            principal_id: req.principal_id,
+            rubric_id: req.rubric_id,
+            agent: req.agent,
+            evaluator: req.evaluator,
+            subject: req.subject,
+            input: req.input,
+            output: req.output,
+            scores: req.scores,
+            notes: req.notes,
+        })
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Query string for [`thymus_list_evaluations`]: the asserted owner plus optional AND-filters.
+#[derive(Debug, Deserialize)]
+pub struct ThymusEvaluationsQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// Only evaluations of this agent.
+    pub agent: Option<PrincipalId>,
+    /// Only evaluations against this rubric.
+    pub rubric_id: Option<i64>,
+    /// Maximum rows to return.
+    pub limit: Option<usize>,
+    /// Rows to skip (pagination).
+    pub offset: Option<usize>,
+}
+
+/// List the asserted principal's evaluations, newest first.
+async fn thymus_list_evaluations(
+    State(state): State<AppState>,
+    Query(q): Query<ThymusEvaluationsQuery>,
+) -> Result<Json<Vec<Evaluation>>, (StatusCode, String)> {
+    state
+        .thymus
+        .list_evaluations(
+            q.principal_id,
+            EvaluationFilter {
+                agent: q.agent,
+                rubric_id: q.rubric_id,
+                limit: q.limit,
+                offset: q.offset,
+            },
+        )
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// An agent's rolling evaluation summary.
+async fn thymus_agent_scores(
+    State(state): State<AppState>,
+    Path(agent): Path<PrincipalId>,
+    Query(q): Query<ThymusOwnerQuery>,
+) -> Result<Json<AgentScores>, (StatusCode, String)> {
+    state
+        .thymus
+        .agent_scores(q.principal_id, agent)
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Body for [`thymus_record_metric`].
+#[derive(Debug, Deserialize)]
+pub struct ThymusRecordMetric {
+    /// Tenant the metric belongs to.
+    pub tenant: TenantId,
+    /// Owner principal.
+    pub principal_id: PrincipalId,
+    /// The agent the metric describes.
+    pub agent: PrincipalId,
+    /// Metric name.
+    pub metric: String,
+    /// The data point.
+    pub value: f64,
+    /// Free-form dimension tags (a JSON object).
+    pub tags: Option<serde_json::Value>,
+}
+
+/// Record a quality-metric data point.
+async fn thymus_record_metric(
+    State(state): State<AppState>,
+    Json(req): Json<ThymusRecordMetric>,
+) -> Result<Json<QualityMetric>, (StatusCode, String)> {
+    state
+        .thymus
+        .record_metric(NewMetric {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            agent: req.agent,
+            metric: req.metric,
+            value: req.value,
+            tags: req.tags,
+        })
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Query string for [`thymus_metric_summary`]: one (agent, metric) series.
+#[derive(Debug, Deserialize)]
+pub struct ThymusMetricSummaryQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// The agent whose series is summarized.
+    pub agent: PrincipalId,
+    /// The metric name.
+    pub metric: String,
+}
+
+/// Summarize one (agent, metric) series.
+async fn thymus_metric_summary(
+    State(state): State<AppState>,
+    Query(q): Query<ThymusMetricSummaryQuery>,
+) -> Result<Json<MetricSummary>, (StatusCode, String)> {
+    state
+        .thymus
+        .metric_summary(q.principal_id, q.agent, &q.metric)
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Body for [`thymus_record_drift`].
+#[derive(Debug, Deserialize)]
+pub struct ThymusRecordDrift {
+    /// Tenant the event belongs to.
+    pub tenant: TenantId,
+    /// Owner principal.
+    pub principal_id: PrincipalId,
+    /// The drifting agent's principal.
+    pub agent: PrincipalId,
+    /// The session the drift was observed in, when known.
+    pub session: Option<String>,
+    /// The drift category.
+    pub drift_type: DriftType,
+    /// Severity (defaults to `medium`).
+    pub severity: Option<DriftSeverity>,
+    /// The observed signal.
+    pub signal: String,
+}
+
+/// Record a behavioral-drift observation; the agent's drift flags propagate to Soma.
+async fn thymus_record_drift(
+    State(state): State<AppState>,
+    Json(req): Json<ThymusRecordDrift>,
+) -> Result<Json<DriftEvent>, (StatusCode, String)> {
+    state
+        .thymus
+        .record_drift_event(NewDriftEvent {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            agent: req.agent,
+            session: req.session,
+            drift_type: req.drift_type,
+            severity: req.severity,
+            signal: req.signal,
+        })
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Query string for [`thymus_list_drift`].
+#[derive(Debug, Deserialize)]
+pub struct ThymusDriftQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// Only events for this agent.
+    pub agent: Option<PrincipalId>,
+    /// Maximum rows to return (defaults to 100).
+    pub limit: Option<usize>,
+}
+
+/// List the asserted principal's drift events, newest first.
+async fn thymus_list_drift(
+    State(state): State<AppState>,
+    Query(q): Query<ThymusDriftQuery>,
+) -> Result<Json<Vec<DriftEvent>>, (StatusCode, String)> {
+    state
+        .thymus
+        .list_drift_events(q.principal_id, q.agent, q.limit.unwrap_or(100))
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
+/// Aggregate quality counts for the asserted principal.
+async fn thymus_stats(
+    State(state): State<AppState>,
+    Query(q): Query<ThymusOwnerQuery>,
+) -> Result<Json<ThymusStats>, (StatusCode, String)> {
+    state
+        .thymus
+        .stats(q.principal_id)
+        .await
+        .map(Json)
+        .map_err(thymus_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,7 +1258,12 @@ mod tests {
                 .expect("loom store")
                 .with_executor(Box::new(henosis_loom::TransformExecutor)),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom)
+        let thymus = Arc::new(
+            ThymusStore::open_in_memory(bus.clone())
+                .expect("thymus store")
+                .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus)
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -918,7 +1284,12 @@ mod tests {
                 .expect("loom store")
                 .with_executor(Box::new(henosis_loom::TransformExecutor)),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom)
+        let thymus = Arc::new(
+            ThymusStore::open_in_memory(bus.clone())
+                .expect("thymus store")
+                .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus)
     }
 
     /// Collect a response body into a UTF-8 string.
@@ -1286,6 +1657,95 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(stats["total"], 1);
         assert_eq!(stats["online"], 1);
+    }
+
+    #[tokio::test]
+    async fn thymus_evaluation_updates_soma_quality_over_http() {
+        use syntheos_contracts::TenantId;
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let owner = enroll_http(&app, "human", "operator").await;
+        let agent = enroll_http(&app, "agent", "worker").await;
+
+        // The agent registers presence (so the quality sink has a projection to update).
+        let body = serde_json::json!({
+            "principal_id": agent, "tenant": tenant,
+            "name": "worker", "agent_type": "coding",
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/soma/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Define a one-criterion rubric and evaluate the agent at 0.8.
+        let body = serde_json::json!({
+            "tenant": tenant, "principal_id": owner,
+            "name": "review", "criteria": [{"name": "quality"}],
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/thymus/rubrics")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rubric: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+
+        let body = serde_json::json!({
+            "principal_id": owner,
+            "rubric_id": rubric["id"],
+            "agent": agent,
+            "evaluator": owner,
+            "subject": "slice review",
+            "scores": {"quality": 0.8},
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/thymus/evaluations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let evaluation: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(evaluation["overall_score"], 0.8);
+
+        // THE Phase 1 acceptance: the evaluation propagated into the agent's Soma presence.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/soma/agents/{agent}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let presence: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(presence["quality_score"], 0.8, "evaluation reached Soma via the sink");
     }
 
     #[tokio::test]

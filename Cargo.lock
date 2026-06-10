@@ -1943,11 +1943,13 @@ dependencies = [
 name = "syntheos-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "henosis-broca",
  "henosis-chiasm",
  "henosis-loom",
  "henosis-soma",
+ "henosis-thymus",
  "serde",
  "serde_json",
  "syntheos-axon",
