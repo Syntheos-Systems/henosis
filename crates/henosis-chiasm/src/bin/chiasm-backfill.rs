@@ -3,9 +3,13 @@
 //! Kleos production database first (roadmap risk R1) and inspect the dry-run report before
 //! applying anywhere.
 //!
+//! Each imported database has its own legacy id space, so every run names its source
+//! (e.g. `monolith`, `tenant-1`); idempotency is per source.
+//!
 //! ```text
 //! chiasm-backfill --legacy <kleos.sqlite> --target <chiasm.sqlite> \
-//!                 --directory <identity.sqlite> --tenant <uuid|new> [--apply]
+//!                 --directory <identity.sqlite> --tenant <uuid|new> \
+//!                 --source <label> [--apply]
 //! ```
 
 use std::path::PathBuf;
@@ -23,6 +27,8 @@ struct Args {
     target: PathBuf,
     /// Path to the syntheos-identity SqliteDirectory database.
     directory: PathBuf,
+    /// Operator-chosen label of the source database (per-source id space + idempotency).
+    source: String,
     /// Tenant every imported task is homed under.
     tenant: TenantId,
     /// Whether the tenant id was freshly minted by `--tenant new` (printed so it is not lost).
@@ -34,10 +40,12 @@ struct Args {
 /// Parse argv; `Err` carries the usage/diagnostic message.
 fn parse_args() -> Result<Args, String> {
     const USAGE: &str = "usage: chiasm-backfill --legacy <kleos.sqlite> --target <chiasm.sqlite> \
-                         --directory <identity.sqlite> --tenant <uuid|new> [--apply]";
+                         --directory <identity.sqlite> --tenant <uuid|new> \
+                         --source <label> [--apply]";
     let mut legacy = None;
     let mut target = None;
     let mut directory = None;
+    let mut source = None;
     let mut tenant = None;
     let mut tenant_minted = false;
     let mut apply = false;
@@ -52,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
             "--legacy" => legacy = Some(PathBuf::from(value("--legacy")?)),
             "--target" => target = Some(PathBuf::from(value("--target")?)),
             "--directory" => directory = Some(PathBuf::from(value("--directory")?)),
+            "--source" => source = Some(value("--source")?),
             "--tenant" => {
                 let v = value("--tenant")?;
                 tenant = Some(if v == "new" {
@@ -70,6 +79,8 @@ fn parse_args() -> Result<Args, String> {
         legacy: legacy.ok_or_else(|| format!("--legacy is required\n{USAGE}"))?,
         target: target.ok_or_else(|| format!("--target is required\n{USAGE}"))?,
         directory: directory.ok_or_else(|| format!("--directory is required\n{USAGE}"))?,
+        source: source
+            .ok_or_else(|| format!("--source is required (e.g. 'monolith', 'tenant-1')\n{USAGE}"))?,
         tenant: tenant.ok_or_else(|| format!("--tenant is required (a UUID, or 'new')\n{USAGE}"))?,
         tenant_minted,
         apply,
@@ -100,6 +111,7 @@ fn main() -> ExitCode {
             &args.target,
             &directory,
             args.tenant,
+            &args.source,
             BackfillOptions {
                 dry_run: !args.apply,
             },
@@ -111,6 +123,7 @@ fn main() -> ExitCode {
         Ok(report) => {
             let mode = if report.dry_run { "DRY RUN" } else { "APPLIED" };
             println!("chiasm-backfill {mode}");
+            println!("  source: {}", report.source);
             if args.tenant_minted {
                 println!("  tenant (newly minted -- record this): {}", args.tenant);
             } else {

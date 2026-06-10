@@ -39,6 +39,7 @@ use crate::model::{
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__soma_presence.sql")),
     (2, include_str!("../migrations/V2__soma_legacy_maps.sql")),
+    (3, include_str!("../migrations/V3__soma_legacy_map_source.sql")),
 ];
 
 /// The columns of `soma_presence`, in the order [`read_raw`] reads them.

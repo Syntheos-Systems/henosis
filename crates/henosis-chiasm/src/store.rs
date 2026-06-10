@@ -33,6 +33,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__chiasm_tasks.sql")),
     (2, include_str!("../migrations/V2__chiasm_claims_deps.sql")),
     (3, include_str!("../migrations/V3__chiasm_legacy_maps.sql")),
+    (4, include_str!("../migrations/V4__chiasm_legacy_map_source.sql")),
 ];
 
 /// Seconds a heartbeat extends a task's unreleased path-claim leases by (Kleos parity: 600).

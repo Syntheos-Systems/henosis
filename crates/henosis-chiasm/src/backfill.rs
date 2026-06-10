@@ -6,8 +6,15 @@
 //! tasks (new `TaskId`s, owner = mapped principal), their change history, and their dependency
 //! edges (both remapped through `chiasm_legacy_task_id_map`).
 //!
+//! The live Kleos deployment splits chiasm data across databases with independent
+//! AUTOINCREMENT id spaces (the shared monolith plus per-tenant shards), so every import
+//! carries an operator-chosen **source label** and the task-id map keys on
+//! `(source, legacy_task_id)`. Owner keys are NOT source-scoped: Kleos user ids are
+//! registry-global, and the same key maps to the same Human principal from every source.
+//!
 //! Rules, all from the projection convention:
-//! - **Runs once, not at startup** (3.2). Re-running is safe: the map tables make it idempotent.
+//! - **Runs once per source, not at startup** (3.2). Re-running is safe: the map tables make
+//!   it idempotent per source.
 //! - **No on-demand minting** (3.3). Every principal is minted here; a legacy row that cannot be
 //!   handled fails the run with an explicit [`ChiasmError::Backfill`] naming the problem.
 //! - **The map tables are migration artifacts** (3.1), scheduled to drop one release cycle after
@@ -42,6 +49,8 @@ pub struct BackfillOptions {
 /// The outcome of a backfill run. In a dry run the counts report what WOULD happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
+    /// The operator-chosen label of the source database this run imported from.
+    pub source: String,
     /// Legacy owner key -> principal, covering both reused (prior-run) and newly minted
     /// mappings. Empty of new entries in a dry run.
     pub principals_by_legacy_user: BTreeMap<i64, PrincipalId>,
@@ -286,9 +295,10 @@ fn read_legacy_deps(legacy: &Connection) -> Result<Vec<LegacyDep>, ChiasmError> 
     Ok(out)
 }
 
-/// Run the absorption backfill from a legacy Kleos SQLite database at `legacy_db` into the
+/// Run the absorption backfill from ONE legacy Kleos SQLite database at `legacy_db` into the
 /// Henosis chiasm store at `target_db`, minting principals in `directory` and homing every
-/// imported task under `tenant`.
+/// imported task under `tenant`. `source` labels which Kleos database this is (monolith vs a
+/// tenant shard); each source has its own legacy id space and its own idempotency scope.
 ///
 /// All target writes happen in one transaction, so a failed run leaves the store untouched.
 /// (Principals enrolled before a transaction failure would remain in the directory; the next
@@ -298,8 +308,14 @@ pub async fn backfill_from_kleos(
     target_db: &Path,
     directory: &dyn PrincipalDirectory,
     tenant: TenantId,
+    source: &str,
     options: BackfillOptions,
 ) -> Result<BackfillReport, ChiasmError> {
+    if source.trim().is_empty() {
+        return Err(ChiasmError::Backfill(
+            "a non-empty source label is required (e.g. 'monolith', 'tenant-1')".to_string(),
+        ));
+    }
     let legacy = Connection::open_with_flags(
         legacy_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -338,10 +354,12 @@ pub async fn backfill_from_kleos(
     };
     let mut task_map: BTreeMap<i64, TaskId> = {
         let mut stmt = target
-            .prepare("SELECT legacy_task_id, task_id FROM chiasm_legacy_task_id_map")
+            .prepare("SELECT legacy_task_id, task_id FROM chiasm_legacy_task_id_map WHERE source = ?1")
             .map_err(berr)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .query_map(rusqlite::params![source], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(berr)?;
         let mut map = BTreeMap::new();
         for row in rows {
@@ -383,6 +401,7 @@ pub async fn backfill_from_kleos(
 
     if options.dry_run {
         return Ok(BackfillReport {
+            source: source.to_string(),
             principals_by_legacy_user: user_map,
             principals_minted: pending_users.len(),
             tasks_imported: pending_tasks.len(),
@@ -451,9 +470,9 @@ pub async fn backfill_from_kleos(
             },
         )?;
         tx.execute(
-            "INSERT INTO chiasm_legacy_task_id_map (legacy_task_id, task_id, legacy_agent) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![t.legacy_id, id.to_string(), &t.agent],
+            "INSERT INTO chiasm_legacy_task_id_map (source, legacy_task_id, task_id, legacy_agent) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source, t.legacy_id, id.to_string(), &t.agent],
         )
         .map_err(berr)?;
         task_map.insert(t.legacy_id, id);
@@ -506,6 +525,7 @@ pub async fn backfill_from_kleos(
     tx.commit().map_err(berr)?;
 
     Ok(BackfillReport {
+        source: source.to_string(),
         principals_by_legacy_user: user_map,
         principals_minted: minted,
         tasks_imported,
@@ -619,6 +639,7 @@ mod tests {
             &target,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions { dry_run: true },
         )
         .await
@@ -648,9 +669,10 @@ mod tests {
         let dir = InMemoryDirectory::new();
         let tenant = TenantId::new();
 
-        let report = backfill_from_kleos(&legacy, &target, &dir, tenant, BackfillOptions::default())
-            .await
-            .expect("apply");
+        let report =
+            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
+                .await
+                .expect("apply");
         assert!(!report.dry_run);
         assert_eq!(report.principals_minted, 2);
         assert_eq!(report.tasks_imported, 3);
@@ -719,12 +741,14 @@ mod tests {
         let dir = InMemoryDirectory::new();
         let tenant = TenantId::new();
 
-        let first = backfill_from_kleos(&legacy, &target, &dir, tenant, BackfillOptions::default())
-            .await
-            .expect("first run");
-        let second = backfill_from_kleos(&legacy, &target, &dir, tenant, BackfillOptions::default())
-            .await
-            .expect("second run");
+        let first =
+            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
+                .await
+                .expect("first run");
+        let second =
+            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
+                .await
+                .expect("second run");
         assert_eq!(second.principals_minted, 0);
         assert_eq!(second.tasks_imported, 0);
         assert_eq!(second.tasks_skipped, 3);
@@ -755,6 +779,7 @@ mod tests {
             &target,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions::default(),
         )
         .await
@@ -801,12 +826,102 @@ mod tests {
             &target,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions::default(),
         )
         .await
         .expect("apply");
         assert_eq!(report.tasks_imported, 1);
         assert_eq!(report.dependencies_imported, 0);
+        cleanup(&[&legacy, &target]);
+    }
+
+    /// THE two-source regression: the monolith and a tenant shard have independent
+    /// AUTOINCREMENT id spaces, so their task ids overlap numerically. Before the
+    /// (source, legacy_task_id) key, the second import silently skipped every overlapping id.
+    #[tokio::test]
+    async fn two_sources_with_overlapping_ids_both_import_fully() {
+        let (monolith, target) = db_pair("twosrc-a");
+        let (shard, _unused) = db_pair("twosrc-b");
+        build_legacy_fixture(&monolith); // tasks with ids 1..=3
+        build_legacy_fixture(&shard); // ALSO ids 1..=3, different logical tasks
+        {
+            // Make the shard's content distinguishable.
+            let conn = Connection::open(&shard).expect("shard");
+            conn.execute("UPDATE chiasm_tasks SET title = 'shard: ' || title", [])
+                .expect("retitle");
+        }
+        let dir = InMemoryDirectory::new();
+        let tenant = TenantId::new();
+
+        let first = backfill_from_kleos(
+            &monolith,
+            &target,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("monolith import");
+        assert_eq!(first.tasks_imported, 3);
+        let second = backfill_from_kleos(
+            &shard,
+            &target,
+            &dir,
+            tenant,
+            "tenant-1",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("shard import");
+        // Every shard row imports despite the id overlap -- NO silent skips.
+        assert_eq!(second.tasks_imported, 3);
+        assert_eq!(second.tasks_skipped, 0);
+        // Same registry-global owner key resolved to the SAME Human principal across sources.
+        assert_eq!(
+            first.principals_by_legacy_user[&1],
+            second.principals_by_legacy_user[&1]
+        );
+
+        // The target holds all six tasks; per-source idempotency still works.
+        let raw = Connection::open(&target).expect("raw");
+        let total: i64 = raw
+            .query_row("SELECT COUNT(*) FROM chiasm_tasks", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(total, 6);
+        let rerun = backfill_from_kleos(
+            &shard,
+            &target,
+            &dir,
+            tenant,
+            "tenant-1",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("shard re-run");
+        assert_eq!(rerun.tasks_imported, 0);
+        assert_eq!(rerun.tasks_skipped, 3);
+        cleanup(&[&monolith, &shard, &target]);
+    }
+
+    /// An empty source label is an explicit error, not a default.
+    #[tokio::test]
+    async fn empty_source_label_rejected() {
+        let (legacy, target) = db_pair("nosrc");
+        build_legacy_fixture(&legacy);
+        let dir = InMemoryDirectory::new();
+        let err = backfill_from_kleos(
+            &legacy,
+            &target,
+            &dir,
+            TenantId::new(),
+            "  ",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect_err("blank source");
+        assert!(matches!(err, ChiasmError::Backfill(_)));
         cleanup(&[&legacy, &target]);
     }
 }

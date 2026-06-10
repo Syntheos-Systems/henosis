@@ -14,6 +14,13 @@
 //!   only keys chiasm never saw mint a fresh Human here. Presence rows do not carry the owner;
 //!   `soma_legacy_user_id_map` preserves the linkage for later attribution (Pistis grants).
 //!
+//! The live Kleos deployment splits soma data across databases with independent AUTOINCREMENT
+//! id spaces (the shared monolith plus per-tenant shards), so every import carries an
+//! operator-chosen **source label**: the agent map keys on `(source, legacy_agent_id)`, and a
+//! legacy agent whose `(tenant, name)` presence already exists in the target (the same logical
+//! agent absorbed from an earlier source) REUSES that presence's principal instead of minting
+//! a duplicate. Owner keys are NOT source-scoped (registry-global, convention 3.4).
+//!
 //! Legacy JSON columns are sanitized on the way in (the live store parses strictly): a
 //! capabilities/drift value that is not an array of strings degrades per-entry (non-strings
 //! stringified) or to empty, matching what Kleos's own lenient reader would have produced. A
@@ -24,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use syntheos_contracts::{PrincipalId, PrincipalKind, TenantId, Timestamp};
 use syntheos_identity::PrincipalDirectory;
 
@@ -43,6 +50,11 @@ pub struct BackfillOptions {
 /// The outcome of a backfill run. In a dry run the counts report what WOULD happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
+    /// The operator-chosen label of the source database this run imported from.
+    pub source: String,
+    /// How many legacy agents resolved to an EXISTING same-(tenant, name) presence (the same
+    /// logical agent absorbed from an earlier source) instead of minting a new principal.
+    pub agents_reused_existing: usize,
     /// Legacy owner key -> Human principal (reused from chiasm, prior runs, or minted here).
     pub owners_by_legacy_user: BTreeMap<i64, PrincipalId>,
     /// How many owner keys were resolved by reusing chiasm's mapping (convention 3.4).
@@ -219,8 +231,11 @@ fn read_i64_map(
     Ok(map)
 }
 
-/// Run the soma absorption backfill from a legacy Kleos SQLite database at `legacy_db` into the
-/// Henosis soma store at `target_db`, homing every imported presence under `tenant`.
+/// Run the soma absorption backfill from ONE legacy Kleos SQLite database at `legacy_db` into
+/// the Henosis soma store at `target_db`, homing every imported presence under `tenant`.
+/// `source` labels which Kleos database this is (monolith vs a tenant shard); each source has
+/// its own legacy id space and idempotency scope, and same-named agents already absorbed from
+/// another source reuse their existing principal.
 ///
 /// `chiasm_db` is the path to the already-backfilled Henosis CHIASM database; when given, owner
 /// keys resolve through `chiasm_legacy_user_id_map` first so the same legacy key maps to the
@@ -233,8 +248,14 @@ pub async fn backfill_from_kleos(
     chiasm_db: Option<&Path>,
     directory: &dyn PrincipalDirectory,
     tenant: TenantId,
+    source: &str,
     options: BackfillOptions,
 ) -> Result<BackfillReport, SomaError> {
+    if source.trim().is_empty() {
+        return Err(SomaError::Backfill(
+            "a non-empty source label is required (e.g. 'monolith', 'tenant-1')".to_string(),
+        ));
+    }
     let legacy = Connection::open_with_flags(
         legacy_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -270,11 +291,31 @@ pub async fn backfill_from_kleos(
         "SELECT user_id, principal_id FROM soma_legacy_user_id_map",
         "soma owner map",
     )?;
-    let agent_map = read_i64_map(
-        &target,
-        "SELECT legacy_agent_id, principal_id FROM soma_legacy_agent_map",
-        "soma agent map",
-    )?;
+    let agent_map = {
+        let mut stmt = target
+            .prepare(
+                "SELECT legacy_agent_id, principal_id FROM soma_legacy_agent_map \
+                 WHERE source = ?1",
+            )
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![source], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(berr)?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let (key, pid) = row.map_err(berr)?;
+            map.insert(
+                key,
+                pid.parse::<PrincipalId>().map_err(|e| {
+                    SomaError::Backfill(format!("corrupt mapped agent principal {pid:?}: {e}"))
+                })?,
+            );
+        }
+        drop(stmt);
+        map
+    };
     let chiasm_map: BTreeMap<i64, PrincipalId> = match chiasm_db {
         Some(path) => {
             let chiasm = Connection::open_with_flags(
@@ -311,12 +352,37 @@ pub async fn backfill_from_kleos(
         .count();
     let owners_minted = pending_owner_keys.len() - owners_reused_from_chiasm;
 
+    // Same logical agent absorbed from an earlier source: a (tenant, name) presence already in
+    // the target means REUSE its principal, not a duplicate mint.
+    let mut reusable: BTreeMap<i64, PrincipalId> = BTreeMap::new();
+    for agent in &pending_agents {
+        let existing: Option<String> = target
+            .query_row(
+                "SELECT principal_id FROM soma_presence WHERE tenant = ?1 AND name = ?2",
+                rusqlite::params![tenant.to_string(), &agent.name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(berr)?;
+        if let Some(pid) = existing {
+            reusable.insert(
+                agent.legacy_id,
+                pid.parse::<PrincipalId>().map_err(|e| {
+                    SomaError::Backfill(format!("corrupt presence principal {pid:?}: {e}"))
+                })?,
+            );
+        }
+    }
+    let agents_reused_existing = reusable.len();
+
     if options.dry_run {
         return Ok(BackfillReport {
+            source: source.to_string(),
+            agents_reused_existing,
             owners_by_legacy_user: owner_map,
             owners_reused_from_chiasm,
             owners_minted,
-            agents_imported: pending_agents.len(),
+            agents_imported: pending_agents.len() - agents_reused_existing,
             agents_skipped: agents.len() - pending_agents.len(),
             dry_run: true,
         });
@@ -338,7 +404,12 @@ pub async fn backfill_from_kleos(
         owner_map.insert(key, principal);
     }
     let mut minted_agents: Vec<(&LegacyAgent, PrincipalId)> = Vec::with_capacity(pending_agents.len());
+    let mut reused_agents: Vec<(&LegacyAgent, PrincipalId)> = Vec::with_capacity(reusable.len());
     for agent in &pending_agents {
+        if let Some(principal) = reusable.get(&agent.legacy_id) {
+            reused_agents.push((agent, *principal));
+            continue;
+        }
         let principal = directory
             .enroll(PrincipalKind::Agent, Some(agent.name.clone()))
             .await
@@ -384,21 +455,31 @@ pub async fn backfill_from_kleos(
         )
         .map_err(berr)?;
         tx.execute(
-            "INSERT INTO soma_legacy_agent_map (legacy_agent_id, principal_id, legacy_name) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![agent.legacy_id, principal.to_string(), &agent.name],
+            "INSERT INTO soma_legacy_agent_map (source, legacy_agent_id, principal_id, legacy_name) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source, agent.legacy_id, principal.to_string(), &agent.name],
         )
         .map_err(berr)?;
         agents_imported += 1;
     }
+    for (agent, principal) in &reused_agents {
+        tx.execute(
+            "INSERT INTO soma_legacy_agent_map (source, legacy_agent_id, principal_id, legacy_name) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source, agent.legacy_id, principal.to_string(), &agent.name],
+        )
+        .map_err(berr)?;
+    }
     tx.commit().map_err(berr)?;
 
     Ok(BackfillReport {
+        source: source.to_string(),
+        agents_reused_existing,
         owners_by_legacy_user: owner_map,
         owners_reused_from_chiasm,
         owners_minted,
         agents_imported,
-        agents_skipped: agents.len() - agents_imported,
+        agents_skipped: agents.len() - agents_imported - agents_reused_existing,
         dry_run: false,
     })
 }
@@ -479,6 +560,7 @@ mod tests {
             None,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions { dry_run: true },
         )
         .await
@@ -504,6 +586,7 @@ mod tests {
             None,
             dir.as_ref(),
             tenant,
+            "monolith",
             BackfillOptions::default(),
         )
         .await
@@ -564,6 +647,7 @@ mod tests {
             Some(&chiasm_path),
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions::default(),
         )
         .await
@@ -588,14 +672,28 @@ mod tests {
         let dir = InMemoryDirectory::new();
         let tenant = TenantId::new();
 
-        let first =
-            backfill_from_kleos(&legacy, &target, None, &dir, tenant, BackfillOptions::default())
-                .await
-                .expect("first run");
-        let second =
-            backfill_from_kleos(&legacy, &target, None, &dir, tenant, BackfillOptions::default())
-                .await
-                .expect("second run");
+        let first = backfill_from_kleos(
+            &legacy,
+            &target,
+            None,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("first run");
+        let second = backfill_from_kleos(
+            &legacy,
+            &target,
+            None,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("second run");
         assert_eq!(second.agents_imported, 0);
         assert_eq!(second.agents_skipped, 3);
         assert_eq!(second.owners_minted, 0);
@@ -624,6 +722,7 @@ mod tests {
             None,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions::default(),
         )
         .await
@@ -653,11 +752,116 @@ mod tests {
             None,
             &dir,
             TenantId::new(),
+            "monolith",
             BackfillOptions::default(),
         )
         .await
         .expect_err("must fail on name collision");
         assert!(matches!(err, SomaError::Backfill(msg) if msg.contains("claude-code")));
         cleanup(&[&legacy, &target]);
+    }
+
+    /// THE two-source scenario from the live deployment: the monolith and a tenant shard hold
+    /// the SAME logical agents (same names) under independent id spaces. The second import
+    /// must reuse the existing principals (no duplicate presence, no duplicate mint) while its
+    /// map rows record the second source's own legacy ids.
+    #[tokio::test]
+    async fn second_source_reuses_same_named_agents() {
+        let (monolith, target) = db_pair("twosrc-m");
+        let (shard, _unused) = db_pair("twosrc-s");
+        build_legacy_fixture(&monolith); // claude-code, messy, synapse (ids 1..=3)
+        build_legacy_fixture(&shard); // same names, ids also 1..=3
+        {
+            // The shard also has one agent the monolith lacks.
+            let conn = Connection::open(&shard).expect("shard");
+            conn.execute(
+                "INSERT INTO soma_agents (name, type, status, user_id) \
+                 VALUES ('shard-only', 'cli', 'online', 1)",
+                [],
+            )
+            .expect("insert");
+        }
+        let dir = Arc::new(InMemoryDirectory::new());
+        let tenant = TenantId::new();
+
+        let first = backfill_from_kleos(
+            &monolith,
+            &target,
+            None,
+            dir.as_ref(),
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("monolith import");
+        assert_eq!(first.agents_imported, 3);
+        assert_eq!(first.agents_reused_existing, 0);
+
+        let second = backfill_from_kleos(
+            &shard,
+            &target,
+            None,
+            dir.as_ref(),
+            tenant,
+            "tenant-1",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("shard import");
+        // 3 same-named agents reused, 1 new one imported; nothing silently skipped.
+        assert_eq!(second.agents_reused_existing, 3);
+        assert_eq!(second.agents_imported, 1);
+        assert_eq!(second.agents_skipped, 0);
+
+        // No duplicate presence rows, and the directory minted 3 + 1 Agent principals
+        // (+ 1 Human owner), not 7.
+        let store = SomaStore::open(&target, Arc::new(AxonBus::new()), dir.clone()).expect("open");
+        assert_eq!(store.list(PresenceFilter::default()).await.expect("list").len(), 4);
+        let agents = dir
+            .list()
+            .await
+            .expect("list")
+            .iter()
+            .filter(|p| p.kind == PrincipalKind::Agent)
+            .count();
+        assert_eq!(agents, 4);
+
+        // Both sources' map rows for 'claude-code' point at the SAME principal.
+        let raw = Connection::open(&target).expect("raw");
+        let distinct: i64 = raw
+            .query_row(
+                "SELECT COUNT(DISTINCT principal_id) FROM soma_legacy_agent_map \
+                 WHERE legacy_name = 'claude-code'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(distinct, 1);
+        let rows: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM soma_legacy_agent_map WHERE legacy_name = 'claude-code'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 2, "one map row per source");
+
+        // Per-source idempotency: re-running the shard import is a no-op.
+        let rerun = backfill_from_kleos(
+            &shard,
+            &target,
+            None,
+            dir.as_ref(),
+            tenant,
+            "tenant-1",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("shard re-run");
+        assert_eq!(rerun.agents_imported, 0);
+        assert_eq!(rerun.agents_reused_existing, 0);
+        assert_eq!(rerun.agents_skipped, 4);
+        cleanup(&[&monolith, &shard, &target]);
     }
 }

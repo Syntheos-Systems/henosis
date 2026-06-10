@@ -4,10 +4,14 @@
 //! principal across services. Run against a COPY of the Kleos production database first
 //! (roadmap risk R1) and inspect the dry-run report before applying anywhere.
 //!
+//! Each imported database has its own legacy id space, so every run names its source (e.g.
+//! `monolith`, `tenant-1`); same-named agents already absorbed from another source reuse their
+//! existing principal.
+//!
 //! ```text
 //! soma-backfill --legacy <kleos.sqlite> --target <soma.sqlite> \
 //!               --directory <identity.sqlite> --tenant <uuid|new> \
-//!               [--chiasm <chiasm.sqlite>] [--apply]
+//!               --source <label> [--chiasm <chiasm.sqlite>] [--apply]
 //! ```
 
 use std::path::PathBuf;
@@ -27,6 +31,8 @@ struct Args {
     directory: PathBuf,
     /// Path to the already-backfilled Henosis chiasm database (owner cross-map, conv 3.4).
     chiasm: Option<PathBuf>,
+    /// Operator-chosen label of the source database (per-source id space + idempotency).
+    source: String,
     /// Tenant every imported presence is homed under.
     tenant: TenantId,
     /// Whether the tenant id was freshly minted by `--tenant new` (printed so it is not lost).
@@ -39,11 +45,12 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     const USAGE: &str = "usage: soma-backfill --legacy <kleos.sqlite> --target <soma.sqlite> \
                          --directory <identity.sqlite> --tenant <uuid|new> \
-                         [--chiasm <chiasm.sqlite>] [--apply]";
+                         --source <label> [--chiasm <chiasm.sqlite>] [--apply]";
     let mut legacy = None;
     let mut target = None;
     let mut directory = None;
     let mut chiasm = None;
+    let mut source = None;
     let mut tenant = None;
     let mut tenant_minted = false;
     let mut apply = false;
@@ -59,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
             "--target" => target = Some(PathBuf::from(value("--target")?)),
             "--directory" => directory = Some(PathBuf::from(value("--directory")?)),
             "--chiasm" => chiasm = Some(PathBuf::from(value("--chiasm")?)),
+            "--source" => source = Some(value("--source")?),
             "--tenant" => {
                 let v = value("--tenant")?;
                 tenant = Some(if v == "new" {
@@ -78,6 +86,8 @@ fn parse_args() -> Result<Args, String> {
         target: target.ok_or_else(|| format!("--target is required\n{USAGE}"))?,
         directory: directory.ok_or_else(|| format!("--directory is required\n{USAGE}"))?,
         chiasm,
+        source: source
+            .ok_or_else(|| format!("--source is required (e.g. 'monolith', 'tenant-1')\n{USAGE}"))?,
         tenant: tenant.ok_or_else(|| format!("--tenant is required (a UUID, or 'new')\n{USAGE}"))?,
         tenant_minted,
         apply,
@@ -109,6 +119,7 @@ fn main() -> ExitCode {
             args.chiasm.as_deref(),
             &directory,
             args.tenant,
+            &args.source,
             BackfillOptions {
                 dry_run: !args.apply,
             },
@@ -120,6 +131,7 @@ fn main() -> ExitCode {
         Ok(report) => {
             let mode = if report.dry_run { "DRY RUN" } else { "APPLIED" };
             println!("soma-backfill {mode}");
+            println!("  source: {}", report.source);
             if args.tenant_minted {
                 println!("  tenant (newly minted -- record this): {}", args.tenant);
             } else {
@@ -131,6 +143,7 @@ fn main() -> ExitCode {
                 println!("    legacy key {legacy_key} -> {principal}");
             }
             println!("  agents imported:           {}", report.agents_imported);
+            println!("  agents reused (same name): {}", report.agents_reused_existing);
             println!("  agents skipped:            {}", report.agents_skipped);
             ExitCode::SUCCESS
         }
