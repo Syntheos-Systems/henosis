@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use henosis_chiasm::{
+    ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
+};
 use serde::Deserialize;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{GateRequest, Principal, PrincipalKind};
+use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 use syntheos_identity::PrincipalDirectory;
 
@@ -23,6 +26,8 @@ pub struct AppState {
     directory: Arc<dyn PrincipalDirectory>,
     /// The in-process event bus (held for a future event-stream surface).
     bus: Arc<AxonBus>,
+    /// The Chiasm task store (the first Phase 1 kernel service, Story 1.7).
+    chiasm: Arc<ChiasmStore>,
 }
 
 impl AppState {
@@ -31,11 +36,13 @@ impl AppState {
         dispatcher: Arc<Dispatcher>,
         directory: Arc<dyn PrincipalDirectory>,
         bus: Arc<AxonBus>,
+        chiasm: Arc<ChiasmStore>,
     ) -> Self {
         Self {
             dispatcher,
             directory,
             bus,
+            chiasm,
         }
     }
 
@@ -45,13 +52,17 @@ impl AppState {
     }
 }
 
-/// Build the router for the Phase 0 surface: health, version, enroll, dispatch.
+/// Build the router: the Phase 0 surface (health, version, enroll, dispatch) plus the Phase 1
+/// Chiasm task surface.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/enroll", post(enroll))
         .route("/dispatch", post(dispatch))
+        .route("/chiasm/tasks", post(chiasm_create_task).get(chiasm_list_tasks))
+        .route("/chiasm/tasks/{id}", get(chiasm_get_task))
+        .route("/chiasm/stats", get(chiasm_stats))
         .with_state(state)
 }
 
@@ -106,6 +117,142 @@ async fn dispatch(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// Map a [`ChiasmError`] onto an HTTP status + message.
+fn chiasm_error(e: ChiasmError) -> (StatusCode, String) {
+    let status = match &e {
+        ChiasmError::NotFound(_) => StatusCode::NOT_FOUND,
+        ChiasmError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
+        // Backend, backfill, and any future variants are server-side failures.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Body for [`chiasm_create_task`].
+///
+/// `tenant` and `principal_id` are caller-asserted in Phase 1: the server has no authentication
+/// layer yet, so identity rides in the body the same way `/dispatch` carries a `RequestContext`.
+/// PistisGate (Phase 3) replaces caller-asserted identity with verified capability checks.
+#[derive(Debug, Deserialize)]
+pub struct ChiasmCreateTask {
+    /// Tenant the task belongs to.
+    pub tenant: TenantId,
+    /// Owner principal.
+    pub principal_id: PrincipalId,
+    /// Project the task groups under.
+    pub project: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Initial status (defaults to `active`).
+    pub status: Option<TaskStatus>,
+    /// Optional progress note.
+    pub summary: Option<String>,
+    /// Optional description of the expected output.
+    pub expected_output: Option<String>,
+    /// Output format hint (defaults to `raw`).
+    pub output_format: Option<String>,
+    /// Optional assignee principal.
+    pub assignee: Option<PrincipalId>,
+    /// Heartbeat interval in seconds (defaults to 300).
+    pub heartbeat_interval_secs: Option<i64>,
+}
+
+/// Create a Chiasm task owned by the asserted principal.
+async fn chiasm_create_task(
+    State(state): State<AppState>,
+    Json(req): Json<ChiasmCreateTask>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    state
+        .chiasm
+        .create(NewTask {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            project: req.project,
+            title: req.title,
+            status: req.status,
+            summary: req.summary,
+            expected_output: req.expected_output,
+            output_format: req.output_format,
+            assignee: req.assignee,
+            heartbeat_interval_secs: req.heartbeat_interval_secs,
+        })
+        .await
+        .map(Json)
+        .map_err(chiasm_error)
+}
+
+/// Query string for [`chiasm_list_tasks`]: the asserted owner plus optional AND-filters.
+#[derive(Debug, Deserialize)]
+pub struct ChiasmListQuery {
+    /// Owner principal whose tasks are listed.
+    pub principal_id: PrincipalId,
+    /// Only tasks with this status.
+    pub status: Option<TaskStatus>,
+    /// Only tasks in this project.
+    pub project: Option<String>,
+    /// Maximum rows to return.
+    pub limit: Option<usize>,
+    /// Rows to skip (pagination).
+    pub offset: Option<usize>,
+}
+
+/// List the asserted principal's tasks, newest-updated first.
+async fn chiasm_list_tasks(
+    State(state): State<AppState>,
+    Query(q): Query<ChiasmListQuery>,
+) -> Result<Json<Vec<Task>>, (StatusCode, String)> {
+    state
+        .chiasm
+        .list(
+            q.principal_id,
+            TaskFilter {
+                status: q.status,
+                project: q.project,
+                limit: q.limit,
+                offset: q.offset,
+            },
+        )
+        .await
+        .map(Json)
+        .map_err(chiasm_error)
+}
+
+/// Query string asserting the owner principal for single-task reads and stats.
+#[derive(Debug, Deserialize)]
+pub struct ChiasmOwnerQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+}
+
+/// Fetch one of the asserted principal's tasks by id. Owner-scoped: another principal's task is
+/// indistinguishable from a missing one (404), never disclosed.
+async fn chiasm_get_task(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Query(q): Query<ChiasmOwnerQuery>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    state
+        .chiasm
+        .get(q.principal_id, id)
+        .await
+        .map_err(chiasm_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("task not found: {id}")))
+}
+
+/// Aggregate task counts for the asserted principal.
+async fn chiasm_stats(
+    State(state): State<AppState>,
+    Query(q): Query<ChiasmOwnerQuery>,
+) -> Result<Json<ChiasmStats>, (StatusCode, String)> {
+    state
+        .chiasm
+        .stats(q.principal_id)
+        .await
+        .map(Json)
+        .map_err(chiasm_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +264,7 @@ mod tests {
     use tower::ServiceExt;
 
     /// Build app state over the real foundation (allow-all stub gates + echo executor, both from
-    /// the test-only `stubs` feature).
+    /// the test-only `stubs` feature) with an in-memory Chiasm store.
     fn test_state() -> AppState {
         let bus = Arc::new(AxonBus::new());
         let directory: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());
@@ -125,7 +272,8 @@ mod tests {
             Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
                 .expect("canonical stub chain"),
         );
-        AppState::new(dispatcher, directory, bus)
+        let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm store"));
+        AppState::new(dispatcher, directory, bus, chiasm)
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -136,7 +284,8 @@ mod tests {
             Dispatcher::new(deny_gate_chain(), Box::new(DenyExecutor), bus.clone())
                 .expect("canonical deny chain"),
         );
-        AppState::new(dispatcher, directory, bus)
+        let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm store"));
+        AppState::new(dispatcher, directory, bus, chiasm)
     }
 
     /// Collect a response body into a UTF-8 string.
@@ -239,6 +388,156 @@ mod tests {
             result.is_err(),
             "an empty gate chain must never construct a runnable dispatcher"
         );
+    }
+
+    /// POST a Chiasm task creation and return the parsed response body (status must be 200).
+    async fn create_task_http(
+        app: &Router,
+        tenant: &str,
+        principal: &str,
+        project: &str,
+        title: &str,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "tenant": tenant,
+            "principal_id": principal,
+            "project": project,
+            "title": title,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chiasm/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body_string(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn chiasm_create_then_get_roundtrips_over_http() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let owner = PrincipalId::new().to_string();
+        let created = create_task_http(&app, &tenant, &owner, "henosis", "wire chiasm").await;
+        assert_eq!(created["status"], "active");
+        assert_eq!(created["principal_id"], owner);
+        let id = created["id"].as_str().expect("task id");
+
+        // The owner reads it back.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chiasm/tasks/{id}?principal_id={owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let got: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(got["title"], "wire chiasm");
+
+        // Another principal gets 404 -- owner-scoping does not disclose existence.
+        let other = PrincipalId::new();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chiasm/tasks/{id}?principal_id={other}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chiasm_list_and_stats_are_owner_scoped() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let owner = PrincipalId::new().to_string();
+        create_task_http(&app, &tenant, &owner, "alpha", "a").await;
+        create_task_http(&app, &tenant, &owner, "beta", "b").await;
+
+        // Project filter narrows the list.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chiasm/tasks?principal_id={owner}&project=beta"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let tasks: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(tasks.as_array().expect("array").len(), 1);
+        assert_eq!(tasks[0]["title"], "b");
+
+        // Stats count the owner's tasks; a stranger sees zero.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chiasm/stats?principal_id={owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stats["total"], 2);
+        let stranger = PrincipalId::new();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chiasm/stats?principal_id={stranger}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stats["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn chiasm_create_rejects_unknown_status() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let body = serde_json::json!({
+            "tenant": TenantId::new().to_string(),
+            "principal_id": PrincipalId::new().to_string(),
+            "project": "p",
+            "title": "t",
+            "status": "definitely_not_a_status",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chiasm/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Typed TaskStatus deserialization rejects the token before any handler runs.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

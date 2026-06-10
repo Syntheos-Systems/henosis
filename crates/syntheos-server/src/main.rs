@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
+use henosis_chiasm::ChiasmStore;
 use syntheos_axon::AxonBus;
 use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
 use syntheos_dispatch::Dispatcher;
@@ -44,7 +45,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(DenyExecutor),
         bus.clone(),
     )?);
-    let state = AppState::new(dispatcher, directory, bus);
+
+    // Chiasm: the first Phase 1 kernel service, persistent SQLite at a configurable path
+    // (migrations apply on open). The parent directory is created if absent.
+    let chiasm_db =
+        std::env::var("SYNTHEOS_CHIASM_DB").unwrap_or_else(|_| "data/chiasm.sqlite".to_string());
+    if let Some(parent) = std::path::Path::new(&chiasm_db).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let chiasm = Arc::new(ChiasmStore::open(&chiasm_db, bus.clone())?);
+    tracing::info!(path = %chiasm_db, "chiasm task store open");
+
+    let state = AppState::new(dispatcher, directory, bus, chiasm);
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.

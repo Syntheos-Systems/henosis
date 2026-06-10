@@ -1882,6 +1882,7 @@ name = "syntheos-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "henosis-chiasm",
  "serde",
  "serde_json",
  "syntheos-axon",
