@@ -12,12 +12,16 @@ use henosis_chiasm::{
 use henosis_broca::{
     ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStore, LogAction,
 };
+use henosis_loom::{
+    LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
+    StepDef, Workflow,
+};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
 };
 use serde::Deserialize;
-use syntheos_contracts::Timestamp;
+use syntheos_contracts::{RunId, Timestamp, WorkflowId};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
@@ -40,6 +44,8 @@ pub struct AppState {
     soma: Arc<SomaStore>,
     /// The Broca narration log (Story 1.3).
     broca: Arc<BrocaStore>,
+    /// The Loom workflow engine (Story 1.4).
+    loom: Arc<LoomStore>,
 }
 
 impl AppState {
@@ -51,6 +57,7 @@ impl AppState {
         chiasm: Arc<ChiasmStore>,
         soma: Arc<SomaStore>,
         broca: Arc<BrocaStore>,
+        loom: Arc<LoomStore>,
     ) -> Self {
         Self {
             dispatcher,
@@ -59,6 +66,7 @@ impl AppState {
             chiasm,
             soma,
             broca,
+            loom,
         }
     }
 
@@ -88,6 +96,16 @@ pub fn router(state: AppState) -> Router {
         .route("/broca/actions/{id}", get(broca_get))
         .route("/broca/actions/{id}/narrate", post(broca_narrate))
         .route("/broca/stats", get(broca_stats))
+        .route("/loom/workflows", post(loom_create_workflow).get(loom_list_workflows))
+        .route("/loom/workflows/{id}", get(loom_get_workflow))
+        .route("/loom/runs", post(loom_create_run).get(loom_list_runs))
+        .route("/loom/runs/{id}", get(loom_get_run))
+        .route("/loom/runs/{id}/cancel", post(loom_cancel_run))
+        .route("/loom/runs/{id}/steps", get(loom_get_steps))
+        .route("/loom/runs/{id}/logs", get(loom_get_logs))
+        .route("/loom/steps/{id}/complete", post(loom_complete_step))
+        .route("/loom/steps/{id}/fail", post(loom_fail_step))
+        .route("/loom/stats", get(loom_stats))
         .with_state(state)
 }
 
@@ -581,6 +599,275 @@ async fn broca_stats(
     state.broca.stats(q.tenant).await.map(Json).map_err(broca_error)
 }
 
+/// Map a [`LoomError`] onto an HTTP status + message.
+fn loom_error(e: LoomError) -> (StatusCode, String) {
+    let status = match &e {
+        LoomError::WorkflowNotFound(_) | LoomError::RunNotFound(_) | LoomError::StepNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        LoomError::InvalidDefinition(_) | LoomError::InvalidInput(_) | LoomError::InvalidStatus(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        // Backend and any future variants are server-side failures.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Body for [`loom_create_workflow`]. Identity is caller-asserted, the established posture.
+#[derive(Debug, Deserialize)]
+pub struct LoomCreateWorkflow {
+    /// Tenant the workflow belongs to.
+    pub tenant: TenantId,
+    /// Owner principal.
+    pub principal_id: PrincipalId,
+    /// Workflow name, unique per owner.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Step definitions (validated: unique names, known deps, acyclic).
+    pub steps: Vec<StepDef>,
+}
+
+/// Define a new workflow.
+async fn loom_create_workflow(
+    State(state): State<AppState>,
+    Json(req): Json<LoomCreateWorkflow>,
+) -> Result<Json<Workflow>, (StatusCode, String)> {
+    state
+        .loom
+        .create_workflow(NewWorkflow {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            name: req.name,
+            description: req.description,
+            steps: req.steps,
+        })
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Query string asserting the owner principal for Loom reads.
+#[derive(Debug, Deserialize)]
+pub struct LoomOwnerQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+}
+
+/// List the asserted principal's workflows.
+async fn loom_list_workflows(
+    State(state): State<AppState>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<Vec<Workflow>>, (StatusCode, String)> {
+    state
+        .loom
+        .list_workflows(q.principal_id)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Fetch one of the asserted principal's workflows by id.
+async fn loom_get_workflow(
+    State(state): State<AppState>,
+    Path(id): Path<WorkflowId>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<Workflow>, (StatusCode, String)> {
+    state
+        .loom
+        .get_workflow(q.principal_id, id)
+        .await
+        .map_err(loom_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("workflow not found: {id}")))
+}
+
+/// Body for [`loom_create_run`].
+#[derive(Debug, Deserialize)]
+pub struct LoomCreateRun {
+    /// Owner principal (the runner; must own the workflow).
+    pub principal_id: PrincipalId,
+    /// The workflow to run.
+    pub workflow_id: WorkflowId,
+    /// Run input object (defaults to `{}`).
+    pub input: Option<serde_json::Value>,
+}
+
+/// Start a run (the engine advances immediately; inline steps may finish it synchronously).
+async fn loom_create_run(
+    State(state): State<AppState>,
+    Json(req): Json<LoomCreateRun>,
+) -> Result<Json<Run>, (StatusCode, String)> {
+    state
+        .loom
+        .create_run(req.principal_id, req.workflow_id, req.input)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Query string for [`loom_list_runs`]: the asserted owner plus optional AND-filters.
+#[derive(Debug, Deserialize)]
+pub struct LoomRunsQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// Only runs of this workflow.
+    pub workflow_id: Option<WorkflowId>,
+    /// Only runs in this status.
+    pub status: Option<RunStatus>,
+    /// Maximum rows to return.
+    pub limit: Option<usize>,
+    /// Rows to skip (pagination).
+    pub offset: Option<usize>,
+}
+
+/// List the asserted principal's runs, newest first.
+async fn loom_list_runs(
+    State(state): State<AppState>,
+    Query(q): Query<LoomRunsQuery>,
+) -> Result<Json<Vec<Run>>, (StatusCode, String)> {
+    state
+        .loom
+        .list_runs(
+            q.principal_id,
+            RunFilter {
+                workflow_id: q.workflow_id,
+                status: q.status,
+                limit: q.limit,
+                offset: q.offset,
+            },
+        )
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Fetch one of the asserted principal's runs by id.
+async fn loom_get_run(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<Run>, (StatusCode, String)> {
+    state
+        .loom
+        .get_run(q.principal_id, id)
+        .await
+        .map_err(loom_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("run not found: {id}")))
+}
+
+/// Cancel a non-terminal run; returns whether anything was cancelled.
+async fn loom_cancel_run(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .loom
+        .cancel_run(q.principal_id, id)
+        .await
+        .map(|cancelled| Json(serde_json::json!({ "cancelled": cancelled })))
+        .map_err(loom_error)
+}
+
+/// List a run's steps in definition order.
+async fn loom_get_steps(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<Vec<Step>>, (StatusCode, String)> {
+    state
+        .loom
+        .get_steps(q.principal_id, id)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Query string for [`loom_get_logs`]: owner plus an optional cap.
+#[derive(Debug, Deserialize)]
+pub struct LoomLogsQuery {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// Maximum lines to return (defaults to 200).
+    pub limit: Option<usize>,
+}
+
+/// Read a run's execution log, oldest first.
+async fn loom_get_logs(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Query(q): Query<LoomLogsQuery>,
+) -> Result<Json<Vec<LogEntry>>, (StatusCode, String)> {
+    state
+        .loom
+        .logs(q.principal_id, id, q.limit.unwrap_or(200))
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Body for [`loom_complete_step`]: the external-completion path.
+#[derive(Debug, Deserialize)]
+pub struct LoomCompleteStep {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// The step's output object.
+    pub output: serde_json::Value,
+}
+
+/// Complete a running step and advance its run.
+async fn loom_complete_step(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<LoomCompleteStep>,
+) -> Result<Json<Step>, (StatusCode, String)> {
+    state
+        .loom
+        .complete_step(req.principal_id, id, req.output)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Body for [`loom_fail_step`].
+#[derive(Debug, Deserialize)]
+pub struct LoomFailStep {
+    /// The asserted owner principal.
+    pub principal_id: PrincipalId,
+    /// The failure reason.
+    pub error: String,
+}
+
+/// Fail a running step's attempt (retry semantics apply).
+async fn loom_fail_step(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<LoomFailStep>,
+) -> Result<Json<Step>, (StatusCode, String)> {
+    state
+        .loom
+        .fail_step(req.principal_id, id, &req.error)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
+/// Aggregate workflow/run counts for the asserted principal.
+async fn loom_stats(
+    State(state): State<AppState>,
+    Query(q): Query<LoomOwnerQuery>,
+) -> Result<Json<LoomStats>, (StatusCode, String)> {
+    state
+        .loom
+        .stats(q.principal_id)
+        .await
+        .map(Json)
+        .map_err(loom_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,7 +892,12 @@ mod tests {
             SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
         );
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca store"));
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca)
+        let loom = Arc::new(
+            LoomStore::open_in_memory(bus.clone())
+                .expect("loom store")
+                .with_executor(Box::new(henosis_loom::TransformExecutor)),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom)
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -621,7 +913,12 @@ mod tests {
             SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
         );
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca store"));
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca)
+        let loom = Arc::new(
+            LoomStore::open_in_memory(bus.clone())
+                .expect("loom store")
+                .with_executor(Box::new(henosis_loom::TransformExecutor)),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom)
     }
 
     /// Collect a response body into a UTF-8 string.
@@ -989,6 +1286,108 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(stats["total"], 1);
         assert_eq!(stats["online"], 1);
+    }
+
+    #[tokio::test]
+    async fn loom_workflow_runs_inline_over_http() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let owner = PrincipalId::new().to_string();
+
+        // Define a one-step transform workflow.
+        let body = serde_json::json!({
+            "tenant": tenant,
+            "principal_id": owner,
+            "name": "greet",
+            "steps": [{
+                "name": "render",
+                "type": "transform",
+                "config": {"template": {"greeting": "hello {{who}}"}},
+            }],
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let workflow: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let workflow_id = workflow["id"].as_str().expect("workflow id");
+
+        // A run advances and completes inline via the transform executor.
+        let body = serde_json::json!({
+            "principal_id": owner,
+            "workflow_id": workflow_id,
+            "input": {"who": "henosis"},
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let run: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(run["status"], "completed");
+        assert_eq!(run["output"]["greeting"], "hello henosis");
+
+        // The log is readable over HTTP.
+        let run_id = run["id"].as_str().expect("run id");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/loom/runs/{run_id}/logs?principal_id={owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let logs: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(logs.as_array().expect("array").len() >= 3, "created/started/completed lines");
+    }
+
+    #[tokio::test]
+    async fn loom_rejects_cyclic_definition_over_http() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let body = serde_json::json!({
+            "tenant": TenantId::new().to_string(),
+            "principal_id": PrincipalId::new().to_string(),
+            "name": "tangled",
+            "steps": [
+                {"name": "a", "type": "action", "depends_on": ["b"]},
+                {"name": "b", "type": "action", "depends_on": ["a"]},
+            ],
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

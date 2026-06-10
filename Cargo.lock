@@ -1931,6 +1931,7 @@ dependencies = [
  "axum",
  "henosis-broca",
  "henosis-chiasm",
+ "henosis-loom",
  "henosis-soma",
  "serde",
  "serde_json",

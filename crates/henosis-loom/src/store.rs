@@ -893,16 +893,16 @@ impl LoomStore {
         step_id: i64,
         output: serde_json::Value,
     ) -> Result<Step, LoomError> {
-        let run_id = {
+        // The guard must leave scope via the block (an explicit drop is not enough for the
+        // future's Send analysis) before any await.
+        let (step, run) = {
             let conn = self.lock();
-            let (step, run) = Self::get_step_with_run(&conn, step_id)?
+            Self::get_step_with_run(&conn, step_id)?
                 .filter(|(_, run)| run.principal_id == principal)
-                .ok_or(LoomError::StepNotFound(step_id))?;
-            drop(conn);
-            self.complete_step_inner(&step, &run, output).await?;
-            step.run_id
+                .ok_or(LoomError::StepNotFound(step_id))?
         };
-        self.advance_boxed(run_id).await?;
+        self.complete_step_inner(&step, &run, output).await?;
+        self.advance_boxed(step.run_id).await?;
         self.read_step(step_id)
     }
 

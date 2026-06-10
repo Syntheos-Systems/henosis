@@ -16,6 +16,7 @@ syntheos-identity = { path = "../syntheos-identity" }
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
+henosis-loom = { path = "../henosis-loom" }
 # HTTP surface.
 axum.workspace = true
 # Global concurrency cap on the HTTP surface (resource-limit hardening).

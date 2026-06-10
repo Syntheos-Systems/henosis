@@ -8,6 +8,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
+use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_soma::SomaStore;
 use syntheos_axon::AxonBus;
 use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
@@ -65,8 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broca_db = db_path("SYNTHEOS_BROCA_DB", "data/broca.sqlite")?;
     let broca = Arc::new(BrocaStore::open(&broca_db, bus.clone())?);
     tracing::info!(path = %broca_db, "broca narration log open");
+    // The built-in transform executor runs pure-JSON steps inline; Hephaestus swaps in the
+    // real executor in Phase 5.
+    let loom_db = db_path("SYNTHEOS_LOOM_DB", "data/loom.sqlite")?;
+    let loom = Arc::new(
+        LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(TransformExecutor)),
+    );
+    tracing::info!(path = %loom_db, "loom workflow engine open");
 
-    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca);
+    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom);
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
