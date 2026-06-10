@@ -1,0 +1,28 @@
+[package]
+name = "henosis-broca"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Broca: the action-narration kernel service, extracted onto syntheos-contracts + in-process Axon."
+
+[dependencies]
+# Canonical ids (PrincipalId/TenantId), Timestamp, and the TypedEvent trait.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# In-process bus the narration events are published onto.
+syntheos-axon = { path = "../syntheos-axon" }
+# SQLite backend (bundled = no system libsqlite). Migration convention: PRAGMA user_version.
+rusqlite = { workspace = true, features = ["bundled"] }
+# BrocaError.
+thiserror.workspace = true
+# Payload JSON and event payloads.
+serde = { workspace = true }
+serde_json.workspace = true
+# Fire-and-forget event-emission failures are logged, never fatal.
+tracing.workspace = true
+# The object-safe async Narrator seam (same pattern as the contracts Gate trait).
+async-trait.workspace = true
+
+[dev-dependencies]
+# Workspace tokio is "full" -- runtime + macros for #[tokio::test].
+tokio = { workspace = true }
