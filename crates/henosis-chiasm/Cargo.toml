@@ -20,6 +20,8 @@ serde = { workspace = true }
 serde_json.workspace = true
 # Fire-and-forget event-emission failures are logged, never fatal.
 tracing.workspace = true
+# Duration arithmetic for path-claim TTL leases (Timestamp wraps time::OffsetDateTime).
+time.workspace = true
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test].

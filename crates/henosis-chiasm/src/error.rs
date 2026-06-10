@@ -21,4 +21,17 @@ pub enum ChiasmError {
     /// A status string read from storage or supplied by a caller is not a known [`crate::TaskStatus`].
     #[error("invalid task status: {0:?}")]
     InvalidStatus(String),
+
+    /// A task may not depend on itself.
+    #[error("task {0} cannot depend on itself")]
+    SelfDependency(TaskId),
+
+    /// Adding this dependency edge would close a cycle in the dependency DAG.
+    #[error("circular dependency: {task_id} -> {depends_on} creates a cycle")]
+    DependencyCycle {
+        /// The task the edge was being added to.
+        task_id: TaskId,
+        /// The dependency target that can already reach `task_id`.
+        depends_on: TaskId,
+    },
 }

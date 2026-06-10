@@ -7,8 +7,9 @@
 //! (`PRAGMA user_version` + `migrations/Vn__*.sql`). Concurrency: one `Connection` behind a
 //! `Mutex` (a pool can replace it later without changing this surface).
 //!
-//! Slice 1 covers task CRUD, history, and stats. Queue/claim, heartbeat/stale, path claims,
-//! dependencies, and the legacy `user_id -> PrincipalId` backfill land in later slices.
+//! Slices 1-3 cover task CRUD/history/stats, the work queue (enqueue/claim), heartbeat + stale
+//! sweep, path claims (TTL leases), and the dependency DAG (BFS cycle check + auto-unblock).
+//! The legacy `user_id -> PrincipalId` backfill lands in a later slice.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,14 +20,22 @@ use syntheos_contracts::{PrincipalId, TaskId, TenantId, Timestamp, TypedEvent};
 
 use crate::error::ChiasmError;
 use crate::events::{
-    TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued, TaskStale, TaskUpdated,
+    ClaimCreated, ClaimReleased, TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued,
+    TaskStale, TaskUnblocked, TaskUpdated,
 };
 use crate::model::{
-    ChiasmStats, EnqueueTask, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
+    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskFilter,
+    TaskPatch, TaskStatus, TaskUpdate,
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__chiasm_tasks.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__chiasm_tasks.sql")),
+    (2, include_str!("../migrations/V2__chiasm_claims_deps.sql")),
+];
+
+/// Seconds a heartbeat extends a task's unreleased path-claim leases by (Kleos parity: 600).
+const HEARTBEAT_CLAIM_REFRESH_SECS: i64 = 600;
 
 /// The columns of `chiasm_tasks`, in the order [`read_raw`] reads them.
 const TASK_COLUMNS: &str = "id, tenant, principal_id, assignee, project, title, status, summary, \
@@ -60,6 +69,70 @@ fn ts_to_db(ts: &Timestamp) -> Result<String, ChiasmError> {
 fn ts_from_db(s: &str) -> Result<Timestamp, ChiasmError> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| ChiasmError::Backend(format!("timestamp parse {s:?}: {e}")))
+}
+
+/// The instant `secs` seconds after `ts`. Used for path-claim lease expiry.
+fn ts_plus(ts: &Timestamp, secs: i64) -> Timestamp {
+    Timestamp::from_utc(ts.as_offset_date_time() + time::Duration::seconds(secs))
+}
+
+/// The columns of `chiasm_path_claims`, in the order [`read_raw_claim`] reads them.
+const CLAIM_COLUMNS: &str =
+    "id, task_id, principal_id, project, path, claimed_at, expires_at, released";
+
+/// The raw column values of one `chiasm_path_claims` row, before parsing into a [`PathClaim`].
+struct RawClaim {
+    /// Lease log id.
+    id: i64,
+    /// Holding task id (TaskId string).
+    task_id: String,
+    /// Owner principal (PrincipalId string).
+    principal_id: String,
+    /// Project the path belongs to.
+    project: String,
+    /// The claimed path.
+    path: String,
+    /// Claim creation time (RFC3339).
+    claimed_at: String,
+    /// Lease expiry time (RFC3339).
+    expires_at: String,
+    /// 0 = live lease, 1 = released.
+    released: i64,
+}
+
+/// Read a `chiasm_path_claims` row positionally into a [`RawClaim`] (column order = [`CLAIM_COLUMNS`]).
+fn read_raw_claim(row: &rusqlite::Row) -> rusqlite::Result<RawClaim> {
+    Ok(RawClaim {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        principal_id: row.get(2)?,
+        project: row.get(3)?,
+        path: row.get(4)?,
+        claimed_at: row.get(5)?,
+        expires_at: row.get(6)?,
+        released: row.get(7)?,
+    })
+}
+
+impl RawClaim {
+    /// Parse raw columns into a typed [`PathClaim`], surfacing any corrupt value as a backend error.
+    fn into_claim(self) -> Result<PathClaim, ChiasmError> {
+        Ok(PathClaim {
+            id: self.id,
+            task_id: self
+                .task_id
+                .parse::<TaskId>()
+                .map_err(|e| ChiasmError::Backend(format!("corrupt task_id {:?}: {e}", self.task_id)))?,
+            principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
+                ChiasmError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
+            })?,
+            project: self.project,
+            path: self.path,
+            claimed_at: ts_from_db(&self.claimed_at)?,
+            expires_at: ts_from_db(&self.expires_at)?,
+            released: self.released != 0,
+        })
+    }
 }
 
 /// The raw column values of one `chiasm_tasks` row, before parsing into typed [`Task`] fields.
@@ -543,24 +616,40 @@ impl ChiasmStore {
         Ok(task)
     }
 
-    /// Record a liveness heartbeat for an owned task, refreshing `last_heartbeat`. Returns
-    /// [`ChiasmError::NotFound`] if the task does not exist or is owned by another principal.
-    ///
-    /// (Path-claim expiry refresh, which Kleos folds in here, lands with the claims slice.)
+    /// Record a liveness heartbeat for an owned task, refreshing `last_heartbeat` and extending
+    /// every unreleased path-claim lease the task holds to now + 600s. The lease refresh is
+    /// fire-and-forget (Kleos parity): a refresh failure is logged, never fatal, because task
+    /// liveness must not depend on the claims table. Like Kleos, the refresh also revives an
+    /// unreleased lease that had already lapsed -- the heartbeat proves the holder is still
+    /// alive and working. Returns [`ChiasmError::NotFound`] if the task does not exist or is
+    /// owned by another principal.
     pub async fn record_heartbeat(
         &self,
         principal: PrincipalId,
         id: TaskId,
     ) -> Result<(), ChiasmError> {
-        let now = ts_to_db(&Timestamp::now())?;
+        let now_ts = Timestamp::now();
+        let now = ts_to_db(&now_ts)?;
+        let lease = ts_to_db(&ts_plus(&now_ts, HEARTBEAT_CLAIM_REFRESH_SECS))?;
         let updated = {
             let conn = self.lock();
-            conn.execute(
-                "UPDATE chiasm_tasks SET last_heartbeat = ?1, updated_at = ?1 \
-                 WHERE id = ?2 AND principal_id = ?3",
-                rusqlite::params![now, id.to_string(), principal.to_string()],
-            )
-            .map_err(berr)?
+            let updated = conn
+                .execute(
+                    "UPDATE chiasm_tasks SET last_heartbeat = ?1, updated_at = ?1 \
+                     WHERE id = ?2 AND principal_id = ?3",
+                    rusqlite::params![now, id.to_string(), principal.to_string()],
+                )
+                .map_err(berr)?;
+            if updated > 0 {
+                if let Err(e) = conn.execute(
+                    "UPDATE chiasm_path_claims SET expires_at = ?1 \
+                     WHERE task_id = ?2 AND released = 0",
+                    rusqlite::params![lease, id.to_string()],
+                ) {
+                    tracing::warn!(error = %e, task = %id, "failed to refresh path-claim leases on heartbeat");
+                }
+            }
+            updated
         };
         if updated == 0 {
             return Err(ChiasmError::NotFound(id));
@@ -569,9 +658,11 @@ impl ChiasmStore {
     }
 
     /// System-wide sweep (NOT owner-scoped -- a maintenance task) that marks every active/paused
-    /// task whose heartbeat is overdue as [`TaskStatus::Stale`], appends a history row, and emits
-    /// `task.stale`. A task is overdue when `now - last_heartbeat > heartbeat_interval_secs *
-    /// grace_multiplier`. Returns the tasks it staled.
+    /// task whose heartbeat is overdue as [`TaskStatus::Stale`], appends a history row, releases
+    /// the task's path-claim leases (a stale task forfeits its claims, Kleos parity), and emits
+    /// `task.stale` (plus `claim.released` when leases were forfeited). A task is overdue when
+    /// `now - last_heartbeat > heartbeat_interval_secs * grace_multiplier`. Returns the tasks it
+    /// staled.
     ///
     /// The overdue comparison is computed in Rust rather than SQL so it does not depend on SQLite
     /// parsing nanosecond-precision RFC3339 timestamps.
@@ -605,7 +696,7 @@ impl ChiasmStore {
             }
             let now_ts = Timestamp::now();
             let now_db = ts_to_db(&now_ts)?;
-            {
+            let released = {
                 let mut conn = self.lock();
                 let tx = conn.transaction().map_err(berr)?;
                 tx.execute(
@@ -620,8 +711,16 @@ impl ChiasmStore {
                     rusqlite::params![task.id.to_string(), STALE_SUMMARY, now_db],
                 )
                 .map_err(berr)?;
+                let released = tx
+                    .execute(
+                        "UPDATE chiasm_path_claims SET released = 1 \
+                         WHERE task_id = ?1 AND released = 0",
+                        rusqlite::params![task.id.to_string()],
+                    )
+                    .map_err(berr)?;
                 tx.commit().map_err(berr)?;
-            }
+                released
+            };
             task.status = TaskStatus::Stale;
             task.summary = Some(STALE_SUMMARY.to_string());
             task.updated_at = now_ts;
@@ -632,9 +731,439 @@ impl ChiasmStore {
                 task.tenant,
                 task.principal_id,
             );
+            if released > 0 {
+                self.emit(
+                    &ClaimReleased {
+                        task_id: task.id.to_string(),
+                        count: released as u64,
+                    },
+                    task.tenant,
+                    task.principal_id,
+                );
+            }
             staled.push(task);
         }
         Ok(staled)
+    }
+
+    /// Create TTL path-claim leases on `paths` for an owned task, and emit `claim.created`.
+    ///
+    /// Each lease is created at now and expires at now + `ttl_seconds`; heartbeats on the task
+    /// extend unreleased leases. The project is taken from the task itself (Kleos accepted it
+    /// as a separate argument, which let a claim land in a different project than its task).
+    /// Returns the new claims, in path order. An empty `paths` creates nothing and emits
+    /// nothing. [`ChiasmError::NotFound`] if the task does not exist or is owned by another
+    /// principal.
+    pub async fn create_claims(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+        paths: &[&str],
+        ttl_seconds: i64,
+    ) -> Result<Vec<PathClaim>, ChiasmError> {
+        let now = Timestamp::now();
+        let expires = ts_plus(&now, ttl_seconds);
+        let (task, claims) = {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(berr)?;
+            let task = Self::get_in(&tx, principal, task_id)?.ok_or(ChiasmError::NotFound(task_id))?;
+            let mut claims = Vec::with_capacity(paths.len());
+            for &path in paths {
+                tx.execute(
+                    "INSERT INTO chiasm_path_claims \
+                     (task_id, principal_id, project, path, claimed_at, expires_at, released) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                    rusqlite::params![
+                        task_id.to_string(),
+                        principal.to_string(),
+                        &task.project,
+                        path,
+                        ts_to_db(&now)?,
+                        ts_to_db(&expires)?,
+                    ],
+                )
+                .map_err(berr)?;
+                claims.push(PathClaim {
+                    id: tx.last_insert_rowid(),
+                    task_id,
+                    principal_id: principal,
+                    project: task.project.clone(),
+                    path: path.to_string(),
+                    claimed_at: now,
+                    expires_at: expires,
+                    released: false,
+                });
+            }
+            tx.commit().map_err(berr)?;
+            (task, claims)
+        };
+        if !claims.is_empty() {
+            self.emit(
+                &ClaimCreated {
+                    task_id: task_id.to_string(),
+                    project: task.project.clone(),
+                    count: claims.len() as u64,
+                },
+                task.tenant,
+                task.principal_id,
+            );
+        }
+        Ok(claims)
+    }
+
+    /// Check `paths` in a project for conflicts with active claims held by OTHER tasks, within
+    /// one owner's coordination space. Pass `exclude_task_id` so a task re-claiming its own
+    /// paths does not self-block. Active = unreleased and unexpired; expiry is compared in Rust
+    /// (see [`PathClaim::is_active_at`]).
+    pub async fn check_conflicts(
+        &self,
+        principal: PrincipalId,
+        project: &str,
+        paths: &[&str],
+        exclude_task_id: Option<TaskId>,
+    ) -> Result<Vec<PathConflict>, ChiasmError> {
+        let now = Timestamp::now();
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM chiasm_path_claims \
+                 WHERE principal_id = ?1 AND project = ?2 AND path = ?3 AND released = 0 \
+                 ORDER BY id ASC"
+            ))
+            .map_err(berr)?;
+        let mut conflicts = Vec::new();
+        for &path in paths {
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![principal.to_string(), project, path],
+                    read_raw_claim,
+                )
+                .map_err(berr)?;
+            for row in rows {
+                let claim = row.map_err(berr)?.into_claim()?;
+                if exclude_task_id == Some(claim.task_id) || !claim.is_active_at(&now) {
+                    continue;
+                }
+                conflicts.push(PathConflict {
+                    path: claim.path.clone(),
+                    claimed_by_task: claim.task_id,
+                    claimed_by_principal: claim.principal_id,
+                    expires_at: claim.expires_at,
+                });
+            }
+        }
+        Ok(conflicts)
+    }
+
+    /// List a task's active (unreleased, unexpired) claims, oldest first. Owner-scoped: another
+    /// principal's task yields an empty list (matching `history`'s read semantics).
+    pub async fn get_claims_for_task(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+    ) -> Result<Vec<PathClaim>, ChiasmError> {
+        let now = Timestamp::now();
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM chiasm_path_claims \
+                 WHERE task_id = ?1 AND principal_id = ?2 AND released = 0 ORDER BY id ASC"
+            ))
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![task_id.to_string(), principal.to_string()],
+                read_raw_claim,
+            )
+            .map_err(berr)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let claim = row.map_err(berr)?.into_claim()?;
+            if claim.is_active_at(&now) {
+                out.push(claim);
+            }
+        }
+        Ok(out)
+    }
+
+    /// List every active (unreleased, unexpired) claim in one of a principal's projects,
+    /// oldest first.
+    pub async fn get_claims_for_project(
+        &self,
+        principal: PrincipalId,
+        project: &str,
+    ) -> Result<Vec<PathClaim>, ChiasmError> {
+        let now = Timestamp::now();
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {CLAIM_COLUMNS} FROM chiasm_path_claims \
+                 WHERE principal_id = ?1 AND project = ?2 AND released = 0 ORDER BY id ASC"
+            ))
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![principal.to_string(), project], read_raw_claim)
+            .map_err(berr)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let claim = row.map_err(berr)?.into_claim()?;
+            if claim.is_active_at(&now) {
+                out.push(claim);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Release every unreleased claim an owned task holds (`released = 1`), returning how many
+    /// were released, and emit `claim.released` when any were. Idempotent: a second release, a
+    /// task with no live claims, or another principal's task releases zero and emits nothing.
+    pub async fn release_claims(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+    ) -> Result<usize, ChiasmError> {
+        let Some(task) = self.get(principal, task_id).await? else {
+            return Ok(0);
+        };
+        let count = {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE chiasm_path_claims SET released = 1 \
+                 WHERE task_id = ?1 AND principal_id = ?2 AND released = 0",
+                rusqlite::params![task_id.to_string(), principal.to_string()],
+            )
+            .map_err(berr)?
+        };
+        if count > 0 {
+            self.emit(
+                &ClaimReleased {
+                    task_id: task_id.to_string(),
+                    count: count as u64,
+                },
+                task.tenant,
+                task.principal_id,
+            );
+        }
+        Ok(count)
+    }
+
+    /// Whether `needle` is reachable from `start` by walking `depends_on` edges (BFS). Used to
+    /// reject a new edge `needle -> start` that would close a cycle.
+    fn reaches(conn: &Connection, start: TaskId, needle: TaskId) -> Result<bool, ChiasmError> {
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        let mut stmt = conn
+            .prepare("SELECT depends_on FROM chiasm_task_dependencies WHERE task_id = ?1")
+            .map_err(berr)?;
+        while let Some(current) = queue.pop_front() {
+            if current == needle {
+                return Ok(true);
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            let rows = stmt
+                .query_map(rusqlite::params![current.to_string()], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(berr)?;
+            for row in rows {
+                let dep = row.map_err(berr)?;
+                queue.push_back(dep.parse::<TaskId>().map_err(|e| {
+                    ChiasmError::Backend(format!("corrupt depends_on {dep:?}: {e}"))
+                })?);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Add dependency edges `task_id -> depends_on[i]`, validating each target against
+    /// self-reference ([`ChiasmError::SelfDependency`]) and cycles
+    /// ([`ChiasmError::DependencyCycle`], BFS over existing edges). Both endpoints must be
+    /// owned by `principal` -- a missing or foreign target is [`ChiasmError::NotFound`], so
+    /// cross-principal edges cannot exist by construction. Duplicate edges are ignored. The
+    /// whole batch is one transaction: any rejection inserts nothing, and the cycle check sees
+    /// edges added earlier in the same batch.
+    pub async fn add_dependencies(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+        depends_on: &[TaskId],
+    ) -> Result<(), ChiasmError> {
+        let now = ts_to_db(&Timestamp::now())?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(berr)?;
+        Self::get_in(&tx, principal, task_id)?.ok_or(ChiasmError::NotFound(task_id))?;
+        for &dep in depends_on {
+            if dep == task_id {
+                return Err(ChiasmError::SelfDependency(task_id));
+            }
+            Self::get_in(&tx, principal, dep)?.ok_or(ChiasmError::NotFound(dep))?;
+            if Self::reaches(&tx, dep, task_id)? {
+                return Err(ChiasmError::DependencyCycle {
+                    task_id,
+                    depends_on: dep,
+                });
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO chiasm_task_dependencies (task_id, depends_on, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![task_id.to_string(), dep.to_string(), now],
+            )
+            .map_err(berr)?;
+        }
+        tx.commit().map_err(berr)?;
+        Ok(())
+    }
+
+    /// List a task's dependency edges, oldest first, each joined with the depended-on task's
+    /// current title and status. Owner-scoped: another principal's task yields an empty list.
+    pub async fn get_dependencies(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+    ) -> Result<Vec<Dependency>, ChiasmError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.id, d.task_id, d.depends_on, dt.title, dt.status, d.created_at \
+                 FROM chiasm_task_dependencies d \
+                 JOIN chiasm_tasks t ON t.id = d.task_id \
+                 LEFT JOIN chiasm_tasks dt ON dt.id = d.depends_on \
+                 WHERE d.task_id = ?1 AND t.principal_id = ?2 ORDER BY d.id ASC",
+            )
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![task_id.to_string(), principal.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(berr)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, edge_task, depends_on, title, status, created_at) = row.map_err(berr)?;
+            out.push(Dependency {
+                id,
+                task_id: edge_task.parse::<TaskId>().map_err(|e| {
+                    ChiasmError::Backend(format!("corrupt task_id {edge_task:?}: {e}"))
+                })?,
+                depends_on: depends_on.parse::<TaskId>().map_err(|e| {
+                    ChiasmError::Backend(format!("corrupt depends_on {depends_on:?}: {e}"))
+                })?,
+                depends_on_title: title,
+                depends_on_status: status.as_deref().map(TaskStatus::parse).transpose()?,
+                created_at: ts_from_db(&created_at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Remove one dependency edge from an owned task. Returns whether an edge was removed
+    /// (`false` for a missing edge or another principal's task).
+    pub async fn remove_dependency(
+        &self,
+        principal: PrincipalId,
+        task_id: TaskId,
+        depends_on: TaskId,
+    ) -> Result<bool, ChiasmError> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM chiasm_task_dependencies WHERE task_id = ?1 AND depends_on = ?2 \
+                 AND task_id IN (SELECT id FROM chiasm_tasks WHERE principal_id = ?3)",
+                rusqlite::params![
+                    task_id.to_string(),
+                    depends_on.to_string(),
+                    principal.to_string()
+                ],
+            )
+            .map_err(berr)?;
+        Ok(n > 0)
+    }
+
+    /// After `completed_task_id` completes, activate every owned dependent task that is
+    /// currently [`TaskStatus::Blocked`] and whose dependencies are ALL completed. Each unblock
+    /// goes through [`Self::update`] (history row + `task.updated`) and then emits
+    /// `task.unblocked`. The just-completed task counts as completed even if the caller has not
+    /// yet committed its status change, so the call is order-independent. Returns the tasks it
+    /// activated. [`ChiasmError::NotFound`] if the completed task is not owned by `principal`.
+    ///
+    /// Two deliberate deviations from the Kleos port: the unblock is scoped to the dependent's
+    /// owner principal (Kleos hardcoded `user_id = 1`), and only `blocked` dependents are
+    /// activated (Kleos activated dependents in ANY status, which could resurrect a completed
+    /// or stale task).
+    pub async fn check_and_unblock(
+        &self,
+        principal: PrincipalId,
+        completed_task_id: TaskId,
+    ) -> Result<Vec<Task>, ChiasmError> {
+        let candidates: Vec<TaskId> = {
+            let conn = self.lock();
+            Self::get_in(&conn, principal, completed_task_id)?
+                .ok_or(ChiasmError::NotFound(completed_task_id))?;
+            // Blocked dependents of the completed task with no other incomplete dependency.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT d.task_id FROM chiasm_task_dependencies d \
+                     JOIN chiasm_tasks t ON t.id = d.task_id \
+                     WHERE d.depends_on = ?1 AND t.principal_id = ?2 AND t.status = 'blocked' \
+                       AND NOT EXISTS (\
+                           SELECT 1 FROM chiasm_task_dependencies d2 \
+                           JOIN chiasm_tasks t2 ON t2.id = d2.depends_on \
+                           WHERE d2.task_id = d.task_id AND d2.depends_on != ?1 \
+                             AND t2.status != 'completed') \
+                     ORDER BY d.task_id",
+                )
+                .map_err(berr)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![completed_task_id.to_string(), principal.to_string()],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(berr)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let id = row.map_err(berr)?;
+                ids.push(id.parse::<TaskId>().map_err(|e| {
+                    ChiasmError::Backend(format!("corrupt task_id {id:?}: {e}"))
+                })?);
+            }
+            ids
+        };
+        let mut unblocked = Vec::new();
+        for id in candidates {
+            let task = self
+                .update(
+                    principal,
+                    id,
+                    TaskPatch {
+                        status: Some(TaskStatus::Active),
+                        summary: Some("auto-unblocked: all dependencies completed".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            self.emit(
+                &TaskUnblocked {
+                    task_id: task.id.to_string(),
+                    completed_dependency: completed_task_id.to_string(),
+                },
+                task.tenant,
+                task.principal_id,
+            );
+            unblocked.push(task);
+        }
+        Ok(unblocked)
     }
 }
 
@@ -1036,5 +1565,376 @@ mod tests {
         // A task with no heartbeat is never swept, even at grace 0.0.
         let unbeaten = store.create(new_task(tenant, principal, "unbeaten")).await.expect("create");
         assert!(store.mark_stale(0.0).await.expect("sweep").iter().all(|t| t.id != unbeaten.id));
+    }
+
+    #[tokio::test]
+    async fn create_and_list_claims() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let _ = drain_kinds(&mut rx);
+
+        let claims = store
+            .create_claims(principal, task.id, &["a.rs", "b.rs"], 1800)
+            .await
+            .expect("claims");
+        assert_eq!(claims.len(), 2);
+        // The project comes from the task itself, and a fresh lease is live.
+        assert!(claims.iter().all(|c| c.project == "henosis" && !c.released));
+        assert_eq!(drain_kinds(&mut rx), ["claim.created"]);
+
+        let listed = store.get_claims_for_task(principal, task.id).await.expect("list");
+        assert_eq!(listed, claims, "stored claims round-trip exactly");
+        let by_project = store.get_claims_for_project(principal, "henosis").await.expect("list");
+        assert_eq!(by_project, claims);
+
+        // Empty paths: nothing created, nothing emitted.
+        assert!(store.create_claims(principal, task.id, &[], 1800).await.expect("claims").is_empty());
+        assert!(drain_kinds(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_claims_requires_owned_task() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        // Unknown task.
+        let err = store
+            .create_claims(principal, TaskId::new(), &["x.rs"], 60)
+            .await
+            .expect_err("unknown task");
+        assert!(matches!(err, ChiasmError::NotFound(_)));
+        // Another principal's task.
+        let err = store
+            .create_claims(PrincipalId::new(), task.id, &["x.rs"], 60)
+            .await
+            .expect_err("foreign task");
+        assert!(matches!(err, ChiasmError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn conflict_detection_and_self_exclusion() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let holder = store.create(new_task(tenant, principal, "holder")).await.expect("create");
+        let requester = store.create(new_task(tenant, principal, "requester")).await.expect("create");
+        store.create_claims(principal, holder.id, &["src/lib.rs"], 1800).await.expect("claims");
+
+        let conflicts = store
+            .check_conflicts(principal, "henosis", &["src/lib.rs", "other.rs"], Some(requester.id))
+            .await
+            .expect("check");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "src/lib.rs");
+        assert_eq!(conflicts[0].claimed_by_task, holder.id);
+        assert_eq!(conflicts[0].claimed_by_principal, principal);
+
+        // The holder re-checking its own paths does not self-block.
+        let own = store
+            .check_conflicts(principal, "henosis", &["src/lib.rs"], Some(holder.id))
+            .await
+            .expect("check");
+        assert!(own.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflicts_are_owner_scoped() {
+        let (store, _bus) = store();
+        let tenant = TenantId::new();
+        let owner = PrincipalId::new();
+        let other = PrincipalId::new();
+        let task = store.create(new_task(tenant, owner, "t")).await.expect("create");
+        store.create_claims(owner, task.id, &["shared.rs"], 1800).await.expect("claims");
+        // Another principal's coordination space sees no conflict on the same project+path.
+        let conflicts = store
+            .check_conflicts(other, "henosis", &["shared.rs"], None)
+            .await
+            .expect("check");
+        assert!(conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_claims_are_inactive() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        // TTL 0: expires_at == claimed_at, already in the past by check time.
+        store.create_claims(principal, task.id, &["old.rs"], 0).await.expect("claims");
+        assert!(store
+            .check_conflicts(principal, "henosis", &["old.rs"], None)
+            .await
+            .expect("check")
+            .is_empty());
+        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
+        assert!(store.get_claims_for_project(principal, "henosis").await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_claims_releases_and_emits() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        store.create_claims(principal, task.id, &["main.rs"], 1800).await.expect("claims");
+        let _ = drain_kinds(&mut rx);
+
+        assert_eq!(store.release_claims(principal, task.id).await.expect("release"), 1);
+        assert_eq!(drain_kinds(&mut rx), ["claim.released"]);
+        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
+        assert!(store
+            .check_conflicts(principal, "henosis", &["main.rs"], None)
+            .await
+            .expect("check")
+            .is_empty());
+
+        // Idempotent: a second release (or a foreign principal) releases zero, no event.
+        assert_eq!(store.release_claims(principal, task.id).await.expect("release"), 0);
+        assert_eq!(store.release_claims(PrincipalId::new(), task.id).await.expect("release"), 0);
+        assert!(drain_kinds(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_claim_leases() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        // An immediately-lapsed lease (TTL 0) is inactive...
+        let claimed = store.create_claims(principal, task.id, &["a.rs"], 0).await.expect("claims");
+        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
+        // ...until a heartbeat proves the holder alive and extends it to now + 600s.
+        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        let refreshed = store.get_claims_for_task(principal, task.id).await.expect("list");
+        assert_eq!(refreshed.len(), 1);
+        assert!(
+            refreshed[0].expires_at.as_offset_date_time()
+                > claimed[0].expires_at.as_offset_date_time(),
+            "heartbeat pushed the lease expiry forward"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_sweep_forfeits_claims() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        store.create_claims(principal, task.id, &["w.rs"], 1800).await.expect("claims");
+        let _ = drain_kinds(&mut rx);
+
+        // grace 0.0 -> any elapsed time is overdue.
+        let staled = store.mark_stale(0.0).await.expect("sweep");
+        assert_eq!(staled.len(), 1);
+        assert_eq!(staled[0].id, task.id);
+        assert_eq!(drain_kinds(&mut rx), ["task.stale", "claim.released"]);
+        assert!(
+            store.get_claims_for_task(principal, task.id).await.expect("list").is_empty(),
+            "a staled task forfeits its leases"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_and_list_dependencies() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let t1 = store.create(new_task(tenant, principal, "task-1")).await.expect("create");
+        let t2 = store.create(new_task(tenant, principal, "task-2")).await.expect("create");
+        let t3 = store.create(new_task(tenant, principal, "task-3")).await.expect("create");
+
+        store.add_dependencies(principal, t3.id, &[t1.id, t2.id]).await.expect("add");
+        // Duplicate edges are ignored.
+        store.add_dependencies(principal, t3.id, &[t1.id]).await.expect("re-add");
+
+        let deps = store.get_dependencies(principal, t3.id).await.expect("list");
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].depends_on, t1.id);
+        assert_eq!(deps[0].depends_on_title.as_deref(), Some("task-1"));
+        assert_eq!(deps[0].depends_on_status, Some(TaskStatus::Active));
+        assert_eq!(deps[1].depends_on, t2.id);
+
+        // Owner-scoped read: another principal sees no edges.
+        assert!(store
+            .get_dependencies(PrincipalId::new(), t3.id)
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn self_dependency_rejected() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let t = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let err = store
+            .add_dependencies(principal, t.id, &[t.id])
+            .await
+            .expect_err("self-dependency");
+        assert!(matches!(err, ChiasmError::SelfDependency(id) if id == t.id));
+    }
+
+    #[tokio::test]
+    async fn circular_dependency_rejected() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
+        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
+        let t3 = store.create(new_task(tenant, principal, "t3")).await.expect("create");
+
+        store.add_dependencies(principal, t2.id, &[t1.id]).await.expect("t2 -> t1");
+        // Direct cycle: t1 -> t2 while t2 -> t1 exists.
+        let err = store
+            .add_dependencies(principal, t1.id, &[t2.id])
+            .await
+            .expect_err("direct cycle");
+        assert!(matches!(err, ChiasmError::DependencyCycle { .. }));
+        // Transitive cycle: with t3 -> t2 -> t1, adding t1 -> t3 closes the loop.
+        store.add_dependencies(principal, t3.id, &[t2.id]).await.expect("t3 -> t2");
+        let err = store
+            .add_dependencies(principal, t1.id, &[t3.id])
+            .await
+            .expect_err("transitive cycle");
+        assert!(matches!(err, ChiasmError::DependencyCycle { .. }));
+        // A rejected batch inserts nothing.
+        assert!(store.get_dependencies(principal, t1.id).await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_principal_dependency_rejected() {
+        let (store, _bus) = store();
+        let tenant = TenantId::new();
+        let owner = PrincipalId::new();
+        let other = PrincipalId::new();
+        let mine = store.create(new_task(tenant, owner, "mine")).await.expect("create");
+        let theirs = store.create(new_task(tenant, other, "theirs")).await.expect("create");
+        let err = store
+            .add_dependencies(owner, mine.id, &[theirs.id])
+            .await
+            .expect_err("cross-principal edge");
+        assert!(matches!(err, ChiasmError::NotFound(id) if id == theirs.id));
+    }
+
+    #[tokio::test]
+    async fn remove_dependency_works() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
+        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
+        store.add_dependencies(principal, t2.id, &[t1.id]).await.expect("add");
+
+        // Another principal cannot remove it.
+        assert!(!store
+            .remove_dependency(PrincipalId::new(), t2.id, t1.id)
+            .await
+            .expect("remove"));
+        assert!(store.remove_dependency(principal, t2.id, t1.id).await.expect("remove"));
+        assert!(store.get_dependencies(principal, t2.id).await.expect("list").is_empty());
+        // Removing a missing edge reports false.
+        assert!(!store.remove_dependency(principal, t2.id, t1.id).await.expect("remove"));
+    }
+
+    #[tokio::test]
+    async fn auto_unblock_on_completion() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("task");
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let blocker = store.create(new_task(tenant, principal, "blocker")).await.expect("create");
+        let blocked = store.create(new_task(tenant, principal, "blocked")).await.expect("create");
+        store.add_dependencies(principal, blocked.id, &[blocker.id]).await.expect("add");
+        store
+            .update(
+                principal,
+                blocked.id,
+                TaskPatch { status: Some(TaskStatus::Blocked), ..Default::default() },
+            )
+            .await
+            .expect("block");
+        let _ = drain_kinds(&mut rx);
+
+        // Order-independent: the blocker's completion need not be committed yet.
+        let unblocked = store.check_and_unblock(principal, blocker.id).await.expect("unblock");
+        assert_eq!(unblocked.len(), 1);
+        assert_eq!(unblocked[0].id, blocked.id);
+        assert_eq!(unblocked[0].status, TaskStatus::Active);
+        assert_eq!(drain_kinds(&mut rx), ["task.updated", "task.unblocked"]);
+
+        let history = store.history(principal, blocked.id, 10).await.expect("history");
+        assert_eq!(
+            history[0].summary.as_deref(),
+            Some("auto-unblocked: all dependencies completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_requires_all_dependencies_completed() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
+        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
+        let dependent = store.create(new_task(tenant, principal, "dependent")).await.expect("create");
+        store
+            .add_dependencies(principal, dependent.id, &[t1.id, t2.id])
+            .await
+            .expect("add");
+        store
+            .update(
+                principal,
+                dependent.id,
+                TaskPatch { status: Some(TaskStatus::Blocked), ..Default::default() },
+            )
+            .await
+            .expect("block");
+
+        // t2 is still incomplete -> nothing unblocks.
+        store
+            .update(
+                principal,
+                t1.id,
+                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+            )
+            .await
+            .expect("complete t1");
+        assert!(store.check_and_unblock(principal, t1.id).await.expect("check").is_empty());
+
+        // Completing t2 unblocks the dependent (t1 is already completed in the DB).
+        store
+            .update(
+                principal,
+                t2.id,
+                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+            )
+            .await
+            .expect("complete t2");
+        let unblocked = store.check_and_unblock(principal, t2.id).await.expect("check");
+        assert_eq!(unblocked.len(), 1);
+        assert_eq!(unblocked[0].id, dependent.id);
+    }
+
+    #[tokio::test]
+    async fn unblock_only_activates_blocked_dependents() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        let blocker = store.create(new_task(tenant, principal, "blocker")).await.expect("create");
+        let done = store.create(new_task(tenant, principal, "done")).await.expect("create");
+        store.add_dependencies(principal, done.id, &[blocker.id]).await.expect("add");
+        // The dependent already completed -- it must NOT be resurrected to active.
+        store
+            .update(
+                principal,
+                done.id,
+                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+            )
+            .await
+            .expect("complete dependent");
+        assert!(store.check_and_unblock(principal, blocker.id).await.expect("check").is_empty());
+        let got = store.get(principal, done.id).await.expect("get").expect("present");
+        assert_eq!(got.status, TaskStatus::Completed);
+
+        // And the completed task itself must be owned: a foreign principal is NotFound.
+        let err = store
+            .check_and_unblock(PrincipalId::new(), blocker.id)
+            .await
+            .expect_err("foreign completed task");
+        assert!(matches!(err, ChiasmError::NotFound(_)));
     }
 }

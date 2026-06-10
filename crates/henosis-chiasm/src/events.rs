@@ -121,3 +121,54 @@ impl TypedEvent for TaskStale {
     const CHANNEL: &'static str = TASK_CHANNEL;
     const KIND: &'static str = "task.stale";
 }
+
+/// A task created path-claim leases. The payload carries counts and ids only -- never the
+/// claimed paths themselves, which can reveal repository layout to every bus subscriber.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimCreated {
+    /// The claiming task's id.
+    pub task_id: String,
+    /// The project the claimed paths belong to.
+    pub project: String,
+    /// How many path leases were created.
+    pub count: u64,
+}
+
+/// Emit `ClaimCreated` on the task channel.
+impl TypedEvent for ClaimCreated {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "claim.created";
+}
+
+/// A task's path-claim leases were released (explicitly, or forfeited by the stale sweep).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimReleased {
+    /// The task whose leases were released.
+    pub task_id: String,
+    /// How many leases were released.
+    pub count: u64,
+}
+
+/// Emit `ClaimReleased` on the task channel.
+impl TypedEvent for ClaimReleased {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "claim.released";
+}
+
+/// A blocked task was auto-activated because all of its dependencies completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskUnblocked {
+    /// The task that was unblocked.
+    pub task_id: String,
+    /// The dependency whose completion triggered the unblock.
+    pub completed_dependency: String,
+}
+
+/// Emit `TaskUnblocked` on the task channel.
+impl TypedEvent for TaskUnblocked {
+    const CHANNEL: &'static str = TASK_CHANNEL;
+    const KIND: &'static str = "task.unblocked";
+}

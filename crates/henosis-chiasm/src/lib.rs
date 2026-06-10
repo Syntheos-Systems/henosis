@@ -17,9 +17,10 @@
 //!
 //! ## Scope
 //!
-//! Slice 1 (this commit): task CRUD, change history, and per-principal stats. Later slices port the
-//! work queue (enqueue/claim), heartbeat + stale detection, path claims, the dependency DAG, and the
-//! one-time `user_id -> PrincipalId` legacy backfill. Agent bearer keys (`keys.rs` in Kleos) are
+//! Slices 1-3: task CRUD, change history, per-principal stats, the work queue (enqueue/claim),
+//! heartbeat + stale detection, path claims (TTL leases scoped to the owner principal), and the
+//! dependency DAG (BFS cycle detection + auto-unblock). A later slice ports the one-time
+//! `user_id -> PrincipalId` legacy backfill. Agent bearer keys (`keys.rs` in Kleos) are
 //! deliberately NOT ported here -- they are an authentication artifact that belongs to the security
 //! authorities (Pistis/Phylax), not the task service. LLM plan generation defers to the Broca
 //! extraction.
@@ -31,10 +32,11 @@ pub mod store;
 
 pub use error::ChiasmError;
 pub use events::{
-    TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued, TaskStale, TaskUpdated,
-    TASK_CHANNEL,
+    ClaimCreated, ClaimReleased, TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued,
+    TaskStale, TaskUnblocked, TaskUpdated, TASK_CHANNEL,
 };
 pub use model::{
-    ChiasmStats, EnqueueTask, NewTask, Task, TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
+    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskFilter,
+    TaskPatch, TaskStatus, TaskUpdate,
 };
 pub use store::ChiasmStore;

@@ -209,3 +209,67 @@ pub struct ChiasmStats {
     /// Count per status token.
     pub by_status: BTreeMap<String, i64>,
 }
+
+/// A path claim: a TTL lease a task holds on a file path while an agent works it.
+///
+/// The Kleos claim was held by a stringly `agent` within a `user_id` shard. Here the claim is
+/// held by its [`TaskId`] and scoped to the task's owner [`PrincipalId`]; heartbeats on the task
+/// push `expires_at` forward, and the stale sweep releases the leases of any task it stales.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathClaim {
+    /// Lease log id (storage surrogate, not a projection key).
+    pub id: i64,
+    /// The task that holds this claim.
+    pub task_id: TaskId,
+    /// Owner principal of the claiming task. All claim reads/writes scope on this.
+    pub principal_id: PrincipalId,
+    /// Project the claimed path belongs to.
+    pub project: String,
+    /// The file path being claimed.
+    pub path: String,
+    /// When the claim was created.
+    pub claimed_at: Timestamp,
+    /// When the lease expires (heartbeats refresh this).
+    pub expires_at: Timestamp,
+    /// Whether the claim has been explicitly released.
+    pub released: bool,
+}
+
+impl PathClaim {
+    /// Whether this claim is active at `now`: not released and not yet expired. Expiry is
+    /// compared here in Rust because the stored nanosecond RFC3339 strings do not order
+    /// reliably in SQL.
+    pub fn is_active_at(&self, now: &Timestamp) -> bool {
+        !self.released && self.expires_at.as_offset_date_time() > now.as_offset_date_time()
+    }
+}
+
+/// A conflict between a requested path and another task's active claim on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathConflict {
+    /// The path that is already claimed.
+    pub path: String,
+    /// The task holding the conflicting claim.
+    pub claimed_by_task: TaskId,
+    /// Owner principal of the conflicting claim (the scope conflicts are checked within).
+    pub claimed_by_principal: PrincipalId,
+    /// When the conflicting lease expires.
+    pub expires_at: Timestamp,
+}
+
+/// A dependency edge: the task `task_id` depends on `depends_on` completing first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dependency {
+    /// Edge log id (storage surrogate, not a projection key).
+    pub id: i64,
+    /// The dependent (downstream) task.
+    pub task_id: TaskId,
+    /// The task that must complete first.
+    pub depends_on: TaskId,
+    /// Title of the depended-on task (joined at read time; `None` if it was deleted mid-read).
+    pub depends_on_title: Option<String>,
+    /// Current status of the depended-on task (joined at read time).
+    pub depends_on_status: Option<TaskStatus>,
+    /// When the edge was created.
+    pub created_at: Timestamp,
+}
