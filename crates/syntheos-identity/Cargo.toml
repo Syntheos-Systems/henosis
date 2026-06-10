@@ -13,6 +13,11 @@ syntheos-contracts = { path = "../syntheos-contracts" }
 async-trait.workspace = true
 # DirectoryError.
 thiserror.workspace = true
+# SQLite backend for the persistent directory (SqliteDirectory). `bundled` avoids a system
+# libsqlite dependency. Migration convention: PRAGMA user_version + migrations/Vn__*.sql.
+rusqlite = { workspace = true, features = ["bundled"] }
+# PrincipalKind is stored as its serde string form.
+serde_json.workspace = true
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test].

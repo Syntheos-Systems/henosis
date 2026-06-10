@@ -32,6 +32,13 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v8", "serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 async-trait = "0.1"
+# SQLite for kernel-service storage (matches Kleos's rusqlite 0.31). Per-crate `bundled` feature
+# avoids a system libsqlite dependency. Migration convention: PRAGMA user_version + ordered
+# migrations/Vn__*.sql -- see 2026-06-10-henosis-db-and-migration-convention.md.
+rusqlite = { version = "0.31" }
+# Postgres for runtime-service storage (Rift, Hermes, Hephaestus, Plutus). Declared now so those
+# crates inherit one pinned version; unused until the first Postgres crate lands.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid"] }
 zeroize = { version = "1", features = ["derive"] }
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
