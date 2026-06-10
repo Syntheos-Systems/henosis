@@ -46,7 +46,7 @@ pub use credential::CredentialHandle;
 
 pub mod gate;
 
-pub use gate::{Gate, GateDecision, GateRequest};
+pub use gate::{Gate, GateDecision, GateError, GateRequest};
 
 pub mod lifecycle;
 

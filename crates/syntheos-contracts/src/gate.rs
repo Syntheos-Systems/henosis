@@ -44,6 +44,40 @@ pub enum GateDecision {
     },
 }
 
+/// A gate could not reach a decision.
+///
+/// Distinct from [`GateDecision::Deny`]: a `Deny` is a *decision* (policy said no), whereas a
+/// `GateError` means the gate could not decide at all -- the authority backing it was
+/// unreachable, a dependency failed, or the request was malformed. The dispatcher treats every
+/// `GateError` as a denial, so fail-closed is the type's default: a gate that cannot decide has
+/// no way to accidentally allow, because the only value it can return on that path is an error
+/// the dispatcher denies on. This is what makes "fail-closed" expressible in the type rather
+/// than a convention each gate author must remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateError {
+    /// Human-readable description of why the gate could not decide.
+    pub message: String,
+}
+
+impl GateError {
+    /// Build a [`GateError`] from anything string-like.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Render the gate error as its message.
+impl std::fmt::Display for GateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// `GateError` is a standard error type so callers can box or `?`-propagate it.
+impl std::error::Error for GateError {}
+
 /// One authorization gate in the dispatcher chain.
 ///
 /// Object-safe via `async_trait` so the dispatcher can hold `Vec<Box<dyn Gate>>`.
@@ -52,8 +86,11 @@ pub trait Gate: Send + Sync {
     /// A short, stable name for this gate (used in logs and audit trails).
     fn name(&self) -> &str;
 
-    /// Authorize (or reject, or escalate) a single request.
-    async fn check(&self, req: &GateRequest) -> GateDecision;
+    /// Authorize (or reject, or escalate) a single request, or return a [`GateError`] if the
+    /// gate could not decide. The dispatcher denies the action (fail-closed) on any error, so a
+    /// gate signals "authority unavailable" by returning `Err` -- never by fabricating an
+    /// `Allow`/`Deny` it has no basis for.
+    async fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError>;
 }
 
 /// Tests for gate trait object-safety and decision wire contracts.
@@ -74,8 +111,8 @@ mod tests {
         }
 
         /// Permit every request in the object-safety test.
-        async fn check(&self, _req: &GateRequest) -> GateDecision {
-            GateDecision::Allow
+        async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+            Ok(GateDecision::Allow)
         }
     }
 
@@ -104,7 +141,7 @@ mod tests {
     async fn boxed_gate_is_object_safe_and_allows() {
         let gate: Box<dyn Gate> = Box::new(AllowAllGate);
         assert_eq!(gate.name(), "allow-all");
-        let decision = gate.check(&sample_request()).await;
+        let decision = gate.check(&sample_request()).await.expect("allows");
         assert_eq!(decision, GateDecision::Allow);
     }
 

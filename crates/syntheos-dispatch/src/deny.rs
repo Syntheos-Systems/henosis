@@ -8,7 +8,7 @@
 //! non-default `stubs` feature and never reach a release build.
 
 use async_trait::async_trait;
-use syntheos_contracts::{Gate, GateDecision, GateRequest, RequestContext, ToolInvocation};
+use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest, RequestContext, ToolInvocation};
 
 use crate::dispatcher::CANONICAL_GATE_ORDER;
 use crate::executor::{Executor, ExecutorError};
@@ -33,13 +33,13 @@ impl Gate for DenyGate {
         self.name
     }
 
-    async fn check(&self, _req: &GateRequest) -> GateDecision {
-        GateDecision::Deny {
+    async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+        Ok(GateDecision::Deny {
             reason: format!(
                 "fail-closed: the {} authority is not yet implemented",
                 self.name
             ),
-        }
+        })
     }
 }
 

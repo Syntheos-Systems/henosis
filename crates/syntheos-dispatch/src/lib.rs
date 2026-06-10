@@ -15,10 +15,12 @@
 //!
 //! The gate trait and the canonical chain order already exist; the real authorities do not.
 //! The dispatcher is fail-closed BY CONSTRUCTION: [`Dispatcher::new`] rejects an empty chain and
-//! any chain whose canonical authorities (`pistis -> plutus -> eidolon -> human -> phylax`,
-//! [`dispatcher::CANONICAL_GATE_ORDER`]) are missing, duplicated, or misordered. Until real
-//! authorities land, the live binary wires [`deny::deny_gate_chain`] and [`deny::DenyExecutor`],
-//! denying every action. Allow-all placeholders (`stubs::stub_gate_chain`,
+//! any chain that is not *exactly* the canonical authority set (`pistis -> plutus -> eidolon ->
+//! human -> phylax`, [`dispatcher::CANONICAL_GATE_ORDER`]) -- a missing, duplicated, or misordered
+//! authority, or any extra non-canonical gate, is refused. A gate that cannot reach a decision
+//! returns `Err`, which the dispatcher also denies (fail-closed). Until real authorities land,
+//! the live binary wires [`deny::deny_gate_chain`] and [`deny::DenyExecutor`], denying every
+//! action. Allow-all placeholders (`stubs::stub_gate_chain`,
 //! `stubs::EchoExecutor`) exist for tests only, behind the non-default `stubs` cargo feature --
 //! they never compile into a release build. Real gates and executors swap in by trait object as
 //! each authority lands (EidolonGate Phase 2; Pistis/Phylax Phase 3; Plutus Phase 6; Human via

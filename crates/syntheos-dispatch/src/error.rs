@@ -20,11 +20,11 @@ pub enum DispatchError {
     #[error("gate chain is empty: a dispatcher without gates would allow everything (fail-closed)")]
     EmptyGateChain,
 
-    /// Construction was attempted with a chain missing canonical authorities, holding
-    /// duplicates of them, or holding them out of canonical order.
-    #[error("gate chain is not canonical: expected the authority order {expected:?}, got {got:?}")]
+    /// Construction was attempted with a chain that is not *exactly* the canonical authority set:
+    /// a missing authority, a duplicate, a misordering, or an extra non-canonical gate.
+    #[error("gate chain is not canonical: expected exactly the authority order {expected:?}, got {got:?}")]
     NonCanonicalChain {
-        /// The canonical authority order every chain must contain.
+        /// The canonical authority order every chain must be, exactly.
         expected: Vec<String>,
         /// The gate names the rejected chain actually presented, in order.
         got: Vec<String>,

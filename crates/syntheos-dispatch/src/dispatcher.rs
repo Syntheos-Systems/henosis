@@ -13,11 +13,14 @@ use crate::error::DispatchError;
 use crate::executor::Executor;
 use crate::outcome::DispatchOutcome;
 
-/// The canonical authority order every gate chain must contain, in dispatch order:
+/// The canonical authority order every gate chain must be, exactly, in dispatch order:
 /// `pistis -> plutus -> eidolon -> human -> phylax`.
 ///
-/// [`Dispatcher::new`] validates against this by [`Gate::name`]; chains missing an authority,
-/// duplicating one, or reordering them are rejected at construction.
+/// [`Dispatcher::new`] validates against this by [`Gate::name`]: a runnable chain is *exactly*
+/// these five authorities, each once, in this order -- no missing authority, no duplicate, no
+/// reordering, and no extra non-canonical gate. The audit trail then attests precisely this set
+/// ran; defense-in-depth checks (rate limiting, quotas) belong at the transport/server layer,
+/// not interleaved into the authority chain.
 pub const CANONICAL_GATE_ORDER: [&str; 5] = ["pistis", "plutus", "eidolon", "human", "phylax"];
 
 /// The single chokepoint every action passes through. Holds the ordered gate chain, the
@@ -41,10 +44,9 @@ impl Dispatcher {
     /// Assemble a dispatcher from an ordered gate chain, an executor, and the shared bus,
     /// validating the chain before anything can dispatch through it.
     ///
-    /// Rejects an empty chain ([`DispatchError::EmptyGateChain`]) and any chain whose canonical
-    /// authorities (matched on [`Gate::name`]) are not exactly [`CANONICAL_GATE_ORDER`] -- each
-    /// present once, in canonical relative order ([`DispatchError::NonCanonicalChain`]).
-    /// Additional non-canonical gates may be interleaved anywhere in the chain.
+    /// Rejects an empty chain ([`DispatchError::EmptyGateChain`]) and any chain that is not
+    /// *exactly* [`CANONICAL_GATE_ORDER`] by [`Gate::name`] -- each authority present once, in
+    /// order, with no extra non-canonical gate ([`DispatchError::NonCanonicalChain`]).
     pub fn new(
         gates: Vec<Box<dyn Gate>>,
         executor: Box<dyn Executor>,
@@ -58,23 +60,22 @@ impl Dispatcher {
         })
     }
 
-    /// Reject a gate chain that is empty or whose canonical authorities are missing,
-    /// duplicated, or out of canonical order.
+    /// Reject a gate chain that is empty or is not *exactly* the canonical authority set, in
+    /// order, with nothing extra.
     fn validate_chain(gates: &[Box<dyn Gate>]) -> Result<(), DispatchError> {
         if gates.is_empty() {
             return Err(DispatchError::EmptyGateChain);
         }
-        // The canonical authorities, in the order this chain presents them. Each must appear
-        // exactly once and in canonical relative order; anything else is fail-closed rejected.
-        let canonical_in_chain: Vec<&str> = gates
-            .iter()
-            .map(|g| g.name())
-            .filter(|name| CANONICAL_GATE_ORDER.contains(name))
-            .collect();
-        if canonical_in_chain != CANONICAL_GATE_ORDER {
+        // Strict identity: the chain's gate names, in order, must equal CANONICAL_GATE_ORDER
+        // verbatim. This rejects a missing authority, a duplicate, a reordering, AND any extra
+        // non-canonical gate interleaved into the chain -- an unrecognized gate in the authority
+        // set is a configuration error, not defense-in-depth, and is fail-closed rejected so the
+        // audit trail attests exactly the canonical authorities ran.
+        let names: Vec<&str> = gates.iter().map(|g| g.name()).collect();
+        if names != CANONICAL_GATE_ORDER {
             return Err(DispatchError::NonCanonicalChain {
                 expected: CANONICAL_GATE_ORDER.iter().map(|s| s.to_string()).collect(),
-                got: gates.iter().map(|g| g.name().to_string()).collect(),
+                got: names.iter().map(|s| s.to_string()).collect(),
             });
         }
         Ok(())
@@ -88,11 +89,11 @@ impl Dispatcher {
     /// Authorize and (if allowed) execute a single request.
     ///
     /// Runs the gate chain in order; the first `Deny`/`RequireApproval` short-circuits and the
-    /// executor is never called. An unrecognized (`#[non_exhaustive]`) gate decision is treated
-    /// as a denial -- fail-closed. On full approval the executor runs; its result rides
-    /// [`DispatchOutcome::Executed`], and an execution failure becomes [`DispatchError`]. A
-    /// lifecycle event is emitted at every branch (best-effort; a publish failure is logged,
-    /// never fatal).
+    /// executor is never called. An unrecognized (`#[non_exhaustive]`) gate decision, and a gate
+    /// that returns `Err` (could not decide), are both treated as a denial -- fail-closed. On
+    /// full approval the executor runs; its result rides [`DispatchOutcome::Executed`], and an
+    /// execution failure becomes [`DispatchError`]. A lifecycle event is emitted at every branch
+    /// (best-effort; a publish failure is logged, never fatal).
     pub async fn dispatch(&self, request: GateRequest) -> Result<DispatchOutcome, DispatchError> {
         let tenant = request.context.tenant;
         let principal = request.context.principal;
@@ -110,8 +111,8 @@ impl Dispatcher {
 
         for gate in &self.gates {
             match gate.check(&request).await {
-                GateDecision::Allow => continue,
-                GateDecision::Deny { reason } => {
+                Ok(GateDecision::Allow) => continue,
+                Ok(GateDecision::Deny { reason }) => {
                     let gate = gate.name().to_string();
                     self.emit(
                         &ActionDenied {
@@ -125,7 +126,7 @@ impl Dispatcher {
                     );
                     return Ok(DispatchOutcome::Denied { gate, reason });
                 }
-                GateDecision::RequireApproval { prompt } => {
+                Ok(GateDecision::RequireApproval { prompt }) => {
                     let gate = gate.name().to_string();
                     self.emit(
                         &ApprovalRequired {
@@ -140,9 +141,26 @@ impl Dispatcher {
                     return Ok(DispatchOutcome::RequiresApproval { gate, prompt });
                 }
                 // `GateDecision` is `#[non_exhaustive]`: an unrecognized decision is fail-closed.
-                _ => {
+                Ok(_) => {
                     let gate = gate.name().to_string();
                     let reason = "unrecognized gate decision (fail-closed)".to_string();
+                    self.emit(
+                        &ActionDenied {
+                            tool: tool.clone(),
+                            action: action.clone(),
+                            gate: gate.clone(),
+                            reason: reason.clone(),
+                        },
+                        tenant,
+                        principal,
+                    );
+                    return Ok(DispatchOutcome::Denied { gate, reason });
+                }
+                // The gate could not reach a decision (authority unavailable, dependency failed,
+                // malformed request). Fail-closed: deny, attributed to this gate.
+                Err(err) => {
+                    let gate = gate.name().to_string();
+                    let reason = format!("gate error (fail-closed): {err}");
                     self.emit(
                         &ActionDenied {
                             tool: tool.clone(),
@@ -196,7 +214,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use syntheos_contracts::{AxonEnvelope, RequestContext, ToolInvocation};
+    use syntheos_contracts::{AxonEnvelope, GateError, RequestContext, ToolInvocation};
 
     /// Build a minimal request for `tool`/`action`.
     fn request(tool: &str, action: &str) -> GateRequest {
@@ -228,10 +246,10 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        async fn check(&self, _req: &GateRequest) -> GateDecision {
-            GateDecision::Deny {
+        async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+            Ok(GateDecision::Deny {
                 reason: self.reason.to_string(),
-            }
+            })
         }
     }
 
@@ -244,10 +262,10 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        async fn check(&self, _req: &GateRequest) -> GateDecision {
-            GateDecision::RequireApproval {
+        async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+            Ok(GateDecision::RequireApproval {
                 prompt: "approve?".to_string(),
-            }
+            })
         }
     }
 
@@ -263,9 +281,9 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        async fn check(&self, _req: &GateRequest) -> GateDecision {
+        async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             self.log.lock().unwrap().push(self.name.to_string());
-            self.decision.clone()
+            Ok(self.decision.clone())
         }
     }
 
@@ -571,20 +589,86 @@ mod tests {
     }
 
     #[test]
-    fn extra_non_canonical_gates_allowed() {
+    fn extra_non_canonical_gate_rejected() {
         let bus = Arc::new(AxonBus::new());
-        // Defense-in-depth gates may interleave as long as the canonical five stay in order.
+        // An extra gate interleaved into the canonical five is rejected: the authority chain must
+        // be EXACTLY canonical, so the audit trail attests precisely which authorities ran.
+        // Defense-in-depth (e.g. rate limiting) belongs at the transport layer, not here.
         let gates: Vec<Box<dyn Gate>> =
             ["pistis", "plutus", "ratelimit", "eidolon", "human", "phylax"]
                 .into_iter()
                 .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
                 .collect();
-        let dispatcher = Dispatcher::new(gates, Box::new(EchoExecutor), bus)
-            .expect("interleaved extras are valid");
+        let err = Dispatcher::new(gates, Box::new(EchoExecutor), bus)
+            .err()
+            .expect("an extra non-canonical gate must be rejected");
+        match err {
+            DispatchError::NonCanonicalChain { expected, got } => {
+                assert_eq!(expected, CANONICAL_GATE_ORDER);
+                assert_eq!(
+                    got,
+                    ["pistis", "plutus", "ratelimit", "eidolon", "human", "phylax"]
+                );
+            }
+            other => panic!("expected NonCanonicalChain, got {other:?}"),
+        }
+    }
+
+    /// A gate that cannot reach a decision -- it always errors.
+    struct ErroringGate {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Gate for ErroringGate {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+            Err(GateError::new("authority unreachable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_error_denies_fail_closed() {
+        let bus = Arc::new(AxonBus::new());
+        let mut rx = bus.subscribe("action");
+        let calls = Arc::new(AtomicUsize::new(0));
+        // pistis allows, then plutus errors: a gate that cannot decide must deny (fail-closed),
+        // the executor must never run, and the rest of the chain must not run either.
+        let gates: Vec<Box<dyn Gate>> = vec![
+            Box::new(StubGate::new("pistis")),
+            Box::new(ErroringGate { name: "plutus" }),
+            Box::new(StubGate::new("eidolon")),
+            Box::new(StubGate::new("human")),
+            Box::new(StubGate::new("phylax")),
+        ];
+        let dispatcher = Dispatcher::new(
+            gates,
+            Box::new(CountingExecutor {
+                calls: calls.clone(),
+            }),
+            bus.clone(),
+        )
+        .expect("canonical chain");
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("dispatch");
+        match outcome {
+            DispatchOutcome::Denied { gate, reason } => {
+                assert_eq!(gate, "plutus", "denial is attributed to the erroring gate");
+                assert!(reason.contains("fail-closed"), "reason: {reason}");
+                assert!(reason.contains("authority unreachable"), "reason: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
         assert_eq!(
-            dispatcher.gate_names(),
-            ["pistis", "plutus", "ratelimit", "eidolon", "human", "phylax"]
+            calls.load(Ordering::SeqCst),
+            0,
+            "executor must not run when a gate errors"
         );
+        assert_eq!(drain_kinds(&mut rx), ["action.invoked", "action.denied"]);
     }
 
     #[tokio::test]

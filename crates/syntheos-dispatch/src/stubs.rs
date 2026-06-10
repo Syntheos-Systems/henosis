@@ -7,7 +7,7 @@
 //! object as they land.
 
 use async_trait::async_trait;
-use syntheos_contracts::{Gate, GateDecision, GateRequest, RequestContext, ToolInvocation};
+use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest, RequestContext, ToolInvocation};
 
 use crate::dispatcher::CANONICAL_GATE_ORDER;
 use crate::executor::{Executor, ExecutorError};
@@ -32,8 +32,8 @@ impl Gate for StubGate {
         self.name
     }
 
-    async fn check(&self, _req: &GateRequest) -> GateDecision {
-        GateDecision::Allow
+    async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+        Ok(GateDecision::Allow)
     }
 }
 
