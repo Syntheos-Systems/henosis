@@ -22,6 +22,11 @@ thiserror.workspace = true
 # Best-effort warning when a lifecycle event fails to publish.
 tracing.workspace = true
 
+[features]
+# Allow-all test placeholders (StubGate / stub_gate_chain / EchoExecutor). NOT a default
+# feature: stubs must never compile into a release build. Enable from [dev-dependencies] only.
+stubs = []
+
 [dev-dependencies]
 # Workspace tokio is "full" -- macros + runtime for #[tokio::test].
 tokio = { workspace = true }
