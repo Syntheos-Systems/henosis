@@ -8,6 +8,7 @@ use crate::time::Timestamp;
 
 /// The envelope every Axon event travels in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AxonEnvelope {
     /// Stable identity of this event.
     pub id: EventId,
@@ -56,6 +57,7 @@ pub trait TypedEvent: Serialize {
     }
 }
 
+/// Tests for Axon envelope and typed event wire contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,14 +65,17 @@ mod tests {
     /// A trivial event used only to exercise the `TypedEvent` default impl.
     #[derive(Serialize)]
     struct ToolInvoked {
+        /// Tool name included in the test payload.
         tool: String,
     }
 
+    /// Implement `TypedEvent` for the test event.
     impl TypedEvent for ToolInvoked {
         const CHANNEL: &'static str = "tool";
         const KIND: &'static str = "tool.invoked";
     }
 
+    /// `TypedEvent::to_envelope` fills routing fields from associated constants.
     #[test]
     fn into_envelope_fills_channel_and_kind() {
         let ev = ToolInvoked {
@@ -84,6 +89,7 @@ mod tests {
         assert_eq!(env.payload, serde_json::json!({ "tool": "kleos" }));
     }
 
+    /// Axon envelopes roundtrip with the current wire shape.
     #[test]
     fn envelope_roundtrip() {
         let env = AxonEnvelope {
@@ -98,5 +104,23 @@ mod tests {
         let json = serde_json::to_string(&env).expect("serialize");
         let back: AxonEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    /// Axon envelopes reject misspelled routing or context fields.
+    #[test]
+    fn envelope_rejects_unknown_fields() {
+        let env = AxonEnvelope {
+            id: EventId::new(),
+            channel: "task".to_string(),
+            kind: "task.completed".to_string(),
+            tenant: TenantId::new(),
+            principal: PrincipalId::new(),
+            occurred_at: Timestamp::now(),
+            payload: serde_json::json!({ "ok": true }),
+        };
+        let mut value = serde_json::to_value(env).expect("serialize");
+        value["principle"] = serde_json::json!("wrong");
+        let err = serde_json::from_value::<AxonEnvelope>(value).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
     }
 }

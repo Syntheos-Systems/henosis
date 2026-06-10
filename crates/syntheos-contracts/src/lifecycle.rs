@@ -18,6 +18,7 @@ pub const ACTION_CHANNEL: &str = "action";
 
 /// An action entered the dispatcher and is about to run the gate chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionInvoked {
     /// The tool/adapter being invoked (e.g. `kleos`).
     pub tool: String,
@@ -25,6 +26,7 @@ pub struct ActionInvoked {
     pub action: String,
 }
 
+/// Emit `ActionInvoked` on the action lifecycle channel.
 impl TypedEvent for ActionInvoked {
     const CHANNEL: &'static str = ACTION_CHANNEL;
     const KIND: &'static str = "action.invoked";
@@ -32,6 +34,7 @@ impl TypedEvent for ActionInvoked {
 
 /// An action that passed every gate and executed successfully.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionCompleted {
     /// The tool/adapter that ran.
     pub tool: String,
@@ -39,6 +42,7 @@ pub struct ActionCompleted {
     pub action: String,
 }
 
+/// Emit `ActionCompleted` on the action lifecycle channel.
 impl TypedEvent for ActionCompleted {
     const CHANNEL: &'static str = ACTION_CHANNEL;
     const KIND: &'static str = "action.completed";
@@ -46,6 +50,7 @@ impl TypedEvent for ActionCompleted {
 
 /// An action that passed every gate but failed during execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionFailed {
     /// The tool/adapter that was invoked.
     pub tool: String,
@@ -55,6 +60,7 @@ pub struct ActionFailed {
     pub error: String,
 }
 
+/// Emit `ActionFailed` on the action lifecycle channel.
 impl TypedEvent for ActionFailed {
     const CHANNEL: &'static str = ACTION_CHANNEL;
     const KIND: &'static str = "action.failed";
@@ -62,6 +68,7 @@ impl TypedEvent for ActionFailed {
 
 /// An action rejected by a gate before execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionDenied {
     /// The tool/adapter that was requested.
     pub tool: String,
@@ -73,6 +80,7 @@ pub struct ActionDenied {
     pub reason: String,
 }
 
+/// Emit `ActionDenied` on the action lifecycle channel.
 impl TypedEvent for ActionDenied {
     const CHANNEL: &'static str = ACTION_CHANNEL;
     const KIND: &'static str = "action.denied";
@@ -80,6 +88,7 @@ impl TypedEvent for ActionDenied {
 
 /// An action a gate escalated for explicit approval before it may proceed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRequired {
     /// The tool/adapter awaiting approval.
     pub tool: String,
@@ -91,17 +100,20 @@ pub struct ApprovalRequired {
     pub prompt: String,
 }
 
+/// Emit `ApprovalRequired` on the action lifecycle channel.
 impl TypedEvent for ApprovalRequired {
     const CHANNEL: &'static str = ACTION_CHANNEL;
     const KIND: &'static str = "action.approval_required";
 }
 
+/// Tests for action lifecycle event wire contracts.
 #[cfg(test)]
 mod tests {
     use super::{ActionDenied, ActionInvoked};
     use crate::event::TypedEvent;
     use crate::ids::{PrincipalId, TenantId};
 
+    /// Invoked events envelope onto the shared action channel.
     #[test]
     fn invoked_envelopes_onto_action_channel() {
         let ev = ActionInvoked {
@@ -119,6 +131,7 @@ mod tests {
         );
     }
 
+    /// Denied events carry audit fields and roundtrip from envelope payloads.
     #[test]
     fn denied_carries_gate_and_reason_and_roundtrips() {
         let ev = ActionDenied {
@@ -133,5 +146,13 @@ mod tests {
         assert_eq!(env.kind, "action.denied");
         let back: ActionDenied = serde_json::from_value(env.payload).expect("roundtrip");
         assert_eq!(back, ev);
+    }
+
+    /// Lifecycle events reject misspelled fields.
+    #[test]
+    fn lifecycle_event_rejects_unknown_fields() {
+        let json = r#"{"tool":"kleos","action":"memory_store","toool":"bad"}"#;
+        let err = serde_json::from_str::<ActionInvoked>(json).expect_err("unknown field");
+        assert!(err.to_string().contains("unknown field"));
     }
 }
