@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
+use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
 use henosis_soma::SomaStore;
 use syntheos_axon::AxonBus;
@@ -59,8 +60,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let soma_db = db_path("SYNTHEOS_SOMA_DB", "data/soma.sqlite")?;
     let soma = Arc::new(SomaStore::open(&soma_db, bus.clone(), directory.clone())?);
     tracing::info!(path = %soma_db, "soma presence store open");
+    // No LLM narrator is attached in Phase 1 (template-or-nothing); a Synapse/Foundry-backed
+    // Narrator plugs in via BrocaStore::with_narrator when Phase 4 lands.
+    let broca_db = db_path("SYNTHEOS_BROCA_DB", "data/broca.sqlite")?;
+    let broca = Arc::new(BrocaStore::open(&broca_db, bus.clone())?);
+    tracing::info!(path = %broca_db, "broca narration log open");
 
-    let state = AppState::new(dispatcher, directory, bus, chiasm, soma);
+    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca);
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.

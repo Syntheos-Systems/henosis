@@ -15,6 +15,7 @@ syntheos-identity = { path = "../syntheos-identity" }
 # Phase 1 kernel services, wired into AppState as they are extracted (Story 1.7).
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
+henosis-broca = { path = "../henosis-broca" }
 # HTTP surface.
 axum.workspace = true
 # Global concurrency cap on the HTTP surface (resource-limit hardening).

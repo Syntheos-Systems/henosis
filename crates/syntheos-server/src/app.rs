@@ -9,11 +9,15 @@ use axum::{Json, Router};
 use henosis_chiasm::{
     ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
 };
+use henosis_broca::{
+    ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStore, LogAction,
+};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
 };
 use serde::Deserialize;
+use syntheos_contracts::Timestamp;
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
@@ -34,6 +38,8 @@ pub struct AppState {
     chiasm: Arc<ChiasmStore>,
     /// The Soma presence store (Story 1.2).
     soma: Arc<SomaStore>,
+    /// The Broca narration log (Story 1.3).
+    broca: Arc<BrocaStore>,
 }
 
 impl AppState {
@@ -44,6 +50,7 @@ impl AppState {
         bus: Arc<AxonBus>,
         chiasm: Arc<ChiasmStore>,
         soma: Arc<SomaStore>,
+        broca: Arc<BrocaStore>,
     ) -> Self {
         Self {
             dispatcher,
@@ -51,6 +58,7 @@ impl AppState {
             bus,
             chiasm,
             soma,
+            broca,
         }
     }
 
@@ -76,6 +84,10 @@ pub fn router(state: AppState) -> Router {
         .route("/soma/agents/{id}/heartbeat", post(soma_heartbeat))
         .route("/soma/agents/{id}/quality", post(soma_quality))
         .route("/soma/stats", get(soma_stats))
+        .route("/broca/actions", post(broca_log).get(broca_feed))
+        .route("/broca/actions/{id}", get(broca_get))
+        .route("/broca/actions/{id}/narrate", post(broca_narrate))
+        .route("/broca/stats", get(broca_stats))
         .with_state(state)
 }
 
@@ -433,6 +445,142 @@ async fn soma_stats(
     state.soma.stats(q.tenant).await.map(Json).map_err(soma_error)
 }
 
+/// Map a [`BrocaError`] onto an HTTP status + message.
+fn broca_error(e: BrocaError) -> (StatusCode, String) {
+    let status = match &e {
+        BrocaError::NotFound(_) => StatusCode::NOT_FOUND,
+        BrocaError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        // The pluggable narrator failed upstream; the action row itself is fine.
+        BrocaError::Narration(_) => StatusCode::BAD_GATEWAY,
+        // Backend and any future variants are server-side failures.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Body for [`broca_log`]. Identity is caller-asserted in Phase 1, the established posture.
+#[derive(Debug, Deserialize)]
+pub struct BrocaLogRequest {
+    /// Tenant the action belongs to.
+    pub tenant: TenantId,
+    /// The acting agent's principal.
+    pub principal_id: PrincipalId,
+    /// Originating service name (defaults to `henosis`).
+    pub service: Option<String>,
+    /// Action type token.
+    pub action: String,
+    /// Structured payload (must be a JSON object when supplied).
+    pub payload: Option<serde_json::Value>,
+    /// Pre-computed narrative; when absent the template renderer runs at log time.
+    pub narrative: Option<String>,
+}
+
+/// Record an action in the narration log.
+async fn broca_log(
+    State(state): State<AppState>,
+    Json(req): Json<BrocaLogRequest>,
+) -> Result<Json<ActionEntry>, (StatusCode, String)> {
+    state
+        .broca
+        .log(LogAction {
+            tenant: req.tenant,
+            principal_id: req.principal_id,
+            service: req.service,
+            action: req.action,
+            payload: req.payload,
+            narrative: req.narrative,
+        })
+        .await
+        .map(Json)
+        .map_err(broca_error)
+}
+
+/// Query string for [`broca_feed`]: the asserted tenant plus optional AND-filters.
+#[derive(Debug, Deserialize)]
+pub struct BrocaFeedQuery {
+    /// Tenant whose feed is read.
+    pub tenant: TenantId,
+    /// Only actions by this principal.
+    pub principal_id: Option<PrincipalId>,
+    /// Only actions from this service.
+    pub service: Option<String>,
+    /// Only actions of this type.
+    pub action: Option<String>,
+    /// Only actions recorded at or after this RFC3339 instant.
+    pub since: Option<Timestamp>,
+    /// Maximum rows to return.
+    pub limit: Option<usize>,
+    /// Rows to skip (pagination).
+    pub offset: Option<usize>,
+}
+
+/// Read a tenant's narration feed, newest first.
+async fn broca_feed(
+    State(state): State<AppState>,
+    Query(q): Query<BrocaFeedQuery>,
+) -> Result<Json<Vec<ActionEntry>>, (StatusCode, String)> {
+    state
+        .broca
+        .query(
+            q.tenant,
+            ActionFilter {
+                principal_id: q.principal_id,
+                service: q.service,
+                action: q.action,
+                since: q.since,
+                limit: q.limit,
+                offset: q.offset,
+            },
+        )
+        .await
+        .map(Json)
+        .map_err(broca_error)
+}
+
+/// Query string asserting the tenant for single-action reads, narration, and stats.
+#[derive(Debug, Deserialize)]
+pub struct BrocaTenantQuery {
+    /// The asserted tenant.
+    pub tenant: TenantId,
+}
+
+/// Fetch one action by id within the asserted tenant.
+async fn broca_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<BrocaTenantQuery>,
+) -> Result<Json<ActionEntry>, (StatusCode, String)> {
+    state
+        .broca
+        .get(q.tenant, id)
+        .await
+        .map_err(broca_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("action not found: {id}")))
+}
+
+/// Ensure an action carries a narrative (template, then the attached narrator) and return it.
+async fn broca_narrate(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<BrocaTenantQuery>,
+) -> Result<Json<ActionEntry>, (StatusCode, String)> {
+    state
+        .broca
+        .get_or_narrate(q.tenant, id)
+        .await
+        .map(Json)
+        .map_err(broca_error)
+}
+
+/// Aggregate action counts for the asserted tenant.
+async fn broca_stats(
+    State(state): State<AppState>,
+    Query(q): Query<BrocaTenantQuery>,
+) -> Result<Json<BrocaStats>, (StatusCode, String)> {
+    state.broca.stats(q.tenant).await.map(Json).map_err(broca_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,7 +604,8 @@ mod tests {
         let soma = Arc::new(
             SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma)
+        let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca store"));
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca)
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -471,7 +620,8 @@ mod tests {
         let soma = Arc::new(
             SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma)
+        let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca store"));
+        AppState::new(dispatcher, directory, bus, chiasm, soma, broca)
     }
 
     /// Collect a response body into a UTF-8 string.
@@ -839,6 +989,85 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(stats["total"], 1);
         assert_eq!(stats["online"], 1);
+    }
+
+    #[tokio::test]
+    async fn broca_log_and_feed_over_http() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let actor = PrincipalId::new().to_string();
+
+        // Log an action with a template-narratable type.
+        let body = serde_json::json!({
+            "tenant": tenant,
+            "principal_id": actor,
+            "service": "chiasm",
+            "action": "task.completed",
+            "payload": {"title": "wire broca", "agent": "claude"},
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/broca/actions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let logged: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(
+            logged["narrative"], "\"wire broca\" was completed by claude",
+            "template narrative derived at log time"
+        );
+
+        // The feed returns it, filtered by service; a stranger tenant sees nothing.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/broca/actions?tenant={tenant}&service=chiasm"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let feed: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(feed.as_array().expect("array").len(), 1);
+        let other = TenantId::new();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/broca/actions?tenant={other}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let empty: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(empty.as_array().expect("array").is_empty());
+
+        // Stats count it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/broca/stats?tenant={tenant}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stats["total"], 1);
+        assert_eq!(stats["by_service"]["chiasm"], 1);
     }
 
     #[tokio::test]
