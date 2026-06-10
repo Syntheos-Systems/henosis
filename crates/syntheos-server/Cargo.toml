@@ -14,6 +14,10 @@ syntheos-dispatch = { path = "../syntheos-dispatch" }
 syntheos-identity = { path = "../syntheos-identity" }
 # HTTP surface.
 axum.workspace = true
+# Global concurrency cap on the HTTP surface (resource-limit hardening).
+tower = { version = "0.5", features = ["limit"] }
+# Per-request timeout layer (resource-limit hardening).
+tower-http = { version = "0.6", features = ["timeout"] }
 # Full runtime: the binary needs rt, net, signal, and macros.
 tokio = { workspace = true }
 # EnrollRequest body.
@@ -27,6 +31,9 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # ServiceExt::oneshot drives the router in handler tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# Tests opt into the allow-all stub chain; the non-default `stubs` feature never reaches a
+# normal (release) build of the binary.
+syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
 
 [features]
 default = []

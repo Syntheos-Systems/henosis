@@ -11,12 +11,16 @@
 //! [`syntheos_axon`] bus, where reactors (narration, evaluation, the future durable audit path)
 //! observe the action stream.
 //!
-//! ## Phase 0 posture
+//! ## Phase 0 posture: fail-closed
 //!
 //! The gate trait and the canonical chain order already exist; the real authorities do not.
-//! [`stubs::stub_gate_chain`] assembles the canonical `pistis -> plutus -> eidolon -> human ->
-//! phylax` chain with allow-all stubs, and [`stubs::EchoExecutor`] stands in for a real executor,
-//! so the dispatcher runs end-to-end today. Real gates and executors swap in by trait object as
+//! The dispatcher is fail-closed BY CONSTRUCTION: [`Dispatcher::new`] rejects an empty chain and
+//! any chain whose canonical authorities (`pistis -> plutus -> eidolon -> human -> phylax`,
+//! [`dispatcher::CANONICAL_GATE_ORDER`]) are missing, duplicated, or misordered. Until real
+//! authorities land, the live binary wires [`deny::deny_gate_chain`] and [`deny::DenyExecutor`],
+//! denying every action. Allow-all placeholders (`stubs::stub_gate_chain`,
+//! `stubs::EchoExecutor`) exist for tests only, behind the non-default `stubs` cargo feature --
+//! they never compile into a release build. Real gates and executors swap in by trait object as
 //! each authority lands (EidolonGate Phase 2; Pistis/Phylax Phase 3; Plutus Phase 6; Human via
 //! Rift/Athena).
 //!
@@ -26,13 +30,18 @@
 //! no approval *resolution* (the dispatcher only surfaces [`DispatchOutcome::RequiresApproval`] and
 //! stops), and no persistence/audit.
 
+pub mod deny;
 pub mod dispatcher;
 pub mod error;
 pub mod executor;
 pub mod outcome;
+/// Allow-all test placeholders, compiled only for this crate's own tests or under the
+/// non-default `stubs` feature -- never into a default or release build.
+#[cfg(any(test, feature = "stubs"))]
 pub mod stubs;
 
-pub use dispatcher::Dispatcher;
+pub use deny::{deny_gate_chain, DenyExecutor, DenyGate};
+pub use dispatcher::{Dispatcher, CANONICAL_GATE_ORDER};
 pub use error::DispatchError;
 pub use executor::{Executor, ExecutorError};
 pub use outcome::DispatchOutcome;

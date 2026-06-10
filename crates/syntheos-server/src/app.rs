@@ -17,7 +17,7 @@ use syntheos_identity::PrincipalDirectory;
 /// Cheap to clone (it is all `Arc`s), as the `axum` `State` extractor requires.
 #[derive(Clone)]
 pub struct AppState {
-    /// The unified action dispatcher (stub gate chain + echo executor in Phase 0).
+    /// The unified action dispatcher (deny-by-default gate chain in Phase 0).
     dispatcher: Arc<Dispatcher>,
     /// The principal directory actors are enrolled into and looked up from.
     directory: Arc<dyn PrincipalDirectory>,
@@ -111,19 +111,31 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
     use syntheos_dispatch::stubs::{stub_gate_chain, EchoExecutor};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
-    /// Build app state over the real foundation (stubbed gates + echo executor).
+    /// Build app state over the real foundation (allow-all stub gates + echo executor, both from
+    /// the test-only `stubs` feature).
     fn test_state() -> AppState {
         let bus = Arc::new(AxonBus::new());
         let directory: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());
-        let dispatcher = Arc::new(Dispatcher::new(
-            stub_gate_chain(),
-            Box::new(EchoExecutor),
-            bus.clone(),
-        ));
+        let dispatcher = Arc::new(
+            Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+                .expect("canonical stub chain"),
+        );
+        AppState::new(dispatcher, directory, bus)
+    }
+
+    /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
+    fn deny_state() -> AppState {
+        let bus = Arc::new(AxonBus::new());
+        let directory: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());
+        let dispatcher = Arc::new(
+            Dispatcher::new(deny_gate_chain(), Box::new(DenyExecutor), bus.clone())
+                .expect("canonical deny chain"),
+        );
         AppState::new(dispatcher, directory, bus)
     }
 
@@ -217,5 +229,62 @@ mod tests {
         // DispatchOutcome::Executed { result } serializes externally-tagged.
         assert_eq!(out["Executed"]["result"]["echoed"], true);
         assert_eq!(out["Executed"]["result"]["tool"], "kleos");
+    }
+
+    #[test]
+    fn empty_gate_chain_cannot_become_a_dispatcher() {
+        let bus = Arc::new(AxonBus::new());
+        let result = Dispatcher::new(Vec::new(), Box::new(DenyExecutor), bus);
+        assert!(
+            result.is_err(),
+            "an empty gate chain must never construct a runnable dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_deny_chain_denies() {
+        use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
+        let req = GateRequest {
+            context: RequestContext {
+                tenant: TenantId::new(),
+                principal: PrincipalId::new(),
+                persona: None,
+                session: None,
+                room: None,
+                task: None,
+                workflow: None,
+            },
+            invocation: ToolInvocation {
+                tool: "kleos".into(),
+                action: "memory_store".into(),
+                args: serde_json::json!({}),
+            },
+        };
+        let body = serde_json::to_string(&req).unwrap();
+        // deny_state wires the DenyExecutor: if the chain failed to deny, execution would error
+        // into a 500, so a 200 Denied outcome proves the executor never ran.
+        let response = router(deny_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dispatch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let out: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        // DispatchOutcome::Denied { gate, reason } serializes externally-tagged; the first
+        // canonical authority denies.
+        assert_eq!(out["Denied"]["gate"], "pistis");
+        assert!(
+            out["Denied"]["reason"]
+                .as_str()
+                .expect("reason string")
+                .contains("fail-closed"),
+            "deny reason should state the fail-closed posture: {out}"
+        );
     }
 }

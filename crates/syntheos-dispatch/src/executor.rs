@@ -6,7 +6,8 @@ use syntheos_contracts::{RequestContext, ToolInvocation};
 /// Performs an action that has passed the full gate chain.
 ///
 /// Object-safe via `async_trait` so the dispatcher can hold `Box<dyn Executor>`. Phase 0 ships
-/// [`crate::stubs::EchoExecutor`]; real executors (Hermes, Synapse) wire in later by trait object.
+/// the fail-closed [`crate::deny::DenyExecutor`] (tests use the feature-gated
+/// `stubs::EchoExecutor`); real executors (Hermes, Synapse) wire in later by trait object.
 #[async_trait]
 pub trait Executor: Send + Sync {
     /// Execute `invocation` in `ctx`, returning its result as JSON or an [`ExecutorError`].
