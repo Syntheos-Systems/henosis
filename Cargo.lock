@@ -646,6 +646,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-thymus"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

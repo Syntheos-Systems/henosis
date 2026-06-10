@@ -11,6 +11,7 @@ members = [
     "crates/henosis-soma",
     "crates/henosis-broca",
     "crates/henosis-loom",
+    "crates/henosis-thymus",
 ]
 
 [workspace.package]
