@@ -7,10 +7,11 @@ use std::time::Duration;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use henosis_chiasm::ChiasmStore;
+use henosis_soma::SomaStore;
 use syntheos_axon::AxonBus;
 use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
 use syntheos_dispatch::Dispatcher;
-use syntheos_identity::{InMemoryDirectory, PrincipalDirectory};
+use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
 use syntheos_server::{router, AppState};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -38,27 +39,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wire the Phase 0 foundation: bus, directory, and the dispatcher. The live chain is
     // deny-by-default (every action is denied at the first gate) until real authorities land --
     // fail-closed posture, enforced again by `Dispatcher::new` rejecting an invalid chain.
+    // The directory is the persistent SqliteDirectory (G2): with persistent Chiasm/Soma stores,
+    // an in-memory directory would orphan every projection row on restart.
     let bus = Arc::new(AxonBus::new());
-    let directory: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());
+    let identity_db = db_path("SYNTHEOS_IDENTITY_DB", "data/identity.sqlite")?;
+    let directory: Arc<dyn PrincipalDirectory> = Arc::new(SqliteDirectory::open(&identity_db)?);
+    tracing::info!(path = %identity_db, "principal directory open");
     let dispatcher = Arc::new(Dispatcher::new(
         deny_gate_chain(),
         Box::new(DenyExecutor),
         bus.clone(),
     )?);
 
-    // Chiasm: the first Phase 1 kernel service, persistent SQLite at a configurable path
-    // (migrations apply on open). The parent directory is created if absent.
-    let chiasm_db =
-        std::env::var("SYNTHEOS_CHIASM_DB").unwrap_or_else(|_| "data/chiasm.sqlite".to_string());
-    if let Some(parent) = std::path::Path::new(&chiasm_db).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    // Phase 1 kernel services: persistent SQLite at configurable paths (migrations apply on
+    // open).
+    let chiasm_db = db_path("SYNTHEOS_CHIASM_DB", "data/chiasm.sqlite")?;
     let chiasm = Arc::new(ChiasmStore::open(&chiasm_db, bus.clone())?);
     tracing::info!(path = %chiasm_db, "chiasm task store open");
+    let soma_db = db_path("SYNTHEOS_SOMA_DB", "data/soma.sqlite")?;
+    let soma = Arc::new(SomaStore::open(&soma_db, bus.clone(), directory.clone())?);
+    tracing::info!(path = %soma_db, "soma presence store open");
 
-    let state = AppState::new(dispatcher, directory, bus, chiasm);
+    let state = AppState::new(dispatcher, directory, bus, chiasm, soma);
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
@@ -78,6 +80,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Resolve a service database path from `var` (default `default`), creating the parent
+/// directory if absent so `Connection::open` can create the file.
+fn db_path(var: &str, default: &str) -> Result<String, std::io::Error> {
+    let path = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(path)
 }
 
 /// Resolve when a shutdown signal is received, so `axum` can drain in-flight requests.

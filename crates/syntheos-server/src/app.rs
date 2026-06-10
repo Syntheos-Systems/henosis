@@ -9,6 +9,10 @@ use axum::{Json, Router};
 use henosis_chiasm::{
     ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
 };
+use henosis_soma::{
+    AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
+    SomaStats, SomaStore,
+};
 use serde::Deserialize;
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
@@ -28,6 +32,8 @@ pub struct AppState {
     bus: Arc<AxonBus>,
     /// The Chiasm task store (the first Phase 1 kernel service, Story 1.7).
     chiasm: Arc<ChiasmStore>,
+    /// The Soma presence store (Story 1.2).
+    soma: Arc<SomaStore>,
 }
 
 impl AppState {
@@ -37,12 +43,14 @@ impl AppState {
         directory: Arc<dyn PrincipalDirectory>,
         bus: Arc<AxonBus>,
         chiasm: Arc<ChiasmStore>,
+        soma: Arc<SomaStore>,
     ) -> Self {
         Self {
             dispatcher,
             directory,
             bus,
             chiasm,
+            soma,
         }
     }
 
@@ -53,7 +61,7 @@ impl AppState {
 }
 
 /// Build the router: the Phase 0 surface (health, version, enroll, dispatch) plus the Phase 1
-/// Chiasm task surface.
+/// Chiasm task and Soma presence surfaces.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -63,6 +71,11 @@ pub fn router(state: AppState) -> Router {
         .route("/chiasm/tasks", post(chiasm_create_task).get(chiasm_list_tasks))
         .route("/chiasm/tasks/{id}", get(chiasm_get_task))
         .route("/chiasm/stats", get(chiasm_stats))
+        .route("/soma/agents", post(soma_register).get(soma_list))
+        .route("/soma/agents/{id}", get(soma_get))
+        .route("/soma/agents/{id}/heartbeat", post(soma_heartbeat))
+        .route("/soma/agents/{id}/quality", post(soma_quality))
+        .route("/soma/stats", get(soma_stats))
         .with_state(state)
 }
 
@@ -253,6 +266,173 @@ async fn chiasm_stats(
         .map_err(chiasm_error)
 }
 
+/// Map a [`SomaError`] onto an HTTP status + message.
+fn soma_error(e: SomaError) -> (StatusCode, String) {
+    let status = match &e {
+        SomaError::NotFound(_) => StatusCode::NOT_FOUND,
+        // The body referenced a principal that is not enrolled: the request is well-formed but
+        // names an actor the directory does not know.
+        SomaError::UnknownPrincipal(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        SomaError::NameTaken(_) => StatusCode::CONFLICT,
+        SomaError::InvalidInput(_) | SomaError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
+        // Backend, directory, backfill, and any future variants are server-side failures.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Body for [`soma_register`].
+///
+/// `principal_id` must already be enrolled (via `POST /enroll` or the future Pistis admission
+/// path); registration verifies and never mints. Identity is caller-asserted in Phase 1, the
+/// same posture as the Chiasm surface.
+#[derive(Debug, Deserialize)]
+pub struct SomaRegisterRequest {
+    /// The agent's canonical principal id.
+    pub principal_id: PrincipalId,
+    /// Tenant the registration belongs to.
+    pub tenant: TenantId,
+    /// Working label (unique per tenant).
+    pub name: String,
+    /// Coarse category (e.g. `coding`, `cli`).
+    pub agent_type: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Capability strings (defaults to none).
+    pub capabilities: Option<Vec<String>>,
+    /// Agent-specific configuration object (defaults to `{}`).
+    pub config: Option<serde_json::Value>,
+}
+
+/// Register (or re-register) an agent's presence.
+async fn soma_register(
+    State(state): State<AppState>,
+    Json(req): Json<SomaRegisterRequest>,
+) -> Result<Json<AgentPresence>, (StatusCode, String)> {
+    state
+        .soma
+        .register(RegisterAgent {
+            principal_id: req.principal_id,
+            tenant: req.tenant,
+            name: req.name,
+            agent_type: req.agent_type,
+            description: req.description,
+            capabilities: req.capabilities,
+            config: req.config,
+        })
+        .await
+        .map(Json)
+        .map_err(soma_error)
+}
+
+/// Query string for [`soma_list`]: optional AND-filters.
+#[derive(Debug, Deserialize)]
+pub struct SomaListQuery {
+    /// Only agents of this type.
+    pub agent_type: Option<String>,
+    /// Only agents in this status.
+    pub status: Option<PresenceStatus>,
+    /// Maximum rows to return.
+    pub limit: Option<usize>,
+}
+
+/// List registered agents, newest first.
+async fn soma_list(
+    State(state): State<AppState>,
+    Query(q): Query<SomaListQuery>,
+) -> Result<Json<Vec<AgentPresence>>, (StatusCode, String)> {
+    state
+        .soma
+        .list(PresenceFilter {
+            agent_type: q.agent_type,
+            status: q.status,
+            limit: q.limit,
+        })
+        .await
+        .map(Json)
+        .map_err(soma_error)
+}
+
+/// Fetch one agent's presence by its principal id.
+async fn soma_get(
+    State(state): State<AppState>,
+    Path(id): Path<PrincipalId>,
+) -> Result<Json<AgentPresence>, (StatusCode, String)> {
+    state
+        .soma
+        .get(id)
+        .await
+        .map_err(soma_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("agent not registered: {id}")))
+}
+
+/// Body for [`soma_heartbeat`]: an optional status override riding the liveness signal.
+#[derive(Debug, Default, Deserialize)]
+pub struct SomaHeartbeatRequest {
+    /// When set, the agent's status becomes this value; when absent, `pending`/`offline`
+    /// revive to `online` and `error` stays sticky.
+    pub status: Option<PresenceStatus>,
+}
+
+/// Record an agent heartbeat; returns the status after the beat.
+async fn soma_heartbeat(
+    State(state): State<AppState>,
+    Path(id): Path<PrincipalId>,
+    Json(req): Json<SomaHeartbeatRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .soma
+        .heartbeat(id, req.status)
+        .await
+        .map(|status| Json(serde_json::json!({ "status": status })))
+        .map_err(soma_error)
+}
+
+/// Body for [`soma_quality`]: a partial quality-signal update (at least one field).
+#[derive(Debug, Default, Deserialize)]
+pub struct SomaQualityRequest {
+    /// New quality score.
+    pub quality_score: Option<f64>,
+    /// Replacement drift-flag set.
+    pub drift_flags: Option<Vec<String>>,
+}
+
+/// Apply a quality-signal update (Thymus evaluation / supervision path).
+async fn soma_quality(
+    State(state): State<AppState>,
+    Path(id): Path<PrincipalId>,
+    Json(req): Json<SomaQualityRequest>,
+) -> Result<Json<AgentPresence>, (StatusCode, String)> {
+    state
+        .soma
+        .update_quality(
+            id,
+            QualityPatch {
+                quality_score: req.quality_score,
+                drift_flags: req.drift_flags,
+            },
+        )
+        .await
+        .map(Json)
+        .map_err(soma_error)
+}
+
+/// Query string asserting the tenant for presence stats.
+#[derive(Debug, Deserialize)]
+pub struct SomaStatsQuery {
+    /// The tenant whose registry is aggregated.
+    pub tenant: TenantId,
+}
+
+/// Aggregate presence counts for the asserted tenant.
+async fn soma_stats(
+    State(state): State<AppState>,
+    Query(q): Query<SomaStatsQuery>,
+) -> Result<Json<SomaStats>, (StatusCode, String)> {
+    state.soma.stats(q.tenant).await.map(Json).map_err(soma_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,7 +453,10 @@ mod tests {
                 .expect("canonical stub chain"),
         );
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm store"));
-        AppState::new(dispatcher, directory, bus, chiasm)
+        let soma = Arc::new(
+            SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma)
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -285,7 +468,10 @@ mod tests {
                 .expect("canonical deny chain"),
         );
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm store"));
-        AppState::new(dispatcher, directory, bus, chiasm)
+        let soma = Arc::new(
+            SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("soma store"),
+        );
+        AppState::new(dispatcher, directory, bus, chiasm, soma)
     }
 
     /// Collect a response body into a UTF-8 string.
@@ -537,6 +723,146 @@ mod tests {
             .await
             .unwrap();
         // Typed TaskStatus deserialization rejects the token before any handler runs.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Enroll a principal over HTTP and return its id string.
+    async fn enroll_http(app: &Router, kind: &str, display: &str) -> String {
+        let body = serde_json::json!({ "kind": kind, "display": display });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/enroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let principal: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        principal["id"].as_str().expect("principal id").to_string()
+    }
+
+    #[tokio::test]
+    async fn soma_register_heartbeat_quality_roundtrip_over_http() {
+        use syntheos_contracts::TenantId;
+        let app = router(test_state());
+        let tenant = TenantId::new().to_string();
+        let agent = enroll_http(&app, "agent", "worker").await;
+
+        // Register the enrolled principal's presence.
+        let body = serde_json::json!({
+            "principal_id": agent,
+            "tenant": tenant,
+            "name": "worker",
+            "agent_type": "coding",
+            "capabilities": ["rust"],
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/soma/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let registered: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(registered["status"], "pending");
+
+        // A heartbeat revives it to online.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/soma/agents/{agent}/heartbeat"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let beat: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(beat["status"], "online");
+
+        // Quality lands and reads back through GET.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/soma/agents/{agent}/quality"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"quality_score": 0.9}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/soma/agents/{agent}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let got: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(got["quality_score"], 0.9);
+        assert_eq!(got["status"], "online");
+
+        // Stats for the tenant see one online agent.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/soma/stats?tenant={tenant}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stats["total"], 1);
+        assert_eq!(stats["online"], 1);
+    }
+
+    #[tokio::test]
+    async fn soma_register_rejects_unenrolled_principal() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let body = serde_json::json!({
+            "principal_id": PrincipalId::new().to_string(), // never enrolled
+            "tenant": TenantId::new().to_string(),
+            "name": "ghost",
+            "agent_type": "cli",
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/soma/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Registration verifies against the directory and never mints (projection convention).
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
