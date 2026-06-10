@@ -591,6 +591,7 @@ dependencies = [
  "serde_json",
  "syntheos-axon",
  "syntheos-contracts",
+ "syntheos-identity",
  "thiserror 1.0.69",
  "time",
  "tokio",

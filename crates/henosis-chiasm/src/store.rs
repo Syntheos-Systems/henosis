@@ -32,6 +32,7 @@ use crate::model::{
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__chiasm_tasks.sql")),
     (2, include_str!("../migrations/V2__chiasm_claims_deps.sql")),
+    (3, include_str!("../migrations/V3__chiasm_legacy_maps.sql")),
 ];
 
 /// Seconds a heartbeat extends a task's unreleased path-claim leases by (Kleos parity: 600).
@@ -53,12 +54,12 @@ pub struct ChiasmStore {
 }
 
 /// Map a generic rusqlite error to an opaque backend error.
-fn berr(e: rusqlite::Error) -> ChiasmError {
+pub(crate) fn berr(e: rusqlite::Error) -> ChiasmError {
     ChiasmError::Backend(e.to_string())
 }
 
 /// Serialize a [`Timestamp`] to its stored RFC3339-UTC string (via the contracts wire form).
-fn ts_to_db(ts: &Timestamp) -> Result<String, ChiasmError> {
+pub(crate) fn ts_to_db(ts: &Timestamp) -> Result<String, ChiasmError> {
     serde_json::to_value(ts)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
@@ -66,7 +67,7 @@ fn ts_to_db(ts: &Timestamp) -> Result<String, ChiasmError> {
 }
 
 /// Parse a stored RFC3339 string back into a UTC-normalized [`Timestamp`].
-fn ts_from_db(s: &str) -> Result<Timestamp, ChiasmError> {
+pub(crate) fn ts_from_db(s: &str) -> Result<Timestamp, ChiasmError> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| ChiasmError::Backend(format!("timestamp parse {s:?}: {e}")))
 }
@@ -1167,8 +1168,8 @@ impl ChiasmStore {
     }
 }
 
-/// Insert a fully-formed [`Task`] row. Shared by `create` and `enqueue`.
-fn insert_task(conn: &Connection, task: &Task) -> Result<(), ChiasmError> {
+/// Insert a fully-formed [`Task`] row. Shared by `create`, `enqueue`, and the legacy backfill.
+pub(crate) fn insert_task(conn: &Connection, task: &Task) -> Result<(), ChiasmError> {
     conn.execute(
         "INSERT INTO chiasm_tasks (id, tenant, principal_id, assignee, project, title, status, \
          summary, expected_output, output_format, output, plan, feedback, last_heartbeat, \
@@ -1200,7 +1201,7 @@ fn insert_task(conn: &Connection, task: &Task) -> Result<(), ChiasmError> {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-fn apply_migrations(conn: &mut Connection) -> Result<(), ChiasmError> {
+pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), ChiasmError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;

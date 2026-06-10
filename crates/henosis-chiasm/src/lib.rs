@@ -17,19 +17,22 @@
 //!
 //! ## Scope
 //!
-//! Slices 1-3: task CRUD, change history, per-principal stats, the work queue (enqueue/claim),
-//! heartbeat + stale detection, path claims (TTL leases scoped to the owner principal), and the
-//! dependency DAG (BFS cycle detection + auto-unblock). A later slice ports the one-time
-//! `user_id -> PrincipalId` legacy backfill. Agent bearer keys (`keys.rs` in Kleos) are
+//! Slices 1-4: task CRUD, change history, per-principal stats, the work queue (enqueue/claim),
+//! heartbeat + stale detection, path claims (TTL leases scoped to the owner principal), the
+//! dependency DAG (BFS cycle detection + auto-unblock), and the one-time
+//! `user_id -> PrincipalId` legacy absorption backfill ([`backfill`], with the `chiasm-backfill`
+//! CLI behind the `backfill-cli` feature). Agent bearer keys (`keys.rs` in Kleos) are
 //! deliberately NOT ported here -- they are an authentication artifact that belongs to the security
 //! authorities (Pistis/Phylax), not the task service. LLM plan generation defers to the Broca
 //! extraction.
 
+pub mod backfill;
 pub mod error;
 pub mod events;
 pub mod model;
 pub mod store;
 
+pub use backfill::{backfill_from_kleos, BackfillOptions, BackfillReport};
 pub use error::ChiasmError;
 pub use events::{
     ClaimCreated, ClaimReleased, TaskClaimed, TaskCompleted, TaskCreated, TaskDeleted, TaskQueued,

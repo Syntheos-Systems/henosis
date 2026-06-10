@@ -34,4 +34,10 @@ pub enum ChiasmError {
         /// The dependency target that can already reach `task_id`.
         depends_on: TaskId,
     },
+
+    /// The one-time legacy backfill failed (unreadable legacy DB, unparseable legacy row,
+    /// or a directory enrollment error). Per projection convention 3.3, bad legacy data is
+    /// an explicit failure naming the problem -- never silently discarded.
+    #[error("legacy backfill failed: {0}")]
+    Backfill(String),
 }
