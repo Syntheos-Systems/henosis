@@ -40,4 +40,11 @@ pub enum SomaError {
     /// A caller-supplied value is structurally invalid (e.g. an empty name).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// The one-time legacy backfill failed (unreadable legacy DB, unparseable legacy row, a
+    /// cross-tenant name collision, or a directory enrollment error). Per projection
+    /// convention 3.3, bad legacy data is an explicit failure naming the problem -- never
+    /// silently discarded.
+    #[error("legacy backfill failed: {0}")]
+    Backfill(String),
 }

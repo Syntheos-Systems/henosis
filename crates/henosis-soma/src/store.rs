@@ -36,7 +36,10 @@ use crate::model::{
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__soma_presence.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__soma_presence.sql")),
+    (2, include_str!("../migrations/V2__soma_legacy_maps.sql")),
+];
 
 /// The columns of `soma_presence`, in the order [`read_raw`] reads them.
 const PRESENCE_COLUMNS: &str = "principal_id, tenant, name, agent_type, description, \
@@ -56,12 +59,12 @@ pub struct SomaStore {
 }
 
 /// Map a generic rusqlite error to an opaque backend error.
-fn berr(e: rusqlite::Error) -> SomaError {
+pub(crate) fn berr(e: rusqlite::Error) -> SomaError {
     SomaError::Backend(e.to_string())
 }
 
 /// Serialize a [`Timestamp`] to its stored RFC3339-UTC string (via the contracts wire form).
-fn ts_to_db(ts: &Timestamp) -> Result<String, SomaError> {
+pub(crate) fn ts_to_db(ts: &Timestamp) -> Result<String, SomaError> {
     serde_json::to_value(ts)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
@@ -69,7 +72,7 @@ fn ts_to_db(ts: &Timestamp) -> Result<String, SomaError> {
 }
 
 /// Parse a stored RFC3339 string back into a UTC-normalized [`Timestamp`].
-fn ts_from_db(s: &str) -> Result<Timestamp, SomaError> {
+pub(crate) fn ts_from_db(s: &str) -> Result<Timestamp, SomaError> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| SomaError::Backend(format!("timestamp parse {s:?}: {e}")))
 }
@@ -648,7 +651,7 @@ impl SomaStore {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-fn apply_migrations(conn: &mut Connection) -> Result<(), SomaError> {
+pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), SomaError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;

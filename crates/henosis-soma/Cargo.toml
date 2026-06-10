@@ -24,6 +24,16 @@ serde_json.workspace = true
 tracing.workspace = true
 # Heartbeat staleness window arithmetic (Timestamp wraps time::OffsetDateTime).
 time.workspace = true
+# Runtime for the soma-backfill CLI only (the library itself stays runtime-free).
+tokio = { workspace = true, optional = true }
+
+[features]
+# Enables the one-time `soma-backfill` migration CLI (pulls in a tokio runtime).
+backfill-cli = ["dep:tokio"]
+
+[[bin]]
+name = "soma-backfill"
+required-features = ["backfill-cli"]
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test].

@@ -19,17 +19,20 @@
 //!
 //! ## Scope
 //!
-//! Slice 1 (this commit): presence register/heartbeat/status, reads and listing, stale
-//! detection, capability search, quality updates, and per-tenant stats. The one-time legacy
-//! backfill (reusing chiasm's `user_id` map per convention 3.4) lands in the next slice. Kleos
-//! `soma_groups` and `soma_agent_logs` are deliberately NOT ported here -- logs overlap Broca
-//! narration (Story 1.3), and groups can follow as a later slice if the OS needs them.
+//! Slices 1-2: presence register/heartbeat/status, reads and listing, stale detection,
+//! capability search, quality updates, per-tenant stats, and the one-time legacy absorption
+//! backfill ([`backfill`], reusing chiasm's `user_id` map per convention 3.4, with the
+//! `soma-backfill` CLI behind the `backfill-cli` feature). Kleos `soma_groups` and
+//! `soma_agent_logs` are deliberately NOT ported here -- logs overlap Broca narration
+//! (Story 1.3), and groups can follow as a later slice if the OS needs them.
 
+pub mod backfill;
 pub mod error;
 pub mod events;
 pub mod model;
 pub mod store;
 
+pub use backfill::{backfill_from_kleos, BackfillOptions, BackfillReport};
 pub use error::SomaError;
 pub use events::{
     AgentDeregistered, AgentHeartbeat, AgentQualityUpdated, AgentRegistered, AgentStatusChanged,
