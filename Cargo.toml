@@ -8,6 +8,7 @@ members = [
     "crates/syntheos-identity",
     "crates/syntheos-server",
     "crates/henosis-chiasm",
+    "crates/henosis-soma",
 ]
 
 [workspace.package]
