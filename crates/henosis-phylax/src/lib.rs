@@ -12,20 +12,23 @@
 //! approval-flow / SSH-CA machinery deliberately left behind (authn is the dispatcher's job;
 //! human-in-the-loop is the Human gate's).
 //!
-//! Slice 1 (this commit) lands the encrypted secret store and its owner-tier administration
-//! surface. Capability policies, the four resolve modes (sign/verify/derive/exec), and the
-//! fail-closed [`Gate`](syntheos_contracts::Gate) impl follow in later slices.
+//! The crate has three layers: the field-encrypted secret store with its owner-tier
+//! administration surface ([`store`]), the capability policies and the four use-without-holding
+//! resolve modes ([`policy_store`], [`resolve`]), and the fail-closed
+//! [`Gate`](syntheos_contracts::Gate) impl for the dispatcher's phylax slot ([`gate`]).
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod crypto;
 pub mod error;
 pub mod events;
+pub mod gate;
 pub mod model;
 pub mod policy_store;
 pub mod resolve;
 pub mod store;
 
 pub use error::PhylaxError;
+pub use gate::PhylaxGate;
 pub use model::{ExecOutcome, Policy, ResolveMode, SecretData, SignAlgo};
 pub use store::PhylaxStore;

@@ -11,6 +11,7 @@ use henosis_chiasm::ChiasmStore;
 use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
 use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
+use henosis_phylax::PhylaxStore;
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
@@ -84,10 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // authorities land, the deny executor (no real executor until Hermes, Phase 5), and the
     // eidolon output filter scrubbing credential fields from any executor result.
     // `Dispatcher::new` re-validates the chain is exactly canonical at boot.
+    // The phylax credential authority is opt-in and fail-closed: it activates only when a master
+    // key is configured (SYNTHEOS_PHYLAX_KEY). Absent a key, the phylax slot stays a deny-stub so
+    // no credential operation is silently permitted.
+    let phylax = phylax_from_env(bus.clone())?;
+    match &phylax {
+        Some(_) => {
+            tracing::info!("phylax credential authority enabled (real gate in the phylax slot)")
+        }
+        None => tracing::info!("phylax disabled (SYNTHEOS_PHYLAX_KEY unset); phylax slot denies"),
+    }
+
     let policy = EidolonPolicy::default();
     let dispatcher = Arc::new(
         Dispatcher::new(
-            live_gate_chain(&policy, thymus.clone())?,
+            live_gate_chain(&policy, thymus.clone(), phylax)?,
             Box::new(DenyExecutor),
             bus.clone(),
         )?
@@ -140,6 +152,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `SYNTHEOS_SUPERVISOR_PRINCIPAL`, canonical UUID strings) and a configured-but-unreadable
 /// rules file (`SYNTHEOS_SUPERVISOR_RULES`) is a boot error rather than a silent fall-back to
 /// defaults. `SYNTHEOS_SUPERVISOR_ALLOWED_PATHS` (colon-separated) enables the file-scope check.
+/// Open the Phylax credential store if a master key is configured, else `None`.
+///
+/// Opt-in and fail-closed: the store activates only when `SYNTHEOS_PHYLAX_KEY` holds a 64-hex
+/// (32-byte) master key. The DB path defaults to `data/phylax.sqlite` (override with
+/// `SYNTHEOS_PHYLAX_DB`). A set-but-malformed key is a hard boot error -- never a silent
+/// fallback to no authority -- so a misconfiguration cannot quietly leave the slot denying when
+/// the operator intended it enabled.
+fn phylax_from_env(
+    bus: Arc<AxonBus>,
+) -> Result<Option<Arc<PhylaxStore>>, Box<dyn std::error::Error>> {
+    let key_hex = match std::env::var("SYNTHEOS_PHYLAX_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return Ok(None),
+    };
+    let key_bytes =
+        hex::decode(key_hex.trim()).map_err(|e| format!("SYNTHEOS_PHYLAX_KEY must be hex: {e}"))?;
+    let key: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| "SYNTHEOS_PHYLAX_KEY must decode to exactly 32 bytes (64 hex chars)")?;
+    let db = db_path("SYNTHEOS_PHYLAX_DB", "data/phylax.sqlite")?;
+    let store = PhylaxStore::open(&db, bus, key)?;
+    tracing::info!(path = %db, "phylax credential store open");
+    Ok(Some(Arc::new(store)))
+}
+
 fn supervisor_from_env(
     bus: Arc<AxonBus>,
 ) -> Result<Option<Supervisor>, Box<dyn std::error::Error>> {

@@ -5,10 +5,10 @@
 //! predicate), secret values are AES-256-GCM encrypted at the field level before they touch
 //! disk, and lifecycle events are typed and published to the in-process [`AxonBus`].
 //!
-//! This slice covers the owner-tier secret administration surface: store, read (the ONLY
-//! plaintext path, named loudly and never reachable through the gate), delete, and list-names.
-//! Capability policies and the use-without-holding resolve modes (sign/verify/derive/exec) plus
-//! the [`crate::gate`] land in later slices.
+//! This module owns the secret table and its owner-tier administration surface: store, read (the
+//! ONLY plaintext path, named loudly and never reachable through the gate), delete, and
+//! list-names. Capability policies live in [`crate::policy_store`], the use-without-holding
+//! resolve modes in [`crate::resolve`], and the fail-closed gate in [`crate::gate`].
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};

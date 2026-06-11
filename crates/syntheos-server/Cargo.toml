@@ -20,6 +20,10 @@ henosis-loom = { path = "../henosis-loom" }
 henosis-thymus = { path = "../henosis-thymus" }
 # The eidolon authority: the real gate in the eidolon slot + the output filter (Story 2.6).
 henosis-eidolon = { path = "../henosis-eidolon" }
+# The phylax authority: the real gate in the phylax slot (Story 3.6).
+henosis-phylax = { path = "../henosis-phylax" }
+# Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
+hex.workspace = true
 # HTTP surface.
 axum.workspace = true
 # Global concurrency cap on the HTTP surface (resource-limit hardening).

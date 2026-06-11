@@ -34,6 +34,22 @@ const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 
 impl PhylaxStore {
+    /// Confirm a policy permits `mode` for (tenant, principal, category, name) without performing
+    /// the operation. This is the [`crate::gate::PhylaxGate`]'s decision point: `Ok(())` means
+    /// allowed, [`PhylaxError::PermissionDenied`] means denied, and a [`PhylaxError::Backend`]
+    /// means the authority could not decide (the gate turns that into a fail-closed `GateError`).
+    pub fn authorize_mode(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+        category: &str,
+        name: &str,
+        mode: ResolveMode,
+    ) -> Result<(), PhylaxError> {
+        self.authorize(tenant, principal, category, name, mode)
+            .map(|_| ())
+    }
+
     /// Confirm a policy permits `mode` for (tenant, principal, category, name), returning the
     /// matched policy. Fail-closed: no matching policy, or a policy that does not name the mode,
     /// is a [`PhylaxError::PermissionDenied`].

@@ -16,6 +16,7 @@ use henosis_loom::{
     LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
     StepDef, Workflow,
 };
+use henosis_phylax::{PhylaxGate, PhylaxStore};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
@@ -98,19 +99,29 @@ pub fn eidolon_gate(
     EidolonGate::new(policy.clone(), Arc::new(ThymusDriftSignal(thymus)))
 }
 
-/// The live gate chain, Phase 2 shape: deny-stubs in the pistis/plutus/human/phylax slots
-/// (fail-closed until those authorities land in Phases 3-4) and the REAL [`EidolonGate`] in the
-/// eidolon slot. Canonical by construction -- [`Dispatcher::new`] validates it again at boot.
+/// The live gate chain: the REAL [`EidolonGate`] in the eidolon slot, the REAL [`PhylaxGate`] in
+/// the phylax slot when a credential store is configured, and fail-closed deny-stubs in the
+/// pistis/plutus/human slots until those authorities land. Canonical by construction --
+/// [`Dispatcher::new`] validates it again at boot.
+///
+/// `phylax` is optional: with no configured credential store (no master key in the environment)
+/// the phylax slot stays a [`DenyGate`], so the absence of the authority denies rather than
+/// silently permitting credential operations.
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
+    phylax: Option<Arc<PhylaxStore>>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
+    let phylax_gate: Box<dyn Gate> = match phylax {
+        Some(store) => Box::new(PhylaxGate::new(store)),
+        None => Box::new(DenyGate::new("phylax")),
+    };
     Ok(vec![
         Box::new(DenyGate::new("pistis")),
         Box::new(DenyGate::new("plutus")),
         Box::new(eidolon_gate(policy, thymus)?),
         Box::new(DenyGate::new("human")),
-        Box::new(DenyGate::new("phylax")),
+        phylax_gate,
     ])
 }
 
@@ -1557,12 +1568,13 @@ mod tests {
         assert_eq!(result["api_key"], serde_json::json!("[redacted]"));
     }
 
-    /// The live chain builder produces exactly the canonical chain with the real eidolon slot.
+    /// The live chain builder produces exactly the canonical chain. With no phylax store the
+    /// phylax slot is a deny-stub (fail-closed: no credential authority means deny).
     #[tokio::test]
     async fn live_gate_chain_is_canonical() {
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
-        let chain = live_gate_chain(&henosis_eidolon::EidolonPolicy::default(), thymus)
+        let chain = live_gate_chain(&henosis_eidolon::EidolonPolicy::default(), thymus, None)
             .expect("valid default policy");
         let dispatcher =
             Dispatcher::new(chain, Box::new(syntheos_dispatch::deny::DenyExecutor), bus)
@@ -1571,6 +1583,89 @@ mod tests {
             dispatcher.gate_names(),
             ["pistis", "plutus", "eidolon", "human", "phylax"]
         );
+    }
+
+    /// With a configured phylax store the chain is still canonical, and the phylax slot is the
+    /// REAL gate: a credential invocation the principal's policy permits is allowed by it (the
+    /// dispatcher still denies overall at the pistis deny-stub, but the phylax gate itself does
+    /// not deny -- proven by checking the gate directly).
+    #[tokio::test]
+    async fn live_gate_chain_uses_real_phylax_when_configured() {
+        use henosis_phylax::{ResolveMode, SecretData};
+        use syntheos_contracts::{GateDecision, GateRequest, RequestContext, ToolInvocation};
+
+        let bus = Arc::new(AxonBus::new());
+        let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        let phylax = Arc::new(
+            PhylaxStore::open_in_memory(bus.clone(), *henosis_phylax::crypto::generate_key())
+                .expect("phylax store"),
+        );
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        phylax
+            .store_secret(
+                &tenant,
+                &principal,
+                "prod",
+                "db",
+                &SecretData::Note {
+                    content: "x".into(),
+                },
+            )
+            .expect("store secret");
+        phylax
+            .create_policy(
+                &tenant,
+                Some(&principal),
+                Some("prod"),
+                None,
+                &[ResolveMode::Sign],
+                None,
+            )
+            .expect("policy");
+
+        let chain = live_gate_chain(
+            &henosis_eidolon::EidolonPolicy::default(),
+            thymus,
+            Some(phylax),
+        )
+        .expect("valid default policy");
+        // The phylax slot is last; assert it is the real gate by exercising it.
+        let phylax_slot = chain.last().expect("phylax slot");
+        assert_eq!(phylax_slot.name(), "phylax");
+        let req = GateRequest {
+            context: RequestContext {
+                tenant,
+                principal,
+                persona: None,
+                session: None,
+                room: None,
+                task: None,
+                workflow: None,
+            },
+            invocation: ToolInvocation {
+                tool: "phylax".into(),
+                action: "sign".into(),
+                args: serde_json::json!({"category": "prod", "name": "db"}),
+            },
+        };
+        assert_eq!(phylax_slot.check(&req).await.unwrap(), GateDecision::Allow);
+
+        // A deny-stub would have denied this same request; the real gate allowing it proves the
+        // slot is wired to PhylaxGate.
+        let denied = ToolInvocation {
+            tool: "phylax".into(),
+            action: "derive".into(),
+            args: serde_json::json!({"category": "prod", "name": "db"}),
+        };
+        let denied_req = GateRequest {
+            invocation: denied,
+            ..req
+        };
+        assert!(matches!(
+            phylax_slot.check(&denied_req).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
     }
 
     /// Collect a response body into a UTF-8 string.
