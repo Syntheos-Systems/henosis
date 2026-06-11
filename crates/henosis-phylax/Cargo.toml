@@ -1,0 +1,53 @@
+[package]
+name = "henosis-phylax"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Phylax: the credential authority for the dispatcher's phylax gate slot -- field-encrypted secrets, capability policies, and use-without-holding resolve modes (sign/verify/derive/exec)."
+
+[dependencies]
+# Gate/GateDecision/GateRequest contract plus PrincipalId/TenantId/Timestamp/TypedEvent.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# The in-process bus phylax publishes secret/policy/resolve events onto.
+syntheos-axon = { path = "../syntheos-axon" }
+# Object-safe async Gate impl.
+async-trait.workspace = true
+# Encrypted-at-rest storage.
+rusqlite = { workspace = true, features = ["bundled"] }
+# SecretData and policy types serialize (the secret value is encrypted before it touches disk).
+serde.workspace = true
+# SecretData JSON is the plaintext that gets encrypted; policy allowed_modes/exec_allowlist are JSON.
+serde_json.workspace = true
+# PhylaxError.
+thiserror.workspace = true
+# Field-level secret encryption (AES-256-GCM, ported from kleos-cred).
+aes-gcm.workspace = true
+# Secret material is zeroized after use.
+zeroize.workspace = true
+# CSPRNG for nonces and key generation.
+rand.workspace = true
+# HKDF derive mode.
+hkdf.workspace = true
+# HMAC sign/verify mode.
+hmac.workspace = true
+sha2.workspace = true
+# Constant-time MAC comparison in verify mode.
+subtle.workspace = true
+# ed25519 sign/verify over stored OpenSSH keys.
+ed25519-dalek.workspace = true
+ssh-key.workspace = true
+# exec/derive output and signatures are base64 on the wire; hex used by the output scrubber.
+base64.workspace = true
+hex.workspace = true
+# exec mode spawns allowlisted commands with a wall-clock timeout.
+tokio = { workspace = true }
+# Resolve denials and exec failures are logged.
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Property tests: scrub totality, and the gate fail-closed invariants.
+proptest = { workspace = true }
+# Dispatcher-integration test: the real PhylaxGate in the canonical chain's phylax slot.
+syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
