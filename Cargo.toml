@@ -50,5 +50,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 zeroize = { version = "1", features = ["derive"] }
 # Property testing for security-critical invariants (the EidolonGate fail-closed proofs). Dev-only.
 proptest = "1"
+# Eidolon supervisor (Story 2.5): session-JSONL watching, rule regexes, bounded file-position cache.
+# Versions match the Kleos workspace the supervisor was absorbed from.
+notify = "8"
+notify-debouncer-mini = "0.6"
+regex = "1"
+lru = "0.16"
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

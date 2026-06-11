@@ -9,6 +9,8 @@ description = "Eidolon: the policy authority for the dispatcher's eidolon gate s
 [dependencies]
 # The canonical Gate/GateDecision/GateRequest contract plus PrincipalId/TenantId.
 syntheos-contracts = { path = "../syntheos-contracts" }
+# The in-process bus the supervisor publishes violation events onto.
+syntheos-axon = { path = "../syntheos-axon" }
 # Object-safe async traits: the Gate impl and the DriftSignal seam.
 async-trait.workspace = true
 # Policy config types serialize for logging/persistence (shared with the 2.3 output filter).
@@ -17,6 +19,17 @@ serde.workspace = true
 serde_json.workspace = true
 # EidolonError (policy construction validation).
 thiserror.workspace = true
+# Supervisor (Story 2.5): rule patterns are regexes, compiled once at construction.
+regex.workspace = true
+# Supervisor: filesystem watching of session JSONL directories.
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+# Supervisor: bounded session-file -> read-offset cache (heap stays flat over long runs).
+lru.workspace = true
+# Supervisor: the async watch loop (mpsc from the watcher thread, sleep on a missing dir).
+tokio = { workspace = true }
+# Supervisor: violation logging.
+tracing.workspace = true
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test] and the proptest block_on runtime.

@@ -8,6 +8,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
+use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
 use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_soma::SomaStore;
@@ -93,6 +94,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_output_filter(Box::new(EidolonOutputFilter::new(&policy)?)),
     );
 
+    // The eidolon supervisor task (Stories 2.5/2.6): watches session JSONL and publishes
+    // violation events on the shared bus. Opt-in and all-or-nothing: it runs only when the
+    // watch dir AND the identity its events carry are explicitly configured -- a supervisor
+    // with a fabricated identity would poison the audit trail.
+    match supervisor_from_env(bus.clone()) {
+        Ok(Some(sup)) => {
+            tokio::spawn(sup.run());
+            tracing::info!("eidolon supervisor task started");
+        }
+        Ok(None) => {
+            tracing::info!("eidolon supervisor disabled (SYNTHEOS_SUPERVISOR_WATCH_DIR unset)");
+        }
+        Err(err) => return Err(err),
+    }
+
     let state = AppState::new(
         dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
     );
@@ -115,6 +131,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Build the supervisor from the environment, when enabled.
+///
+/// `SYNTHEOS_SUPERVISOR_WATCH_DIR` unset = disabled (`Ok(None)`). When set, the identity the
+/// violation events carry is REQUIRED (`SYNTHEOS_SUPERVISOR_TENANT` /
+/// `SYNTHEOS_SUPERVISOR_PRINCIPAL`, canonical UUID strings) and a configured-but-unreadable
+/// rules file (`SYNTHEOS_SUPERVISOR_RULES`) is a boot error rather than a silent fall-back to
+/// defaults. `SYNTHEOS_SUPERVISOR_ALLOWED_PATHS` (colon-separated) enables the file-scope check.
+fn supervisor_from_env(
+    bus: Arc<AxonBus>,
+) -> Result<Option<Supervisor>, Box<dyn std::error::Error>> {
+    let watch_dir = match std::env::var("SYNTHEOS_SUPERVISOR_WATCH_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => return Ok(None),
+    };
+    let tenant = std::env::var("SYNTHEOS_SUPERVISOR_TENANT")
+        .map_err(|_| "SYNTHEOS_SUPERVISOR_TENANT is required when the supervisor is enabled")?
+        .parse()
+        .map_err(|e| format!("SYNTHEOS_SUPERVISOR_TENANT: {e}"))?;
+    let principal = std::env::var("SYNTHEOS_SUPERVISOR_PRINCIPAL")
+        .map_err(|_| "SYNTHEOS_SUPERVISOR_PRINCIPAL is required when the supervisor is enabled")?
+        .parse()
+        .map_err(|e| format!("SYNTHEOS_SUPERVISOR_PRINCIPAL: {e}"))?;
+    let rules = match std::env::var("SYNTHEOS_SUPERVISOR_RULES") {
+        Ok(path) if !path.is_empty() => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("SYNTHEOS_SUPERVISOR_RULES {path:?}: {e}"))?;
+            supervisor::rules_from_json(&content)?
+        }
+        _ => supervisor::default_rules(),
+    };
+    let allowed_paths: Vec<String> = std::env::var("SYNTHEOS_SUPERVISOR_ALLOWED_PATHS")
+        .map(|v| {
+            v.split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    tracing::info!(
+        watch_dir = %watch_dir.display(),
+        rules = rules.len(),
+        scope_check = !allowed_paths.is_empty(),
+        "eidolon supervisor configured"
+    );
+    Ok(Some(Supervisor::new(
+        SupervisorConfig {
+            watch_dir,
+            rules,
+            allowed_paths,
+            tenant,
+            principal,
+        },
+        bus,
+    )?))
 }
 
 /// Resolve a service database path from `var` (default `default`), creating the parent

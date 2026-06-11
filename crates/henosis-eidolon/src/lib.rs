@@ -27,6 +27,7 @@ mod gate;
 mod output_filter;
 mod policy;
 mod signal;
+pub mod supervisor;
 
 pub use gate::EidolonGate;
 pub use output_filter::{EidolonOutputFilter, REDACTED};
