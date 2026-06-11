@@ -30,26 +30,57 @@ pub enum EidolonError {
     InvalidPolicy(String),
 }
 
-/// The Eidolon policy: what the gate denies on.
+/// The Eidolon policy: what the gate denies on (input direction) and what the output filter
+/// scrubs (output direction). One config, both sides of the eidolon authority.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EidolonPolicy {
     /// Forbidden patterns, matched case- and whitespace-insensitively as substrings of the
-    /// invocation payload (tool, action, and serialized args). An empty list disables the
-    /// injection check (the scope and drift checks still run).
+    /// invocation payload (tool, action, and the args' keys and string values). An empty list
+    /// disables the injection check (the scope and drift checks still run).
     pub injection_patterns: Vec<String>,
     /// Deny when the principal carries any active drift flag at this severity or above.
     pub deny_at: DriftSeverity,
+    /// Field-name patterns whose values the output filter redacts from executor results,
+    /// matched case-insensitively as substrings of the (normalized) field name. An empty list
+    /// disables output scrubbing.
+    pub sensitive_fields: Vec<String>,
 }
 
 /// Default policy: the built-in injection pattern set, denying at `Medium` drift (the Thymus
-/// default severity), so any ordinarily-recorded drift flag denies until it is cleared.
+/// default severity, so any ordinarily-recorded drift flag denies until it is cleared), and the
+/// built-in sensitive-field set for output scrubbing.
 impl Default for EidolonPolicy {
     fn default() -> Self {
         Self {
             injection_patterns: default_injection_patterns(),
             deny_at: DriftSeverity::Medium,
+            sensitive_fields: default_sensitive_fields(),
         }
     }
+}
+
+/// The built-in sensitive-field set: credential-bearing field names, matched as substrings of
+/// normalized (lowercased) key names so `kleos_api_key` matches `api_key`.
+pub fn default_sensitive_fields() -> Vec<String> {
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "authorization",
+        "bearer",
+        "cookie",
+        "session_id",
+        "ssh_key",
+        "passphrase",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// The built-in forbidden-pattern set: classic prompt-injection phrasings, matched after

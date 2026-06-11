@@ -137,7 +137,7 @@ impl EidolonGate {
         Ok(Self {
             policy: EidolonPolicy {
                 injection_patterns: normalized,
-                deny_at: policy.deny_at,
+                ..policy
             },
             signal,
         })
@@ -579,7 +579,7 @@ mod tests {
     fn empty_pattern_rejected_at_construction() {
         let policy = EidolonPolicy {
             injection_patterns: vec!["ignore previous instructions".to_string(), "  ".to_string()],
-            deny_at: DriftSeverity::Medium,
+            ..EidolonPolicy::default()
         };
         let err = EidolonGate::new(policy, Arc::new(QuietSignal))
             .err()
@@ -592,7 +592,7 @@ mod tests {
     async fn empty_pattern_list_disables_injection_check_only() {
         let policy = EidolonPolicy {
             injection_patterns: Vec::new(),
-            deny_at: DriftSeverity::Medium,
+            ..EidolonPolicy::default()
         };
         let gate = EidolonGate::new(policy, Arc::new(QuietSignal)).expect("valid policy");
         let decision = gate

@@ -18,11 +18,20 @@
 //! The drift signal is a trait seam, consistent with the kernel convention (kernel crates never
 //! depend on each other): the server adapts `ThymusStore` to [`DriftSignal`] at wiring time
 //! (Story 2.6), exactly as Soma is adapted to Thymus's `QualitySink`.
+//!
+//! [`EidolonOutputFilter`] is the OUTPUT side of the same authority (the dispatcher's
+//! `with_output_filter` slot): it scrubs credential-bearing fields from executor results per the
+//! same shared [`EidolonPolicy`], so input policy and output redaction are configured once.
 
 mod gate;
+mod output_filter;
 mod policy;
 mod signal;
 
 pub use gate::EidolonGate;
-pub use policy::{default_injection_patterns, DriftSeverity, EidolonError, EidolonPolicy};
+pub use output_filter::{EidolonOutputFilter, REDACTED};
+pub use policy::{
+    default_injection_patterns, default_sensitive_fields, DriftSeverity, EidolonError,
+    EidolonPolicy,
+};
 pub use signal::{DriftFlag, DriftSignal};
