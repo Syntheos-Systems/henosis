@@ -197,7 +197,11 @@ impl Dispatcher {
             }
         }
 
-        match self.executor.execute(&request.context, &request.invocation).await {
+        match self
+            .executor
+            .execute(&request.context, &request.invocation)
+            .await
+        {
             Ok(mut result) => {
                 // Output-filter seam: redact/transform the result after execution. No filter wired
                 // = pass-through (the Phase 0 default). The real policy filter (the EidolonGate
@@ -512,10 +516,13 @@ mod tests {
                 }) as Box<dyn Gate>
             })
             .collect();
-        let dispatcher = Dispatcher::new(gates, Box::new(EchoExecutor), bus.clone())
-            .expect("canonical chain");
+        let dispatcher =
+            Dispatcher::new(gates, Box::new(EchoExecutor), bus.clone()).expect("canonical chain");
 
-        let outcome = dispatcher.dispatch(request("kleos", "x")).await.expect("dispatch");
+        let outcome = dispatcher
+            .dispatch(request("kleos", "x"))
+            .await
+            .expect("dispatch");
         assert_eq!(
             outcome,
             DispatchOutcome::Denied {
@@ -624,10 +631,9 @@ mod tests {
     #[tokio::test]
     async fn output_filter_redacts_result() {
         let bus = Arc::new(AxonBus::new());
-        let dispatcher =
-            Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
-                .expect("canonical chain")
-                .with_output_filter(Box::new(RedactFilter { reason: "pii" }));
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
+            .expect("canonical chain")
+            .with_output_filter(Box::new(RedactFilter { reason: "pii" }));
 
         let outcome = dispatcher
             .dispatch(request("kleos", "memory_store"))
@@ -777,11 +783,17 @@ mod tests {
         // An extra gate interleaved into the canonical five is rejected: the authority chain must
         // be EXACTLY canonical, so the audit trail attests precisely which authorities ran.
         // Defense-in-depth (e.g. rate limiting) belongs at the transport layer, not here.
-        let gates: Vec<Box<dyn Gate>> =
-            ["pistis", "plutus", "ratelimit", "eidolon", "human", "phylax"]
-                .into_iter()
-                .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
-                .collect();
+        let gates: Vec<Box<dyn Gate>> = [
+            "pistis",
+            "plutus",
+            "ratelimit",
+            "eidolon",
+            "human",
+            "phylax",
+        ]
+        .into_iter()
+        .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
+        .collect();
         let err = Dispatcher::new(gates, Box::new(EchoExecutor), bus)
             .err()
             .expect("an extra non-canonical gate must be rejected");
@@ -790,7 +802,14 @@ mod tests {
                 assert_eq!(expected, CANONICAL_GATE_ORDER);
                 assert_eq!(
                     got,
-                    ["pistis", "plutus", "ratelimit", "eidolon", "human", "phylax"]
+                    [
+                        "pistis",
+                        "plutus",
+                        "ratelimit",
+                        "eidolon",
+                        "human",
+                        "phylax"
+                    ]
                 );
             }
             other => panic!("expected NonCanonicalChain, got {other:?}"),

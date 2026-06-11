@@ -2,21 +2,20 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use henosis_broca::{ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStore, LogAction};
 use henosis_chiasm::{
     ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
 };
-use henosis_broca::{
-    ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStore, LogAction,
-};
+use henosis_eidolon::{DriftFlag, DriftSignal, EidolonError, EidolonGate, EidolonPolicy};
 use henosis_loom::{
     LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
     StepDef, Workflow,
 };
-use async_trait::async_trait;
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
@@ -26,10 +25,9 @@ use henosis_thymus::{
     MetricSummary, NewDriftEvent, NewEvaluation, NewMetric, NewRubric, QualityMetric, QualitySink,
     Rubric, ThymusError, ThymusStats, ThymusStore,
 };
-use henosis_eidolon::{DriftFlag, DriftSignal, EidolonError, EidolonGate, EidolonPolicy};
 use serde::Deserialize;
-use syntheos_contracts::{Gate, RunId, Timestamp, WorkflowId};
 use syntheos_axon::AxonBus;
+use syntheos_contracts::{Gate, RunId, Timestamp, WorkflowId};
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::deny::DenyGate;
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
@@ -144,6 +142,11 @@ impl QualitySink for SomaQualitySink {
 
 impl AppState {
     /// Wire the foundation into shared application state.
+    ///
+    /// One parameter per wired subsystem, deliberately: this is the boot-time wiring point, and
+    /// the count grows as kernel services land (clippy's 7-argument heuristic is about API
+    /// ergonomics, which does not apply to a constructor called exactly twice -- main and tests).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dispatcher: Arc<Dispatcher>,
         directory: Arc<dyn PrincipalDirectory>,
@@ -180,7 +183,10 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/enroll", post(enroll))
         .route("/dispatch", post(dispatch))
-        .route("/chiasm/tasks", post(chiasm_create_task).get(chiasm_list_tasks))
+        .route(
+            "/chiasm/tasks",
+            post(chiasm_create_task).get(chiasm_list_tasks),
+        )
         .route("/chiasm/tasks/{id}", get(chiasm_get_task))
         .route("/chiasm/stats", get(chiasm_stats))
         .route("/soma/agents", post(soma_register).get(soma_list))
@@ -192,7 +198,10 @@ pub fn router(state: AppState) -> Router {
         .route("/broca/actions/{id}", get(broca_get))
         .route("/broca/actions/{id}/narrate", post(broca_narrate))
         .route("/broca/stats", get(broca_stats))
-        .route("/loom/workflows", post(loom_create_workflow).get(loom_list_workflows))
+        .route(
+            "/loom/workflows",
+            post(loom_create_workflow).get(loom_list_workflows),
+        )
         .route("/loom/workflows/{id}", get(loom_get_workflow))
         .route("/loom/runs", post(loom_create_run).get(loom_list_runs))
         .route("/loom/runs/{id}", get(loom_get_run))
@@ -202,13 +211,22 @@ pub fn router(state: AppState) -> Router {
         .route("/loom/steps/{id}/complete", post(loom_complete_step))
         .route("/loom/steps/{id}/fail", post(loom_fail_step))
         .route("/loom/stats", get(loom_stats))
-        .route("/thymus/rubrics", post(thymus_create_rubric).get(thymus_list_rubrics))
+        .route(
+            "/thymus/rubrics",
+            post(thymus_create_rubric).get(thymus_list_rubrics),
+        )
         .route("/thymus/rubrics/{id}", get(thymus_get_rubric))
-        .route("/thymus/evaluations", post(thymus_evaluate).get(thymus_list_evaluations))
+        .route(
+            "/thymus/evaluations",
+            post(thymus_evaluate).get(thymus_list_evaluations),
+        )
         .route("/thymus/agents/{id}/scores", get(thymus_agent_scores))
         .route("/thymus/metrics", post(thymus_record_metric))
         .route("/thymus/metrics/summary", get(thymus_metric_summary))
-        .route("/thymus/drift", post(thymus_record_drift).get(thymus_list_drift))
+        .route(
+            "/thymus/drift",
+            post(thymus_record_drift).get(thymus_list_drift),
+        )
         .route("/thymus/stats", get(thymus_stats))
         .with_state(state)
 }
@@ -564,7 +582,12 @@ async fn soma_stats(
     State(state): State<AppState>,
     Query(q): Query<SomaStatsQuery>,
 ) -> Result<Json<SomaStats>, (StatusCode, String)> {
-    state.soma.stats(q.tenant).await.map(Json).map_err(soma_error)
+    state
+        .soma
+        .stats(q.tenant)
+        .await
+        .map(Json)
+        .map_err(soma_error)
 }
 
 /// Map a [`BrocaError`] onto an HTTP status + message.
@@ -700,7 +723,12 @@ async fn broca_stats(
     State(state): State<AppState>,
     Query(q): Query<BrocaTenantQuery>,
 ) -> Result<Json<BrocaStats>, (StatusCode, String)> {
-    state.broca.stats(q.tenant).await.map(Json).map_err(broca_error)
+    state
+        .broca
+        .stats(q.tenant)
+        .await
+        .map(Json)
+        .map_err(broca_error)
 }
 
 /// Map a [`LoomError`] onto an HTTP status + message.
@@ -709,9 +737,9 @@ fn loom_error(e: LoomError) -> (StatusCode, String) {
         LoomError::WorkflowNotFound(_) | LoomError::RunNotFound(_) | LoomError::StepNotFound(_) => {
             StatusCode::NOT_FOUND
         }
-        LoomError::InvalidDefinition(_) | LoomError::InvalidInput(_) | LoomError::InvalidStatus(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        LoomError::InvalidDefinition(_)
+        | LoomError::InvalidInput(_)
+        | LoomError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
         // Backend and any future variants are server-side failures.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1323,7 +1351,9 @@ mod tests {
                 .expect("thymus store")
                 .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus)
+        AppState::new(
+            dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+        )
     }
 
     /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
@@ -1349,7 +1379,9 @@ mod tests {
                 .expect("thymus store")
                 .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
         );
-        AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus)
+        AppState::new(
+            dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+        )
     }
 
     /// Build app state with the REAL EidolonGate (over the state's own ThymusStore through the
@@ -1422,11 +1454,7 @@ mod tests {
     }
 
     /// Build a /dispatch request body for (tenant, principal) with the given args.
-    fn dispatch_body(
-        tenant: TenantId,
-        principal: PrincipalId,
-        args: serde_json::Value,
-    ) -> String {
+    fn dispatch_body(tenant: TenantId, principal: PrincipalId, args: serde_json::Value) -> String {
         serde_json::json!({
             "context": {
                 "tenant": tenant,
@@ -1498,7 +1526,11 @@ mod tests {
 
         let outcome = post_dispatch(
             state,
-            dispatch_body(tenant, principal, serde_json::json!({ "content": "a clean note" })),
+            dispatch_body(
+                tenant,
+                principal,
+                serde_json::json!({ "content": "a clean note" }),
+            ),
         )
         .await;
         assert_eq!(outcome["Denied"]["gate"], serde_json::json!("eidolon"));
@@ -1552,7 +1584,12 @@ mod tests {
     #[tokio::test]
     async fn health_ok() {
         let response = router(test_state())
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1871,7 +1908,9 @@ mod tests {
                     .method("POST")
                     .uri(format!("/soma/agents/{agent}/quality"))
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::json!({"quality_score": 0.9}).to_string()))
+                    .body(Body::from(
+                        serde_json::json!({"quality_score": 0.9}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1994,7 +2033,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let presence: serde_json::Value =
             serde_json::from_str(&body_string(response).await).unwrap();
-        assert_eq!(presence["quality_score"], 0.8, "evaluation reached Soma via the sink");
+        assert_eq!(
+            presence["quality_score"], 0.8,
+            "evaluation reached Soma via the sink"
+        );
     }
 
     #[tokio::test]
@@ -2069,7 +2111,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let logs: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
-        assert!(logs.as_array().expect("array").len() >= 3, "created/started/completed lines");
+        assert!(
+            logs.as_array().expect("array").len() >= 3,
+            "created/started/completed lines"
+        );
     }
 
     #[tokio::test]
@@ -2127,8 +2172,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let logged: serde_json::Value =
-            serde_json::from_str(&body_string(response).await).unwrap();
+        let logged: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(
             logged["narrative"], "\"wire broca\" was completed by claude",
             "template narrative derived at log time"

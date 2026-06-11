@@ -98,12 +98,16 @@ fn tid_from_db(s: &str) -> Result<TenantId, ThymusError> {
 /// Validate rubric criteria: non-empty, unique non-empty names, positive weights, sane scales.
 fn validate_criteria(criteria: &[Criterion]) -> Result<(), ThymusError> {
     if criteria.is_empty() {
-        return Err(ThymusError::InvalidInput("rubric has no criteria".to_string()));
+        return Err(ThymusError::InvalidInput(
+            "rubric has no criteria".to_string(),
+        ));
     }
     let mut names = std::collections::HashSet::new();
     for c in criteria {
         if c.name.trim().is_empty() {
-            return Err(ThymusError::InvalidInput("empty criterion name".to_string()));
+            return Err(ThymusError::InvalidInput(
+                "empty criterion name".to_string(),
+            ));
         }
         if !names.insert(c.name.as_str()) {
             return Err(ThymusError::InvalidInput(format!(
@@ -302,7 +306,8 @@ impl ThymusStore {
 
     /// Enable foreign keys, apply migrations, and wrap the connection.
     fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
-        conn.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -340,7 +345,9 @@ impl ThymusStore {
     /// Define a new rubric (criteria validated).
     pub async fn create_rubric(&self, new: NewRubric) -> Result<Rubric, ThymusError> {
         if new.name.trim().is_empty() {
-            return Err(ThymusError::InvalidInput("rubric name required".to_string()));
+            return Err(ThymusError::InvalidInput(
+                "rubric name required".to_string(),
+            ));
         }
         validate_criteria(&new.criteria)?;
         let now = Timestamp::now();
@@ -471,7 +478,11 @@ impl ThymusStore {
 
     /// Delete an owned rubric. Returns whether a row was removed;
     /// [`ThymusError::RubricInUse`] if evaluations reference it (they are the audit record).
-    pub async fn delete_rubric(&self, principal: PrincipalId, id: i64) -> Result<bool, ThymusError> {
+    pub async fn delete_rubric(
+        &self,
+        principal: PrincipalId,
+        id: i64,
+    ) -> Result<bool, ThymusError> {
         let conn = self.lock();
         conn.execute(
             "DELETE FROM thymus_rubrics WHERE id = ?1 AND principal_id = ?2",
@@ -561,7 +572,8 @@ impl ThymusStore {
             evaluation.tenant,
             evaluation.principal_id,
         );
-        self.propagate(evaluation.agent, Some(rolling_avg), None).await;
+        self.propagate(evaluation.agent, Some(rolling_avg), None)
+            .await;
         Ok(evaluation)
     }
 
@@ -670,11 +682,15 @@ impl ThymusStore {
     /// Record a metric data point and emit `metric.recorded`.
     pub async fn record_metric(&self, new: NewMetric) -> Result<QualityMetric, ThymusError> {
         if new.metric.trim().is_empty() {
-            return Err(ThymusError::InvalidInput("metric name required".to_string()));
+            return Err(ThymusError::InvalidInput(
+                "metric name required".to_string(),
+            ));
         }
         let tags = new.tags.unwrap_or_else(|| serde_json::json!({}));
         if !tags.is_object() {
-            return Err(ThymusError::InvalidInput("tags must be a JSON object".to_string()));
+            return Err(ThymusError::InvalidInput(
+                "tags must be a JSON object".to_string(),
+            ));
         }
         let now = Timestamp::now();
         let metric = {
@@ -886,7 +902,10 @@ impl ThymusStore {
         let mut flags = Vec::new();
         for row in rows {
             let (drift_type, severity) = row.map_err(berr)?;
-            flags.push((DriftType::parse(&drift_type)?, DriftSeverity::parse(&severity)?));
+            flags.push((
+                DriftType::parse(&drift_type)?,
+                DriftSeverity::parse(&severity)?,
+            ));
         }
         Ok(flags)
     }
@@ -952,11 +971,14 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    /// One recorded sink propagation: (agent, score, flags).
+    type SinkCall = (PrincipalId, Option<f64>, Option<Vec<String>>);
+
     /// A recording sink capturing every propagation.
     #[derive(Default)]
     struct RecordingSink {
         /// The (agent, score, flags) tuples received, in order.
-        calls: StdMutex<Vec<(PrincipalId, Option<f64>, Option<Vec<String>>)>>,
+        calls: StdMutex<Vec<SinkCall>>,
     }
 
     /// Records the call and succeeds.
@@ -1015,7 +1037,10 @@ mod tests {
 
     /// Scores for the test rubric.
     fn scores(quality: f64, speed: f64) -> BTreeMap<String, f64> {
-        BTreeMap::from([("quality".to_string(), quality), ("speed".to_string(), speed)])
+        BTreeMap::from([
+            ("quality".to_string(), quality),
+            ("speed".to_string(), speed),
+        ])
     }
 
     /// Drain the kind strings currently buffered on a raw subscriber.
@@ -1034,9 +1059,17 @@ mod tests {
         let (store, _sink, _bus) = store_with_sink();
         let principal = PrincipalId::new();
         let r = rubric(&store, principal).await;
-        let got = store.get_rubric(principal, r.id).await.expect("get").expect("present");
+        let got = store
+            .get_rubric(principal, r.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got, r);
-        assert!(store.get_rubric(PrincipalId::new(), r.id).await.expect("get").is_none());
+        assert!(store
+            .get_rubric(PrincipalId::new(), r.id)
+            .await
+            .expect("get")
+            .is_none());
 
         // Empty criteria, duplicate names, bad weight/scale are rejected.
         let bad = |criteria: Vec<Criterion>| NewRubric {
@@ -1050,25 +1083,48 @@ mod tests {
             store.create_rubric(bad(vec![])).await.expect_err("empty"),
             ThymusError::InvalidInput(_)
         ));
-        let c = Criterion { name: "x".to_string(), weight: 1.0, scale_min: 0.0, scale_max: 1.0 };
-        assert!(store
-            .create_rubric(bad(vec![c.clone(), c.clone()]))
-            .await
-            .is_err(), "duplicate names");
-        assert!(store
-            .create_rubric(bad(vec![Criterion { weight: 0.0, ..c.clone() }]))
-            .await
-            .is_err(), "zero weight");
-        assert!(store
-            .create_rubric(bad(vec![Criterion { scale_max: 0.0, ..c }]))
-            .await
-            .is_err(), "inverted scale");
+        let c = Criterion {
+            name: "x".to_string(),
+            weight: 1.0,
+            scale_min: 0.0,
+            scale_max: 1.0,
+        };
+        assert!(
+            store
+                .create_rubric(bad(vec![c.clone(), c.clone()]))
+                .await
+                .is_err(),
+            "duplicate names"
+        );
+        assert!(
+            store
+                .create_rubric(bad(vec![Criterion {
+                    weight: 0.0,
+                    ..c.clone()
+                }]))
+                .await
+                .is_err(),
+            "zero weight"
+        );
+        assert!(
+            store
+                .create_rubric(bad(vec![Criterion {
+                    scale_max: 0.0,
+                    ..c
+                }]))
+                .await
+                .is_err(),
+            "inverted scale"
+        );
 
         let updated = store
             .update_rubric(
                 principal,
                 r.id,
-                RubricPatch { description: Some("desc".to_string()), ..Default::default() },
+                RubricPatch {
+                    description: Some("desc".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("update");
@@ -1125,12 +1181,15 @@ mod tests {
             })
             .await
             .expect("evaluate");
-        let calls = sink.calls.lock().unwrap();
-        let expected_avg = (2.0 / 3.0 + 1.0) / 2.0;
-        assert!((calls[1].1.expect("score") - expected_avg).abs() < 1e-9);
+        // Block scope, not drop(): the guard must EXIT SCOPE before the next await (the same
+        // scope-based analysis as rustc's Send check; clippy await_holding_lock agrees).
+        {
+            let calls = sink.calls.lock().unwrap();
+            let expected_avg = (2.0 / 3.0 + 1.0) / 2.0;
+            assert!((calls[1].1.expect("score") - expected_avg).abs() < 1e-9);
+        }
 
         // Missing criterion score is rejected.
-        drop(calls);
         let err = store
             .evaluate(NewEvaluation {
                 principal_id: principal,
@@ -1167,7 +1226,10 @@ mod tests {
             })
             .await
             .expect("evaluate");
-        let err = store.delete_rubric(principal, r.id).await.expect_err("in use");
+        let err = store
+            .delete_rubric(principal, r.id)
+            .await
+            .expect_err("in use");
         assert!(matches!(err, ThymusError::RubricInUse(_)));
     }
 
@@ -1196,7 +1258,10 @@ mod tests {
         let mine = store
             .list_evaluations(
                 principal,
-                EvaluationFilter { agent: Some(agent), ..Default::default() },
+                EvaluationFilter {
+                    agent: Some(agent),
+                    ..Default::default()
+                },
             )
             .await
             .expect("list");
@@ -1275,20 +1340,31 @@ mod tests {
             severity: None,
             signal: "observed".to_string(),
         };
-        let event = store.record_drift_event(drift(DriftType::Priority)).await.expect("drift");
+        let event = store
+            .record_drift_event(drift(DriftType::Priority))
+            .await
+            .expect("drift");
         assert_eq!(event.severity, DriftSeverity::Medium, "default severity");
-        store.record_drift_event(drift(DriftType::Safety)).await.expect("drift");
-        store.record_drift_event(drift(DriftType::Priority)).await.expect("drift");
+        store
+            .record_drift_event(drift(DriftType::Safety))
+            .await
+            .expect("drift");
+        store
+            .record_drift_event(drift(DriftType::Priority))
+            .await
+            .expect("drift");
         assert_eq!(drain_kinds(&mut rx), vec!["drift.detected"; 3]);
 
-        // The sink saw the distinct, sorted token set after the third event.
-        let calls = sink.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[2].2.as_deref(),
-            Some(["priority".to_string(), "safety".to_string()].as_slice())
-        );
-        drop(calls);
+        // The sink saw the distinct, sorted token set after the third event. Block scope, not
+        // drop(): the guard must exit scope before the next await (scope-based analysis).
+        {
+            let calls = sink.calls.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(
+                calls[2].2.as_deref(),
+                Some(["priority".to_string(), "safety".to_string()].as_slice())
+            );
+        }
 
         let events = store
             .list_drift_events(principal, Some(agent), 10)
@@ -1372,10 +1448,7 @@ mod tests {
                 .await
                 .expect("record");
         }
-        let mut flags = store
-            .agent_drift_flags(tenant, agent)
-            .await
-            .expect("flags");
+        let mut flags = store.agent_drift_flags(tenant, agent).await.expect("flags");
         flags.sort_by_key(|(t, _)| t.as_str());
         assert_eq!(
             flags,

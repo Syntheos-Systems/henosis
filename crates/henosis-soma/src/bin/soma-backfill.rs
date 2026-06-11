@@ -86,9 +86,11 @@ fn parse_args() -> Result<Args, String> {
         target: target.ok_or_else(|| format!("--target is required\n{USAGE}"))?,
         directory: directory.ok_or_else(|| format!("--directory is required\n{USAGE}"))?,
         chiasm,
-        source: source
-            .ok_or_else(|| format!("--source is required (e.g. 'monolith', 'tenant-1')\n{USAGE}"))?,
-        tenant: tenant.ok_or_else(|| format!("--tenant is required (a UUID, or 'new')\n{USAGE}"))?,
+        source: source.ok_or_else(|| {
+            format!("--source is required (e.g. 'monolith', 'tenant-1')\n{USAGE}")
+        })?,
+        tenant: tenant
+            .ok_or_else(|| format!("--tenant is required (a UUID, or 'new')\n{USAGE}"))?,
         tenant_minted,
         apply,
     })
@@ -103,7 +105,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
@@ -137,13 +142,19 @@ fn main() -> ExitCode {
             } else {
                 println!("  tenant: {}", args.tenant);
             }
-            println!("  owners reused from chiasm: {}", report.owners_reused_from_chiasm);
+            println!(
+                "  owners reused from chiasm: {}",
+                report.owners_reused_from_chiasm
+            );
             println!("  owners minted:             {}", report.owners_minted);
             for (legacy_key, principal) in &report.owners_by_legacy_user {
                 println!("    legacy key {legacy_key} -> {principal}");
             }
             println!("  agents imported:           {}", report.agents_imported);
-            println!("  agents reused (same name): {}", report.agents_reused_existing);
+            println!(
+                "  agents reused (same name): {}",
+                report.agents_reused_existing
+            );
             println!("  agents skipped:            {}", report.agents_skipped);
             ExitCode::SUCCESS
         }

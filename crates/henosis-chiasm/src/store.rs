@@ -33,7 +33,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__chiasm_tasks.sql")),
     (2, include_str!("../migrations/V2__chiasm_claims_deps.sql")),
     (3, include_str!("../migrations/V3__chiasm_legacy_maps.sql")),
-    (4, include_str!("../migrations/V4__chiasm_legacy_map_source.sql")),
+    (
+        4,
+        include_str!("../migrations/V4__chiasm_legacy_map_source.sql"),
+    ),
 ];
 
 /// Seconds a heartbeat extends a task's unreleased path-claim leases by (Kleos parity: 600).
@@ -121,10 +124,9 @@ impl RawClaim {
     fn into_claim(self) -> Result<PathClaim, ChiasmError> {
         Ok(PathClaim {
             id: self.id,
-            task_id: self
-                .task_id
-                .parse::<TaskId>()
-                .map_err(|e| ChiasmError::Backend(format!("corrupt task_id {:?}: {e}", self.task_id)))?,
+            task_id: self.task_id.parse::<TaskId>().map_err(|e| {
+                ChiasmError::Backend(format!("corrupt task_id {:?}: {e}", self.task_id))
+            })?,
             principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
                 ChiasmError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
             })?,
@@ -193,12 +195,15 @@ impl RawTask {
                 .id
                 .parse::<TaskId>()
                 .map_err(|e| ChiasmError::Backend(format!("corrupt task id {:?}: {e}", self.id)))?,
-            tenant: self
-                .tenant
-                .parse::<TenantId>()
-                .map_err(|e| ChiasmError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant)))?,
+            tenant: self.tenant.parse::<TenantId>().map_err(|e| {
+                ChiasmError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant))
+            })?,
             principal_id: parse_id(&self.principal_id, "principal_id")?,
-            assignee: self.assignee.as_deref().map(|s| parse_id(s, "assignee")).transpose()?,
+            assignee: self
+                .assignee
+                .as_deref()
+                .map(|s| parse_id(s, "assignee"))
+                .transpose()?,
             project: self.project,
             title: self.title,
             status: TaskStatus::parse(&self.status)?,
@@ -231,7 +236,8 @@ impl ChiasmStore {
 
     /// Enable foreign keys, apply migrations, and wrap the connection.
     fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
-        conn.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -309,7 +315,9 @@ impl ChiasmStore {
     ) -> Result<Option<Task>, ChiasmError> {
         let raw = conn
             .query_row(
-                &format!("SELECT {TASK_COLUMNS} FROM chiasm_tasks WHERE id = ?1 AND principal_id = ?2"),
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM chiasm_tasks WHERE id = ?1 AND principal_id = ?2"
+                ),
                 rusqlite::params![id.to_string(), principal.to_string()],
                 read_raw,
             )
@@ -494,9 +502,9 @@ impl ChiasmStore {
             let (uid, task_id, status, summary, created_at) = row.map_err(berr)?;
             out.push(TaskUpdate {
                 id: uid,
-                task_id: task_id
-                    .parse::<TaskId>()
-                    .map_err(|e| ChiasmError::Backend(format!("corrupt task_id {task_id:?}: {e}")))?,
+                task_id: task_id.parse::<TaskId>().map_err(|e| {
+                    ChiasmError::Backend(format!("corrupt task_id {task_id:?}: {e}"))
+                })?,
                 status: TaskStatus::parse(&status)?,
                 summary,
                 created_at: ts_from_db(&created_at)?,
@@ -509,7 +517,9 @@ impl ChiasmStore {
     pub async fn stats(&self, principal: PrincipalId) -> Result<ChiasmStats, ChiasmError> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT status, COUNT(*) FROM chiasm_tasks WHERE principal_id = ?1 GROUP BY status")
+            .prepare(
+                "SELECT status, COUNT(*) FROM chiasm_tasks WHERE principal_id = ?1 GROUP BY status",
+            )
             .map_err(berr)?;
         let rows = stmt
             .query_map(rusqlite::params![principal.to_string()], |r| {
@@ -688,7 +698,11 @@ impl ChiasmStore {
         let now_odt = Timestamp::now().as_offset_date_time();
         let mut staled = Vec::new();
         for mut task in candidates {
-            let Some(hb) = task.last_heartbeat.as_ref().map(|t| t.as_offset_date_time()) else {
+            let Some(hb) = task
+                .last_heartbeat
+                .as_ref()
+                .map(|t| t.as_offset_date_time())
+            else {
                 continue;
             };
             let elapsed = (now_odt - hb).as_seconds_f64();
@@ -768,7 +782,8 @@ impl ChiasmStore {
         let (task, claims) = {
             let mut conn = self.lock();
             let tx = conn.transaction().map_err(berr)?;
-            let task = Self::get_in(&tx, principal, task_id)?.ok_or(ChiasmError::NotFound(task_id))?;
+            let task =
+                Self::get_in(&tx, principal, task_id)?.ok_or(ChiasmError::NotFound(task_id))?;
             let mut claims = Vec::with_capacity(paths.len());
             for &path in paths {
                 tx.execute(
@@ -904,7 +919,10 @@ impl ChiasmStore {
             ))
             .map_err(berr)?;
         let rows = stmt
-            .query_map(rusqlite::params![principal.to_string(), project], read_raw_claim)
+            .query_map(
+                rusqlite::params![principal.to_string(), project],
+                read_raw_claim,
+            )
             .map_err(berr)?;
         let mut out = Vec::new();
         for row in rows {
@@ -1109,14 +1127,15 @@ impl ChiasmStore {
         principal: PrincipalId,
         completed_task_id: TaskId,
     ) -> Result<Vec<Task>, ChiasmError> {
-        let candidates: Vec<TaskId> = {
-            let conn = self.lock();
-            Self::get_in(&conn, principal, completed_task_id)?
-                .ok_or(ChiasmError::NotFound(completed_task_id))?;
-            // Blocked dependents of the completed task with no other incomplete dependency.
-            let mut stmt = conn
-                .prepare(
-                    "SELECT DISTINCT d.task_id FROM chiasm_task_dependencies d \
+        let candidates: Vec<TaskId> =
+            {
+                let conn = self.lock();
+                Self::get_in(&conn, principal, completed_task_id)?
+                    .ok_or(ChiasmError::NotFound(completed_task_id))?;
+                // Blocked dependents of the completed task with no other incomplete dependency.
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT d.task_id FROM chiasm_task_dependencies d \
                      JOIN chiasm_tasks t ON t.id = d.task_id \
                      WHERE d.depends_on = ?1 AND t.principal_id = ?2 AND t.status = 'blocked' \
                        AND NOT EXISTS (\
@@ -1125,23 +1144,23 @@ impl ChiasmStore {
                            WHERE d2.task_id = d.task_id AND d2.depends_on != ?1 \
                              AND t2.status != 'completed') \
                      ORDER BY d.task_id",
-                )
-                .map_err(berr)?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![completed_task_id.to_string(), principal.to_string()],
-                    |r| r.get::<_, String>(0),
-                )
-                .map_err(berr)?;
-            let mut ids = Vec::new();
-            for row in rows {
-                let id = row.map_err(berr)?;
-                ids.push(id.parse::<TaskId>().map_err(|e| {
-                    ChiasmError::Backend(format!("corrupt task_id {id:?}: {e}"))
-                })?);
-            }
-            ids
-        };
+                    )
+                    .map_err(berr)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![completed_task_id.to_string(), principal.to_string()],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(berr)?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    let id = row.map_err(berr)?;
+                    ids.push(id.parse::<TaskId>().map_err(|e| {
+                        ChiasmError::Backend(format!("corrupt task_id {id:?}: {e}"))
+                    })?);
+                }
+                ids
+            };
         let mut unblocked = Vec::new();
         for id in candidates {
             let task = self
@@ -1248,7 +1267,9 @@ mod tests {
     }
 
     /// Drain the kind strings currently buffered on a raw subscriber.
-    fn drain_kinds(rx: &mut tokio::sync::broadcast::Receiver<syntheos_contracts::AxonEnvelope>) -> Vec<String> {
+    fn drain_kinds(
+        rx: &mut tokio::sync::broadcast::Receiver<syntheos_contracts::AxonEnvelope>,
+    ) -> Vec<String> {
         let mut kinds = Vec::new();
         while let Ok(env) = rx.try_recv() {
             kinds.push(env.kind);
@@ -1266,7 +1287,11 @@ mod tests {
             .expect("create");
         assert_eq!(made.status, TaskStatus::Active);
         assert_eq!(made.output_format, "raw");
-        let got = store.get(principal, made.id).await.expect("get").expect("present");
+        let got = store
+            .get(principal, made.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got, made);
     }
 
@@ -1287,7 +1312,10 @@ mod tests {
         let tenant = TenantId::new();
         let owner = PrincipalId::new();
         let other = PrincipalId::new();
-        let task = store.create(new_task(tenant, owner, "secret")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, owner, "secret"))
+            .await
+            .expect("create");
         // The owner sees it; a different principal does not.
         assert!(store.get(owner, task.id).await.expect("get").is_some());
         assert!(store.get(other, task.id).await.expect("get").is_none());
@@ -1298,7 +1326,10 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         let _ = drain_kinds(&mut rx); // discard task.created
 
         store
@@ -1329,7 +1360,10 @@ mod tests {
         assert_eq!(completed.status, TaskStatus::Completed);
         assert_eq!(drain_kinds(&mut rx), ["task.completed"]);
 
-        let history = store.history(principal, task.id, 10).await.expect("history");
+        let history = store
+            .history(principal, task.id, 10)
+            .await
+            .expect("history");
         // Two updates recorded, newest first.
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].status, TaskStatus::Completed);
@@ -1350,21 +1384,43 @@ mod tests {
     async fn list_filters_by_status_and_project() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let a = store.create(new_task(tenant, principal, "a")).await.expect("create");
-        store.create(new_task(tenant, principal, "b")).await.expect("create");
+        let a = store
+            .create(new_task(tenant, principal, "a"))
+            .await
+            .expect("create");
         store
-            .update(principal, a.id, TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() })
+            .create(new_task(tenant, principal, "b"))
+            .await
+            .expect("create");
+        store
+            .update(
+                principal,
+                a.id,
+                TaskPatch {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("update");
 
         let active = store
-            .list(principal, TaskFilter { status: Some(TaskStatus::Active), ..Default::default() })
+            .list(
+                principal,
+                TaskFilter {
+                    status: Some(TaskStatus::Active),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("list");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].title, "b");
 
-        let all = store.list(principal, TaskFilter::default()).await.expect("list");
+        let all = store
+            .list(principal, TaskFilter::default())
+            .await
+            .expect("list");
         assert_eq!(all.len(), 2);
     }
 
@@ -1373,7 +1429,10 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         let _ = drain_kinds(&mut rx);
 
         assert!(store.delete(principal, task.id).await.expect("delete"));
@@ -1388,10 +1447,23 @@ mod tests {
     async fn stats_counts_by_status() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let a = store.create(new_task(tenant, principal, "a")).await.expect("create");
-        store.create(new_task(tenant, principal, "b")).await.expect("create");
+        let a = store
+            .create(new_task(tenant, principal, "a"))
+            .await
+            .expect("create");
         store
-            .update(principal, a.id, TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() })
+            .create(new_task(tenant, principal, "b"))
+            .await
+            .expect("create");
+        store
+            .update(
+                principal,
+                a.id,
+                TaskPatch {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("update");
         let stats = store.stats(principal).await.expect("stats");
@@ -1417,14 +1489,23 @@ mod tests {
         {
             let bus = Arc::new(AxonBus::new());
             let store = ChiasmStore::open(&tmp, bus).expect("reopen");
-            let got = store.get(principal, id).await.expect("get").expect("present after reopen");
+            let got = store
+                .get(principal, id)
+                .await
+                .expect("get")
+                .expect("present after reopen");
             assert_eq!(got.title, "durable");
         }
         let _ = std::fs::remove_file(&tmp);
     }
 
     /// A minimal EnqueueTask for `principal` in `tenant` under `project`.
-    fn enqueue_task(tenant: TenantId, principal: PrincipalId, title: &str, project: &str) -> EnqueueTask {
+    fn enqueue_task(
+        tenant: TenantId,
+        principal: PrincipalId,
+        title: &str,
+        project: &str,
+    ) -> EnqueueTask {
         EnqueueTask {
             tenant,
             principal_id: principal,
@@ -1457,39 +1538,64 @@ mod tests {
         assert_eq!(claimed.id, queued.id);
         assert_eq!(claimed.status, TaskStatus::Active);
         assert_eq!(claimed.assignee, Some(claimer));
-        assert!(claimed.last_heartbeat.is_some(), "claim stamps a first heartbeat");
+        assert!(
+            claimed.last_heartbeat.is_some(),
+            "claim stamps a first heartbeat"
+        );
         assert_eq!(drain_kinds(&mut rx), ["task.claimed"]);
 
         // Queue is now empty.
-        assert!(store.claim_next(owner, claimer, None).await.expect("claim").is_none());
+        assert!(store
+            .claim_next(owner, claimer, None)
+            .await
+            .expect("claim")
+            .is_none());
     }
 
     #[tokio::test]
     async fn claim_is_fifo() {
         let (store, _bus) = store();
         let (tenant, owner) = (TenantId::new(), PrincipalId::new());
-        let first = store.enqueue(enqueue_task(tenant, owner, "first", "p")).await.expect("enqueue");
-        let _second = store.enqueue(enqueue_task(tenant, owner, "second", "p")).await.expect("enqueue");
+        let first = store
+            .enqueue(enqueue_task(tenant, owner, "first", "p"))
+            .await
+            .expect("enqueue");
+        let _second = store
+            .enqueue(enqueue_task(tenant, owner, "second", "p"))
+            .await
+            .expect("enqueue");
         let claimed = store
             .claim_next(owner, PrincipalId::new(), None)
             .await
             .expect("claim")
             .expect("task");
-        assert_eq!(claimed.id, first.id, "oldest-enqueued task is claimed first");
+        assert_eq!(
+            claimed.id, first.id,
+            "oldest-enqueued task is claimed first"
+        );
     }
 
     #[tokio::test]
     async fn claim_respects_project_filter() {
         let (store, _bus) = store();
         let (tenant, owner) = (TenantId::new(), PrincipalId::new());
-        store.enqueue(enqueue_task(tenant, owner, "alpha-task", "alpha")).await.expect("enqueue");
-        let beta = store.enqueue(enqueue_task(tenant, owner, "beta-task", "beta")).await.expect("enqueue");
+        store
+            .enqueue(enqueue_task(tenant, owner, "alpha-task", "alpha"))
+            .await
+            .expect("enqueue");
+        let beta = store
+            .enqueue(enqueue_task(tenant, owner, "beta-task", "beta"))
+            .await
+            .expect("enqueue");
         let claimed = store
             .claim_next(owner, PrincipalId::new(), Some("beta"))
             .await
             .expect("claim")
             .expect("task");
-        assert_eq!(claimed.id, beta.id, "only the beta-project task is claimable");
+        assert_eq!(
+            claimed.id, beta.id,
+            "only the beta-project task is claimable"
+        );
     }
 
     #[tokio::test]
@@ -1498,7 +1604,10 @@ mod tests {
         let tenant = TenantId::new();
         let owner = PrincipalId::new();
         let other_owner = PrincipalId::new();
-        store.enqueue(enqueue_task(tenant, owner, "t", "p")).await.expect("enqueue");
+        store
+            .enqueue(enqueue_task(tenant, owner, "t", "p"))
+            .await
+            .expect("enqueue");
         // A different owner's queue is empty.
         assert!(store
             .claim_next(other_owner, PrincipalId::new(), None)
@@ -1511,12 +1620,25 @@ mod tests {
     async fn record_heartbeat_updates_and_notfound() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         assert!(task.last_heartbeat.is_none());
 
-        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
-        let got = store.get(principal, task.id).await.expect("get").expect("present");
-        assert!(got.last_heartbeat.is_some(), "heartbeat sets last_heartbeat");
+        store
+            .record_heartbeat(principal, task.id)
+            .await
+            .expect("heartbeat");
+        let got = store
+            .get(principal, task.id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(
+            got.last_heartbeat.is_some(),
+            "heartbeat sets last_heartbeat"
+        );
 
         // Unknown task, or another principal's task, is NotFound.
         let err = store
@@ -1535,11 +1657,21 @@ mod tests {
     async fn fresh_heartbeat_is_not_stale() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
-        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
+        store
+            .record_heartbeat(principal, task.id)
+            .await
+            .expect("heartbeat");
         // Just beaten, default 300s interval, grace 1.0 -> not overdue.
         assert!(store.mark_stale(1.0).await.expect("sweep").is_empty());
-        let got = store.get(principal, task.id).await.expect("get").expect("present");
+        let got = store
+            .get(principal, task.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got.status, TaskStatus::Active);
     }
 
@@ -1548,8 +1680,14 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
-        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
+        store
+            .record_heartbeat(principal, task.id)
+            .await
+            .expect("heartbeat");
         let _ = drain_kinds(&mut rx);
 
         // grace 0.0 -> threshold 0 -> any elapsed time is overdue.
@@ -1559,14 +1697,33 @@ mod tests {
         assert_eq!(staled[0].status, TaskStatus::Stale);
         assert_eq!(drain_kinds(&mut rx), ["task.stale"]);
 
-        let got = store.get(principal, task.id).await.expect("get").expect("present");
+        let got = store
+            .get(principal, task.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got.status, TaskStatus::Stale);
-        let history = store.history(principal, task.id, 10).await.expect("history");
-        assert_eq!(history[0].status, TaskStatus::Stale, "stale recorded in history");
+        let history = store
+            .history(principal, task.id, 10)
+            .await
+            .expect("history");
+        assert_eq!(
+            history[0].status,
+            TaskStatus::Stale,
+            "stale recorded in history"
+        );
 
         // A task with no heartbeat is never swept, even at grace 0.0.
-        let unbeaten = store.create(new_task(tenant, principal, "unbeaten")).await.expect("create");
-        assert!(store.mark_stale(0.0).await.expect("sweep").iter().all(|t| t.id != unbeaten.id));
+        let unbeaten = store
+            .create(new_task(tenant, principal, "unbeaten"))
+            .await
+            .expect("create");
+        assert!(store
+            .mark_stale(0.0)
+            .await
+            .expect("sweep")
+            .iter()
+            .all(|t| t.id != unbeaten.id));
     }
 
     #[tokio::test]
@@ -1574,7 +1731,10 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         let _ = drain_kinds(&mut rx);
 
         let claims = store
@@ -1586,13 +1746,23 @@ mod tests {
         assert!(claims.iter().all(|c| c.project == "henosis" && !c.released));
         assert_eq!(drain_kinds(&mut rx), ["claim.created"]);
 
-        let listed = store.get_claims_for_task(principal, task.id).await.expect("list");
+        let listed = store
+            .get_claims_for_task(principal, task.id)
+            .await
+            .expect("list");
         assert_eq!(listed, claims, "stored claims round-trip exactly");
-        let by_project = store.get_claims_for_project(principal, "henosis").await.expect("list");
+        let by_project = store
+            .get_claims_for_project(principal, "henosis")
+            .await
+            .expect("list");
         assert_eq!(by_project, claims);
 
         // Empty paths: nothing created, nothing emitted.
-        assert!(store.create_claims(principal, task.id, &[], 1800).await.expect("claims").is_empty());
+        assert!(store
+            .create_claims(principal, task.id, &[], 1800)
+            .await
+            .expect("claims")
+            .is_empty());
         assert!(drain_kinds(&mut rx).is_empty());
     }
 
@@ -1600,7 +1770,10 @@ mod tests {
     async fn create_claims_requires_owned_task() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         // Unknown task.
         let err = store
             .create_claims(principal, TaskId::new(), &["x.rs"], 60)
@@ -1619,12 +1792,26 @@ mod tests {
     async fn conflict_detection_and_self_exclusion() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let holder = store.create(new_task(tenant, principal, "holder")).await.expect("create");
-        let requester = store.create(new_task(tenant, principal, "requester")).await.expect("create");
-        store.create_claims(principal, holder.id, &["src/lib.rs"], 1800).await.expect("claims");
+        let holder = store
+            .create(new_task(tenant, principal, "holder"))
+            .await
+            .expect("create");
+        let requester = store
+            .create(new_task(tenant, principal, "requester"))
+            .await
+            .expect("create");
+        store
+            .create_claims(principal, holder.id, &["src/lib.rs"], 1800)
+            .await
+            .expect("claims");
 
         let conflicts = store
-            .check_conflicts(principal, "henosis", &["src/lib.rs", "other.rs"], Some(requester.id))
+            .check_conflicts(
+                principal,
+                "henosis",
+                &["src/lib.rs", "other.rs"],
+                Some(requester.id),
+            )
             .await
             .expect("check");
         assert_eq!(conflicts.len(), 1);
@@ -1646,8 +1833,14 @@ mod tests {
         let tenant = TenantId::new();
         let owner = PrincipalId::new();
         let other = PrincipalId::new();
-        let task = store.create(new_task(tenant, owner, "t")).await.expect("create");
-        store.create_claims(owner, task.id, &["shared.rs"], 1800).await.expect("claims");
+        let task = store
+            .create(new_task(tenant, owner, "t"))
+            .await
+            .expect("create");
+        store
+            .create_claims(owner, task.id, &["shared.rs"], 1800)
+            .await
+            .expect("claims");
         // Another principal's coordination space sees no conflict on the same project+path.
         let conflicts = store
             .check_conflicts(other, "henosis", &["shared.rs"], None)
@@ -1660,16 +1853,30 @@ mod tests {
     async fn expired_claims_are_inactive() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         // TTL 0: expires_at == claimed_at, already in the past by check time.
-        store.create_claims(principal, task.id, &["old.rs"], 0).await.expect("claims");
+        store
+            .create_claims(principal, task.id, &["old.rs"], 0)
+            .await
+            .expect("claims");
         assert!(store
             .check_conflicts(principal, "henosis", &["old.rs"], None)
             .await
             .expect("check")
             .is_empty());
-        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
-        assert!(store.get_claims_for_project(principal, "henosis").await.expect("list").is_empty());
+        assert!(store
+            .get_claims_for_task(principal, task.id)
+            .await
+            .expect("list")
+            .is_empty());
+        assert!(store
+            .get_claims_for_project(principal, "henosis")
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1677,13 +1884,29 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
-        store.create_claims(principal, task.id, &["main.rs"], 1800).await.expect("claims");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
+        store
+            .create_claims(principal, task.id, &["main.rs"], 1800)
+            .await
+            .expect("claims");
         let _ = drain_kinds(&mut rx);
 
-        assert_eq!(store.release_claims(principal, task.id).await.expect("release"), 1);
+        assert_eq!(
+            store
+                .release_claims(principal, task.id)
+                .await
+                .expect("release"),
+            1
+        );
         assert_eq!(drain_kinds(&mut rx), ["claim.released"]);
-        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
+        assert!(store
+            .get_claims_for_task(principal, task.id)
+            .await
+            .expect("list")
+            .is_empty());
         assert!(store
             .check_conflicts(principal, "henosis", &["main.rs"], None)
             .await
@@ -1691,8 +1914,20 @@ mod tests {
             .is_empty());
 
         // Idempotent: a second release (or a foreign principal) releases zero, no event.
-        assert_eq!(store.release_claims(principal, task.id).await.expect("release"), 0);
-        assert_eq!(store.release_claims(PrincipalId::new(), task.id).await.expect("release"), 0);
+        assert_eq!(
+            store
+                .release_claims(principal, task.id)
+                .await
+                .expect("release"),
+            0
+        );
+        assert_eq!(
+            store
+                .release_claims(PrincipalId::new(), task.id)
+                .await
+                .expect("release"),
+            0
+        );
         assert!(drain_kinds(&mut rx).is_empty());
     }
 
@@ -1700,13 +1935,29 @@ mod tests {
     async fn heartbeat_refreshes_claim_leases() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         // An immediately-lapsed lease (TTL 0) is inactive...
-        let claimed = store.create_claims(principal, task.id, &["a.rs"], 0).await.expect("claims");
-        assert!(store.get_claims_for_task(principal, task.id).await.expect("list").is_empty());
+        let claimed = store
+            .create_claims(principal, task.id, &["a.rs"], 0)
+            .await
+            .expect("claims");
+        assert!(store
+            .get_claims_for_task(principal, task.id)
+            .await
+            .expect("list")
+            .is_empty());
         // ...until a heartbeat proves the holder alive and extends it to now + 600s.
-        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
-        let refreshed = store.get_claims_for_task(principal, task.id).await.expect("list");
+        store
+            .record_heartbeat(principal, task.id)
+            .await
+            .expect("heartbeat");
+        let refreshed = store
+            .get_claims_for_task(principal, task.id)
+            .await
+            .expect("list");
         assert_eq!(refreshed.len(), 1);
         assert!(
             refreshed[0].expires_at.as_offset_date_time()
@@ -1720,9 +1971,18 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let task = store.create(new_task(tenant, principal, "t")).await.expect("create");
-        store.record_heartbeat(principal, task.id).await.expect("heartbeat");
-        store.create_claims(principal, task.id, &["w.rs"], 1800).await.expect("claims");
+        let task = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
+        store
+            .record_heartbeat(principal, task.id)
+            .await
+            .expect("heartbeat");
+        store
+            .create_claims(principal, task.id, &["w.rs"], 1800)
+            .await
+            .expect("claims");
         let _ = drain_kinds(&mut rx);
 
         // grace 0.0 -> any elapsed time is overdue.
@@ -1731,7 +1991,11 @@ mod tests {
         assert_eq!(staled[0].id, task.id);
         assert_eq!(drain_kinds(&mut rx), ["task.stale", "claim.released"]);
         assert!(
-            store.get_claims_for_task(principal, task.id).await.expect("list").is_empty(),
+            store
+                .get_claims_for_task(principal, task.id)
+                .await
+                .expect("list")
+                .is_empty(),
             "a staled task forfeits its leases"
         );
     }
@@ -1740,15 +2004,33 @@ mod tests {
     async fn add_and_list_dependencies() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let t1 = store.create(new_task(tenant, principal, "task-1")).await.expect("create");
-        let t2 = store.create(new_task(tenant, principal, "task-2")).await.expect("create");
-        let t3 = store.create(new_task(tenant, principal, "task-3")).await.expect("create");
+        let t1 = store
+            .create(new_task(tenant, principal, "task-1"))
+            .await
+            .expect("create");
+        let t2 = store
+            .create(new_task(tenant, principal, "task-2"))
+            .await
+            .expect("create");
+        let t3 = store
+            .create(new_task(tenant, principal, "task-3"))
+            .await
+            .expect("create");
 
-        store.add_dependencies(principal, t3.id, &[t1.id, t2.id]).await.expect("add");
+        store
+            .add_dependencies(principal, t3.id, &[t1.id, t2.id])
+            .await
+            .expect("add");
         // Duplicate edges are ignored.
-        store.add_dependencies(principal, t3.id, &[t1.id]).await.expect("re-add");
+        store
+            .add_dependencies(principal, t3.id, &[t1.id])
+            .await
+            .expect("re-add");
 
-        let deps = store.get_dependencies(principal, t3.id).await.expect("list");
+        let deps = store
+            .get_dependencies(principal, t3.id)
+            .await
+            .expect("list");
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].depends_on, t1.id);
         assert_eq!(deps[0].depends_on_title.as_deref(), Some("task-1"));
@@ -1767,7 +2049,10 @@ mod tests {
     async fn self_dependency_rejected() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let t = store.create(new_task(tenant, principal, "t")).await.expect("create");
+        let t = store
+            .create(new_task(tenant, principal, "t"))
+            .await
+            .expect("create");
         let err = store
             .add_dependencies(principal, t.id, &[t.id])
             .await
@@ -1779,11 +2064,23 @@ mod tests {
     async fn circular_dependency_rejected() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
-        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
-        let t3 = store.create(new_task(tenant, principal, "t3")).await.expect("create");
+        let t1 = store
+            .create(new_task(tenant, principal, "t1"))
+            .await
+            .expect("create");
+        let t2 = store
+            .create(new_task(tenant, principal, "t2"))
+            .await
+            .expect("create");
+        let t3 = store
+            .create(new_task(tenant, principal, "t3"))
+            .await
+            .expect("create");
 
-        store.add_dependencies(principal, t2.id, &[t1.id]).await.expect("t2 -> t1");
+        store
+            .add_dependencies(principal, t2.id, &[t1.id])
+            .await
+            .expect("t2 -> t1");
         // Direct cycle: t1 -> t2 while t2 -> t1 exists.
         let err = store
             .add_dependencies(principal, t1.id, &[t2.id])
@@ -1791,14 +2088,21 @@ mod tests {
             .expect_err("direct cycle");
         assert!(matches!(err, ChiasmError::DependencyCycle { .. }));
         // Transitive cycle: with t3 -> t2 -> t1, adding t1 -> t3 closes the loop.
-        store.add_dependencies(principal, t3.id, &[t2.id]).await.expect("t3 -> t2");
+        store
+            .add_dependencies(principal, t3.id, &[t2.id])
+            .await
+            .expect("t3 -> t2");
         let err = store
             .add_dependencies(principal, t1.id, &[t3.id])
             .await
             .expect_err("transitive cycle");
         assert!(matches!(err, ChiasmError::DependencyCycle { .. }));
         // A rejected batch inserts nothing.
-        assert!(store.get_dependencies(principal, t1.id).await.expect("list").is_empty());
+        assert!(store
+            .get_dependencies(principal, t1.id)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1807,8 +2111,14 @@ mod tests {
         let tenant = TenantId::new();
         let owner = PrincipalId::new();
         let other = PrincipalId::new();
-        let mine = store.create(new_task(tenant, owner, "mine")).await.expect("create");
-        let theirs = store.create(new_task(tenant, other, "theirs")).await.expect("create");
+        let mine = store
+            .create(new_task(tenant, owner, "mine"))
+            .await
+            .expect("create");
+        let theirs = store
+            .create(new_task(tenant, other, "theirs"))
+            .await
+            .expect("create");
         let err = store
             .add_dependencies(owner, mine.id, &[theirs.id])
             .await
@@ -1820,19 +2130,38 @@ mod tests {
     async fn remove_dependency_works() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
-        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
-        store.add_dependencies(principal, t2.id, &[t1.id]).await.expect("add");
+        let t1 = store
+            .create(new_task(tenant, principal, "t1"))
+            .await
+            .expect("create");
+        let t2 = store
+            .create(new_task(tenant, principal, "t2"))
+            .await
+            .expect("create");
+        store
+            .add_dependencies(principal, t2.id, &[t1.id])
+            .await
+            .expect("add");
 
         // Another principal cannot remove it.
         assert!(!store
             .remove_dependency(PrincipalId::new(), t2.id, t1.id)
             .await
             .expect("remove"));
-        assert!(store.remove_dependency(principal, t2.id, t1.id).await.expect("remove"));
-        assert!(store.get_dependencies(principal, t2.id).await.expect("list").is_empty());
+        assert!(store
+            .remove_dependency(principal, t2.id, t1.id)
+            .await
+            .expect("remove"));
+        assert!(store
+            .get_dependencies(principal, t2.id)
+            .await
+            .expect("list")
+            .is_empty());
         // Removing a missing edge reports false.
-        assert!(!store.remove_dependency(principal, t2.id, t1.id).await.expect("remove"));
+        assert!(!store
+            .remove_dependency(principal, t2.id, t1.id)
+            .await
+            .expect("remove"));
     }
 
     #[tokio::test]
@@ -1840,27 +2169,45 @@ mod tests {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let blocker = store.create(new_task(tenant, principal, "blocker")).await.expect("create");
-        let blocked = store.create(new_task(tenant, principal, "blocked")).await.expect("create");
-        store.add_dependencies(principal, blocked.id, &[blocker.id]).await.expect("add");
+        let blocker = store
+            .create(new_task(tenant, principal, "blocker"))
+            .await
+            .expect("create");
+        let blocked = store
+            .create(new_task(tenant, principal, "blocked"))
+            .await
+            .expect("create");
+        store
+            .add_dependencies(principal, blocked.id, &[blocker.id])
+            .await
+            .expect("add");
         store
             .update(
                 principal,
                 blocked.id,
-                TaskPatch { status: Some(TaskStatus::Blocked), ..Default::default() },
+                TaskPatch {
+                    status: Some(TaskStatus::Blocked),
+                    ..Default::default()
+                },
             )
             .await
             .expect("block");
         let _ = drain_kinds(&mut rx);
 
         // Order-independent: the blocker's completion need not be committed yet.
-        let unblocked = store.check_and_unblock(principal, blocker.id).await.expect("unblock");
+        let unblocked = store
+            .check_and_unblock(principal, blocker.id)
+            .await
+            .expect("unblock");
         assert_eq!(unblocked.len(), 1);
         assert_eq!(unblocked[0].id, blocked.id);
         assert_eq!(unblocked[0].status, TaskStatus::Active);
         assert_eq!(drain_kinds(&mut rx), ["task.updated", "task.unblocked"]);
 
-        let history = store.history(principal, blocked.id, 10).await.expect("history");
+        let history = store
+            .history(principal, blocked.id, 10)
+            .await
+            .expect("history");
         assert_eq!(
             history[0].summary.as_deref(),
             Some("auto-unblocked: all dependencies completed")
@@ -1871,9 +2218,18 @@ mod tests {
     async fn unblock_requires_all_dependencies_completed() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let t1 = store.create(new_task(tenant, principal, "t1")).await.expect("create");
-        let t2 = store.create(new_task(tenant, principal, "t2")).await.expect("create");
-        let dependent = store.create(new_task(tenant, principal, "dependent")).await.expect("create");
+        let t1 = store
+            .create(new_task(tenant, principal, "t1"))
+            .await
+            .expect("create");
+        let t2 = store
+            .create(new_task(tenant, principal, "t2"))
+            .await
+            .expect("create");
+        let dependent = store
+            .create(new_task(tenant, principal, "dependent"))
+            .await
+            .expect("create");
         store
             .add_dependencies(principal, dependent.id, &[t1.id, t2.id])
             .await
@@ -1882,7 +2238,10 @@ mod tests {
             .update(
                 principal,
                 dependent.id,
-                TaskPatch { status: Some(TaskStatus::Blocked), ..Default::default() },
+                TaskPatch {
+                    status: Some(TaskStatus::Blocked),
+                    ..Default::default()
+                },
             )
             .await
             .expect("block");
@@ -1892,22 +2251,35 @@ mod tests {
             .update(
                 principal,
                 t1.id,
-                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+                TaskPatch {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
             )
             .await
             .expect("complete t1");
-        assert!(store.check_and_unblock(principal, t1.id).await.expect("check").is_empty());
+        assert!(store
+            .check_and_unblock(principal, t1.id)
+            .await
+            .expect("check")
+            .is_empty());
 
         // Completing t2 unblocks the dependent (t1 is already completed in the DB).
         store
             .update(
                 principal,
                 t2.id,
-                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+                TaskPatch {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
             )
             .await
             .expect("complete t2");
-        let unblocked = store.check_and_unblock(principal, t2.id).await.expect("check");
+        let unblocked = store
+            .check_and_unblock(principal, t2.id)
+            .await
+            .expect("check");
         assert_eq!(unblocked.len(), 1);
         assert_eq!(unblocked[0].id, dependent.id);
     }
@@ -1916,20 +2288,40 @@ mod tests {
     async fn unblock_only_activates_blocked_dependents() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        let blocker = store.create(new_task(tenant, principal, "blocker")).await.expect("create");
-        let done = store.create(new_task(tenant, principal, "done")).await.expect("create");
-        store.add_dependencies(principal, done.id, &[blocker.id]).await.expect("add");
+        let blocker = store
+            .create(new_task(tenant, principal, "blocker"))
+            .await
+            .expect("create");
+        let done = store
+            .create(new_task(tenant, principal, "done"))
+            .await
+            .expect("create");
+        store
+            .add_dependencies(principal, done.id, &[blocker.id])
+            .await
+            .expect("add");
         // The dependent already completed -- it must NOT be resurrected to active.
         store
             .update(
                 principal,
                 done.id,
-                TaskPatch { status: Some(TaskStatus::Completed), ..Default::default() },
+                TaskPatch {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
             )
             .await
             .expect("complete dependent");
-        assert!(store.check_and_unblock(principal, blocker.id).await.expect("check").is_empty());
-        let got = store.get(principal, done.id).await.expect("get").expect("present");
+        assert!(store
+            .check_and_unblock(principal, blocker.id)
+            .await
+            .expect("check")
+            .is_empty());
+        let got = store
+            .get(principal, done.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got.status, TaskStatus::Completed);
 
         // And the completed task itself must be owned: a foreign principal is NotFound.

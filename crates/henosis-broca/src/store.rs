@@ -109,17 +109,17 @@ impl RawAction {
     fn into_entry(self) -> Result<ActionEntry, BrocaError> {
         Ok(ActionEntry {
             id: self.id,
-            tenant: self
-                .tenant
-                .parse::<TenantId>()
-                .map_err(|e| BrocaError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant)))?,
+            tenant: self.tenant.parse::<TenantId>().map_err(|e| {
+                BrocaError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant))
+            })?,
             principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
                 BrocaError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
             })?,
             service: self.service,
             action: self.action,
-            payload: serde_json::from_str(&self.payload)
-                .map_err(|e| BrocaError::Backend(format!("corrupt payload {:?}: {e}", self.payload)))?,
+            payload: serde_json::from_str(&self.payload).map_err(|e| {
+                BrocaError::Backend(format!("corrupt payload {:?}: {e}", self.payload))
+            })?,
             narrative: self.narrative,
             created_at: ts_from_db(&self.created_at)?,
         })
@@ -150,7 +150,8 @@ impl BrocaStore {
 
     /// Enable foreign keys, apply migrations, and wrap the connection.
     fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, BrocaError> {
-        conn.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -247,7 +248,9 @@ impl BrocaStore {
     ) -> Result<Option<ActionEntry>, BrocaError> {
         let raw = conn
             .query_row(
-                &format!("SELECT {ACTION_COLUMNS} FROM broca_actions WHERE id = ?1 AND tenant = ?2"),
+                &format!(
+                    "SELECT {ACTION_COLUMNS} FROM broca_actions WHERE id = ?1 AND tenant = ?2"
+                ),
                 rusqlite::params![id, tenant.to_string()],
                 read_raw,
             )
@@ -458,7 +461,11 @@ mod tests {
             "template narrative derived at log time"
         );
         assert_eq!(drain_kinds(&mut rx), ["narration.logged"]);
-        let got = store.get(tenant, entry.id).await.expect("get").expect("present");
+        let got = store
+            .get(tenant, entry.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got, entry);
     }
 
@@ -480,7 +487,10 @@ mod tests {
             .log(log_action(tenant, principal, "custom.exotic.event"))
             .await
             .expect("log");
-        assert!(bare.narrative.is_none(), "no template, no narrator -> no narrative");
+        assert!(
+            bare.narrative.is_none(),
+            "no template, no narrator -> no narrative"
+        );
     }
 
     #[tokio::test]
@@ -505,7 +515,11 @@ mod tests {
             .await
             .expect("log");
         assert!(store.get(tenant, entry.id).await.expect("get").is_some());
-        assert!(store.get(TenantId::new(), entry.id).await.expect("get").is_none());
+        assert!(store
+            .get(TenantId::new(), entry.id)
+            .await
+            .expect("get")
+            .is_none());
     }
 
     #[tokio::test]
@@ -514,7 +528,10 @@ mod tests {
         let tenant = TenantId::new();
         let a = PrincipalId::new();
         let b = PrincipalId::new();
-        store.log(log_action(tenant, a, "task.output")).await.expect("log");
+        store
+            .log(log_action(tenant, a, "task.output"))
+            .await
+            .expect("log");
         store
             .log(LogAction {
                 service: Some("soma".to_string()),
@@ -522,33 +539,64 @@ mod tests {
             })
             .await
             .expect("log");
-        store.log(log_action(tenant, a, "task.output")).await.expect("log");
+        store
+            .log(log_action(tenant, a, "task.output"))
+            .await
+            .expect("log");
 
         // By principal.
         let mine = store
-            .query(tenant, ActionFilter { principal_id: Some(a), ..Default::default() })
+            .query(
+                tenant,
+                ActionFilter {
+                    principal_id: Some(a),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("query");
         assert_eq!(mine.len(), 2);
         // By service.
         let soma = store
-            .query(tenant, ActionFilter { service: Some("soma".to_string()), ..Default::default() })
+            .query(
+                tenant,
+                ActionFilter {
+                    service: Some("soma".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("query");
         assert_eq!(soma.len(), 1);
         assert_eq!(soma[0].action, "agent.heartbeat");
         // By action type.
         let outputs = store
-            .query(tenant, ActionFilter { action: Some("task.output".to_string()), ..Default::default() })
+            .query(
+                tenant,
+                ActionFilter {
+                    action: Some("task.output".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("query");
         assert_eq!(outputs.len(), 2);
         // Newest first + limit/offset pagination.
-        let all = store.query(tenant, ActionFilter::default()).await.expect("query");
+        let all = store
+            .query(tenant, ActionFilter::default())
+            .await
+            .expect("query");
         assert_eq!(all.len(), 3);
         assert!(all[0].id > all[2].id, "newest first");
         let page2 = store
-            .query(tenant, ActionFilter { limit: Some(2), offset: Some(2), ..Default::default() })
+            .query(
+                tenant,
+                ActionFilter {
+                    limit: Some(2),
+                    offset: Some(2),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("query");
         assert_eq!(page2.len(), 1);
@@ -564,12 +612,24 @@ mod tests {
     async fn since_filters_on_nanosecond_instants() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
-        store.log(log_action(tenant, principal, "task.output")).await.expect("log");
+        store
+            .log(log_action(tenant, principal, "task.output"))
+            .await
+            .expect("log");
         let cut = Timestamp::now();
-        store.log(log_action(tenant, principal, "task.plan")).await.expect("log");
+        store
+            .log(log_action(tenant, principal, "task.plan"))
+            .await
+            .expect("log");
 
         let recent = store
-            .query(tenant, ActionFilter { since: Some(cut), ..Default::default() })
+            .query(
+                tenant,
+                ActionFilter {
+                    since: Some(cut),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("query");
         assert_eq!(recent.len(), 1);
@@ -594,7 +654,9 @@ mod tests {
     #[tokio::test]
     async fn get_or_narrate_layers_template_then_narrator() {
         let bus = Arc::new(AxonBus::new());
-        let store = BrocaStore::open_in_memory(bus).expect("open").with_narrator(Box::new(CannedNarrator));
+        let store = BrocaStore::open_in_memory(bus)
+            .expect("open")
+            .with_narrator(Box::new(CannedNarrator));
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
 
         // No template for this action: the narrator fills it in, and it persists.
@@ -603,21 +665,37 @@ mod tests {
             .await
             .expect("log");
         assert!(bare.narrative.is_none());
-        let narrated = store.get_or_narrate(tenant, bare.id).await.expect("narrate");
+        let narrated = store
+            .get_or_narrate(tenant, bare.id)
+            .await
+            .expect("narrate");
         assert_eq!(
             narrated.narrative.as_deref(),
             Some("something happened: custom.exotic.event")
         );
-        let persisted = store.get(tenant, bare.id).await.expect("get").expect("present");
-        assert_eq!(persisted.narrative, narrated.narrative, "derived sentence persisted");
+        let persisted = store
+            .get(tenant, bare.id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            persisted.narrative, narrated.narrative,
+            "derived sentence persisted"
+        );
 
         // An existing narrative is returned untouched.
-        let again = store.get_or_narrate(tenant, bare.id).await.expect("narrate");
+        let again = store
+            .get_or_narrate(tenant, bare.id)
+            .await
+            .expect("narrate");
         assert_eq!(again.narrative, narrated.narrative);
 
         // Unknown id in the tenant is NotFound.
         assert!(matches!(
-            store.get_or_narrate(tenant, 999).await.expect_err("unknown"),
+            store
+                .get_or_narrate(tenant, 999)
+                .await
+                .expect_err("unknown"),
             BrocaError::NotFound(999)
         ));
     }
@@ -630,7 +708,10 @@ mod tests {
             .log(log_action(tenant, principal, "custom.exotic.event"))
             .await
             .expect("log");
-        let entry = store.get_or_narrate(tenant, bare.id).await.expect("narrate");
+        let entry = store
+            .get_or_narrate(tenant, bare.id)
+            .await
+            .expect("narrate");
         assert!(entry.narrative.is_none(), "template-or-nothing in Phase 1");
     }
 
@@ -639,8 +720,14 @@ mod tests {
         let (store, _bus) = store();
         let tenant = TenantId::new();
         let a = PrincipalId::new();
-        store.log(log_action(tenant, a, "task.output")).await.expect("log");
-        store.log(log_action(tenant, a, "task.output")).await.expect("log");
+        store
+            .log(log_action(tenant, a, "task.output"))
+            .await
+            .expect("log");
+        store
+            .log(log_action(tenant, a, "task.output"))
+            .await
+            .expect("log");
         store
             .log(LogAction {
                 service: Some("soma".to_string()),
@@ -676,7 +763,11 @@ mod tests {
         }
         {
             let store = BrocaStore::open(&tmp, Arc::new(AxonBus::new())).expect("reopen");
-            let got = store.get(tenant, id).await.expect("get").expect("present after reopen");
+            let got = store
+                .get(tenant, id)
+                .await
+                .expect("get")
+                .expect("present after reopen");
             assert_eq!(got.action, "task.output");
         }
         let _ = std::fs::remove_file(&tmp);

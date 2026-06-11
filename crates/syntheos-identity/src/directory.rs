@@ -144,8 +144,14 @@ mod tests {
     #[tokio::test]
     async fn enroll_mints_unique_ids() {
         let dir = InMemoryDirectory::new();
-        let a = dir.enroll(PrincipalKind::Human, None).await.expect("enroll");
-        let b = dir.enroll(PrincipalKind::Human, None).await.expect("enroll");
+        let a = dir
+            .enroll(PrincipalKind::Human, None)
+            .await
+            .expect("enroll");
+        let b = dir
+            .enroll(PrincipalKind::Human, None)
+            .await
+            .expect("enroll");
         assert_ne!(a.id, b.id);
     }
 
@@ -164,8 +170,12 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_enrolled() {
         let dir = InMemoryDirectory::new();
-        dir.enroll(PrincipalKind::Agent, None).await.expect("enroll");
-        dir.enroll(PrincipalKind::Human, None).await.expect("enroll");
+        dir.enroll(PrincipalKind::Agent, None)
+            .await
+            .expect("enroll");
+        dir.enroll(PrincipalKind::Human, None)
+            .await
+            .expect("enroll");
         dir.enroll(PrincipalKind::Service, None)
             .await
             .expect("enroll");

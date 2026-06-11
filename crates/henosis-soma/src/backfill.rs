@@ -187,7 +187,10 @@ fn read_legacy_agents(legacy: &Connection) -> Result<Vec<LegacyAgent>, SomaError
     for row in rows {
         let raw: Raw = row.map_err(berr)?;
         let status = PresenceStatus::parse(&raw.5).map_err(|e| {
-            SomaError::Backfill(format!("legacy agent {} ({:?}) has bad status: {e}", raw.0, raw.1))
+            SomaError::Backfill(format!(
+                "legacy agent {} ({:?}) has bad status: {e}",
+                raw.0, raw.1
+            ))
         })?;
         out.push(LegacyAgent {
             legacy_id: raw.0,
@@ -403,7 +406,8 @@ pub async fn backfill_from_kleos(
         };
         owner_map.insert(key, principal);
     }
-    let mut minted_agents: Vec<(&LegacyAgent, PrincipalId)> = Vec::with_capacity(pending_agents.len());
+    let mut minted_agents: Vec<(&LegacyAgent, PrincipalId)> =
+        Vec::with_capacity(pending_agents.len());
     let mut reused_agents: Vec<(&LegacyAgent, PrincipalId)> = Vec::with_capacity(reusable.len());
     for agent in &pending_agents {
         if let Some(principal) = reusable.get(&agent.legacy_id) {
@@ -413,9 +417,7 @@ pub async fn backfill_from_kleos(
         let principal = directory
             .enroll(PrincipalKind::Agent, Some(agent.name.clone()))
             .await
-            .map_err(|e| {
-                SomaError::Backfill(format!("enroll agent {:?}: {e}", agent.name))
-            })?;
+            .map_err(|e| SomaError::Backfill(format!("enroll agent {:?}: {e}", agent.name)))?;
         minted_agents.push((agent, principal.id));
     }
 
@@ -569,7 +571,10 @@ mod tests {
         assert_eq!(report.owners_minted, 1);
         assert_eq!(report.owners_reused_from_chiasm, 0);
         assert_eq!(report.agents_imported, 3);
-        assert!(dir.list().await.expect("list").is_empty(), "nothing enrolled");
+        assert!(
+            dir.list().await.expect("list").is_empty(),
+            "nothing enrolled"
+        );
         cleanup(&[&legacy, &target]);
     }
 
@@ -598,7 +603,10 @@ mod tests {
         let principals = dir.list().await.expect("list");
         assert_eq!(principals.len(), 4);
         assert_eq!(
-            principals.iter().filter(|p| p.kind == PrincipalKind::Agent).count(),
+            principals
+                .iter()
+                .filter(|p| p.kind == PrincipalKind::Agent)
+                .count(),
             3
         );
 
@@ -606,14 +614,32 @@ mod tests {
         let store = SomaStore::open(&target, Arc::new(AxonBus::new()), dir.clone()).expect("open");
         let all = store.list(PresenceFilter::default()).await.expect("list");
         assert_eq!(all.len(), 3);
-        let cc = store.get_by_name(tenant, "claude-code").await.expect("get").expect("present");
+        let cc = store
+            .get_by_name(tenant, "claude-code")
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(cc.status, PresenceStatus::Online, "legacy status preserved");
         assert_eq!(cc.quality_score, Some(0.85));
         assert!(cc.heartbeat_at.is_some(), "legacy heartbeat converted");
-        assert_eq!(cc.capabilities, vec!["planning".to_string(), "implementation".to_string()]);
-        let messy = store.get_by_name(tenant, "messy").await.expect("get").expect("present");
-        assert_eq!(messy.capabilities, vec!["code".to_string(), "7".to_string()]);
-        assert_eq!(messy.config, serde_json::json!({}), "non-object config degraded");
+        assert_eq!(
+            cc.capabilities,
+            vec!["planning".to_string(), "implementation".to_string()]
+        );
+        let messy = store
+            .get_by_name(tenant, "messy")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            messy.capabilities,
+            vec!["code".to_string(), "7".to_string()]
+        );
+        assert_eq!(
+            messy.config,
+            serde_json::json!({}),
+            "non-object config degraded"
+        );
         assert!(messy.drift_flags.is_empty(), "NULL drift_flags degraded");
         cleanup(&[&legacy, &target]);
     }
@@ -623,8 +649,10 @@ mod tests {
         let (legacy, target) = db_pair("crossmap");
         build_legacy_fixture(&legacy);
         // A chiasm target db whose backfill already mapped legacy key 1.
-        let chiasm_path = std::env::temp_dir()
-            .join(format!("henosis-soma-backfill-chiasm-{}.sqlite", PrincipalId::new()));
+        let chiasm_path = std::env::temp_dir().join(format!(
+            "henosis-soma-backfill-chiasm-{}.sqlite",
+            PrincipalId::new()
+        ));
         let chiasm_owner = PrincipalId::new();
         {
             let conn = Connection::open(&chiasm_path).expect("chiasm fixture");
@@ -698,7 +726,11 @@ mod tests {
         assert_eq!(second.agents_skipped, 3);
         assert_eq!(second.owners_minted, 0);
         assert_eq!(second.owners_by_legacy_user, first.owners_by_legacy_user);
-        assert_eq!(dir.list().await.expect("list").len(), 4, "no duplicate principals");
+        assert_eq!(
+            dir.list().await.expect("list").len(),
+            4,
+            "no duplicate principals"
+        );
         cleanup(&[&legacy, &target]);
     }
 
@@ -728,7 +760,10 @@ mod tests {
         .await
         .expect_err("must fail on bad status");
         assert!(matches!(err, SomaError::Backfill(_)));
-        assert!(dir.list().await.expect("list").is_empty(), "validation precedes minting");
+        assert!(
+            dir.list().await.expect("list").is_empty(),
+            "validation precedes minting"
+        );
         cleanup(&[&legacy, &target]);
     }
 
@@ -817,7 +852,14 @@ mod tests {
         // No duplicate presence rows, and the directory minted 3 + 1 Agent principals
         // (+ 1 Human owner), not 7.
         let store = SomaStore::open(&target, Arc::new(AxonBus::new()), dir.clone()).expect("open");
-        assert_eq!(store.list(PresenceFilter::default()).await.expect("list").len(), 4);
+        assert_eq!(
+            store
+                .list(PresenceFilter::default())
+                .await
+                .expect("list")
+                .len(),
+            4
+        );
         let agents = dir
             .list()
             .await

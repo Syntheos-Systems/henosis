@@ -126,7 +126,8 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), DirectoryError> {
             let tx = conn.transaction().map_err(backend)?;
             tx.execute_batch(sql)
                 .map_err(|e| DirectoryError::Backend(format!("migration V{v} failed: {e}")))?;
-            tx.pragma_update(None, "user_version", *v).map_err(backend)?;
+            tx.pragma_update(None, "user_version", *v)
+                .map_err(backend)?;
             tx.commit().map_err(backend)?;
             version = *v;
         }
@@ -237,14 +238,19 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_enrolled() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
-        dir.enroll(PrincipalKind::Agent, None).await.expect("enroll");
-        dir.enroll(PrincipalKind::Human, None).await.expect("enroll");
+        dir.enroll(PrincipalKind::Agent, None)
+            .await
+            .expect("enroll");
+        dir.enroll(PrincipalKind::Human, None)
+            .await
+            .expect("enroll");
         assert_eq!(dir.list().await.expect("list").len(), 2);
     }
 
     #[tokio::test]
     async fn usable_as_trait_object() {
-        let dir: Arc<dyn PrincipalDirectory> = Arc::new(SqliteDirectory::open_in_memory().expect("open"));
+        let dir: Arc<dyn PrincipalDirectory> =
+            Arc::new(SqliteDirectory::open_in_memory().expect("open"));
         let p = dir
             .enroll(PrincipalKind::Integration, Some("github".into()))
             .await
@@ -289,7 +295,11 @@ mod tests {
         }
         {
             let dir = SqliteDirectory::open(&tmp).expect("reopen");
-            let got = dir.lookup(id).await.expect("lookup").expect("present after reopen");
+            let got = dir
+                .lookup(id)
+                .await
+                .expect("lookup")
+                .expect("present after reopen");
             assert_eq!(got.display.as_deref(), Some("durable"));
         }
         let _ = std::fs::remove_file(&tmp);

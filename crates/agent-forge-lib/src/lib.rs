@@ -156,7 +156,12 @@ mod tests {
         assert!(created.success, "{}", created.message);
         let id = created.id.clone().expect("spec id");
 
-        let got = run_tool(&db, Tool::GetSpec, serde_json::json!({ "spec_id": id }), None);
+        let got = run_tool(
+            &db,
+            Tool::GetSpec,
+            serde_json::json!({ "spec_id": id }),
+            None,
+        );
         assert!(got.success, "{}", got.message);
         let listed = run_tool(&db, Tool::ListSpecs, serde_json::json!({}), None);
         assert!(listed.success, "{}", listed.message);

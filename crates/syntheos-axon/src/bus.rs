@@ -146,10 +146,21 @@ mod tests {
     async fn typed_round_trip() {
         let bus = AxonBus::new();
         let mut rx = bus.subscribe_typed::<ToolInvoked>();
-        bus.publish_event(&ToolInvoked { tool: "kleos".into() }, TenantId::new(), PrincipalId::new())
-            .expect("publishes");
+        bus.publish_event(
+            &ToolInvoked {
+                tool: "kleos".into(),
+            },
+            TenantId::new(),
+            PrincipalId::new(),
+        )
+        .expect("publishes");
         let got = rx.recv().await.expect("receives the typed event");
-        assert_eq!(got, ToolInvoked { tool: "kleos".into() });
+        assert_eq!(
+            got,
+            ToolInvoked {
+                tool: "kleos".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -169,10 +180,29 @@ mod tests {
         let mut rx = bus.subscribe_typed::<ToolInvoked>();
         let (t, p) = (TenantId::new(), PrincipalId::new());
         // Same channel, wrong kind first -- it must be skipped.
-        bus.publish_event(&ToolCompleted { tool: "skip".into() }, t, p).expect("publish completed");
-        bus.publish_event(&ToolInvoked { tool: "keep".into() }, t, p).expect("publish invoked");
+        bus.publish_event(
+            &ToolCompleted {
+                tool: "skip".into(),
+            },
+            t,
+            p,
+        )
+        .expect("publish completed");
+        bus.publish_event(
+            &ToolInvoked {
+                tool: "keep".into(),
+            },
+            t,
+            p,
+        )
+        .expect("publish invoked");
         let got = rx.recv().await.expect("receives only the matching kind");
-        assert_eq!(got, ToolInvoked { tool: "keep".into() });
+        assert_eq!(
+            got,
+            ToolInvoked {
+                tool: "keep".into()
+            }
+        );
     }
 
     #[test]
@@ -189,7 +219,14 @@ mod tests {
         let mut rx = bus.subscribe_typed::<ToolInvoked>();
         let (t, p) = (TenantId::new(), PrincipalId::new());
         for i in 0..5 {
-            bus.publish_event(&ToolInvoked { tool: i.to_string() }, t, p).expect("publish");
+            bus.publish_event(
+                &ToolInvoked {
+                    tool: i.to_string(),
+                },
+                t,
+                p,
+            )
+            .expect("publish");
         }
         match rx.recv().await {
             Err(AxonError::Lagged(_)) => {}

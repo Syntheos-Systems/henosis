@@ -237,7 +237,9 @@ fn read_legacy_updates(legacy: &Connection) -> Result<Vec<LegacyUpdate>, ChiasmE
             "SELECT id, task_id, status, summary, created_at FROM chiasm_task_updates \
              ORDER BY id ASC",
         )
-        .map_err(|e| ChiasmError::Backfill(format!("legacy chiasm_task_updates unreadable: {e}")))?;
+        .map_err(|e| {
+            ChiasmError::Backfill(format!("legacy chiasm_task_updates unreadable: {e}"))
+        })?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -354,7 +356,9 @@ pub async fn backfill_from_kleos(
     };
     let mut task_map: BTreeMap<i64, TaskId> = {
         let mut stmt = target
-            .prepare("SELECT legacy_task_id, task_id FROM chiasm_legacy_task_id_map WHERE source = ?1")
+            .prepare(
+                "SELECT legacy_task_id, task_id FROM chiasm_legacy_task_id_map WHERE source = ?1",
+            )
             .map_err(berr)?;
         let rows = stmt
             .query_map(rusqlite::params![source], |r| {
@@ -543,8 +547,8 @@ mod tests {
     use syntheos_axon::AxonBus;
     use syntheos_identity::InMemoryDirectory;
 
-    use crate::store::ChiasmStore;
     use crate::model::TaskFilter;
+    use crate::store::ChiasmStore;
 
     /// The live Kleos chiasm DDL (post-migration-69 column set), as a test fixture.
     const LEGACY_DDL: &str = "
@@ -669,10 +673,16 @@ mod tests {
         let dir = InMemoryDirectory::new();
         let tenant = TenantId::new();
 
-        let report =
-            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
-                .await
-                .expect("apply");
+        let report = backfill_from_kleos(
+            &legacy,
+            &target,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("apply");
         assert!(!report.dry_run);
         assert_eq!(report.principals_minted, 2);
         assert_eq!(report.tasks_imported, 3);
@@ -690,34 +700,58 @@ mod tests {
 
         // The imported tasks are owner-scoped, statuses and timestamps converted.
         let store = ChiasmStore::open(&target, Arc::new(AxonBus::new())).expect("open");
-        let mine = store.list(owner1, TaskFilter::default()).await.expect("list");
+        let mine = store
+            .list(owner1, TaskFilter::default())
+            .await
+            .expect("list");
         assert_eq!(mine.len(), 2, "legacy key 1 owned two tasks");
-        let ship = mine.iter().find(|t| t.title == "ship slice 4").expect("ship task");
+        let ship = mine
+            .iter()
+            .find(|t| t.title == "ship slice 4")
+            .expect("ship task");
         assert_eq!(ship.status, TaskStatus::Active);
         assert_eq!(ship.tenant, tenant);
-        assert!(ship.assignee.is_none(), "agent labels are not minted as assignees");
+        assert!(
+            ship.assignee.is_none(),
+            "agent labels are not minted as assignees"
+        );
         assert_eq!(
             ship.created_at,
             legacy_ts("2026-06-01 10:00:00").expect("ts"),
             "datetime('now') form converted to a UTC Timestamp"
         );
-        let theirs = store.list(owner2, TaskFilter::default()).await.expect("list");
+        let theirs = store
+            .list(owner2, TaskFilter::default())
+            .await
+            .expect("list");
         assert_eq!(theirs.len(), 1);
         assert_eq!(theirs[0].status, TaskStatus::Completed);
 
         // History rode along (owner-scoped read).
         let blocked = store
-            .list(owner1, TaskFilter { status: Some(TaskStatus::Blocked), ..Default::default() })
+            .list(
+                owner1,
+                TaskFilter {
+                    status: Some(TaskStatus::Blocked),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("list")
             .pop()
             .expect("blocked task");
-        let history = store.history(owner1, blocked.id, 10).await.expect("history");
+        let history = store
+            .history(owner1, blocked.id, 10)
+            .await
+            .expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].summary.as_deref(), Some("waiting on 1"));
 
         // The dependency edge was remapped onto the minted TaskIds.
-        let deps = store.get_dependencies(owner1, blocked.id).await.expect("deps");
+        let deps = store
+            .get_dependencies(owner1, blocked.id)
+            .await
+            .expect("deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].depends_on, ship.id);
 
@@ -741,21 +775,36 @@ mod tests {
         let dir = InMemoryDirectory::new();
         let tenant = TenantId::new();
 
-        let first =
-            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
-                .await
-                .expect("first run");
-        let second =
-            backfill_from_kleos(&legacy, &target, &dir, tenant, "monolith", BackfillOptions::default())
-                .await
-                .expect("second run");
+        let first = backfill_from_kleos(
+            &legacy,
+            &target,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("first run");
+        let second = backfill_from_kleos(
+            &legacy,
+            &target,
+            &dir,
+            tenant,
+            "monolith",
+            BackfillOptions::default(),
+        )
+        .await
+        .expect("second run");
         assert_eq!(second.principals_minted, 0);
         assert_eq!(second.tasks_imported, 0);
         assert_eq!(second.tasks_skipped, 3);
         assert_eq!(second.updates_imported, 0);
         assert_eq!(second.dependencies_imported, 0);
         // The mappings are stable across runs and no extra principals appeared.
-        assert_eq!(second.principals_by_legacy_user, first.principals_by_legacy_user);
+        assert_eq!(
+            second.principals_by_legacy_user,
+            first.principals_by_legacy_user
+        );
         assert_eq!(dir.list().await.expect("list").len(), 2);
         cleanup(&[&legacy, &target]);
     }
@@ -789,7 +838,9 @@ mod tests {
         assert!(dir.list().await.expect("list").is_empty());
         let raw = Connection::open(&target).expect("raw");
         let mapped: i64 = raw
-            .query_row("SELECT COUNT(*) FROM chiasm_legacy_user_id_map", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM chiasm_legacy_user_id_map", [], |r| {
+                r.get(0)
+            })
             .expect("count");
         assert_eq!(mapped, 0);
         cleanup(&[&legacy, &target]);

@@ -106,7 +106,10 @@ pub struct SkillRecordExecInput {
 
 /// Record one execution attempt for a skill, including success/failure and
 /// optional timing and error details.
-pub fn skill_record_exec(bridge: Option<&dyn SkillsBridge>, input: SkillRecordExecInput) -> ToolResult {
+pub fn skill_record_exec(
+    bridge: Option<&dyn SkillsBridge>,
+    input: SkillRecordExecInput,
+) -> ToolResult {
     let skill_id = input
         .skill_id
         .ok_or_else(|| ToolError::MissingField("skill_id".into()))?;

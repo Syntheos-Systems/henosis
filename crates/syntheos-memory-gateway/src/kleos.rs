@@ -118,10 +118,9 @@ impl KleosClient {
         let base_rb = match method {
             "GET" => self.http.get(&url),
             "POST" => self.http.post(&url),
-            _ => self.http.request(
-                method.parse().expect("valid HTTP method"),
-                &url,
-            ),
+            _ => self
+                .http
+                .request(method.parse().expect("valid HTTP method"), &url),
         };
 
         // Apply Content-Type, body, or any other caller-supplied decoration.
@@ -142,10 +141,9 @@ impl KleosClient {
                     let base_rb2 = match method {
                         "GET" => self.http.get(&url),
                         "POST" => self.http.post(&url),
-                        _ => self.http.request(
-                            method.parse().expect("valid HTTP method"),
-                            &url,
-                        ),
+                        _ => self
+                            .http
+                            .request(method.parse().expect("valid HTTP method"), &url),
                     };
                     let base_rb2 = build(base_rb2);
                     let headers = signer.sign_request(method, path, query, body)?;
@@ -404,14 +402,8 @@ fn memory_to_wire(v: &Value) -> Memory {
                 .collect()
         })
         .unwrap_or_default();
-    let created_at = v
-        .get("created_at")
-        .and_then(Value::as_str)
-        .map(to_rfc3339);
-    let updated_at = v
-        .get("updated_at")
-        .and_then(Value::as_str)
-        .map(to_rfc3339);
+    let created_at = v.get("created_at").and_then(Value::as_str).map(to_rfc3339);
+    let updated_at = v.get("updated_at").and_then(Value::as_str).map(to_rfc3339);
     let mut metadata = BTreeMap::new();
     for field in ["category", "source", "importance"] {
         if let Some(val) = v.get(field) {

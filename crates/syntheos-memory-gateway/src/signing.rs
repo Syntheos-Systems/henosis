@@ -199,7 +199,9 @@ impl RequestSigner {
             .map_err(|e| GatewayError::Signing(format!("cannot open YubiKey: {e}")))?;
 
         let cert = yubikey::certificate::Certificate::read(&mut yk, SlotId::Authentication)
-            .map_err(|e| GatewayError::Signing(format!("cannot read PIV slot 9a certificate: {e}")))?;
+            .map_err(|e| {
+                GatewayError::Signing(format!("cannot read PIV slot 9a certificate: {e}"))
+            })?;
 
         let spki = cert.subject_pki();
         let pubkey_der = {
@@ -415,10 +417,7 @@ impl RequestSigner {
 
     /// Return a clone of the cached session token, if any is stored.
     pub fn cached_session(&self) -> Option<String> {
-        self.session
-            .lock()
-            .expect("session mutex poisoned")
-            .clone()
+        self.session.lock().expect("session mutex poisoned").clone()
     }
 
     /// Store a session token received from Kleos in `X-Kleos-Session-Issued`.
@@ -441,9 +440,7 @@ impl RequestSigner {
 #[cfg(feature = "piv")]
 fn runtime_piv_pin() -> Result<String, GatewayError> {
     match std::env::var("PIV_PIN") {
-        Ok(p) if p.is_empty() => {
-            Err(GatewayError::Signing("PIV_PIN is set but empty".into()))
-        }
+        Ok(p) if p.is_empty() => Err(GatewayError::Signing("PIV_PIN is set but empty".into())),
         Ok(p) if p == "123456" => Err(GatewayError::Signing(
             "PIV_PIN equals the YubiKey factory-default; refusing to use it".into(),
         )),
@@ -518,8 +515,9 @@ fn load_key_file(path: &PathBuf) -> Result<Option<[u8; 32]>, GatewayError> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read(path)
-        .map_err(|e| GatewayError::Signing(format!("could not read key file {}: {e}", path.display())))?;
+    let raw = std::fs::read(path).map_err(|e| {
+        GatewayError::Signing(format!("could not read key file {}: {e}", path.display()))
+    })?;
     decode_key_material(&raw, &format!("key file {}", path.display())).map(Some)
 }
 
@@ -531,9 +529,9 @@ fn load_key_file(path: &PathBuf) -> Result<Option<[u8; 32]>, GatewayError> {
 fn read_stdin_key() -> Result<[u8; 32], GatewayError> {
     use std::io::Read;
     let mut raw = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut raw)
-        .map_err(|e| GatewayError::Signing(format!("could not read signing key from stdin: {e}")))?;
+    std::io::stdin().read_to_end(&mut raw).map_err(|e| {
+        GatewayError::Signing(format!("could not read signing key from stdin: {e}"))
+    })?;
     decode_key_material(&raw, "stdin")
 }
 
@@ -589,9 +587,7 @@ fn decode_pkcs8_pem(pem: &str) -> Result<[u8; 32], GatewayError> {
             "PKCS8 DER too short for Ed25519".to_string(),
         ));
     }
-    let scalar: [u8; 32] = der[16..48]
-        .try_into()
-        .expect("slice is exactly 32 bytes");
+    let scalar: [u8; 32] = der[16..48].try_into().expect("slice is exactly 32 bytes");
     Ok(scalar)
 }
 

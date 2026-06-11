@@ -35,10 +35,9 @@ impl Config {
             // Fall back to the system hostname, or "unknown" if that fails.
             hostname()
         });
-        let signing_agent = env::var("SYNTHEOS_AGENT_LABEL")
-            .unwrap_or_else(|_| "syntheos-gateway".to_string());
-        let signing_model = env::var("SYNTHEOS_MODEL_LABEL")
-            .unwrap_or_else(|_| "none".to_string());
+        let signing_agent =
+            env::var("SYNTHEOS_AGENT_LABEL").unwrap_or_else(|_| "syntheos-gateway".to_string());
+        let signing_model = env::var("SYNTHEOS_MODEL_LABEL").unwrap_or_else(|_| "none".to_string());
         Self {
             bind_addr,
             kleos_base_url,
@@ -52,9 +51,7 @@ impl Config {
 /// Query the OS for the machine hostname, returning "unknown" on failure.
 fn hostname() -> String {
     match std::process::Command::new("hostname").output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "unknown".to_string(),
     }
 }

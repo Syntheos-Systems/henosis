@@ -7,7 +7,9 @@
 //! object as they land.
 
 use async_trait::async_trait;
-use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest, RequestContext, ToolInvocation};
+use syntheos_contracts::{
+    Gate, GateDecision, GateError, GateRequest, RequestContext, ToolInvocation,
+};
 
 use crate::dispatcher::CANONICAL_GATE_ORDER;
 use crate::executor::{Executor, ExecutorError};

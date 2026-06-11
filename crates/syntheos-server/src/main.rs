@@ -8,15 +8,15 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
+use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_soma::SomaStore;
-use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_thymus::ThymusStore;
-use syntheos_server::{live_gate_chain, SomaQualitySink};
 use syntheos_axon::AxonBus;
 use syntheos_dispatch::deny::DenyExecutor;
 use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
+use syntheos_server::{live_gate_chain, SomaQualitySink};
 use syntheos_server::{router, AppState};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -93,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_output_filter(Box::new(EidolonOutputFilter::new(&policy)?)),
     );
 
-    let state = AppState::new(dispatcher, directory, bus, chiasm, soma, broca, loom, thymus);
+    let state = AppState::new(
+        dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+    );
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.

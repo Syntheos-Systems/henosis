@@ -39,7 +39,10 @@ use crate::model::{
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__soma_presence.sql")),
     (2, include_str!("../migrations/V2__soma_legacy_maps.sql")),
-    (3, include_str!("../migrations/V3__soma_legacy_map_source.sql")),
+    (
+        3,
+        include_str!("../migrations/V3__soma_legacy_map_source.sql"),
+    ),
 ];
 
 /// The columns of `soma_presence`, in the order [`read_raw`] reads them.
@@ -139,10 +142,9 @@ impl RawPresence {
             principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
                 SomaError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
             })?,
-            tenant: self
-                .tenant
-                .parse::<TenantId>()
-                .map_err(|e| SomaError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant)))?,
+            tenant: self.tenant.parse::<TenantId>().map_err(|e| {
+                SomaError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant))
+            })?,
             name: self.name,
             agent_type: self.agent_type,
             description: self.description,
@@ -150,8 +152,9 @@ impl RawPresence {
                 SomaError::Backend(format!("corrupt capabilities {:?}: {e}", self.capabilities))
             })?,
             status: PresenceStatus::parse(&self.status)?,
-            config: serde_json::from_str(&self.config)
-                .map_err(|e| SomaError::Backend(format!("corrupt config {:?}: {e}", self.config)))?,
+            config: serde_json::from_str(&self.config).map_err(|e| {
+                SomaError::Backend(format!("corrupt config {:?}: {e}", self.config))
+            })?,
             heartbeat_at: self.heartbeat_at.as_deref().map(ts_from_db).transpose()?,
             quality_score: self.quality_score,
             drift_flags: serde_json::from_str(&self.drift_flags).map_err(|e| {
@@ -189,7 +192,8 @@ impl SomaStore {
         bus: Arc<AxonBus>,
         directory: Arc<dyn PrincipalDirectory>,
     ) -> Result<Self, SomaError> {
-        conn.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -245,10 +249,8 @@ impl SomaStore {
         }
 
         let now = ts_to_db(&Timestamp::now())?;
-        let capabilities =
-            serde_json::to_string(&req.capabilities.clone().unwrap_or_default()).map_err(|e| {
-                SomaError::Backend(format!("capabilities serialize: {e}"))
-            })?;
+        let capabilities = serde_json::to_string(&req.capabilities.clone().unwrap_or_default())
+            .map_err(|e| SomaError::Backend(format!("capabilities serialize: {e}")))?;
         let config = req
             .config
             .clone()
@@ -522,11 +524,9 @@ impl SomaStore {
         Ok(candidates
             .into_iter()
             .filter(|p| {
-                p.heartbeat_at
-                    .as_ref()
-                    .is_some_and(|hb| {
-                        (now - hb.as_offset_date_time()).as_seconds_f64() > threshold_secs as f64
-                    })
+                p.heartbeat_at.as_ref().is_some_and(|hb| {
+                    (now - hb.as_offset_date_time()).as_seconds_f64() > threshold_secs as f64
+                })
             })
             .collect())
     }
@@ -546,7 +546,9 @@ impl SomaStore {
                     "SELECT {PRESENCE_COLUMNS} FROM soma_presence WHERE capabilities LIKE ?1"
                 ))
                 .map_err(berr)?;
-            let rows = stmt.query_map(rusqlite::params![like], read_raw).map_err(berr)?;
+            let rows = stmt
+                .query_map(rusqlite::params![like], read_raw)
+                .map_err(berr)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.map_err(berr)?.into_presence()?);
@@ -679,8 +681,7 @@ mod tests {
     fn store() -> (SomaStore, Arc<AxonBus>, Arc<InMemoryDirectory>) {
         let bus = Arc::new(AxonBus::new());
         let directory = Arc::new(InMemoryDirectory::new());
-        let store =
-            SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("open");
+        let store = SomaStore::open_in_memory(bus.clone(), directory.clone()).expect("open");
         (store, bus, directory)
     }
 
@@ -727,7 +728,11 @@ mod tests {
         assert_eq!(made.config, serde_json::json!({}));
         assert!(made.drift_flags.is_empty());
         assert!(made.heartbeat_at.is_none());
-        let got = store.get(req.principal_id).await.expect("get").expect("present");
+        let got = store
+            .get(req.principal_id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got, made);
     }
 
@@ -757,11 +762,17 @@ mod tests {
         assert_eq!(drain_kinds(&mut rx), ["agent.registered"]);
 
         // Mark it online with a heartbeat and give it a score.
-        store.heartbeat(req.principal_id, None).await.expect("heartbeat");
+        store
+            .heartbeat(req.principal_id, None)
+            .await
+            .expect("heartbeat");
         store
             .update_quality(
                 req.principal_id,
-                QualityPatch { quality_score: Some(0.9), ..Default::default() },
+                QualityPatch {
+                    quality_score: Some(0.9),
+                    ..Default::default()
+                },
             )
             .await
             .expect("quality");
@@ -833,14 +844,20 @@ mod tests {
         assert_eq!(drain_kinds(&mut rx), ["agent.heartbeat"]);
 
         // Offline -> online.
-        store.set_status(principal, PresenceStatus::Offline).await.expect("offline");
+        store
+            .set_status(principal, PresenceStatus::Offline)
+            .await
+            .expect("offline");
         assert_eq!(
             store.heartbeat(principal, None).await.expect("heartbeat"),
             PresenceStatus::Online
         );
 
         // Error is sticky under a bare heartbeat...
-        store.set_status(principal, PresenceStatus::Error).await.expect("error");
+        store
+            .set_status(principal, PresenceStatus::Error)
+            .await
+            .expect("error");
         assert_eq!(
             store.heartbeat(principal, None).await.expect("heartbeat"),
             PresenceStatus::Error
@@ -856,7 +873,10 @@ mod tests {
 
         // Unknown principal is NotFound.
         assert!(matches!(
-            store.heartbeat(PrincipalId::new(), None).await.expect_err("unknown"),
+            store
+                .heartbeat(PrincipalId::new(), None)
+                .await
+                .expect_err("unknown"),
             SomaError::NotFound(_)
         ));
     }
@@ -871,7 +891,10 @@ mod tests {
         store.register(req).await.expect("register");
         let _ = drain_kinds(&mut rx);
 
-        store.set_status(principal, PresenceStatus::Online).await.expect("set");
+        store
+            .set_status(principal, PresenceStatus::Online)
+            .await
+            .expect("set");
         assert_eq!(drain_kinds(&mut rx), ["agent.status_changed"]);
         let got = store.get(principal).await.expect("get").expect("present");
         assert_eq!(got.status, PresenceStatus::Online);
@@ -894,17 +917,26 @@ mod tests {
         let mut cli = enrolled_agent(&directory, tenant, "cli-tool").await;
         cli.agent_type = "cli".to_string();
         store.register(cli.clone()).await.expect("register");
-        store.heartbeat(cli.principal_id, None).await.expect("heartbeat");
+        store
+            .heartbeat(cli.principal_id, None)
+            .await
+            .expect("heartbeat");
 
         let coding = store
-            .list(PresenceFilter { agent_type: Some("coding".to_string()), ..Default::default() })
+            .list(PresenceFilter {
+                agent_type: Some("coding".to_string()),
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert_eq!(coding.len(), 1);
         assert_eq!(coding[0].name, "coder");
 
         let online = store
-            .list(PresenceFilter { status: Some(PresenceStatus::Online), ..Default::default() })
+            .list(PresenceFilter {
+                status: Some(PresenceStatus::Online),
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert_eq!(online.len(), 1);
@@ -912,13 +944,23 @@ mod tests {
 
         assert_eq!(
             store
-                .list(PresenceFilter { limit: Some(1), ..Default::default() })
+                .list(PresenceFilter {
+                    limit: Some(1),
+                    ..Default::default()
+                })
                 .await
                 .expect("list")
                 .len(),
             1
         );
-        assert_eq!(store.list(PresenceFilter::default()).await.expect("list").len(), 2);
+        assert_eq!(
+            store
+                .list(PresenceFilter::default())
+                .await
+                .expect("list")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -967,7 +1009,10 @@ mod tests {
         let tenant = TenantId::new();
         let beating = enrolled_agent(&directory, tenant, "beating").await;
         store.register(beating.clone()).await.expect("register");
-        store.heartbeat(beating.principal_id, None).await.expect("heartbeat");
+        store
+            .heartbeat(beating.principal_id, None)
+            .await
+            .expect("heartbeat");
         let pending = enrolled_agent(&directory, tenant, "never-beat").await;
         store.register(pending.clone()).await.expect("register");
 
@@ -994,7 +1039,14 @@ mod tests {
         let found = store.find_by_capability("code").await.expect("find");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].principal_id, a.principal_id);
-        assert_eq!(store.find_by_capability("missing").await.expect("find").len(), 0);
+        assert_eq!(
+            store
+                .find_by_capability("missing")
+                .await
+                .expect("find")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1011,7 +1063,10 @@ mod tests {
         let p = store
             .update_quality(
                 principal,
-                QualityPatch { quality_score: Some(0.8), ..Default::default() },
+                QualityPatch {
+                    quality_score: Some(0.8),
+                    ..Default::default()
+                },
             )
             .await
             .expect("score");
@@ -1044,7 +1099,10 @@ mod tests {
             store
                 .update_quality(
                     PrincipalId::new(),
-                    QualityPatch { quality_score: Some(0.1), ..Default::default() },
+                    QualityPatch {
+                        quality_score: Some(0.1),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect_err("unknown"),
@@ -1059,7 +1117,10 @@ mod tests {
         let other_tenant = TenantId::new();
         let a = enrolled_agent(&directory, tenant, "a").await;
         store.register(a.clone()).await.expect("register");
-        store.heartbeat(a.principal_id, None).await.expect("heartbeat");
+        store
+            .heartbeat(a.principal_id, None)
+            .await
+            .expect("heartbeat");
         let mut b = enrolled_agent(&directory, tenant, "b").await;
         b.agent_type = "cli".to_string();
         store.register(b).await.expect("register");
@@ -1093,9 +1154,12 @@ mod tests {
             store.register(req).await.expect("register");
         }
         {
-            let store =
-                SomaStore::open(&tmp, Arc::new(AxonBus::new()), directory).expect("reopen");
-            let got = store.get(principal).await.expect("get").expect("present after reopen");
+            let store = SomaStore::open(&tmp, Arc::new(AxonBus::new()), directory).expect("reopen");
+            let got = store
+                .get(principal)
+                .await
+                .expect("get")
+                .expect("present after reopen");
             assert_eq!(got.name, "durable");
         }
         let _ = std::fs::remove_file(&tmp);

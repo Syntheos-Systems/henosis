@@ -181,14 +181,12 @@ impl RawWorkflow {
     /// Parse raw columns into a typed [`Workflow`].
     fn into_workflow(self) -> Result<Workflow, LoomError> {
         Ok(Workflow {
-            id: self
-                .id
-                .parse::<WorkflowId>()
-                .map_err(|e| LoomError::Backend(format!("corrupt workflow id {:?}: {e}", self.id)))?,
-            tenant: self
-                .tenant
-                .parse::<TenantId>()
-                .map_err(|e| LoomError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant)))?,
+            id: self.id.parse::<WorkflowId>().map_err(|e| {
+                LoomError::Backend(format!("corrupt workflow id {:?}: {e}", self.id))
+            })?,
+            tenant: self.tenant.parse::<TenantId>().map_err(|e| {
+                LoomError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant))
+            })?,
             principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
                 LoomError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
             })?,
@@ -259,10 +257,9 @@ impl RawRun {
             workflow_id: self.workflow_id.parse::<WorkflowId>().map_err(|e| {
                 LoomError::Backend(format!("corrupt workflow_id {:?}: {e}", self.workflow_id))
             })?,
-            tenant: self
-                .tenant
-                .parse::<TenantId>()
-                .map_err(|e| LoomError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant)))?,
+            tenant: self.tenant.parse::<TenantId>().map_err(|e| {
+                LoomError::Backend(format!("corrupt tenant {:?}: {e}", self.tenant))
+            })?,
             principal_id: self.principal_id.parse::<PrincipalId>().map_err(|e| {
                 LoomError::Backend(format!("corrupt principal_id {:?}: {e}", self.principal_id))
             })?,
@@ -343,10 +340,9 @@ impl RawStep {
     fn into_step(self) -> Result<Step, LoomError> {
         Ok(Step {
             id: self.id,
-            run_id: self
-                .run_id
-                .parse::<RunId>()
-                .map_err(|e| LoomError::Backend(format!("corrupt run_id {:?}: {e}", self.run_id)))?,
+            run_id: self.run_id.parse::<RunId>().map_err(|e| {
+                LoomError::Backend(format!("corrupt run_id {:?}: {e}", self.run_id))
+            })?,
             name: self.name,
             step_type: StepType::parse(&self.step_type)?,
             config: serde_json::from_str(&self.config)
@@ -393,7 +389,8 @@ impl LoomStore {
 
     /// Enable foreign keys, apply migrations, and wrap the connection.
     fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, LoomError> {
-        conn.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -442,7 +439,9 @@ impl LoomStore {
     /// Define a new workflow (validated DAG) owned by `new.principal_id`.
     pub async fn create_workflow(&self, new: NewWorkflow) -> Result<Workflow, LoomError> {
         if new.name.trim().is_empty() {
-            return Err(LoomError::InvalidInput("workflow name required".to_string()));
+            return Err(LoomError::InvalidInput(
+                "workflow name required".to_string(),
+            ));
         }
         validate_steps(&new.steps)?;
         let now = Timestamp::now();
@@ -477,7 +476,10 @@ impl LoomStore {
                 if f.code == rusqlite::ErrorCode::ConstraintViolation
                     && msg.contains("loom_workflows.name") =>
             {
-                LoomError::InvalidInput(format!("workflow name already exists: {:?}", workflow.name))
+                LoomError::InvalidInput(format!(
+                    "workflow name already exists: {:?}",
+                    workflow.name
+                ))
             }
             _ => berr(e),
         })?;
@@ -624,7 +626,9 @@ impl LoomStore {
     ) -> Result<Run, LoomError> {
         let input = input.unwrap_or_else(|| serde_json::json!({}));
         if !input.is_object() {
-            return Err(LoomError::InvalidInput("input must be a JSON object".to_string()));
+            return Err(LoomError::InvalidInput(
+                "input must be a JSON object".to_string(),
+            ));
         }
         let now = Timestamp::now();
         let (run, workflow_name) = {
@@ -1053,7 +1057,11 @@ impl LoomStore {
     }
 
     /// Advance an owned run: the public nudge for externally driven graphs.
-    pub async fn advance_run(&self, principal: PrincipalId, run_id: RunId) -> Result<(), LoomError> {
+    pub async fn advance_run(
+        &self,
+        principal: PrincipalId,
+        run_id: RunId,
+    ) -> Result<(), LoomError> {
         {
             let conn = self.lock();
             Self::get_run_any(&conn, run_id)?
@@ -1488,11 +1496,14 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(got, wf);
-        assert!(store
-            .get_workflow(PrincipalId::new(), wf.id)
-            .await
-            .expect("get")
-            .is_none(), "owner-scoped");
+        assert!(
+            store
+                .get_workflow(PrincipalId::new(), wf.id)
+                .await
+                .expect("get")
+                .is_none(),
+            "owner-scoped"
+        );
         let by_name = store
             .get_workflow_by_name(principal, &wf.name)
             .await
@@ -1513,9 +1524,18 @@ mod tests {
             .expect("update");
         assert_eq!(updated.description.as_deref(), Some("now described"));
 
-        assert_eq!(store.list_workflows(principal).await.expect("list").len(), 1);
-        assert!(store.delete_workflow(principal, wf.id).await.expect("delete"));
-        assert!(!store.delete_workflow(principal, wf.id).await.expect("delete"));
+        assert_eq!(
+            store.list_workflows(principal).await.expect("list").len(),
+            1
+        );
+        assert!(store
+            .delete_workflow(principal, wf.id)
+            .await
+            .expect("delete"));
+        assert!(!store
+            .delete_workflow(principal, wf.id)
+            .await
+            .expect("delete"));
     }
 
     #[tokio::test]
@@ -1556,7 +1576,11 @@ mod tests {
         let (principal, wf) = workflow_with(
             &store,
             vec![
-                transform("extract", &[], serde_json::json!({"mapping": {"v": "src.value"}})),
+                transform(
+                    "extract",
+                    &[],
+                    serde_json::json!({"mapping": {"v": "src.value"}}),
+                ),
                 transform(
                     "render",
                     &["extract"],
@@ -1567,12 +1591,19 @@ mod tests {
         .await;
 
         let run = store
-            .create_run(principal, wf.id, Some(serde_json::json!({"src": {"value": 41}})))
+            .create_run(
+                principal,
+                wf.id,
+                Some(serde_json::json!({"src": {"value": 41}})),
+            )
             .await
             .expect("run");
         // The whole graph ran inline: created -> steps started/completed -> run completed.
         assert_eq!(run.status, RunStatus::Completed);
-        assert_eq!(run.output, serde_json::json!({"v": 41, "sentence": "value is 41"}));
+        assert_eq!(
+            run.output,
+            serde_json::json!({"v": 41, "sentence": "value is 41"})
+        );
         let kinds = drain_kinds(&mut rx);
         assert_eq!(
             kinds,
@@ -1596,11 +1627,18 @@ mod tests {
         let mut rx = bus.subscribe("workflow");
         let (principal, wf) = workflow_with(
             &store,
-            vec![action("approve", &[]), transform("after", &["approve"], serde_json::json!({}))],
+            vec![
+                action("approve", &[]),
+                transform("after", &["approve"], serde_json::json!({})),
+            ],
         )
         .await;
         let run = store.create_run(principal, wf.id, None).await.expect("run");
-        assert_eq!(run.status, RunStatus::Running, "waiting on the external step");
+        assert_eq!(
+            run.status,
+            RunStatus::Running,
+            "waiting on the external step"
+        );
         let _ = drain_kinds(&mut rx);
 
         let steps = store.get_steps(principal, run.id).await.expect("steps");
@@ -1619,7 +1657,11 @@ mod tests {
             .complete_step(principal, approve.id, serde_json::json!({"approved": true}))
             .await
             .expect("complete");
-        let run = store.get_run(principal, run.id).await.expect("get").expect("present");
+        let run = store
+            .get_run(principal, run.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(run.status, RunStatus::Completed);
         assert_eq!(run.output["approved"], true);
         let kinds = drain_kinds(&mut rx);
@@ -1687,7 +1729,10 @@ mod tests {
         assert_eq!(run.error.as_deref(), Some("boom"));
         let kinds = drain_kinds(&mut rx);
         assert_eq!(
-            kinds.iter().filter(|k| *k == "workflow.step.failed").count(),
+            kinds
+                .iter()
+                .filter(|k| *k == "workflow.step.failed")
+                .count(),
             3,
             "one per attempt"
         );
@@ -1708,7 +1753,11 @@ mod tests {
 
         assert!(store.cancel_run(principal, run.id).await.expect("cancel"));
         assert_eq!(drain_kinds(&mut rx), ["workflow.run.cancelled"]);
-        let run = store.get_run(principal, run.id).await.expect("get").expect("present");
+        let run = store
+            .get_run(principal, run.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(run.status, RunStatus::Cancelled);
         let steps = store.get_steps(principal, run.id).await.expect("steps");
         assert!(steps.iter().all(|s| s.status == StepStatus::Skipped));
@@ -1744,9 +1793,17 @@ mod tests {
         let timed_out = store.sweep_timeouts().await.expect("sweep");
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].status, StepStatus::Failed);
-        let run = store.get_run(principal, run.id).await.expect("get").expect("present");
+        let run = store
+            .get_run(principal, run.id)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(run.error.as_deref().unwrap_or_default().contains("timed out"));
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("timed out"));
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
     }
@@ -1759,12 +1816,18 @@ mod tests {
         store.create_run(principal, wf.id, None).await.expect("run");
         store.cancel_run(principal, r1.id).await.expect("cancel");
 
-        let all = store.list_runs(principal, RunFilter::default()).await.expect("list");
+        let all = store
+            .list_runs(principal, RunFilter::default())
+            .await
+            .expect("list");
         assert_eq!(all.len(), 2);
         let cancelled = store
             .list_runs(
                 principal,
-                RunFilter { status: Some(RunStatus::Cancelled), ..Default::default() },
+                RunFilter {
+                    status: Some(RunStatus::Cancelled),
+                    ..Default::default()
+                },
             )
             .await
             .expect("list");
@@ -1801,7 +1864,11 @@ mod tests {
                 })
                 .await
                 .expect("workflow");
-            run_id = store.create_run(principal, wf.id, None).await.expect("run").id;
+            run_id = store
+                .create_run(principal, wf.id, None)
+                .await
+                .expect("run")
+                .id;
         }
         {
             let store = LoomStore::open(&tmp, Arc::new(AxonBus::new())).expect("reopen");

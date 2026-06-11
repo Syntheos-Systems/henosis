@@ -66,7 +66,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "Step \"{{step}}\" failed in the \"{{workflow}}\" workflow: {{error}}",
     ),
     // ---- Soma / agents ----
-    ("agent.registered", "{{name}} came online as a {{agent_type}}"),
+    (
+        "agent.registered",
+        "{{name}} came online as a {{agent_type}}",
+    ),
     ("agent.deregistered", "{{name}} went offline"),
     ("agent.online", "{{agent}} is online"),
     ("agent.offline", "{{agent}} went offline"),
@@ -85,7 +88,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "evaluation.completed",
         "{{agent}}'s work on \"{{subject}}\" was evaluated using the {{rubric}} rubric",
     ),
-    ("metric.recorded", "{{agent}} recorded {{metric}}: {{value}}"),
+    (
+        "metric.recorded",
+        "{{agent}} recorded {{metric}}: {{value}}",
+    ),
     // ---- System ----
     ("system.started", "{{service}} started up"),
     ("system.stopped", "{{service}} shut down"),
@@ -151,14 +157,17 @@ mod tests {
             &serde_json::json!({"agent": "claude", "title": "ship it", "project": "henosis"}),
         )
         .expect("template exists");
-        assert_eq!(narrative, "claude started a new task: \"ship it\" in henosis");
+        assert_eq!(
+            narrative,
+            "claude started a new task: \"ship it\" in henosis"
+        );
     }
 
     /// Missing payload keys stay visible as the literal placeholder.
     #[test]
     fn missing_keys_remain_visible() {
-        let narrative = narrate_from_template("task.updated", &serde_json::json!({}))
-            .expect("template exists");
+        let narrative =
+            narrate_from_template("task.updated", &serde_json::json!({})).expect("template exists");
         assert!(narrative.contains("{{title}}"));
         assert!(narrative.contains("{{status}}"));
     }

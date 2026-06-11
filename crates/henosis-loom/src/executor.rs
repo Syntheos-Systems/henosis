@@ -66,9 +66,9 @@ impl StepExecutor for TransformExecutor {
                 .ok_or_else(|| "mapping must be an object".to_string())?;
             let mut output = serde_json::Map::new();
             for (target_path, source_path) in mapping {
-                let source_path = source_path.as_str().ok_or_else(|| {
-                    format!("mapping value for {target_path:?} must be a string")
-                })?;
+                let source_path = source_path
+                    .as_str()
+                    .ok_or_else(|| format!("mapping value for {target_path:?} must be a string"))?;
                 let value = resolve_dot_path(ctx.input, source_path);
                 set_dot_path(&mut output, target_path, value);
             }
@@ -176,14 +176,20 @@ mod tests {
     fn set_dot_path_creates_intermediates() {
         let mut out = serde_json::Map::new();
         set_dot_path(&mut out, "x.y", serde_json::json!(1));
-        assert_eq!(serde_json::Value::Object(out), serde_json::json!({"x": {"y": 1}}));
+        assert_eq!(
+            serde_json::Value::Object(out),
+            serde_json::json!({"x": {"y": 1}})
+        );
     }
 
     /// Interpolation substitutes resolved paths; unknown paths become empty.
     #[test]
     fn interpolate_substitutes() {
         let vars = serde_json::json!({"who": "loom", "n": 3});
-        assert_eq!(interpolate("hi {{who}} x{{n}} ({{gone}})", &vars), "hi loom x3 ()");
+        assert_eq!(
+            interpolate("hi {{who}} x{{n}} ({{gone}})", &vars),
+            "hi loom x3 ()"
+        );
     }
 
     /// The transform executor's three modes: mapping, template, pass-through.
@@ -200,9 +206,15 @@ mod tests {
             input: &input,
             timeout_ms: 1000,
         };
-        let mapped = exec.execute(ctx(r#"{"mapping": {"out.v": "src.v"}}"#)).await.unwrap();
+        let mapped = exec
+            .execute(ctx(r#"{"mapping": {"out.v": "src.v"}}"#))
+            .await
+            .unwrap();
         assert_eq!(mapped, serde_json::json!({"out": {"v": 42}}));
-        let rendered = exec.execute(ctx(r#"{"template": "v={{src.v}}"}"#)).await.unwrap();
+        let rendered = exec
+            .execute(ctx(r#"{"template": "v={{src.v}}"}"#))
+            .await
+            .unwrap();
         assert_eq!(rendered, serde_json::json!("v=42"));
         let passthrough = exec.execute(ctx("{}")).await.unwrap();
         assert_eq!(passthrough, input);
