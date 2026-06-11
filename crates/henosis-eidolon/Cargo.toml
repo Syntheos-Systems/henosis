@@ -1,0 +1,29 @@
+[package]
+name = "henosis-eidolon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Eidolon: the policy authority for the dispatcher's eidolon gate slot -- prompt-injection, persona-drift, and scope-violation checks."
+
+[dependencies]
+# The canonical Gate/GateDecision/GateRequest contract plus PrincipalId/TenantId.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# Object-safe async traits: the Gate impl and the DriftSignal seam.
+async-trait.workspace = true
+# Policy config types serialize for logging/persistence (shared with the 2.3 output filter).
+serde.workspace = true
+# The injection scan serializes the invocation payload; the scope scan walks it.
+serde_json.workspace = true
+# EidolonError (policy construction validation).
+thiserror.workspace = true
+
+[dev-dependencies]
+# Workspace tokio is "full" -- runtime + macros for #[tokio::test] and the proptest block_on runtime.
+tokio = { workspace = true }
+# Property tests proving the fail-closed invariants (any backing error => never Allow).
+proptest = { workspace = true }
+# Dispatcher-integration test: the real EidolonGate in the canonical chain's eidolon slot.
+syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
+# The in-process bus the integration-test dispatcher narrates onto.
+syntheos-axon = { path = "../syntheos-axon" }

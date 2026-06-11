@@ -12,6 +12,7 @@ members = [
     "crates/henosis-broca",
     "crates/henosis-loom",
     "crates/henosis-thymus",
+    "crates/henosis-eidolon",
     "crates/agent-forge-lib",
 ]
 
@@ -46,5 +47,7 @@ rusqlite = { version = "0.31" }
 # crates inherit one pinned version; unused until the first Postgres crate lands.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid"] }
 zeroize = { version = "1", features = ["derive"] }
+# Property testing for security-critical invariants (the EidolonGate fail-closed proofs). Dev-only.
+proptest = "1"
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
