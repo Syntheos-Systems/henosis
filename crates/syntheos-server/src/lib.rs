@@ -5,11 +5,17 @@
 //! The single HTTP entry point for the Henosis agent OS: Phase 0 unit 5 (the capstone).
 //!
 //! It boots the Phase 0 foundation -- the [`syntheos_axon`] bus, the
-//! [`syntheos_identity`] principal directory, and the [`syntheos_dispatch`] dispatcher (running
-//! the canonical deny-by-default gate chain, so every action is denied until real authorities
-//! land) -- into shared [`AppState`] and serves a small surface: `/health`, `/version`,
-//! `POST /enroll`, and `POST /dispatch`. The dispatch route runs an action through the real gate
-//! chain, so the whole Phase 0 stack is exercised fail-closed end-to-end over the wire.
+//! [`syntheos_identity`] principal directory, and the [`syntheos_dispatch`] dispatcher -- into
+//! shared [`AppState`] and serves a small surface: `/health`, `/version`, `POST /enroll`, and
+//! `POST /dispatch`. The dispatch route runs an action through the real gate chain, so the whole
+//! stack is exercised fail-closed end-to-end over the wire.
+//!
+//! The gate chain is the Phase 2 shape ([`live_gate_chain`], Story 2.6): the REAL `EidolonGate`
+//! in the eidolon slot -- prompt-injection, scope-violation, and persona-drift policy, the
+//! latter read from the Thymus store through the [`ThymusDriftSignal`] adapter -- with
+//! fail-closed deny-stubs in the pistis/plutus/human/phylax slots until those authorities land
+//! (Phases 3-4). The `EidolonOutputFilter` is wired into the dispatcher's output slot, scrubbing
+//! credential-bearing fields from executor results.
 //!
 //! All five Phase 1 kernel services are wired (Story 1.7), each with a persistent store opened
 //! at boot: `/chiasm/tasks` (+ `/chiasm/stats`), `/soma/agents`
@@ -30,11 +36,11 @@
 pub mod app;
 
 pub use app::{
-    router, AppState, BrocaFeedQuery, BrocaLogRequest, BrocaTenantQuery, ChiasmCreateTask,
-    ChiasmListQuery, ChiasmOwnerQuery, EnrollRequest, LoomCompleteStep, LoomCreateRun,
-    LoomCreateWorkflow, LoomFailStep, LoomLogsQuery, LoomOwnerQuery, LoomRunsQuery,
-    SomaHeartbeatRequest, SomaListQuery, SomaQualityRequest, SomaQualitySink, SomaRegisterRequest,
-    SomaStatsQuery, ThymusCreateRubric, ThymusDriftQuery, ThymusEvaluate,
-    ThymusEvaluationsQuery, ThymusMetricSummaryQuery, ThymusOwnerQuery, ThymusRecordDrift,
-    ThymusRecordMetric,
+    eidolon_gate, live_gate_chain, router, AppState, BrocaFeedQuery, BrocaLogRequest,
+    BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery, ChiasmOwnerQuery, EnrollRequest,
+    LoomCompleteStep, LoomCreateRun, LoomCreateWorkflow, LoomFailStep, LoomLogsQuery,
+    LoomOwnerQuery, LoomRunsQuery, SomaHeartbeatRequest, SomaListQuery, SomaQualityRequest,
+    SomaQualitySink, SomaRegisterRequest, SomaStatsQuery, ThymusCreateRubric, ThymusDriftQuery,
+    ThymusDriftSignal, ThymusEvaluate, ThymusEvaluationsQuery, ThymusMetricSummaryQuery,
+    ThymusOwnerQuery, ThymusRecordDrift, ThymusRecordMetric,
 };

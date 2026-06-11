@@ -18,6 +18,8 @@ henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
 henosis-loom = { path = "../henosis-loom" }
 henosis-thymus = { path = "../henosis-thymus" }
+# The eidolon authority: the real gate in the eidolon slot + the output filter (Story 2.6).
+henosis-eidolon = { path = "../henosis-eidolon" }
 # HTTP surface.
 axum.workspace = true
 # Global concurrency cap on the HTTP surface (resource-limit hardening).

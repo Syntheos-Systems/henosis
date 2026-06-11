@@ -860,6 +860,37 @@ impl ThymusStore {
         Ok(out)
     }
 
+    /// The distinct (drift type, severity) pairs recorded for `agent` within `tenant`,
+    /// regardless of which owner recorded them: an agent's active drift flags as a
+    /// tenant-scoped authority (the Eidolon gate, through the server's DriftSignal adapter)
+    /// consumes them. Within a tenant, every recorded observation about an agent gates that
+    /// agent -- drift is a property of the agent, not of who noticed it.
+    pub async fn agent_drift_flags(
+        &self,
+        tenant: TenantId,
+        agent: PrincipalId,
+    ) -> Result<Vec<(DriftType, DriftSeverity)>, ThymusError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT drift_type, severity FROM thymus_drift_events \
+                 WHERE tenant = ?1 AND agent = ?2",
+            )
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![tenant.to_string(), agent.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(berr)?;
+        let mut flags = Vec::new();
+        for row in rows {
+            let (drift_type, severity) = row.map_err(berr)?;
+            flags.push((DriftType::parse(&drift_type)?, DriftSeverity::parse(&severity)?));
+        }
+        Ok(flags)
+    }
+
     /// Aggregate quality counts for a principal.
     pub async fn stats(&self, principal: PrincipalId) -> Result<ThymusStats, ThymusError> {
         let conn = self.lock();
@@ -1306,5 +1337,52 @@ mod tests {
             assert_eq!(got.name, "durable");
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `agent_drift_flags` is scoped by (tenant, agent): the distinct (type, severity) pairs for
+    /// that agent in that tenant only, regardless of which owner recorded them. This is the read
+    /// the Eidolon gate consumes through the server's DriftSignal adapter (Story 2.6).
+    #[tokio::test]
+    async fn agent_drift_flags_scoped_by_tenant_and_agent() {
+        let (store, _sink, _bus) = store_with_sink();
+        let tenant = TenantId::new();
+        let owner = PrincipalId::new();
+        let agent = PrincipalId::new();
+        for (t, a, drift_type, severity) in [
+            // Two identical pairs for the agent in-tenant: must dedupe to one flag.
+            (tenant, agent, DriftType::Safety, Some(DriftSeverity::High)),
+            (tenant, agent, DriftType::Safety, Some(DriftSeverity::High)),
+            // Defaulted severity (Medium) for a second type.
+            (tenant, agent, DriftType::Priority, None),
+            // Another agent in the same tenant: excluded.
+            (tenant, PrincipalId::new(), DriftType::Meaning, None),
+            // The same agent in another tenant: excluded.
+            (TenantId::new(), agent, DriftType::Structural, None),
+        ] {
+            store
+                .record_drift_event(NewDriftEvent {
+                    tenant: t,
+                    principal_id: owner,
+                    agent: a,
+                    session: None,
+                    drift_type,
+                    severity,
+                    signal: "test signal".to_string(),
+                })
+                .await
+                .expect("record");
+        }
+        let mut flags = store
+            .agent_drift_flags(tenant, agent)
+            .await
+            .expect("flags");
+        flags.sort_by_key(|(t, _)| t.as_str());
+        assert_eq!(
+            flags,
+            vec![
+                (DriftType::Priority, DriftSeverity::Medium),
+                (DriftType::Safety, DriftSeverity::High),
+            ]
+        );
     }
 }

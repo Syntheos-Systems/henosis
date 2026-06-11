@@ -2576,6 +2576,7 @@ dependencies = [
  "axum",
  "henosis-broca",
  "henosis-chiasm",
+ "henosis-eidolon",
  "henosis-loom",
  "henosis-soma",
  "henosis-thymus",
