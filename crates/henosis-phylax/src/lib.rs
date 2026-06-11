@@ -22,8 +22,10 @@ pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod model;
+pub mod policy_store;
+pub mod resolve;
 pub mod store;
 
 pub use error::PhylaxError;
-pub use model::SecretData;
+pub use model::{ExecOutcome, Policy, ResolveMode, SecretData, SignAlgo};
 pub use store::PhylaxStore;

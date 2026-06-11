@@ -24,16 +24,19 @@ use crate::events::{SecretDeleted, SecretStored};
 use crate::model::SecretData;
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__phylax.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__phylax.sql")),
+    (2, include_str!("../migrations/V2__phylax_policies.sql")),
+];
 
 /// Map a generic rusqlite error to an opaque backend error.
-fn berr(e: impl std::fmt::Display) -> PhylaxError {
+pub(crate) fn berr(e: impl std::fmt::Display) -> PhylaxError {
     PhylaxError::Backend(e.to_string())
 }
 
 /// The current time as its stored RFC3339-UTC string (via the contracts wire form -- `Timestamp`
 /// has no `Display`, only a serde representation).
-fn now_string() -> Result<String, PhylaxError> {
+pub(crate) fn now_string() -> Result<String, PhylaxError> {
     serde_json::to_value(Timestamp::now())
         .ok()
         .and_then(|v| v.as_str().map(String::from))
@@ -87,9 +90,15 @@ impl PhylaxStore {
         })
     }
 
-    /// Lock the connection, recovering from a poisoned mutex.
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    /// Lock the connection, recovering from a poisoned mutex. Crate-internal so sibling modules
+    /// (policy store, resolve modes) share the one serialized connection.
+    pub(crate) fn lock_conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The master key, for the crate-internal resolve modes that decrypt in-process.
+    pub(crate) fn master_key(&self) -> &[u8; KEY_SIZE] {
+        &self.master_key
     }
 
     /// Publish a phylax event, fire-and-forget. A publish failure is logged, never fatal --
@@ -120,7 +129,7 @@ impl PhylaxStore {
         let now = now_string()?;
 
         {
-            let conn = self.lock();
+            let conn = self.lock_conn();
             conn.execute(
                 "INSERT INTO phylax_secrets
                    (tenant, category, name, secret_ciphertext, created_at, updated_at)
@@ -170,7 +179,7 @@ impl PhylaxStore {
         category: &str,
         name: &str,
     ) -> Result<Vec<u8>, PhylaxError> {
-        let conn = self.lock();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT secret_ciphertext FROM phylax_secrets
              WHERE tenant = ?1 AND category = ?2 AND name = ?3",
@@ -185,6 +194,19 @@ impl PhylaxStore {
         })
     }
 
+    /// Decrypt a stored secret for in-process use by the resolve modes. Crate-internal so the
+    /// plaintext path stays off the public surface.
+    pub(crate) fn load_secret(
+        &self,
+        tenant: &TenantId,
+        category: &str,
+        name: &str,
+    ) -> Result<SecretData, PhylaxError> {
+        let blob = self.load_ciphertext(tenant, category, name)?;
+        let plaintext = crypto::decrypt(self.master_key(), &blob)?;
+        serde_json::from_slice(&plaintext).map_err(|e| PhylaxError::Decryption(e.to_string()))
+    }
+
     /// Delete a secret. Owner-tier administration. Errors if it does not exist.
     pub fn delete_secret(
         &self,
@@ -194,7 +216,7 @@ impl PhylaxStore {
         name: &str,
     ) -> Result<(), PhylaxError> {
         let affected = {
-            let conn = self.lock();
+            let conn = self.lock_conn();
             conn.execute(
                 "DELETE FROM phylax_secrets WHERE tenant = ?1 AND category = ?2 AND name = ?3",
                 rusqlite::params![tenant.to_string(), category, name],
@@ -223,7 +245,7 @@ impl PhylaxStore {
         &self,
         tenant: &TenantId,
     ) -> Result<Vec<(String, String)>, PhylaxError> {
-        let conn = self.lock();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT category, name FROM phylax_secrets
