@@ -4,6 +4,7 @@ members = [
     "crates/syntheos-memory-gateway",
     "crates/syntheos-contracts",
     "crates/syntheos-axon",
+    "crates/syntheos-axon-durable",
     "crates/syntheos-dispatch",
     "crates/syntheos-identity",
     "crates/syntheos-server",

@@ -2506,6 +2506,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntheos-axon-durable"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "syntheos-contracts"
 version = "0.1.0"
 dependencies = [
