@@ -1,0 +1,36 @@
+[package]
+name = "henosis-pistis"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pistis: the capability authority for the dispatcher's pistis gate slot -- ed25519 admission, room-materialized trust math, and fail-closed capability authorization. An independent snapshot of the GhostFrame/pistis decision core, reworked onto the principal model."
+
+[dependencies]
+# Gate/GateDecision/GateRequest contract plus PrincipalId/RequestContext/TypedEvent.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# The in-process bus pistis publishes capability-decision events onto.
+syntheos-axon = { path = "../syntheos-axon" }
+# Object-safe async Gate impl.
+async-trait.workspace = true
+# RoomState/Capability/OutcomeAttestation (de)serialize for materialization and audit.
+serde.workspace = true
+# Trust-math timestamps and capability expiry (henosis-native time crate, not chrono).
+time.workspace = true
+# PistisError.
+thiserror.workspace = true
+# ed25519 admission/grant signing + verification.
+ed25519-dalek.workspace = true
+# Secret signing-key bytes are zeroized after each use.
+zeroize.workspace = true
+# CSPRNG for keypair generation.
+rand.workspace = true
+# Capability denials and trust verdicts are logged.
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Gate-request `args` are JSON; tests build them with the `json!` macro.
+serde_json.workspace = true
+# Dispatcher-integration test: the real PistisGate in the canonical chain's pistis slot.
+syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }

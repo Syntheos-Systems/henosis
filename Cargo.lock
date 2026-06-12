@@ -1084,6 +1084,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-pistis"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "syntheos-dispatch",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "henosis-soma"
 version = "0.1.0"
 dependencies = [

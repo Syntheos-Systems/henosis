@@ -15,6 +15,7 @@ members = [
     "crates/henosis-thymus",
     "crates/henosis-eidolon",
     "crates/henosis-phylax",
+    "crates/henosis-pistis",
     "crates/agent-forge-lib",
 ]
 
