@@ -39,6 +39,38 @@ pub trait RoomStateSource: Send + Sync {
     fn room_state(&self, room: &str) -> Option<RoomState>;
 }
 
+/// An in-memory [`RoomStateSource`] backed by a room-id map.
+///
+/// This is the source the server wires until live Matrix materialization lands:
+/// constructed empty, it returns `None` for every room, so the real gate denies
+/// every capability-bearing request (fail-closed) while still allowing requests
+/// that declare no capability. Materialized rooms can be inserted as the live
+/// path comes online.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryRoomStateSource {
+    /// Materialized state keyed by room id.
+    rooms: std::collections::HashMap<String, RoomState>,
+}
+
+impl InMemoryRoomStateSource {
+    /// Construct an empty source (no rooms materialized).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or replace the materialized state for `room`.
+    pub fn insert(&mut self, room: impl Into<String>, state: RoomState) {
+        self.rooms.insert(room.into(), state);
+    }
+}
+
+impl RoomStateSource for InMemoryRoomStateSource {
+    /// Look up the materialized state for `room`.
+    fn room_state(&self, room: &str) -> Option<RoomState> {
+        self.rooms.get(room).cloned()
+    }
+}
+
 /// A wall-clock source, injected so the trust math stays testable.
 pub trait Clock: Send + Sync {
     /// The current UTC instant.

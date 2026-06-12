@@ -12,6 +12,7 @@ use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
 use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_phylax::PhylaxStore;
+use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
@@ -80,11 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(path = %thymus_db, "thymus quality store open");
 
-    // The Phase 2 dispatcher (Story 2.6): the REAL EidolonGate in the eidolon slot (its drift
-    // policy reads the Thymus store), fail-closed deny-stubs in the other four slots until those
-    // authorities land, the deny executor (no real executor until Hermes, Phase 5), and the
-    // eidolon output filter scrubbing credential fields from any executor result.
-    // `Dispatcher::new` re-validates the chain is exactly canonical at boot.
+    // The Phase 3 dispatcher: the REAL PistisGate in the pistis slot (Story 3.3) and the REAL
+    // EidolonGate in the eidolon slot (its drift policy reads the Thymus store), fail-closed
+    // deny-stubs in the plutus/human slots until those authorities land, the deny executor (no
+    // real executor until Hermes, Phase 5), and the eidolon output filter scrubbing credential
+    // fields from any executor result. `Dispatcher::new` re-validates the chain is exactly
+    // canonical at boot.
     // The phylax credential authority is opt-in and fail-closed: it activates only when a master
     // key is configured (SYNTHEOS_PHYLAX_KEY). Absent a key, the phylax slot stays a deny-stub so
     // no credential operation is silently permitted.
@@ -96,10 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => tracing::info!("phylax disabled (SYNTHEOS_PHYLAX_KEY unset); phylax slot denies"),
     }
 
+    // The pistis capability authority is a REAL gate in the pistis slot. Until live Matrix room
+    // materialization lands, its room-state source is empty: a capability-bearing invocation fails
+    // closed (no room state -> deny) while an invocation declaring no capability passes pistis for
+    // the rest of the chain to decide.
+    let pistis_source: Arc<dyn RoomStateSource> = Arc::new(InMemoryRoomStateSource::new());
+
     let policy = EidolonPolicy::default();
     let dispatcher = Arc::new(
         Dispatcher::new(
-            live_gate_chain(&policy, thymus.clone(), phylax)?,
+            live_gate_chain(&policy, thymus.clone(), pistis_source, phylax)?,
             Box::new(DenyExecutor),
             bus.clone(),
         )?
@@ -137,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "syntheos-server listening (eidolon live; pistis/plutus/human/phylax deny-stubbed)");
+    tracing::info!(%addr, "syntheos-server listening (pistis + eidolon live, phylax live when keyed; plutus/human deny-stubbed)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

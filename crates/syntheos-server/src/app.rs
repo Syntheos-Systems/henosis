@@ -17,6 +17,7 @@ use henosis_loom::{
     StepDef, Workflow,
 };
 use henosis_phylax::{PhylaxGate, PhylaxStore};
+use henosis_pistis::{PistisGate, RoomStateSource};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
@@ -99,10 +100,16 @@ pub fn eidolon_gate(
     EidolonGate::new(policy.clone(), Arc::new(ThymusDriftSignal(thymus)))
 }
 
-/// The live gate chain: the REAL [`EidolonGate`] in the eidolon slot, the REAL [`PhylaxGate`] in
-/// the phylax slot when a credential store is configured, and fail-closed deny-stubs in the
-/// pistis/plutus/human slots until those authorities land. Canonical by construction --
-/// [`Dispatcher::new`] validates it again at boot.
+/// The live gate chain: the REAL [`PistisGate`] in the pistis slot, the REAL [`EidolonGate`] in
+/// the eidolon slot, the REAL [`PhylaxGate`] in the phylax slot when a credential store is
+/// configured, and fail-closed deny-stubs in the plutus/human slots until those authorities land.
+/// Canonical by construction -- [`Dispatcher::new`] validates it again at boot.
+///
+/// `pistis_source` supplies the gate's materialized room state. Until live Matrix materialization
+/// lands it is an empty [`InMemoryRoomStateSource`](henosis_pistis::InMemoryRoomStateSource): a
+/// capability-bearing invocation then fails closed (no room state -> deny), while an invocation
+/// that declares no capability passes pistis for the rest of the chain to decide. The pistis slot
+/// is a REAL gate either way -- never a deny-stub that would block the whole chain at its head.
 ///
 /// `phylax` is optional: with no configured credential store (no master key in the environment)
 /// the phylax slot stays a [`DenyGate`], so the absence of the authority denies rather than
@@ -110,6 +117,7 @@ pub fn eidolon_gate(
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
+    pistis_source: Arc<dyn RoomStateSource>,
     phylax: Option<Arc<PhylaxStore>>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     let phylax_gate: Box<dyn Gate> = match phylax {
@@ -117,7 +125,7 @@ pub fn live_gate_chain(
         None => Box::new(DenyGate::new("phylax")),
     };
     Ok(vec![
-        Box::new(DenyGate::new("pistis")),
+        Box::new(PistisGate::new(pistis_source)),
         Box::new(DenyGate::new("plutus")),
         Box::new(eidolon_gate(policy, thymus)?),
         Box::new(DenyGate::new("human")),
@@ -1574,8 +1582,13 @@ mod tests {
     async fn live_gate_chain_is_canonical() {
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
-        let chain = live_gate_chain(&henosis_eidolon::EidolonPolicy::default(), thymus, None)
-            .expect("valid default policy");
+        let chain = live_gate_chain(
+            &henosis_eidolon::EidolonPolicy::default(),
+            thymus,
+            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            None,
+        )
+        .expect("valid default policy");
         let dispatcher =
             Dispatcher::new(chain, Box::new(syntheos_dispatch::deny::DenyExecutor), bus)
                 .expect("canonical chain");
@@ -1627,6 +1640,7 @@ mod tests {
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
+            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
             Some(phylax),
         )
         .expect("valid default policy");
@@ -1666,6 +1680,74 @@ mod tests {
             phylax_slot.check(&denied_req).await.unwrap(),
             GateDecision::Deny { .. }
         ));
+    }
+
+    /// Story 3.7 acceptance: through the live chain, the REAL PistisGate lets a request that
+    /// declares no capability traverse the pistis slot, where the next authority (plutus, still a
+    /// deny-stub) denies it -- and fails a capability-bearing request closed at the pistis slot,
+    /// since the empty room-state source has no authority state to verify against.
+    #[tokio::test]
+    async fn live_chain_pistis_passes_then_plutus_denies() {
+        use syntheos_contracts::{GateRequest, RequestContext, ToolInvocation};
+        use syntheos_dispatch::{DispatchOutcome, Dispatcher};
+
+        let bus = Arc::new(AxonBus::new());
+        let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        let chain = live_gate_chain(
+            &henosis_eidolon::EidolonPolicy::default(),
+            thymus,
+            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            None,
+        )
+        .expect("valid default policy");
+        let dispatcher =
+            Dispatcher::new(chain, Box::new(syntheos_dispatch::deny::DenyExecutor), bus)
+                .expect("canonical chain");
+
+        let base = RequestContext {
+            tenant: TenantId::new(),
+            principal: PrincipalId::new(),
+            persona: None,
+            session: None,
+            room: Some("!room".into()),
+            task: None,
+            workflow: None,
+        };
+
+        // No declared capability -> pistis allows -> plutus (deny-stub) denies. The denial landing
+        // at plutus, not pistis, proves the request traversed the real pistis gate.
+        let no_cap = dispatcher
+            .dispatch(GateRequest {
+                context: base.clone(),
+                invocation: ToolInvocation {
+                    tool: "kleos".into(),
+                    action: "memory_store".into(),
+                    args: serde_json::json!({}),
+                },
+            })
+            .await
+            .expect("dispatch");
+        match no_cap {
+            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "plutus"),
+            other => panic!("expected Denied at plutus, got {other:?}"),
+        }
+
+        // A declared capability with no materialized room state -> pistis fails closed.
+        let with_cap = dispatcher
+            .dispatch(GateRequest {
+                context: base,
+                invocation: ToolInvocation {
+                    tool: "synapse".into(),
+                    action: "run".into(),
+                    args: serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
+                },
+            })
+            .await
+            .expect("dispatch");
+        match with_cap {
+            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "pistis"),
+            other => panic!("expected Denied at pistis, got {other:?}"),
+        }
     }
 
     /// Collect a response body into a UTF-8 string.

@@ -31,7 +31,7 @@ pub use authority::{
     authorize_capabilities, CapabilityCheckDecision, CapabilityCheckRequest, CapabilityRequirement,
 };
 pub use error::{PistisError, Result};
-pub use gate::{Clock, PistisGate, RoomStateSource, SystemClock};
+pub use gate::{Clock, InMemoryRoomStateSource, PistisGate, RoomStateSource, SystemClock};
 pub use model::{
     ActionKind, AdmittedPrincipal, Capability, Outcome, OutcomeAttestation, RoomPolicy,
 };
