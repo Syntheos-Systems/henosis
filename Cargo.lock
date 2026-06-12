@@ -1089,6 +1089,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
+ "proptest",
  "rand 0.9.4",
  "serde",
  "serde_json",

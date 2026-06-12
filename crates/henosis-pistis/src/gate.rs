@@ -426,4 +426,41 @@ mod tests {
             "held capability must reach the executor, got {allowed:?}"
         );
     }
+
+    /// R7 invariant (roadmap line 410): an unavailable backing authority must
+    /// produce a `Deny`, never an `Allow`. Property: for any principal, room,
+    /// capability name, and (well-formed) action kind, a capability-bearing
+    /// request evaluated against an *empty* room-state source -- the authority
+    /// has no state to verify against -- never returns `Allow`.
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn empty_authority_never_allows_capability_request(
+            name in "[a-z_]{1,16}",
+            kind in proptest::sample::select(vec![
+                "message", "capability_claim", "outcome", "task_accept", "task_complete",
+                "commit", "commit_protected", "merge", "deploy", "delete", "credential_rotate",
+                "ledger_modify", "review", "endorse",
+            ]),
+            room in "![a-z]{1,10}",
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let gate = PistisGate::with_clock(
+                Arc::new(InMemoryRoomStateSource::new()),
+                Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)),
+            );
+            let req = request(
+                PrincipalId::new(),
+                Some(&room),
+                serde_json::json!({"capability": name, "action_kind": kind}),
+            );
+            let decision = rt.block_on(gate.check(&req)).expect("gate check is total");
+            prop_assert!(
+                !matches!(decision, GateDecision::Allow),
+                "empty authority must never Allow a capability request, got {decision:?}"
+            );
+        }
+    }
 }

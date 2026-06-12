@@ -32,5 +32,7 @@ tracing.workspace = true
 tokio = { workspace = true }
 # Gate-request `args` are JSON; tests build them with the `json!` macro.
 serde_json.workspace = true
+# R7 property test: an unavailable backing authority never yields Allow.
+proptest = { workspace = true }
 # Dispatcher-integration test: the real PistisGate in the canonical chain's pistis slot.
 syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
