@@ -132,6 +132,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawPresence> {
     })
 }
 
+/// Methods for `RawPresence`.
 impl RawPresence {
     /// Parse raw columns into a typed [`AgentPresence`], surfacing any corrupt value as a
     /// backend error. Strict (no Kleos-style fallback-to-empty): every row is written by this
@@ -166,6 +167,7 @@ impl RawPresence {
     }
 }
 
+/// Methods for `SomaStore`.
 impl SomaStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     pub fn open(
@@ -347,11 +349,21 @@ impl SomaStore {
         raw.map(RawPresence::into_presence).transpose()
     }
 
-    /// List registered agents, newest-registered first, AND-filtered by [`PresenceFilter`].
-    pub async fn list(&self, filter: PresenceFilter) -> Result<Vec<AgentPresence>, SomaError> {
-        let mut sql = format!("SELECT {PRESENCE_COLUMNS} FROM soma_presence WHERE 1 = 1");
-        let mut args: Vec<rusqlite::types::Value> = Vec::new();
-        let mut n = 0;
+    /// List registered agents in `tenant`, newest-registered first, AND-filtered by
+    /// [`PresenceFilter`].
+    ///
+    /// Tenant-scoped: presence rows carry a tenant, and a caller must not be able to
+    /// enumerate other tenants' agents. This mirrors the chiasm kernel precedent (every
+    /// read is owner-scoped) applied at Soma's tenant grain. The tenant is caller-asserted
+    /// in Phase 1; Phase 3 replaces the asserted value with a verified one.
+    pub async fn list(
+        &self,
+        tenant: TenantId,
+        filter: PresenceFilter,
+    ) -> Result<Vec<AgentPresence>, SomaError> {
+        let mut sql = format!("SELECT {PRESENCE_COLUMNS} FROM soma_presence WHERE tenant = ?1");
+        let mut args: Vec<rusqlite::types::Value> = vec![tenant.to_string().into()];
+        let mut n = 1;
         if let Some(agent_type) = &filter.agent_type {
             n += 1;
             sql.push_str(&format!(" AND agent_type = ?{n}"));
@@ -504,6 +516,11 @@ impl SomaStore {
     ///
     /// The overdue comparison is computed in Rust rather than SQL so it does not depend on
     /// SQLite parsing nanosecond-precision RFC3339 timestamps (the chiasm precedent).
+    ///
+    /// Intentionally cross-tenant and NOT HTTP-exposed: this is an internal liveness reaper
+    /// that must sweep every tenant's stale agents. Unlike [`Self::list`] (a caller-facing
+    /// discovery API), it is driven by a trusted background task, so it carries no tenant
+    /// predicate by design.
     pub async fn list_stale(&self, threshold_secs: i64) -> Result<Vec<AgentPresence>, SomaError> {
         let candidates: Vec<AgentPresence> = {
             let conn = self.lock();
@@ -531,11 +548,15 @@ impl SomaStore {
             .collect())
     }
 
-    /// Return every agent advertising exactly `capability`. A SQL `LIKE` prefilter narrows the
-    /// row set; an exact-match post-filter in Rust discards substring false positives (`code`
-    /// must not match `code-review`) -- the Kleos algorithm, ported.
+    /// Return every agent in `tenant` advertising exactly `capability`. A SQL `LIKE`
+    /// prefilter narrows the row set; an exact-match post-filter in Rust discards substring
+    /// false positives (`code` must not match `code-review`) -- the Kleos algorithm, ported.
+    ///
+    /// Tenant-scoped for the same reason as [`Self::list`]: capability discovery must not
+    /// cross the tenant boundary.
     pub async fn find_by_capability(
         &self,
+        tenant: TenantId,
         capability: &str,
     ) -> Result<Vec<AgentPresence>, SomaError> {
         let like = format!("%{capability}%");
@@ -543,11 +564,12 @@ impl SomaStore {
             let conn = self.lock();
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT {PRESENCE_COLUMNS} FROM soma_presence WHERE capabilities LIKE ?1"
+                    "SELECT {PRESENCE_COLUMNS} FROM soma_presence \
+                     WHERE tenant = ?1 AND capabilities LIKE ?2"
                 ))
                 .map_err(berr)?;
             let rows = stmt
-                .query_map(rusqlite::params![like], read_raw)
+                .query_map(rusqlite::params![tenant.to_string(), like], read_raw)
                 .map_err(berr)?;
             let mut out = Vec::new();
             for row in rows {
@@ -672,6 +694,7 @@ pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), SomaError> {
 }
 
 #[cfg(test)]
+/// Unit tests for this module.
 mod tests {
     use super::*;
     use syntheos_contracts::PrincipalKind;
@@ -718,6 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Register then get roundtrips with defaults.
     async fn register_then_get_roundtrips_with_defaults() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -737,6 +761,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Register requires enrolled principal.
     async fn register_requires_enrolled_principal() {
         let (store, _bus, _directory) = store();
         let req = RegisterAgent {
@@ -753,6 +778,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Register emits and upsert preserves liveness.
     async fn register_emits_and_upsert_preserves_liveness() {
         let (store, bus, directory) = store();
         let mut rx = bus.subscribe("agent");
@@ -790,6 +816,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Register rejects empty name and type.
     async fn register_rejects_empty_name_and_type() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -808,6 +835,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Register rejects taken name in tenant.
     async fn register_rejects_taken_name_in_tenant() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -829,6 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Heartbeat revives pending and offline keeps error sticky.
     async fn heartbeat_revives_pending_and_offline_keeps_error_sticky() {
         let (store, bus, directory) = store();
         let mut rx = bus.subscribe("agent");
@@ -882,6 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Set status updates and emits.
     async fn set_status_updates_and_emits() {
         let (store, bus, directory) = store();
         let mut rx = bus.subscribe("agent");
@@ -909,6 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// List filters by type status and limit.
     async fn list_filters_by_type_status_and_limit() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -923,20 +954,26 @@ mod tests {
             .expect("heartbeat");
 
         let coding = store
-            .list(PresenceFilter {
-                agent_type: Some("coding".to_string()),
-                ..Default::default()
-            })
+            .list(
+                tenant,
+                PresenceFilter {
+                    agent_type: Some("coding".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("list");
         assert_eq!(coding.len(), 1);
         assert_eq!(coding[0].name, "coder");
 
         let online = store
-            .list(PresenceFilter {
-                status: Some(PresenceStatus::Online),
-                ..Default::default()
-            })
+            .list(
+                tenant,
+                PresenceFilter {
+                    status: Some(PresenceStatus::Online),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("list");
         assert_eq!(online.len(), 1);
@@ -944,10 +981,13 @@ mod tests {
 
         assert_eq!(
             store
-                .list(PresenceFilter {
-                    limit: Some(1),
-                    ..Default::default()
-                })
+                .list(
+                    tenant,
+                    PresenceFilter {
+                        limit: Some(1),
+                        ..Default::default()
+                    }
+                )
                 .await
                 .expect("list")
                 .len(),
@@ -955,7 +995,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list(PresenceFilter::default())
+                .list(tenant, PresenceFilter::default())
                 .await
                 .expect("list")
                 .len(),
@@ -964,6 +1004,31 @@ mod tests {
     }
 
     #[tokio::test]
+    /// List is tenant scoped.
+    async fn list_is_tenant_scoped() {
+        // Cross-tenant isolation: an agent registered under tenant A must not
+        // appear in tenant B's listing.
+        let (store, _bus, directory) = store();
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let a = enrolled_agent(&directory, tenant_a, "a-agent").await;
+        store.register(a).await.expect("register a");
+
+        let seen_a = store
+            .list(tenant_a, PresenceFilter::default())
+            .await
+            .expect("list a");
+        assert_eq!(seen_a.len(), 1, "tenant A sees its own agent");
+
+        let seen_b = store
+            .list(tenant_b, PresenceFilter::default())
+            .await
+            .expect("list b");
+        assert!(seen_b.is_empty(), "tenant B must not see tenant A's agent");
+    }
+
+    #[tokio::test]
+    /// Get by name finds within tenant.
     async fn get_by_name_finds_within_tenant() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -984,6 +1049,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Delete removes and emits but never touches directory.
     async fn delete_removes_and_emits_but_never_touches_directory() {
         let (store, bus, directory) = store();
         let mut rx = bus.subscribe("agent");
@@ -1004,6 +1070,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// List stale finds overdue online agents only.
     async fn list_stale_finds_overdue_online_agents_only() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -1025,6 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Find by capability is exact.
     async fn find_by_capability_is_exact() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -1036,12 +1104,15 @@ mod tests {
         store.register(b).await.expect("register");
 
         // `code` matches only the exact entry, not the `code-review` substring superset.
-        let found = store.find_by_capability("code").await.expect("find");
+        let found = store
+            .find_by_capability(tenant, "code")
+            .await
+            .expect("find");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].principal_id, a.principal_id);
         assert_eq!(
             store
-                .find_by_capability("missing")
+                .find_by_capability(tenant, "missing")
                 .await
                 .expect("find")
                 .len(),
@@ -1050,6 +1121,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Update quality patches and emits.
     async fn update_quality_patches_and_emits() {
         let (store, bus, directory) = store();
         let mut rx = bus.subscribe("agent");
@@ -1111,6 +1183,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Stats counts per tenant.
     async fn stats_counts_per_tenant() {
         let (store, _bus, directory) = store();
         let tenant = TenantId::new();
@@ -1141,6 +1214,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Presence persists across reopen.
     async fn presence_persists_across_reopen() {
         let tmp = std::env::temp_dir().join(format!("henosis-soma-{}.sqlite", PrincipalId::new()));
         let directory = Arc::new(InMemoryDirectory::new());

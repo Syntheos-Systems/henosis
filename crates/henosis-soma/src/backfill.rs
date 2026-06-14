@@ -487,6 +487,7 @@ pub async fn backfill_from_kleos(
 }
 
 #[cfg(test)]
+/// Unit tests for this module.
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -551,6 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Dry run counts without writing.
     async fn dry_run_counts_without_writing() {
         let (legacy, target) = db_pair("dry");
         build_legacy_fixture(&legacy);
@@ -579,6 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Apply imports agents as principals with sanitized json.
     async fn apply_imports_agents_as_principals_with_sanitized_json() {
         let (legacy, target) = db_pair("apply");
         build_legacy_fixture(&legacy);
@@ -612,7 +615,10 @@ mod tests {
 
         // The presence rows read back through the strict store: sanitization worked.
         let store = SomaStore::open(&target, Arc::new(AxonBus::new()), dir.clone()).expect("open");
-        let all = store.list(PresenceFilter::default()).await.expect("list");
+        let all = store
+            .list(tenant, PresenceFilter::default())
+            .await
+            .expect("list");
         assert_eq!(all.len(), 3);
         let cc = store
             .get_by_name(tenant, "claude-code")
@@ -645,6 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Chiasm cross map reuses owner principal.
     async fn chiasm_cross_map_reuses_owner_principal() {
         let (legacy, target) = db_pair("crossmap");
         build_legacy_fixture(&legacy);
@@ -694,6 +701,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Rerun is idempotent.
     async fn rerun_is_idempotent() {
         let (legacy, target) = db_pair("rerun");
         build_legacy_fixture(&legacy);
@@ -735,6 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Bad status fails before any write.
     async fn bad_status_fails_before_any_write() {
         let (legacy, target) = db_pair("badstatus");
         build_legacy_fixture(&legacy);
@@ -768,6 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Cross owner name collision is explicit error.
     async fn cross_owner_name_collision_is_explicit_error() {
         let (legacy, target) = db_pair("collision");
         build_legacy_fixture(&legacy);
@@ -854,7 +864,7 @@ mod tests {
         let store = SomaStore::open(&target, Arc::new(AxonBus::new()), dir.clone()).expect("open");
         assert_eq!(
             store
-                .list(PresenceFilter::default())
+                .list(tenant, PresenceFilter::default())
                 .await
                 .expect("list")
                 .len(),

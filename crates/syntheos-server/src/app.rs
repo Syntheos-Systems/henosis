@@ -64,7 +64,9 @@ pub struct AppState {
 pub struct ThymusDriftSignal(pub Arc<ThymusStore>);
 
 #[async_trait]
+/// `DriftSignal` implementation for `ThymusDriftSignal`.
 impl DriftSignal for ThymusDriftSignal {
+    /// Active drift.
     async fn active_drift(
         &self,
         tenant: TenantId,
@@ -138,7 +140,9 @@ pub fn live_gate_chain(
 pub struct SomaQualitySink(pub Arc<SomaStore>);
 
 #[async_trait]
+/// `QualitySink` implementation for `SomaQualitySink`.
 impl QualitySink for SomaQualitySink {
+    /// Apply.
     async fn apply(
         &self,
         agent: PrincipalId,
@@ -159,6 +163,7 @@ impl QualitySink for SomaQualitySink {
     }
 }
 
+/// Methods for `AppState`.
 impl AppState {
     /// Wire the foundation into shared application state.
     ///
@@ -496,9 +501,15 @@ async fn soma_register(
         .map_err(soma_error)
 }
 
-/// Query string for [`soma_list`]: optional AND-filters.
+/// Query string for [`soma_list`]: caller-asserted tenant plus optional AND-filters.
+///
+/// `tenant` is caller-asserted in Phase 1 (the server has no authentication yet, same as the
+/// chiasm read APIs); Phase 3 replaces it with a verified value. It is required so the listing
+/// is tenant-scoped and cannot enumerate other tenants' agents.
 #[derive(Debug, Deserialize)]
 pub struct SomaListQuery {
+    /// Tenant whose agents are listed (caller-asserted in Phase 1).
+    pub tenant: TenantId,
     /// Only agents of this type.
     pub agent_type: Option<String>,
     /// Only agents in this status.
@@ -507,18 +518,21 @@ pub struct SomaListQuery {
     pub limit: Option<usize>,
 }
 
-/// List registered agents, newest first.
+/// List the asserted tenant's registered agents, newest first.
 async fn soma_list(
     State(state): State<AppState>,
     Query(q): Query<SomaListQuery>,
 ) -> Result<Json<Vec<AgentPresence>>, (StatusCode, String)> {
     state
         .soma
-        .list(PresenceFilter {
-            agent_type: q.agent_type,
-            status: q.status,
-            limit: q.limit,
-        })
+        .list(
+            q.tenant,
+            PresenceFilter {
+                agent_type: q.agent_type,
+                status: q.status,
+                limit: q.limit,
+            },
+        )
         .await
         .map(Json)
         .map_err(soma_error)
@@ -1337,6 +1351,7 @@ async fn thymus_stats(
 }
 
 #[cfg(test)]
+/// Unit tests for this module.
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
@@ -1463,6 +1478,7 @@ mod tests {
     /// The leaky executor returns a payload with a secret the eidolon filter must scrub.
     #[async_trait]
     impl syntheos_dispatch::Executor for LeakyExecutor {
+        /// Execute.
         async fn execute(
             &self,
             _ctx: &syntheos_contracts::RequestContext,
@@ -1759,6 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Health ok.
     async fn health_ok() {
         let response = router(test_state())
             .oneshot(
@@ -1774,6 +1791,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Version reports crate.
     async fn version_reports_crate() {
         let response = router(test_state())
             .oneshot(
@@ -1790,6 +1808,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Enroll returns principal.
     async fn enroll_returns_principal() {
         let response = router(test_state())
             .oneshot(
@@ -1810,6 +1829,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Dispatch allow executes.
     async fn dispatch_allow_executes() {
         use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
         let req = GateRequest {
@@ -1848,6 +1868,7 @@ mod tests {
     }
 
     #[test]
+    /// Empty gate chain cannot become a dispatcher.
     fn empty_gate_chain_cannot_become_a_dispatcher() {
         let bus = Arc::new(AxonBus::new());
         let result = Dispatcher::new(Vec::new(), Box::new(DenyExecutor), bus);
@@ -1888,6 +1909,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Chiasm create then get roundtrips over http.
     async fn chiasm_create_then_get_roundtrips_over_http() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -1929,6 +1951,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Chiasm list and stats are owner scoped.
     async fn chiasm_list_and_stats_are_owner_scoped() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -1982,6 +2005,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Chiasm create rejects unknown status.
     async fn chiasm_create_rejects_unknown_status() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -2029,6 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Soma register heartbeat quality roundtrip over http.
     async fn soma_register_heartbeat_quality_roundtrip_over_http() {
         use syntheos_contracts::TenantId;
         let app = router(test_state());
@@ -2125,6 +2150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Thymus evaluation updates soma quality over http.
     async fn thymus_evaluation_updates_soma_quality_over_http() {
         use syntheos_contracts::TenantId;
         let app = router(test_state());
@@ -2217,6 +2243,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Loom workflow runs inline over http.
     async fn loom_workflow_runs_inline_over_http() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -2295,6 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Loom rejects cyclic definition over http.
     async fn loom_rejects_cyclic_definition_over_http() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -2322,6 +2350,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Broca log and feed over http.
     async fn broca_log_and_feed_over_http() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -2400,6 +2429,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Soma register rejects unenrolled principal.
     async fn soma_register_rejects_unenrolled_principal() {
         use syntheos_contracts::{PrincipalId, TenantId};
         let app = router(test_state());
@@ -2425,6 +2455,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Dispatch deny chain denies.
     async fn dispatch_deny_chain_denies() {
         use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
         let req = GateRequest {
