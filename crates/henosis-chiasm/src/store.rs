@@ -77,8 +77,20 @@ pub(crate) fn ts_from_db(s: &str) -> Result<Timestamp, ChiasmError> {
 }
 
 /// The instant `secs` seconds after `ts`. Used for path-claim lease expiry.
+///
+/// `OffsetDateTime`'s `Add` panics on overflow, and `secs` comes from a
+/// caller-controlled `ttl_seconds`, so clamp the offset to +/-100 years (far
+/// beyond any real lease, always representable from a current timestamp) and use
+/// `checked_add` as a belt-and-suspenders no-op on any residual overflow. This
+/// keeps a hostile or buggy ttl from panicking the request thread.
 fn ts_plus(ts: &Timestamp, secs: i64) -> Timestamp {
-    Timestamp::from_utc(ts.as_offset_date_time() + time::Duration::seconds(secs))
+    const MAX_OFFSET_SECS: i64 = 100 * 365 * 24 * 3600;
+    let clamped = secs.clamp(-MAX_OFFSET_SECS, MAX_OFFSET_SECS);
+    let base = ts.as_offset_date_time();
+    let result = base
+        .checked_add(time::Duration::seconds(clamped))
+        .unwrap_or(base);
+    Timestamp::from_utc(result)
 }
 
 /// The columns of `chiasm_path_claims`, in the order [`read_raw_claim`] reads them.
@@ -119,6 +131,7 @@ fn read_raw_claim(row: &rusqlite::Row) -> rusqlite::Result<RawClaim> {
     })
 }
 
+/// Methods for `RawClaim`.
 impl RawClaim {
     /// Parse raw columns into a typed [`PathClaim`], surfacing any corrupt value as a backend error.
     fn into_claim(self) -> Result<PathClaim, ChiasmError> {
@@ -183,6 +196,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawTask> {
     })
 }
 
+/// Methods for `RawTask`.
 impl RawTask {
     /// Parse raw columns into a typed [`Task`], surfacing any corrupt value as a backend error.
     fn into_task(self) -> Result<Task, ChiasmError> {
@@ -221,6 +235,7 @@ impl RawTask {
     }
 }
 
+/// Methods for `ChiasmStore`.
 impl ChiasmStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     pub fn open(path: impl AsRef<Path>, bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
@@ -1239,6 +1254,7 @@ pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), ChiasmError>
 }
 
 #[cfg(test)]
+/// Unit tests for this module.
 mod tests {
     use super::*;
     use syntheos_axon::AxonBus;
@@ -1278,6 +1294,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Create then get roundtrips.
     async fn create_then_get_roundtrips() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1296,6 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Create emits task created.
     async fn create_emits_task_created() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1307,6 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Get is owner scoped.
     async fn get_is_owner_scoped() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -1322,6 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Update appends history and emits.
     async fn update_appends_history_and_emits() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1371,6 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Update unknown task is not found.
     async fn update_unknown_task_is_not_found() {
         let (store, _bus) = store();
         let err = store
@@ -1381,6 +1402,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// List filters by status and project.
     async fn list_filters_by_status_and_project() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1425,6 +1447,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Delete removes and emits.
     async fn delete_removes_and_emits() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1444,6 +1467,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Stats counts by status.
     async fn stats_counts_by_status() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1473,6 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Tasks persist across reopen.
     async fn tasks_persist_across_reopen() {
         let tmp = std::env::temp_dir().join(format!("henosis-chiasm-{}.sqlite", TaskId::new()));
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1516,6 +1541,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Enqueue then claim.
     async fn enqueue_then_claim() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1553,6 +1579,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Claim is fifo.
     async fn claim_is_fifo() {
         let (store, _bus) = store();
         let (tenant, owner) = (TenantId::new(), PrincipalId::new());
@@ -1576,6 +1603,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Claim respects project filter.
     async fn claim_respects_project_filter() {
         let (store, _bus) = store();
         let (tenant, owner) = (TenantId::new(), PrincipalId::new());
@@ -1599,6 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Claim is owner scoped.
     async fn claim_is_owner_scoped() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -1617,6 +1646,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Record heartbeat updates and notfound.
     async fn record_heartbeat_updates_and_notfound() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1654,6 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Fresh heartbeat is not stale.
     async fn fresh_heartbeat_is_not_stale() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1676,6 +1707,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Overdue heartbeat marks stale.
     async fn overdue_heartbeat_marks_stale() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1727,6 +1759,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Create and list claims.
     async fn create_and_list_claims() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1767,6 +1800,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Create claims requires owned task.
     async fn create_claims_requires_owned_task() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1789,6 +1823,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Conflict detection and self exclusion.
     async fn conflict_detection_and_self_exclusion() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1828,6 +1863,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Conflicts are owner scoped.
     async fn conflicts_are_owner_scoped() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -1850,6 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Expired claims are inactive.
     async fn expired_claims_are_inactive() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1880,6 +1917,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Release claims releases and emits.
     async fn release_claims_releases_and_emits() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -1932,6 +1970,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Heartbeat refreshes claim leases.
     async fn heartbeat_refreshes_claim_leases() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -1967,6 +2006,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Stale sweep forfeits claims.
     async fn stale_sweep_forfeits_claims() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -2001,6 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Add and list dependencies.
     async fn add_and_list_dependencies() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2046,6 +2087,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Self dependency rejected.
     async fn self_dependency_rejected() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2061,6 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Circular dependency rejected.
     async fn circular_dependency_rejected() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2106,6 +2149,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Cross principal dependency rejected.
     async fn cross_principal_dependency_rejected() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -2127,6 +2171,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Remove dependency works.
     async fn remove_dependency_works() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2165,6 +2210,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Auto unblock on completion.
     async fn auto_unblock_on_completion() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("task");
@@ -2215,6 +2261,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Unblock requires all dependencies completed.
     async fn unblock_requires_all_dependencies_completed() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2285,6 +2332,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Unblock only activates blocked dependents.
     async fn unblock_only_activates_blocked_dependents() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -2330,5 +2378,19 @@ mod tests {
             .await
             .expect_err("foreign completed task");
         assert!(matches!(err, ChiasmError::NotFound(_)));
+    }
+
+    /// Regression: a caller-controlled `ttl_seconds` at the extremes must not
+    /// panic the timestamp arithmetic; it saturates to a far-future/past instant.
+    #[test]
+    fn ts_plus_saturates_instead_of_panicking() {
+        let now = Timestamp::now();
+        let far_future = ts_plus(&now, i64::MAX);
+        assert!(far_future.as_offset_date_time() > now.as_offset_date_time());
+        let far_past = ts_plus(&now, i64::MIN);
+        assert!(far_past.as_offset_date_time() < now.as_offset_date_time());
+        // A normal ttl still works exactly.
+        let in_an_hour = ts_plus(&now, 3600);
+        assert!(in_an_hour.as_offset_date_time() > now.as_offset_date_time());
     }
 }
