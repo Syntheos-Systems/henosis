@@ -264,11 +264,33 @@ pub async fn backfill_from_kleos(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| SomaError::Backfill(format!("open legacy db {legacy_db:?}: {e}")))?;
-    let mut target = Connection::open(target_db).map_err(berr)?;
-    target
-        .pragma_update(None, "foreign_keys", true)
-        .map_err(berr)?;
-    apply_migrations(&mut target)?;
+    // A dry run must write NOTHING to disk -- not even create or migrate the
+    // target file. It still needs to READ prior-run state (owner/agent maps) to
+    // count reused-vs-minted correctly, so read an existing target read-only, or
+    // use a throwaway in-memory DB (empty prior state) when none exists yet. The
+    // real (non-dry) path opens read-write and migrates as before.
+    let mut target = if options.dry_run {
+        if Path::new(target_db).exists() {
+            Connection::open_with_flags(
+                target_db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| {
+                SomaError::Backfill(format!(
+                    "open target db {target_db:?} (dry-run, read-only): {e}"
+                ))
+            })?
+        } else {
+            let mut mem = Connection::open_in_memory().map_err(berr)?;
+            apply_migrations(&mut mem)?;
+            mem
+        }
+    } else {
+        let mut t = Connection::open(target_db).map_err(berr)?;
+        t.pragma_update(None, "foreign_keys", true).map_err(berr)?;
+        apply_migrations(&mut t)?;
+        t
+    };
 
     // Phase 1: read + validate + sanitize ALL legacy data before touching anything.
     let agents = read_legacy_agents(&legacy)?;

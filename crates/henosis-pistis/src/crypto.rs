@@ -10,7 +10,7 @@
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{PistisError, Result};
 
@@ -25,6 +25,7 @@ pub struct PublicKey {
     pub bytes: [u8; 32],
 }
 
+/// Verification methods for an Ed25519 public key.
 impl PublicKey {
     /// Verify `sig` over `msg`. `Err(SignatureInvalid)` on a corrupt key or a
     /// signature that does not validate against the key+message pair.
@@ -52,6 +53,7 @@ pub struct SecretKey {
     inner: Zeroizing<[u8; 32]>,
 }
 
+/// Signing and key-generation methods for an Ed25519 secret key.
 impl SecretKey {
     /// Generate a fresh Ed25519 keypair.
     ///
@@ -59,17 +61,16 @@ impl SecretKey {
     /// key from them, rather than `SigningKey::generate(&mut OsRng)`, to avoid
     /// pinning a specific `rand_core` trait version into the workspace.
     pub fn generate() -> (PublicKey, SecretKey) {
-        let secret_bytes: [u8; 32] = rand::random();
+        let mut secret_bytes: [u8; 32] = rand::random();
         let signing = SigningKey::from_bytes(&secret_bytes);
         let public = PublicKey {
             bytes: signing.verifying_key().to_bytes(),
         };
-        (
-            public,
-            SecretKey {
-                inner: Zeroizing::new(secret_bytes),
-            },
-        )
+        // `Zeroizing::new` below wraps a COPY; scrub this original stack array so
+        // the secret does not linger in memory after generation.
+        let owned = Zeroizing::new(secret_bytes);
+        secret_bytes.zeroize();
+        (public, SecretKey { inner: owned })
     }
 
     /// Reconstruct a `SecretKey` from raw bytes (e.g. loaded from a vault). The
@@ -79,7 +80,6 @@ impl SecretKey {
             inner: Zeroizing::new(bytes),
         };
         // `Zeroizing::new` copied the bytes; wipe the caller's array too.
-        use zeroize::Zeroize;
         bytes.zeroize();
         secret
     }
@@ -102,6 +102,7 @@ impl SecretKey {
     }
 }
 
+/// Unit tests for Ed25519 sign/verify and key generation.
 #[cfg(test)]
 mod tests {
     use super::*;
