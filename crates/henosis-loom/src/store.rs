@@ -177,6 +177,7 @@ fn read_raw_workflow(row: &rusqlite::Row) -> rusqlite::Result<RawWorkflow> {
     })
 }
 
+/// Methods for `RawWorkflow`.
 impl RawWorkflow {
     /// Parse raw columns into a typed [`Workflow`].
     fn into_workflow(self) -> Result<Workflow, LoomError> {
@@ -246,6 +247,7 @@ fn read_raw_run(row: &rusqlite::Row) -> rusqlite::Result<RawRun> {
     })
 }
 
+/// Methods for `RawRun`.
 impl RawRun {
     /// Parse raw columns into a typed [`Run`].
     fn into_run(self) -> Result<Run, LoomError> {
@@ -335,6 +337,7 @@ fn read_raw_step(row: &rusqlite::Row) -> rusqlite::Result<RawStep> {
     })
 }
 
+/// Methods for `RawStep`.
 impl RawStep {
     /// Parse raw columns into a typed [`Step`].
     fn into_step(self) -> Result<Step, LoomError> {
@@ -365,6 +368,7 @@ impl RawStep {
     }
 }
 
+/// Methods for `LoomStore`.
 impl LoomStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     /// No executor is attached; see [`Self::with_executor`].
@@ -952,12 +956,26 @@ impl LoomStore {
         }
         {
             let conn = self.lock();
-            conn.execute(
-                "UPDATE loom_steps SET status = 'completed', output = ?1, completed_at = ?2 \
-                 WHERE id = ?3",
-                rusqlite::params![output.to_string(), ts_to_db(&Timestamp::now())?, step.id],
-            )
-            .map_err(berr)?;
+            // TOCTOU guard: `step` is a snapshot read before this call, so a
+            // concurrent cancel_run (which sets running steps to 'skipped') can
+            // land between the snapshot and this write. Scope the UPDATE to
+            // `status = 'running'` so the DB enforces the precondition
+            // atomically; if no row changed, the step is no longer running and
+            // we must NOT force it to 'completed' or emit a completion event.
+            let affected = conn
+                .execute(
+                    "UPDATE loom_steps SET status = 'completed', output = ?1, completed_at = ?2 \
+                     WHERE id = ?3 AND status = 'running'",
+                    rusqlite::params![output.to_string(), ts_to_db(&Timestamp::now())?, step.id],
+                )
+                .map_err(berr)?;
+            if affected == 0 {
+                return Err(LoomError::InvalidInput(format!(
+                    "cannot complete step {}: it is no longer running \
+                     (concurrently cancelled or changed)",
+                    step.id
+                )));
+            }
             Self::add_log(
                 &conn,
                 step.run_id,
@@ -986,12 +1004,22 @@ impl LoomStore {
         {
             let conn = self.lock();
             if will_retry {
-                conn.execute(
-                    "UPDATE loom_steps SET status = 'pending', retry_count = retry_count + 1, \
-                     error = ?1, started_at = NULL WHERE id = ?2",
-                    rusqlite::params![error, step.id],
-                )
-                .map_err(berr)?;
+                // Same TOCTOU guard as complete_step_inner: only reset a step
+                // that is still 'running', so a concurrent cancel is not undone.
+                let affected = conn
+                    .execute(
+                        "UPDATE loom_steps SET status = 'pending', retry_count = retry_count + 1, \
+                         error = ?1, started_at = NULL WHERE id = ?2 AND status = 'running'",
+                        rusqlite::params![error, step.id],
+                    )
+                    .map_err(berr)?;
+                if affected == 0 {
+                    return Err(LoomError::InvalidInput(format!(
+                        "cannot fail/retry step {}: it is no longer running \
+                         (concurrently cancelled or changed)",
+                        step.id
+                    )));
+                }
                 Self::add_log(
                     &conn,
                     step.run_id,
@@ -1007,12 +1035,23 @@ impl LoomStore {
                 )?;
             } else {
                 let now = ts_to_db(&Timestamp::now())?;
-                conn.execute(
-                    "UPDATE loom_steps SET status = 'failed', error = ?1, completed_at = ?2 \
-                     WHERE id = ?3",
-                    rusqlite::params![error, now, step.id],
-                )
-                .map_err(berr)?;
+                // Guard the step transition on 'running' first; only fail the
+                // run if this step was actually the one still running (so a
+                // concurrent cancel is not overwritten with 'failed').
+                let affected = conn
+                    .execute(
+                        "UPDATE loom_steps SET status = 'failed', error = ?1, completed_at = ?2 \
+                         WHERE id = ?3 AND status = 'running'",
+                        rusqlite::params![error, now, step.id],
+                    )
+                    .map_err(berr)?;
+                if affected == 0 {
+                    return Err(LoomError::InvalidInput(format!(
+                        "cannot fail step {}: it is no longer running \
+                         (concurrently cancelled or changed)",
+                        step.id
+                    )));
+                }
                 conn.execute(
                     "UPDATE loom_runs SET status = 'failed', error = ?1, completed_at = ?2, \
                      updated_at = ?2 WHERE id = ?3",
@@ -1413,6 +1452,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), LoomError> {
 }
 
 #[cfg(test)]
+/// Unit tests for this module.
 mod tests {
     use super::*;
     use crate::executor::TransformExecutor;
@@ -1487,6 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Workflow crud roundtrips.
     async fn workflow_crud_roundtrips() {
         let (store, _bus) = store();
         let (principal, wf) = workflow_with(&store, vec![action("a", &[])]).await;
@@ -1539,6 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Definition validation rejects bad graphs.
     async fn definition_validation_rejects_bad_graphs() {
         let (store, _bus) = store();
         let principal = PrincipalId::new();
@@ -1570,6 +1612,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Transform chain runs to completion inline.
     async fn transform_chain_runs_to_completion_inline() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("workflow");
@@ -1622,6 +1665,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// External steps wait and complete via api.
     async fn external_steps_wait_and_complete_via_api() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("workflow");
@@ -1669,6 +1713,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Completing a non running step is rejected.
     async fn completing_a_non_running_step_is_rejected() {
         let (store, _bus) = store();
         let (principal, wf) =
@@ -1690,15 +1735,18 @@ mod tests {
     /// Claims transform and always errors.
     #[async_trait]
     impl StepExecutor for FailingExecutor {
+        /// Handles.
         fn handles(&self, step_type: StepType) -> bool {
             step_type == StepType::Transform
         }
+        /// Execute.
         async fn execute(&self, _ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
             Err("boom".to_string())
         }
     }
 
     #[tokio::test]
+    /// Retries then fails run when exhausted.
     async fn retries_then_fails_run_when_exhausted() {
         let bus = Arc::new(AxonBus::new());
         let store = LoomStore::open_in_memory(bus.clone())
@@ -1743,6 +1791,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Cancel skips unfinished steps.
     async fn cancel_skips_unfinished_steps() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("workflow");
@@ -1766,6 +1815,56 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Complete step refuses after concurrent cancel.
+    async fn complete_step_refuses_after_concurrent_cancel() {
+        // Regression for the TOCTOU race: completing a step from a stale
+        // 'running' snapshot must not overwrite a concurrent cancel (which marks
+        // the step 'skipped') with 'completed'.
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let wf = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "wait-wf".to_string(),
+                description: None,
+                steps: vec![StepDef {
+                    name: "wait".to_string(),
+                    step_type: StepType::Wait,
+                    config: None,
+                    depends_on: None,
+                    max_retries: Some(0),
+                    // Large timeout so the step stays running, not swept.
+                    timeout_ms: Some(60_000),
+                }],
+            })
+            .await
+            .expect("workflow");
+        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        assert_eq!(run.status, RunStatus::Running);
+        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let running = steps
+            .into_iter()
+            .find(|s| s.status == StepStatus::Running)
+            .expect("a running step");
+
+        // Concurrent cancel: the running step becomes 'skipped'.
+        assert!(store.cancel_run(principal, run.id).await.expect("cancel"));
+
+        // Completing with the now-stale 'running' snapshot must be refused.
+        let result = store
+            .complete_step_inner(&running, &run, serde_json::json!({"ok": true}))
+            .await;
+        assert!(result.is_err(), "stale complete must be refused");
+
+        // The step must remain skipped, not flipped to completed.
+        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let s = steps.iter().find(|s| s.id == running.id).expect("step");
+        assert_eq!(s.status, StepStatus::Skipped);
+    }
+
+    #[tokio::test]
+    /// Sweep times out overdue running steps.
     async fn sweep_times_out_overdue_running_steps() {
         let (store, _bus) = store();
         let principal = PrincipalId::new();
@@ -1809,6 +1908,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// List runs filters and stats count.
     async fn list_runs_filters_and_stats_count() {
         let (store, _bus) = store();
         let (principal, wf) = workflow_with(&store, vec![action("a", &[])]).await;
@@ -1846,6 +1946,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Runs persist across reopen.
     async fn runs_persist_across_reopen() {
         let tmp = std::env::temp_dir().join(format!("henosis-loom-{}.sqlite", RunId::new()));
         let principal = PrincipalId::new();
