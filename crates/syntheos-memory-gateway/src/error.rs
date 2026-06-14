@@ -36,6 +36,20 @@ impl IntoResponse for GatewayError {
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Signing(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        // Variants that wrap internal detail (transport error chains, crypto/key
+        // internals) get a generic external message so network topology and
+        // secrets are not leaked to clients; the full error is logged
+        // server-side only.
+        let external = match &self {
+            GatewayError::InvalidId(_) => "invalid memory id".to_string(),
+            GatewayError::NotFound => "memory not found".to_string(),
+            GatewayError::KleosStatus(s) => format!("upstream returned status {s}"),
+            GatewayError::Upstream(_) => "upstream request failed".to_string(),
+            GatewayError::Signing(_) => "internal signing error".to_string(),
+        };
+        if matches!(self, GatewayError::Upstream(_) | GatewayError::Signing(_)) {
+            tracing::warn!(error = %self, "gateway error (detail withheld from client)");
+        }
+        (status, Json(json!({ "error": external }))).into_response()
     }
 }

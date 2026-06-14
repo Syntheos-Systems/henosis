@@ -60,8 +60,12 @@ async fn main() {
             None
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to load signing key; starting without auth");
-            None
+            // Fail closed: a key-load error is a misconfiguration, not a reason
+            // to silently drop outbound authentication. Refuse to start rather
+            // than proxy to Kleos unsigned. (Ok(None) above is the explicit
+            // no-key-configured path and stays a warning.)
+            tracing::error!(error = %e, "failed to load signing key; refusing to start unsigned");
+            std::process::exit(1);
         }
     };
 

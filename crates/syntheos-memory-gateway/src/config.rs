@@ -49,9 +49,13 @@ impl Config {
 }
 
 /// Query the OS for the machine hostname, returning "unknown" on failure.
+///
+/// Reads `/proc/sys/kernel/hostname` directly rather than spawning a
+/// PATH-resolved `hostname` binary, so a manipulated `PATH` cannot inject an
+/// arbitrary host label into the signing identity.
 fn hostname() -> String {
-    match std::process::Command::new("hostname").output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    match std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
         _ => "unknown".to_string(),
     }
 }

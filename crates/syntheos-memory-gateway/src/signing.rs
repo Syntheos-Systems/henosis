@@ -376,7 +376,7 @@ impl RequestSigner {
             #[cfg(feature = "piv")]
             SigningBackend::Piv(yk_mutex) => {
                 let digest = Sha256::digest(envelope.as_bytes());
-                let mut yk = yk_mutex.lock().expect("YubiKey mutex poisoned");
+                let mut yk = yk_mutex.lock().unwrap_or_else(|p| p.into_inner());
                 let result = piv_verify_and_sign(&mut yk, &digest);
                 let sig_der = match result {
                     Ok(d) => d,
@@ -391,7 +391,7 @@ impl RequestSigner {
                                 "YubiKey PIV signing failed after reconnect: {e}"
                             ))
                         })?;
-                        *yk_mutex.lock().expect("YubiKey mutex poisoned") = fresh;
+                        *yk_mutex.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
                         d
                     }
                 };
@@ -417,18 +417,21 @@ impl RequestSigner {
 
     /// Return a clone of the cached session token, if any is stored.
     pub fn cached_session(&self) -> Option<String> {
-        self.session.lock().expect("session mutex poisoned").clone()
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Store a session token received from Kleos in `X-Kleos-Session-Issued`.
     pub fn set_session(&self, token: &str) {
-        *self.session.lock().expect("session mutex poisoned") = Some(token.to_string());
+        *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.to_string());
     }
 
     /// Discard the cached session token, forcing the next request to use full
     /// envelope signing.
     pub fn clear_session(&self) {
-        *self.session.lock().expect("session mutex poisoned") = None;
+        *self.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -437,6 +440,12 @@ impl RequestSigner {
 // ------------------------------------------------------------------
 
 /// Read the PIV PIN from the environment. Refuses the factory default.
+///
+/// SECURITY: `PIV_PIN` is read from the process environment, which is readable
+/// via `/proc/<pid>/environ` by sufficiently privileged or co-tenant processes.
+/// This is a known weakness of the env-var path; a file-descriptor / stdin PIN
+/// channel is the preferred hardening (tracked as follow-up). We warn once so
+/// operators are aware rather than silently relying on it.
 #[cfg(feature = "piv")]
 fn runtime_piv_pin() -> Result<String, GatewayError> {
     match std::env::var("PIV_PIN") {
@@ -444,7 +453,13 @@ fn runtime_piv_pin() -> Result<String, GatewayError> {
         Ok(p) if p == "123456" => Err(GatewayError::Signing(
             "PIV_PIN equals the YubiKey factory-default; refusing to use it".into(),
         )),
-        Ok(p) => Ok(p),
+        Ok(p) => {
+            tracing::warn!(
+                "PIV_PIN read from the environment is exposed via /proc/<pid>/environ; \
+                 prefer a file-descriptor PIN channel in hardened deployments"
+            );
+            Ok(p)
+        }
         Err(_) => Err(GatewayError::Signing(
             "PIV_PIN environment variable is not set".into(),
         )),
@@ -564,35 +579,64 @@ fn decode_key_material(raw: &[u8], source: &str) -> Result<[u8; 32], GatewayErro
     )))
 }
 
-/// Minimal PKCS8 PEM decoder for Ed25519 private keys.
+/// Decode an Ed25519 private key from PKCS8 PEM via a validated ASN.1 parser.
 ///
-/// Strips PEM armor, base64-decodes the DER body, then extracts the 32-byte
-/// private scalar from the `OneAsymmetricKey` structure.  The PKCS8 DER for
-/// Ed25519 has the 32-byte scalar at offset 16 (after a fixed 16-byte header).
+/// Uses `ed25519-dalek`'s `from_pkcs8_pem` rather than slicing the scalar from a
+/// hardcoded DER offset: the offset trick silently extracts the wrong bytes from
+/// a PKCS8v2 key (which carries a public-key appendix) and yields a key that
+/// signs but never verifies. The validated parser rejects malformed or
+/// unexpected structures instead.
 fn decode_pkcs8_pem(pem: &str) -> Result<[u8; 32], GatewayError> {
-    let b64: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect::<Vec<_>>()
-        .join("");
-
-    use base64::Engine;
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(&b64)
-        .map_err(|e| GatewayError::Signing(format!("PEM base64 decode error: {e}")))?;
-
-    // Ed25519 PKCS8v1 DER is 48 bytes; the scalar occupies bytes 16..48.
-    if der.len() < 48 {
-        return Err(GatewayError::Signing(
-            "PKCS8 DER too short for Ed25519".to_string(),
-        ));
-    }
-    let scalar: [u8; 32] = der[16..48].try_into().expect("slice is exactly 32 bytes");
-    Ok(scalar)
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
+    let signing_key = ed25519_dalek::SigningKey::from_pkcs8_pem(pem)
+        .map_err(|e| GatewayError::Signing(format!("invalid Ed25519 PKCS8 private key: {e}")))?;
+    Ok(signing_key.to_bytes())
 }
 
 /// Resolve the current user's home directory.  The `host` parameter is unused
 /// here but kept for future per-host configuration expansion.
 fn dirs_next(_host: &str) -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Unit tests for key-material decoding (the validated PKCS8 path).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid Ed25519 PKCS8 PEM (static vector from `openssl genpkey
+    /// -algorithm ed25519`) decodes to the scalar it encodes.
+    #[test]
+    fn decode_pkcs8_pem_valid_vector() {
+        let pem = "-----BEGIN PRIVATE KEY-----\n\
+                   MC4CAQAwBQYDK2VwBCIEIOPCl74iq4xOqq3sRD1BBudy7TXys619cwpAVmFec8ZL\n\
+                   -----END PRIVATE KEY-----\n";
+        let scalar = decode_pkcs8_pem(pem).expect("valid pkcs8");
+        let expected =
+            hex::decode("e3c297be22ab8c4eaaadec443d4106e772ed35f2b3ad7d730a4056615e73c64b")
+                .unwrap();
+        assert_eq!(scalar.to_vec(), expected);
+    }
+
+    /// A malformed PKCS8 body is rejected, not silently sliced into a wrong key
+    /// (the hardcoded-offset bug this validated parser replaced).
+    #[test]
+    fn decode_pkcs8_pem_malformed_rejected() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nbm90LXZhbGlkLXBrY3M4\n-----END PRIVATE KEY-----\n";
+        assert!(decode_pkcs8_pem(pem).is_err());
+    }
+
+    /// `decode_key_material` accepts a 64-char hex scalar and round-trips it.
+    #[test]
+    fn decode_key_material_hex() {
+        let hex_key = "11".repeat(32);
+        let scalar = decode_key_material(hex_key.as_bytes(), "test").expect("hex key");
+        assert_eq!(scalar, [0x11u8; 32]);
+    }
+
+    /// `decode_key_material` rejects input that is neither hex nor PKCS8 PEM.
+    #[test]
+    fn decode_key_material_unrecognised() {
+        assert!(decode_key_material(b"not a key", "test").is_err());
+    }
 }

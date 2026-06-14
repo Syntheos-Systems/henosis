@@ -14,6 +14,11 @@ use crate::dto::{
 use crate::error::GatewayError;
 use crate::kleos::KleosClient;
 
+/// Upper bound on caller-requested result counts (search `k`, list `limit`)
+/// before they are forwarded to Kleos, so a caller cannot request billions of
+/// rows and force unbounded allocation upstream and in this gateway.
+const MAX_RESULTS: usize = 1000;
+
 /// Query parameters for the list endpoint.
 #[derive(Debug, Deserialize)]
 struct ListParams {
@@ -48,7 +53,8 @@ async fn search_handler(
     State(client): State<KleosClient>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, GatewayError> {
-    let results = client.search(&req.query, req.k, &req.filters).await?;
+    let k = req.k.min(MAX_RESULTS);
+    let results = client.search(&req.query, k, &req.filters).await?;
     Ok(Json(SearchResponse { results }))
 }
 
@@ -65,9 +71,8 @@ async fn list_handler(
     State(client): State<KleosClient>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<ListResponse>, GatewayError> {
-    let items = client
-        .list(params.limit.unwrap_or(50), params.offset.unwrap_or(0))
-        .await?;
+    let limit = params.limit.unwrap_or(50).min(MAX_RESULTS);
+    let items = client.list(limit, params.offset.unwrap_or(0)).await?;
     Ok(Json(ListResponse { items }))
 }
 

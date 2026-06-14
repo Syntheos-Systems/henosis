@@ -114,13 +114,18 @@ impl KleosClient {
             format!("{}{}?{}", self.base_url, path, query)
         };
 
-        // Build the base request (method + URL).
+        // Build the base request (method + URL). Only GET/POST are issued by
+        // this gateway; anything else is a programming error, so map a bad verb
+        // to an error rather than panicking on a future caller's typo.
         let base_rb = match method {
             "GET" => self.http.get(&url),
             "POST" => self.http.post(&url),
-            _ => self
-                .http
-                .request(method.parse().expect("valid HTTP method"), &url),
+            other => {
+                let verb = other.parse::<reqwest::Method>().map_err(|e| {
+                    GatewayError::Signing(format!("unsupported HTTP method {other:?}: {e}"))
+                })?;
+                self.http.request(verb, &url)
+            }
         };
 
         // Apply Content-Type, body, or any other caller-supplied decoration.
