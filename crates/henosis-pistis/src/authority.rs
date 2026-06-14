@@ -68,14 +68,18 @@ pub fn authorize_capabilities(
         };
     };
 
-    if trust_score < state.policy.trust_threshold {
+    let threshold = state.policy.trust_threshold;
+    // Fail closed on non-finite values. `trust_score < threshold` is silently
+    // false when either side is NaN (and a hostile/corrupt materialized state
+    // can carry a NaN threshold), which would bypass the trust floor entirely.
+    // Deny unless both are finite AND the score genuinely meets the threshold.
+    if !trust_score.is_finite() || !threshold.is_finite() || trust_score < threshold {
         return CapabilityCheckDecision {
             allowed: false,
             missing: request.required.clone(),
             trust_score,
             reason: Some(format!(
-                "trust score {trust_score:.3} is below room threshold {:.3}",
-                state.policy.trust_threshold
+                "trust score {trust_score:.3} is below room threshold {threshold:.3}"
             )),
         };
     }
@@ -109,6 +113,7 @@ pub fn authorize_capabilities(
     }
 }
 
+/// Unit tests for capability authorization and the trust floor.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +249,27 @@ mod tests {
         );
         assert!(d.trust_score < state.policy.trust_threshold);
         assert!(d.reason.unwrap().contains("below room threshold"));
+    }
+
+    /// A NaN trust threshold (e.g. from a corrupt/hostile materialized state)
+    /// must fail closed, not silently bypass the trust floor via `score < NaN`.
+    #[test]
+    fn denies_on_nan_threshold() {
+        let p = PrincipalId::new();
+        let now = OffsetDateTime::now_utc();
+        let state = RoomState::from_genesis(
+            RoomPolicy {
+                trust_threshold: f64::NAN,
+                ..Default::default()
+            },
+            [pubkey()].into_iter().collect(),
+            vec![AdmittedPrincipal::new(
+                p,
+                pubkey(),
+                vec![cap("deploy", ActionKind::Deploy, None)],
+            )],
+        );
+        let d = authorize_capabilities(&state, &req(p, "deploy", ActionKind::Deploy), now);
+        assert!(!d.allowed, "NaN threshold must fail closed");
     }
 }

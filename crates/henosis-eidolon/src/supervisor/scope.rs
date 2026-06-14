@@ -17,9 +17,13 @@ pub fn check_file_scope(entry: &serde_json::Value, allowed_paths: &[String]) -> 
         Some(p) => p,
         None => return Vec::new(),
     };
+    // Component-wise prefix match, not string prefix: `str::starts_with` would
+    // let `/etc/config_backup` escape an allowed `/etc/config`. `Path::starts_with`
+    // only matches whole path components.
+    let edited = std::path::Path::new(&file_path);
     let in_scope = allowed_paths
         .iter()
-        .any(|allowed| file_path.starts_with(allowed));
+        .any(|allowed| edited.starts_with(allowed));
     if !in_scope {
         return vec![Violation {
             rule_id: "scope-violation".into(),
@@ -48,4 +52,39 @@ fn extract_file_path(entry: &serde_json::Value) -> Option<String> {
         .or(input.get("filePath"))
         .and_then(|v| v.as_str())
         .map(String::from)
+}
+
+/// Unit tests for file-scope checking.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an Edit tool-use entry touching `path`.
+    fn edit(path: &str) -> serde_json::Value {
+        serde_json::json!({"tool_name": "Edit", "tool_input": {"file_path": path}})
+    }
+
+    /// A sibling sharing only a string prefix must NOT be considered in-scope:
+    /// `/etc/config_backup` escapes an allowed `/etc/config` under str prefixing.
+    #[test]
+    fn string_prefix_sibling_is_out_of_scope() {
+        let allowed = vec!["/etc/config".to_string()];
+        let v = check_file_scope(&edit("/etc/config_backup/secrets"), &allowed);
+        assert_eq!(v.len(), 1, "sibling-prefix path must be a violation");
+    }
+
+    /// A genuine child component is in-scope.
+    #[test]
+    fn real_child_is_in_scope() {
+        let allowed = vec!["/etc/config".to_string()];
+        let v = check_file_scope(&edit("/etc/config/app.toml"), &allowed);
+        assert!(v.is_empty(), "a real child path must be allowed");
+    }
+
+    /// An empty allow-list disables the check.
+    #[test]
+    fn empty_allowlist_disables() {
+        let v = check_file_scope(&edit("/anywhere/at/all"), &[]);
+        assert!(v.is_empty());
+    }
 }
