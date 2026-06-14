@@ -331,6 +331,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1053,6 +1054,28 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "henosis-memory-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "dirs",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "rand 0.9.4",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

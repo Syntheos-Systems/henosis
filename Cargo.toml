@@ -16,6 +16,7 @@ members = [
     "crates/henosis-eidolon",
     "crates/henosis-phylax",
     "crates/henosis-pistis",
+    "crates/henosis-memory-client",
     "crates/agent-forge-lib",
 ]
 
@@ -33,7 +34,7 @@ serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
 sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
@@ -70,3 +71,5 @@ regex = "1"
 lru = "0.16"
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+# Home/cache dir resolution for the memory-client session-token cache (Story 4.1).
+dirs = "5"
