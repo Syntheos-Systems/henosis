@@ -22,6 +22,9 @@ members = [
     "crates/synapse-session",
     "crates/synapse-tools",
     "crates/synapse-core",
+    "crates/synapse-cron",
+    "crates/synapse-cli",
+    "crates/synapse-tui",
 ]
 
 [workspace.package]
@@ -94,3 +97,8 @@ hostname = "0.4"
 tokio-stream = "0.1"
 # Concurrent session map for the synapse-core multi-session runtime.
 dashmap = "6"
+# Logging backend for the synapse-cli / synapse-tui binaries.
+env_logger = "0.11"
+# Terminal UI for synapse-tui (ratatui renderer over a crossterm backend).
+ratatui = "0.29"
+crossterm = "0.28"

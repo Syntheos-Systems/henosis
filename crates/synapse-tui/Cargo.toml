@@ -1,0 +1,24 @@
+[package]
+name = "synapse-tui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "synapse-tui"
+path = "src/main.rs"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+synapse-provider = { path = "../synapse-provider" }
+synapse-tools = { path = "../synapse-tools" }
+synapse-session = { path = "../synapse-session" }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+dirs = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

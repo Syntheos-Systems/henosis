@@ -1,0 +1,38 @@
+[package]
+name = "synapse-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "synapse"
+path = "src/main.rs"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+synapse-provider = { path = "../synapse-provider" }
+synapse-tools = { path = "../synapse-tools" }
+synapse-session = { path = "../synapse-session" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+# In-workspace replacement for kleos-client + kleos-lib during Synapse
+# absorption (Story 4.1). Retired once in-process dispatch lands.
+henosis-memory-client = { path = "../henosis-memory-client" }
+hostname = { workspace = true }
+chrono = "0.4.44"
+# Streaming markdown renderer for assistant responses.
+# termimad turns markdown into terminal output with syntax-highlighted code,
+# table borders, and styled emphasis. Used by `MarkdownBuffer` to render
+# turn-final output when the response contains markdown features.
+termimad = "0.31"
+# TOML parser for ~/.synapse/hooks.toml hook configuration.
+toml = "0.8"
+urlencoding = "2"
+# Filesystem permission tweak (chmod 0600 on session DB + config) uses
+# std::os::unix::fs::PermissionsExt which lives in std on unix; no extra dep.

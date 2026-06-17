@@ -1,0 +1,84 @@
+# Example ~/.synapse/hooks.toml
+#
+# Synapse fires shell hooks at five lifecycle phases:
+#
+#   - SessionStart       once when the REPL or one-shot command launches
+#   - UserPromptSubmit   before every user message is sent to the LLM
+#   - PreToolUse         before a tool runs; exit code 2 denies the call
+#   - PostToolUse        after a tool runs; observation only
+#   - Stop               once when the session ends
+#
+# Each hook receives:
+#   - SYNAPSE_HOOK_PHASE    the phase name (e.g. PreToolUse)
+#   - SYNAPSE_HOOK_TOOL     tool name (PreToolUse / PostToolUse only)
+#   - SYNAPSE_HOOK_PARAMS   JSON params (PreToolUse / PostToolUse only)
+#
+# stdin is closed. stdout/stderr are captured and logged. Hooks run in the
+# session's cwd. Per-hook `timeout_secs` defaults to 10.
+#
+# Copy this file to ~/.synapse/hooks.toml and remove the examples you don't
+# want. The hook system gracefully tolerates missing binaries -- if
+# `kleos-cli` isn't installed, the hook just logs a warning.
+
+# ---------------------------------------------------------------------------
+# Activity reporting -- fan out lifecycle events to Kleos so the Eidolon
+# context surface can show what Synapse is doing right now.
+
+[[hooks]]
+phase   = "SessionStart"
+label   = "broca-session-start"
+command = 'kleos-cli activity --action task.started --summary "synapse session opened" --project synapse'
+
+[[hooks]]
+phase   = "UserPromptSubmit"
+label   = "broca-prompt"
+command = 'kleos-cli activity --action task.progress --summary "user prompt submitted" --project synapse'
+
+[[hooks]]
+phase   = "PreToolUse"
+label   = "broca-pretool"
+matcher = "*"
+command = 'kleos-cli activity --action task.progress --summary "tool: $SYNAPSE_HOOK_TOOL" --project synapse'
+
+[[hooks]]
+phase   = "Stop"
+label   = "broca-session-stop"
+command = 'kleos-cli activity --action task.completed --summary "synapse session closed" --project synapse'
+
+# ---------------------------------------------------------------------------
+# Bash guardrail -- block the most catastrophic command shapes before the
+# bash tool even runs. The exit-2 contract tells Synapse to deny the call;
+# the message on stderr propagates back into the agent's tool result.
+
+[[hooks]]
+phase   = "PreToolUse"
+matcher = "bash"
+label   = "bash-guardrail"
+command = '''
+set -e
+# Extract the command field from the JSON params.
+cmd=$(printf '%s' "$SYNAPSE_HOOK_PARAMS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('command',''))" 2>/dev/null || echo "")
+case "$cmd" in
+    *"rm -rf /"* | *"rm -rf ~"*)
+        echo "guardrail: refusing destructive rm -rf" >&2
+        exit 2 ;;
+    *"cargo clean"* | *"rm -rf target"*)
+        echo "guardrail: blanket clean would burn the disk; remove a specific subdir instead" >&2
+        exit 2 ;;
+    *":(){:|:&};:"*)
+        echo "guardrail: fork bomb detected" >&2
+        exit 2 ;;
+esac
+exit 0
+'''
+
+# ---------------------------------------------------------------------------
+# Skill capture nudge -- after every successful tool run, ask kleos-cli
+# whether the recent activity looks like a reusable pattern. Background
+# script (no-op if `kleos-cli skill capture` isn't enabled).
+
+# [[hooks]]
+# phase   = "PostToolUse"
+# matcher = "*"
+# label   = "skill-capture"
+# command = 'kleos-cli skill capture --auto --quiet 2>/dev/null || true'
