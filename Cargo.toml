@@ -21,6 +21,7 @@ members = [
     "crates/synapse-provider",
     "crates/synapse-session",
     "crates/synapse-tools",
+    "crates/synapse-core",
 ]
 
 [workspace.package]
@@ -89,3 +90,7 @@ reqwest-eventsource = "0.6"
 which = "7"
 # Hostname detection for the memory-client agent label (synapse-tools/cli auth cascade).
 hostname = "0.4"
+# Async stream adapters for the synapse-core provider response pipeline.
+tokio-stream = "0.1"
+# Concurrent session map for the synapse-core multi-session runtime.
+dashmap = "6"

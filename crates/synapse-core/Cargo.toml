@@ -1,0 +1,24 @@
+[package]
+name = "synapse-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+synapse-provider = { path = "../synapse-provider" }
+synapse-tools = { path = "../synapse-tools" }
+synapse-session = { path = "../synapse-session" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+dirs.workspace = true
+toml = "0.8"
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
