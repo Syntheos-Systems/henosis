@@ -1,0 +1,23 @@
+[package]
+name = "synapse-tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+walkdir = "2"
+hostname = { workspace = true }
+# In-workspace replacement for kleos-client + kleos-lib::{auth_piv, cred::bootstrap}
+# during Synapse absorption (Story 4.1). Retired once in-process dispatch lands.
+henosis-memory-client = { path = "../henosis-memory-client" }
+synapse-session = { path = "../synapse-session" }
+synapse-provider = { path = "../synapse-provider" }
+urlencoding = "2"
