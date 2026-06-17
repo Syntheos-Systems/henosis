@@ -1,0 +1,28 @@
+[package]
+name = "synapse-provider"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+eventsource-stream = { workspace = true }
+reqwest-eventsource = { workspace = true }
+async-trait = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+which = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+# URL-encoding for provider query params; not shared workspace-wide so pinned locally.
+urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"

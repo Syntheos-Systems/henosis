@@ -18,6 +18,8 @@ members = [
     "crates/henosis-pistis",
     "crates/henosis-memory-client",
     "crates/agent-forge-lib",
+    "crates/synapse-provider",
+    "crates/synapse-session",
 ]
 
 [workspace.package]
@@ -40,7 +42,7 @@ hkdf = "0.12"
 hex = "0.4"
 rand = "0.9"
 base64 = "0.22"
-uuid = { version = "1", features = ["v8", "serde"] }
+uuid = { version = "1", features = ["v4", "v8", "serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 async-trait = "0.1"
 # SQLite for kernel-service storage (matches Kleos's rusqlite 0.31). Per-crate `bundled` feature
@@ -73,3 +75,14 @@ yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 # Home/cache dir resolution for the memory-client session-token cache (Story 4.1).
 dirs = "5"
+# Synapse-provider/session absorption (Story 4.1 step 2). Versions pinned to match the Synapse
+# workspace these crates were copy-and-owned from, so the LLM-provider behavior is unchanged.
+anyhow = "1"
+log = "0.4"
+futures = "0.3"
+async-stream = "0.3"
+# SSE streaming for LLM provider responses (Anthropic/OpenAI-style token streams).
+eventsource-stream = "0.2"
+reqwest-eventsource = "0.6"
+# Binary discovery on PATH (claude_max / codex provider subprocess lookup).
+which = "7"
