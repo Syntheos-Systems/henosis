@@ -260,7 +260,6 @@ mod tests {
         let state = RoomState::from_genesis(
             RoomPolicy {
                 trust_threshold: f64::NAN,
-                ..Default::default()
             },
             [pubkey()].into_iter().collect(),
             vec![AdmittedPrincipal::new(
