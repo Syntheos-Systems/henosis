@@ -1,13 +1,18 @@
-//! Bridge to the `frameshift` CLI's automate mode.
+//! In-process bridge to Frameshift's automate-mode persona ranking.
 //!
 //! The operator's persona engine already implements ranking and per-project state.
 //! Synapse does not reinvent any of it; this module is a thin wrapper around:
 //!
-//! - `frameshift automate status` -- learn whether automate is on for the
-//!   current project and which persona is active.
-//! - `frameshift select --library <root> --task <text>` -- rank installed
-//!   personas against a task summary. Output is a fixed-width table whose
-//!   first data row is the top pick.
+//! - In-process [`frameshift_orchestrator::select`] -- rank installed personas
+//!   against a task summary. The top-scored persona is the pick, gated by a
+//!   confidence floor. This is the same ranking the `frameshift select` CLI
+//!   performs, called directly instead of via a subprocess (Story 4.3).
+//! - `frameshift automate status` (subprocess) -- learn whether automate is on
+//!   for the current project and which persona is active. This reads
+//!   Frameshift's per-project automate-mode state, whose on-disk path is
+//!   resolved by Frameshift's own client crate (not the orchestrator lib), so
+//!   it stays a thin, graceful CLI probe rather than an in-process call. It is
+//!   mode *config*, not the persona load/selection path.
 //!
 //! Activation itself does NOT go through `frameshift-activate.sh` -- that
 //! script targets Claude Code's hook surface (writes a per-session marker
@@ -17,19 +22,23 @@
 //!
 //! ## Confidence floor
 //!
-//! `frameshift select` ranks every installed persona, so the "top pick" is
-//! always defined even when no persona truly fits. The wrapper enforces a
-//! configurable score floor (`min_score`) and tie-margin (`min_margin` over
-//! the runner-up) before declaring a winner. Below the floor the caller
-//! sees `Pick::None` and falls back to whatever was previously active.
+//! `select` ranks every installed persona, so the "top pick" is always defined
+//! even when no persona truly fits. The wrapper enforces a configurable score
+//! floor (`min_score`) and tie-margin (`min_margin` over the runner-up) before
+//! declaring a winner. Below the floor the caller sees `None` and falls back to
+//! whatever was previously active.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Result of a single `frameshift select` invocation. `name` is the
-/// directory name (matches `persona::load_by_name`). Score and margin are
-/// surfaced so the CLI can show a rationale line to the user.
+use frameshift_orchestrator::feedback::Preferences;
+use frameshift_orchestrator::policy::{PolicyWeights, Scored};
+use frameshift_orchestrator::run::{select, SelectionInputs};
+
+/// Result of a single persona ranking. `name` is the persona's canonical name
+/// (matches `persona::load_by_name`). Score and margin are surfaced so the CLI
+/// can show a rationale line to the user.
 #[derive(Debug, Clone)]
 pub struct Pick {
     /// Persona name of the top pick. Equal to the directory name under
@@ -41,8 +50,8 @@ pub struct Pick {
     /// signal -- a thin margin means a swap probably is not worth the
     /// context cost.
     pub margin: f64,
-    /// One-line rationale lifted from the `frameshift select` rationale
-    /// column for surface in `/persona` log lines.
+    /// One-line rationale lifted from the ranker's rationale field for surface
+    /// in `/persona` log lines.
     pub rationale: String,
 }
 
@@ -97,6 +106,12 @@ pub struct AutomateStatus {
 /// Query `frameshift automate status`. Returns `on: false` if the CLI is
 /// unavailable -- a fresh install without frameshift should not crash
 /// synapse, it should silently behave as if automate were off.
+///
+/// This reads Frameshift's per-project automate-mode state, whose on-disk path
+/// is computed by Frameshift's client crate (project-root -> state-dir hashing),
+/// not exposed by the orchestrator lib. It stays a subprocess probe by design;
+/// it is mode config, not the persona load/selection path that Story 4.3 moved
+/// in-process.
 pub fn status() -> AutomateStatus {
     let output = match Command::new("frameshift")
         .args(["automate", "status"])
@@ -133,10 +148,13 @@ pub fn status() -> AutomateStatus {
     AutomateStatus { on, active }
 }
 
-/// Call `frameshift select` and return the top pick, gated by the
-/// confidence floor in `opts`. Returns `Ok(None)` when no persona meets
-/// the floor or when the CLI is unavailable -- the caller falls back to
-/// the current persona rather than blocking.
+/// Rank installed personas against `task` in-process and return the top pick,
+/// gated by the confidence floor in `opts`.
+///
+/// Returns `Ok(None)` when the task is empty, the library is absent, the ranker
+/// finds no personas, or no persona meets the floor -- the caller falls back to
+/// the current persona rather than blocking. Errors only on a missing library
+/// path that cannot be defaulted.
 pub fn select_for_task(task: &str, opts: &AutomateOptions) -> Result<Option<Pick>> {
     let task = task.trim();
     if task.is_empty() {
@@ -151,93 +169,55 @@ pub fn select_for_task(task: &str, opts: &AutomateOptions) -> Result<Option<Pick
         return Ok(None);
     }
 
-    let output = match Command::new("frameshift")
-        .args(["select", "--library"])
-        .arg(&library)
-        .args(["--task", task])
-        .output()
-    {
-        Ok(o) => o,
+    // Context is sensed from the current working directory (the project synapse
+    // is operating in), matching the prior `frameshift select` CLI semantics
+    // which had no explicit project-root flag. Fall back to the library dir if
+    // the cwd is unavailable. The catalog to rank is always the library.
+    let project_root = std::env::current_dir().unwrap_or_else(|_| library.clone());
+    let inputs = SelectionInputs {
+        project_root: project_root.as_path(),
+        task_hint: Some(task),
+        source_dirs: Vec::new(),
+        catalog_root: Some(library),
+        prefs: Preferences::default(),
+        weights: PolicyWeights::default(),
+    };
+
+    // A ranking failure (e.g. unreadable catalog) degrades to "no pick" rather
+    // than propagating -- the caller keeps the current persona.
+    let ranked = match select(&inputs) {
+        Ok(r) => r,
         Err(_) => return Ok(None),
     };
-    if !output.status.success() {
-        return Ok(None);
-    }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let rows = parse_select_output(&text);
-    let top = match rows.first() {
-        Some(r) => r,
-        None => return Ok(None),
-    };
+    Ok(top_pick(&ranked, opts))
+}
 
-    if top.score < opts.min_score {
-        return Ok(None);
+/// Pure gating helper: pick the top-ranked persona if it clears the score floor
+/// and tie-margin, mapping it to a [`Pick`]. `ranked` is expected sorted
+/// descending by score (as `frameshift_orchestrator::select` returns it).
+///
+/// Decoupled from the orchestrator call so the floor/margin logic is unit
+/// testable on synthetic rankings without building a real persona catalog.
+fn top_pick(ranked: &[Scored], opts: &AutomateOptions) -> Option<Pick> {
+    let top = ranked.first()?;
+    let score = top.score as f64;
+    if score < opts.min_score {
+        return None;
     }
-    let margin = rows
+    let margin = ranked
         .get(1)
-        .map(|r| top.score - r.score)
-        .unwrap_or(top.score);
+        .map(|second| score - second.score as f64)
+        .unwrap_or(score);
     if margin < opts.min_margin {
-        return Ok(None);
+        return None;
     }
-
-    Ok(Some(Pick {
-        name: top.name.clone(),
-        score: top.score,
+    Some(Pick {
+        name: top.persona.clone(),
+        score,
         margin,
         rationale: top.rationale.clone(),
-    }))
-}
-
-/// Internal shape of one parsed row from `frameshift select`.
-#[derive(Debug, Clone)]
-struct SelectRow {
-    name: String,
-    score: f64,
-    rationale: String,
-}
-
-/// Parse the fixed-width table emitted by `frameshift select`. The header
-/// row and dashed separator are skipped. Each remaining row collapses
-/// run-of-whitespace into single delimiters via `split_whitespace`. The
-/// rationale column itself contains spaces, so after consuming the first
-/// three tokens (name, score, confidence) the rest is rejoined.
-fn parse_select_output(text: &str) -> Vec<SelectRow> {
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
-        }
-        // Skip the column headers and dashed separator.
-        if line.starts_with("persona") || line.starts_with("----") {
-            continue;
-        }
-        let mut iter = line.split_whitespace();
-        let name = match iter.next() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let score = match iter.next().and_then(|s| s.parse::<f64>().ok()) {
-            Some(v) => v,
-            None => continue,
-        };
-        // Skip the confidence column.
-        let _confidence = iter.next();
-        let rationale = iter.collect::<Vec<_>>().join(" ");
-        rows.push(SelectRow {
-            name,
-            score,
-            rationale,
-        });
-    }
-    rows.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    rows
+    })
 }
 
 /// Default personas library when the caller doesn't override.
@@ -257,59 +237,122 @@ fn default_library() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frameshift_orchestrator::policy::ScoreComponents;
+    use std::fs;
+    use tempfile::TempDir;
 
-    /// Sample `frameshift select` output captured live for parser coverage.
-    const SAMPLE: &str = "\
-persona                          score confidence  rationale
---------------------------------------------------------------------------------
-cryptographic                    0.494      0.253  cryptographic 0.49: languages {rust,toml}: lang_score=0.46
-lab                              0.481      0.000  lab 0.48: languages {rust}
-data                             0.460      0.000  data 0.46: languages {rust}
-testing                          0.452      0.000  testing 0.45
-architecture                     0.429      0.000  architecture 0.43";
-
-    /// Handles `parse_select_output_top_pick` behavior.
-    #[test]
-    fn parse_select_output_top_pick() {
-        let rows = parse_select_output(SAMPLE);
-        assert!(!rows.is_empty());
-        assert_eq!(rows[0].name, "cryptographic");
-        assert!((rows[0].score - 0.494).abs() < 1e-9);
-        assert!(rows[0].rationale.contains("languages"));
-    }
-
-    /// Handles `parse_select_output_sorted_by_score_descending` behavior.
-    #[test]
-    fn parse_select_output_sorted_by_score_descending() {
-        let rows = parse_select_output(SAMPLE);
-        for w in rows.windows(2) {
-            assert!(w[0].score >= w[1].score, "{:?} >= {:?}", w[0], w[1]);
+    /// Build a synthetic `Scored` for gating-logic tests.
+    fn scored(persona: &str, score: f32) -> Scored {
+        Scored {
+            persona: persona.to_string(),
+            score,
+            confidence: 0.0,
+            rationale: format!("{persona} {score}"),
+            components: ScoreComponents {
+                language: 0.0,
+                lexical: 0.0,
+                intent: 0.0,
+                capability: 0.0,
+            },
         }
     }
 
-    /// Handles `margin_gate_rejects_thin_wins_when_configured` behavior.
+    /// The top pick is the highest-scored persona above the floor.
     #[test]
-    fn margin_gate_rejects_thin_wins_when_configured() {
-        // Top two scores in SAMPLE: 0.494, 0.481 -> margin 0.013. The
-        // default (zero) margin admits this; an aggressive caller that
-        // requires margin >= 0.02 should reject.
-        let rows = parse_select_output(SAMPLE);
-        let real_margin = rows[0].score - rows[1].score;
+    fn top_pick_takes_highest() {
+        let ranked = vec![scored("cryptographic", 0.49), scored("lab", 0.48)];
+        let pick = top_pick(&ranked, &AutomateOptions::default()).expect("a pick");
+        assert_eq!(pick.name, "cryptographic");
+        assert!((pick.score - 0.49).abs() < 1e-6);
+        assert!((pick.margin - 0.01).abs() < 1e-6);
+    }
+
+    /// A top pick below the score floor yields no pick.
+    #[test]
+    fn top_pick_below_floor_is_none() {
+        let ranked = vec![scored("lab", 0.20), scored("data", 0.10)];
+        assert!(top_pick(&ranked, &AutomateOptions::default()).is_none());
+    }
+
+    /// An aggressive margin requirement rejects a thin win.
+    #[test]
+    fn top_pick_margin_gate_rejects_thin_win() {
+        let ranked = vec![scored("crypto", 0.49), scored("lab", 0.48)];
         let aggressive = AutomateOptions {
             min_margin: 0.02,
             ..AutomateOptions::default()
         };
-        assert!(real_margin < aggressive.min_margin);
-        // Defaults take the top pick regardless of margin.
-        let default = AutomateOptions::default();
-        assert!(rows[0].score >= default.min_score);
-        assert!(real_margin >= default.min_margin);
+        assert!(top_pick(&ranked, &aggressive).is_none());
+        // Defaults (zero margin) admit the same thin win.
+        assert!(top_pick(&ranked, &AutomateOptions::default()).is_some());
     }
 
-    /// Handles `empty_task_returns_none` behavior.
+    /// A single candidate uses its own score as the margin.
+    #[test]
+    fn top_pick_single_candidate_margin_is_score() {
+        let ranked = vec![scored("solo", 0.55)];
+        let pick = top_pick(&ranked, &AutomateOptions::default()).expect("a pick");
+        assert!((pick.margin - 0.55).abs() < 1e-6);
+    }
+
+    /// An empty task returns no pick before touching the catalog.
     #[test]
     fn empty_task_returns_none() {
         let pick = select_for_task("", &AutomateOptions::default()).unwrap();
         assert!(pick.is_none());
+    }
+
+    /// A missing library directory returns no pick (not an error).
+    #[test]
+    fn missing_library_returns_none() {
+        let opts = AutomateOptions {
+            library: Some(PathBuf::from("/nonexistent/persona/library")),
+            ..AutomateOptions::default()
+        };
+        let pick = select_for_task("anything", &opts).unwrap();
+        assert!(pick.is_none());
+    }
+
+    /// End-to-end in-process ranking over a fixture catalog: the task tokens
+    /// strongly match one persona's keywords, so it wins. Proves the subprocess
+    /// is gone and `frameshift_orchestrator::select` drives the pick.
+    #[test]
+    fn in_process_select_picks_matching_persona() {
+        let catalog = TempDir::new().unwrap();
+        let rustacean = catalog.path().join("rustacean");
+        fs::create_dir(&rustacean).unwrap();
+        fs::write(
+            rustacean.join("AGENTS.md"),
+            "# Rustacean\n\nRust systems engineer. Expert in cargo, tokio, async \
+             runtime, borrow checker, clippy, and trait objects. Writes idiomatic \
+             Rust with thiserror and tracing.\n",
+        )
+        .unwrap();
+        let gardener = catalog.path().join("gardener");
+        fs::create_dir(&gardener).unwrap();
+        fs::write(
+            gardener.join("AGENTS.md"),
+            "# Gardener\n\nHorticulture specialist. Knows soil, compost, pruning, \
+             watering schedules, perennials, and greenhouse climate control.\n",
+        )
+        .unwrap();
+
+        let opts = AutomateOptions {
+            library: Some(catalog.path().to_path_buf()),
+            // Drive the decision purely by ranking; the fixture guarantees a
+            // clear lexical winner for the task below.
+            min_score: 0.0,
+            min_margin: 0.0,
+        };
+        let pick = select_for_task(
+            "optimize the rust tokio async runtime and fix cargo clippy warnings",
+            &opts,
+        )
+        .unwrap()
+        .expect("a persona should be picked from the fixture catalog");
+        assert_eq!(
+            pick.name, "rustacean",
+            "the rust-heavy task must rank the rustacean persona first"
+        );
     }
 }
