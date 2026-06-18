@@ -1,10 +1,17 @@
 //! Kleos integration for bridge discussion context and consensus writeback.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
+
+use henosis_broca::{BrocaStore, LogAction};
+use henosis_chiasm::{ChiasmStore, NewTask, Task, TaskFilter, TaskPatch, TaskStatus};
+use henosis_memory_client::Client as MemoryClient;
+use syntheos_contracts::{PrincipalId, TaskId, TenantId};
 
 use crate::error::BridgeError;
 
@@ -373,6 +380,307 @@ impl KleosClient for HttpKleosClient {
     }
 }
 
+/// In-process Kleos client: backs the bridge's [`KleosClient`] trait with the
+/// henosis kernel stores instead of HTTP-to-Kleos.
+///
+/// Chiasm task operations and Broca activity run fully in-process against
+/// `ChiasmStore`/`BrocaStore`. Memory operations route to upstream Kleos via the
+/// workspace memory client, because no in-process vector store exists in the
+/// workspace yet. This is the in-Henosis counterpart to [`HttpKleosClient`],
+/// which stays the standalone-bridge path -- the same trait, two deployments
+/// (mirroring the standalone/Henosis split of the Synapse PistisGate authority).
+pub struct InProcessKleosClient {
+    /// In-process Chiasm task store.
+    chiasm: Arc<ChiasmStore>,
+    /// In-process Broca action/narration store.
+    broca: Arc<BrocaStore>,
+    /// Memory client to upstream Kleos (generic signed HTTP).
+    memory: Arc<MemoryClient>,
+    /// Tenant all bridge kernel writes belong to.
+    tenant: TenantId,
+    /// The bridge service principal: owner/scope for all bridge Chiasm
+    /// bookkeeping, so `active_tasks_summary` (a principal-scoped list) sees the
+    /// tasks the bridge created. Per-agent identity is carried as the task
+    /// assignee via [`crate::identity::principal_for_agent`].
+    principal: PrincipalId,
+}
+
+/// Construction for the in-process Kleos client.
+impl InProcessKleosClient {
+    /// Build from injected kernel store handles, a tenant, and the bridge
+    /// service principal.
+    pub fn new(
+        chiasm: Arc<ChiasmStore>,
+        broca: Arc<BrocaStore>,
+        memory: Arc<MemoryClient>,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Self {
+        Self {
+            chiasm,
+            broca,
+            memory,
+            tenant,
+            principal,
+        }
+    }
+}
+
+/// Collapse in-process Chiasm task rows into one compact executor-facing summary.
+///
+/// Mirrors [`summarize_active_tasks`] but over typed [`Task`] rows. The id is the
+/// task UUID (`KleosTaskSummary` carried an i64; `Task.id` is a `TaskId`). The
+/// agent name is omitted -- it is not recoverable from the assignee principal
+/// (the bridge resolves names to principals one-way), a documented fidelity
+/// difference from the HTTP path.
+fn summarize_tasks(tasks: &[Task]) -> Option<String> {
+    if tasks.is_empty() {
+        return None;
+    }
+    Some(
+        tasks
+            .iter()
+            .take(5)
+            .map(|task| match &task.summary {
+                Some(summary) => format!(
+                    "#{} {} -- {} ({})",
+                    task.id,
+                    task.title,
+                    summary,
+                    task.status.as_str()
+                ),
+                None => format!("#{} {} ({})", task.id, task.title, task.status.as_str()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Implements the bridge-facing Kleos operations in-process over kernel stores.
+#[async_trait]
+impl KleosClient for InProcessKleosClient {
+    /// Search memory via the upstream Kleos memory client (no in-process store).
+    async fn search_memories(
+        &self,
+        project: &str,
+        channel: &str,
+        recent_messages: &[(String, String)],
+        limit: usize,
+    ) -> Result<Vec<String>, BridgeError> {
+        let recent_refs: Vec<(&str, &str)> = recent_messages
+            .iter()
+            .map(|(author, text)| (author.as_str(), text.as_str()))
+            .collect();
+        let query = format!(
+            "project:{} {}",
+            project,
+            build_memory_query(channel, &recent_refs)
+        );
+        let resp = self
+            .memory
+            .post("/search", json!({ "query": query, "limit": limit }))
+            .await
+            .map_err(BridgeError::Kleos)?;
+        let results = resp
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(results
+            .iter()
+            .map(|hit| {
+                let id = hit
+                    .get("id")
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                let source = hit.get("source").and_then(Value::as_str).unwrap_or("unknown");
+                let content = hit.get("content").and_then(Value::as_str).unwrap_or("");
+                format!("[memory:{id} source={source}] {content}")
+            })
+            .collect())
+    }
+
+    /// List the project's active tasks in-process via `ChiasmStore`.
+    async fn active_tasks_summary(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Option<String>, BridgeError> {
+        let filter = TaskFilter {
+            status: Some(TaskStatus::Active),
+            project: Some(project.to_string()),
+            limit: Some(limit),
+            offset: None,
+        };
+        let tasks = self
+            .chiasm
+            .list(self.principal, filter)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(summarize_tasks(&tasks))
+    }
+
+    /// Log a bridge lifecycle event in-process via `BrocaStore`.
+    async fn report_activity(
+        &self,
+        project: &str,
+        agent: &str,
+        action: &str,
+        summary: &str,
+        metadata: serde_json::Value,
+    ) -> Result<(), BridgeError> {
+        // Broca's LogAction has no project/agent slots, so pack them into the
+        // payload (which must be a JSON object) alongside the caller metadata.
+        let mut payload = serde_json::Map::new();
+        payload.insert("project".to_string(), json!(project));
+        payload.insert("agent".to_string(), json!(agent));
+        payload.insert("summary".to_string(), json!(summary));
+        match metadata {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    payload.insert(k, v);
+                }
+            }
+            Value::Null => {}
+            // A non-object metadata value cannot be merged into the object; nest
+            // it under a key so the payload stays a valid object for Broca.
+            other => {
+                payload.insert("metadata".to_string(), other);
+            }
+        }
+        let req = LogAction {
+            tenant: self.tenant,
+            principal_id: crate::identity::principal_for_agent(agent),
+            service: Some("rift-bridge".to_string()),
+            action: action.to_string(),
+            payload: Some(Value::Object(payload)),
+            narrative: None,
+        };
+        self.broca
+            .log(req)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store a consensus memory via the upstream Kleos memory client.
+    ///
+    /// Preserves `category: decision` / `importance: 6` (the gateway client
+    /// would flatten these to general/5) by posting the full body directly.
+    async fn store_consensus_memory(
+        &self,
+        project: &str,
+        content: &str,
+        tags: &[String],
+    ) -> Result<(), BridgeError> {
+        let mut all_tags = tags.to_vec();
+        let project_tag = format!("project:{project}");
+        if !all_tags.iter().any(|tag| tag == &project_tag) {
+            all_tags.push(project_tag);
+        }
+        self.memory
+            .post(
+                "/store",
+                json!({
+                    "content": content,
+                    "category": "decision",
+                    "source": "rift-bridge",
+                    "importance": 6,
+                    "tags": all_tags,
+                }),
+            )
+            .await
+            .map_err(BridgeError::Kleos)?;
+        Ok(())
+    }
+
+    /// Create a human-blocked draft task in-process via `ChiasmStore`.
+    async fn create_draft_task(
+        &self,
+        project: &str,
+        agent: &str,
+        title: &str,
+        summary: &str,
+    ) -> Result<(), BridgeError> {
+        let new = NewTask {
+            tenant: self.tenant,
+            principal_id: self.principal,
+            project: project.to_string(),
+            title: title.to_string(),
+            status: Some(TaskStatus::BlockedOnHuman),
+            summary: Some(summary.to_string()),
+            expected_output: None,
+            output_format: Some("raw".to_string()),
+            assignee: Some(crate::identity::principal_for_agent(agent)),
+            heartbeat_interval_secs: None,
+        };
+        self.chiasm
+            .create(new)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Create an active (claimed) task in-process and return its id string.
+    async fn create_execution_task(
+        &self,
+        project: &str,
+        agent: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<String, BridgeError> {
+        let new = NewTask {
+            tenant: self.tenant,
+            principal_id: self.principal,
+            project: project.to_string(),
+            title: title.to_string(),
+            status: Some(TaskStatus::Active),
+            summary: Some(description.to_string()),
+            expected_output: None,
+            output_format: Some("raw".to_string()),
+            assignee: Some(crate::identity::principal_for_agent(agent)),
+            heartbeat_interval_secs: None,
+        };
+        let task = self
+            .chiasm
+            .create(new)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(task.id.to_string())
+    }
+
+    /// Patch a task's status in-process via `ChiasmStore`.
+    ///
+    /// `note` maps to the task `summary` (Chiasm has no separate note field);
+    /// this clobbers any prior progress summary -- a documented fidelity caveat
+    /// matching the HTTP path's `note` field semantics.
+    async fn update_task_status(
+        &self,
+        task_id: &str,
+        status: &str,
+        note: &str,
+    ) -> Result<(), BridgeError> {
+        let id = task_id
+            .parse::<TaskId>()
+            .map_err(|e| BridgeError::Kleos(format!("invalid task id {task_id}: {e}")))?;
+        let status = TaskStatus::parse(status).map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        let patch = TaskPatch {
+            title: None,
+            status: Some(status),
+            summary: Some(note.to_string()),
+            assignee: None,
+        };
+        self.chiasm
+            .update(self.principal, id, patch)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// Build a compact memory query from channel and recent conversation.
 pub fn build_memory_query(channel: &str, recent_messages: &[(&str, &str)]) -> String {
     let joined = recent_messages
@@ -456,5 +764,114 @@ mod tests {
         assert!(summary.contains("architect"));
         assert!(summary.contains("blocked"));
         assert!(summary.contains("Design Kleos integration"));
+    }
+}
+
+#[cfg(test)]
+/// Tests for the in-process Kleos client over in-memory kernel stores.
+///
+/// The Chiasm/Broca paths run fully in-process and are exercised here. The two
+/// memory methods route to upstream Kleos over HTTP, so they are not covered by
+/// these store-only tests; they share the `build_memory_query` helper which is
+/// tested above.
+mod in_process_tests {
+    use super::*;
+    use henosis_broca::BrocaStore;
+    use henosis_chiasm::ChiasmStore;
+    use henosis_memory_client::Client as MemoryClient;
+    use std::sync::Arc;
+    use syntheos_axon::AxonBus;
+    use syntheos_contracts::{PrincipalId, TenantId};
+
+    /// Build an in-process client over fresh in-memory stores. The memory client
+    /// points at an unused address; the tests below never call a memory method.
+    fn client() -> (InProcessKleosClient, TenantId, PrincipalId) {
+        let bus = Arc::new(AxonBus::new());
+        let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).unwrap());
+        let broca = Arc::new(BrocaStore::open_in_memory(bus).unwrap());
+        let memory = Arc::new(MemoryClient::new("http://127.0.0.1:1".to_string(), None, None));
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        (
+            InProcessKleosClient::new(chiasm, broca, memory, tenant, principal),
+            tenant,
+            principal,
+        )
+    }
+
+    /// An execution task is created and then surfaces in the active-task summary.
+    #[tokio::test]
+    async fn execution_task_round_trips_into_summary() {
+        let (kleos, _, _) = client();
+        let id = kleos
+            .create_execution_task("proj", "architect", "Wire the gateway", "do the thing")
+            .await
+            .expect("create execution task");
+        // The returned id is a parseable task UUID.
+        assert!(!id.is_empty());
+
+        let summary = kleos
+            .active_tasks_summary("proj", 10)
+            .await
+            .expect("summary")
+            .expect("one active task");
+        assert!(summary.contains("Wire the gateway"), "summary: {summary}");
+        assert!(summary.contains("active"), "summary: {summary}");
+    }
+
+    /// A draft task is created blocked-on-human and is NOT listed as active.
+    #[tokio::test]
+    async fn draft_task_is_not_active() {
+        let (kleos, _, _) = client();
+        kleos
+            .create_draft_task("proj", "architect", "Maybe later", "needs human ok")
+            .await
+            .expect("create draft task");
+        let summary = kleos.active_tasks_summary("proj", 10).await.expect("summary");
+        assert!(summary.is_none(), "blocked_on_human task must not be active");
+    }
+
+    /// Updating an execution task to completed removes it from the active list.
+    #[tokio::test]
+    async fn update_status_moves_task_out_of_active() {
+        let (kleos, _, _) = client();
+        let id = kleos
+            .create_execution_task("proj", "architect", "Ship it", "in progress")
+            .await
+            .expect("create");
+        kleos
+            .update_task_status(&id, "completed", "done and verified")
+            .await
+            .expect("update status");
+        let summary = kleos.active_tasks_summary("proj", 10).await.expect("summary");
+        assert!(summary.is_none(), "completed task must not be active");
+    }
+
+    /// A bad status token is a clean error, not a panic.
+    #[tokio::test]
+    async fn update_status_rejects_unknown_status() {
+        let (kleos, _, _) = client();
+        let id = kleos
+            .create_execution_task("proj", "architect", "T", "d")
+            .await
+            .expect("create");
+        let err = kleos.update_task_status(&id, "teleported", "n").await;
+        assert!(err.is_err(), "unknown status must error");
+    }
+
+    /// report_activity logs to Broca in-process without error.
+    #[tokio::test]
+    async fn report_activity_logs() {
+        let (kleos, _, _) = client();
+        kleos
+            .report_activity(
+                "proj",
+                "architect",
+                "bridge.started",
+                "room opened",
+                serde_json::json!({ "room": "!abc" }),
+            )
+            .await
+            .expect("report activity");
     }
 }

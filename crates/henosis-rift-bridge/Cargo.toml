@@ -53,3 +53,15 @@ anyhow = "1"
 
 # Frameshift persona selection engine (local development path dependency)
 frameshift-orchestrator = { path = "../../../frameshift/server/crates/frameshift-orchestrator" }
+
+# In-process Kleos seam (Story 4.4 step 3): InProcessKleosClient backs the
+# KleosClient trait with the henosis kernel stores instead of HTTP-to-Kleos.
+henosis-chiasm = { path = "../henosis-chiasm" }
+henosis-broca = { path = "../henosis-broca" }
+# Memory ops have no in-process vector store yet, so they route to upstream
+# Kleos via the workspace memory client (generic signed HTTP).
+henosis-memory-client = { path = "../henosis-memory-client" }
+
+[dev-dependencies]
+# In-memory kernel stores need an AxonBus to construct in the trait tests.
+syntheos-axon = { path = "../syntheos-axon" }
