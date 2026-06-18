@@ -22,7 +22,11 @@ pub mod write;
 
 pub use capability::Capability;
 pub use executor::ToolRegistryExecutor;
-pub use pistis_gate::{PistisClient, PistisGate};
+pub use pistis_gate::{
+    AuthorizationOutcome, LocalAuthority, PistisAuthority, PistisClient, PistisGate,
+};
+#[cfg(feature = "henosis-pistis")]
+pub use pistis_gate::henosis::HenosisAuthority;
 pub use recall::{RecallDueMemory, RecallOptions, fetch_recall_due, recall_due_as_blocks};
 pub use skill_invoke::SkillInvokeTool;
 pub use tool::{

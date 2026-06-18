@@ -1,17 +1,24 @@
-//! `PistisGate`: capability-checking `ToolGate` backed by a placeholder Pistis client.
+//! `PistisGate`: a capability-checking `ToolGate` with a pluggable authority.
 //!
-//! Pistis is the Synapse trust/capability system (Rust port of "Blindfold" from
-//! the Rift design doc). This module provides the gate-layer placeholder. The real
-//! Pistis client -- with opaque capability handles, scoped grants, and an audit
-//! trail -- lands in a future crate. Until then, `PistisClient` is a thin wrapper
-//! around a `HashSet<Capability>` that the caller populates at construction time.
+//! Pistis is the Synapse trust/capability system. This gate runs inside the
+//! agent loop, before each tool executes, and asks an authority whether the
+//! current principal may run that tool. The authority is pluggable so Synapse
+//! works in two deployments without code changes at the call site:
+//!
+//! - **Standalone** (default): [`LocalAuthority`] checks a tool's required
+//!   capabilities against a session-local `HashSet<Capability>` granted at
+//!   construction. No Henosis dependency; Synapse runs on its own.
+//! - **Under Henosis** (feature `henosis-pistis`): [`henosis::HenosisAuthority`]
+//!   checks against in-process `henosis-pistis` room-state authority -- the same
+//!   `authorize_capabilities` decision the dispatcher's pistis gate uses, with
+//!   admission, trust threshold, and per-capability matching. Fail-closed: a
+//!   room with no materialized state denies every restricted tool.
 //!
 //! ## Composition
 //!
 //! `PistisGate` wraps an inner `SharedGate` (typically `HookGate` wrapping
-//! `PermissiveGate`) following the same pattern as `HookGate`. The capability
-//! check runs first; if it passes, the call is delegated to the inner gate.
-//! This lets callers compose:
+//! `PermissiveGate`). The capability check runs first; if it passes, the call is
+//! delegated to the inner gate:
 //!
 //! ```text
 //! PistisGate
@@ -21,12 +28,14 @@
 //!
 //! ## Static capability map
 //!
-//! Tool names are mapped to required capabilities via a static lookup. The map
-//! covers all built-in Synapse tools. Unknown tools require no capabilities (they
-//! are not blocked by this gate; add them to the map to restrict them).
+//! Tool names are mapped to required capabilities via a static lookup shared by
+//! both authorities. The map covers all built-in Synapse tools. Unknown tools
+//! require no capabilities (they are not blocked by this gate; add them to the
+//! map to restrict them).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -38,14 +47,39 @@ use crate::tool::{GateDecision, SharedGate, ToolGate, ToolResult};
 pub use crate::capability::Capability;
 
 // ---------------------------------------------------------------------------
-// PistisClient (placeholder)
+// PistisAuthority -- the pluggable capability-decision backend
 // ---------------------------------------------------------------------------
 
-/// Placeholder Pistis client.
+/// The outcome of a per-tool authorization decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    /// The tool is authorized to run.
+    Allow,
+    /// The tool is denied; the string is a human-readable reason.
+    Deny(String),
+}
+
+/// A backend that decides whether a named tool may run for the current session.
 ///
-/// Holds the set of capabilities granted for the current execution session.
-/// The real client will replace this with opaque handles, scoped grants,
-/// revocation support, and an audit trail.
+/// `PistisGate` holds an `Arc<dyn PistisAuthority>` and consults it before each
+/// tool. [`LocalAuthority`] implements the standalone path; the feature-gated
+/// [`henosis::HenosisAuthority`] implements the in-process Henosis path.
+#[async_trait::async_trait]
+pub trait PistisAuthority: Send + Sync {
+    /// Decide whether the tool named `name` may execute.
+    async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome;
+}
+
+// ---------------------------------------------------------------------------
+// PistisClient (standalone capability set)
+// ---------------------------------------------------------------------------
+
+/// Session-local Pistis client holding the capabilities granted for this run.
+///
+/// In the standalone deployment this is the source of truth: a task is approved
+/// with a concrete capability set, and the client answers membership queries
+/// against it. Under Henosis the authority comes from room state instead and
+/// this client is unused.
 pub struct PistisClient {
     /// Capabilities currently granted for this session.
     granted: HashSet<Capability>,
@@ -64,7 +98,6 @@ impl PistisClient {
     ///
     /// Useful in development and tests where Pistis enforcement is not yet needed.
     pub fn permissive() -> Self {
-        use crate::capability::Capability;
         Self {
             granted: [
                 Capability::new(Capability::FS_READ),
@@ -99,8 +132,8 @@ impl PistisClient {
 /// Build the static map from tool name to required capabilities.
 ///
 /// Covers all built-in Synapse tools. Unknown tools are not restricted
-/// by this gate (their required slice is empty).
-fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
+/// by this gate (their required slice is empty). Shared by both authorities.
+pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
     let fs_read = || Capability::new(Capability::FS_READ);
     let fs_write = || Capability::new(Capability::FS_WRITE);
     let bash = || Capability::new(Capability::BASH);
@@ -207,80 +240,256 @@ fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
 }
 
 // ---------------------------------------------------------------------------
-// PistisGate
+// LocalAuthority -- standalone capability set + static map
 // ---------------------------------------------------------------------------
 
-/// `ToolGate` implementation that enforces Pistis capability grants.
+/// The standalone Pistis authority: a session-local granted capability set
+/// checked against the static tool->capability map.
 ///
-/// Before each tool execution, looks up the capabilities required for the
-/// tool name in the static map. If the `PistisClient`'s granted set is missing
-/// any required capability, the tool is denied with a descriptive message.
-/// When the check passes, the call is forwarded to the inner gate.
-pub struct PistisGate {
-    /// Placeholder Pistis client holding the granted capability set.
+/// This is the default backend. It requires no Henosis dependency, so Synapse
+/// runs on its own. A tool with no mapped requirement is allowed; a tool whose
+/// requirements are not all granted is denied, naming the first missing one.
+pub struct LocalAuthority {
+    /// The capabilities granted for this session.
     client: PistisClient,
-    /// Inner gate consulted after the capability check passes.
-    inner: SharedGate,
     /// Static tool-to-capability map, computed once at construction.
     cap_map: HashMap<&'static str, Vec<Capability>>,
 }
 
-/// Adds inherent behavior for `PistisGate`.
-impl PistisGate {
-    /// Construct a `PistisGate` with explicit granted capabilities and an inner gate.
-    ///
-    /// `client` holds the set of capabilities granted for this session.
-    /// `inner` is typically `HookGate(PermissiveGate)` or `PermissiveGate` directly.
-    pub fn new(client: PistisClient, inner: SharedGate) -> Self {
+/// Adds inherent behavior for `LocalAuthority`.
+impl LocalAuthority {
+    /// Construct from a populated [`PistisClient`].
+    pub fn new(client: PistisClient) -> Self {
         Self {
             client,
-            inner,
             cap_map: capability_map(),
         }
     }
 
+    /// Construct from an explicit set of granted capabilities.
+    pub fn from_granted_capabilities(granted: impl IntoIterator<Item = Capability>) -> Self {
+        Self::new(PistisClient::new(granted))
+    }
+
+    /// Construct a permissive authority (all capabilities granted).
+    pub fn permissive() -> Self {
+        Self::new(PistisClient::permissive())
+    }
+}
+
+/// Implements the standalone capability check.
+#[async_trait::async_trait]
+impl PistisAuthority for LocalAuthority {
+    /// Allow tools with no mapped requirement; otherwise require every mapped
+    /// capability to be granted, naming the first missing one on denial.
+    async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
+        let required: &[Capability] = self.cap_map.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+        match self.client.check(required) {
+            Ok(()) => AuthorizationOutcome::Allow,
+            Err(missing) => AuthorizationOutcome::Deny(format!(
+                "missing capability: {missing} (required by tool '{name}')"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PistisGate
+// ---------------------------------------------------------------------------
+
+/// `ToolGate` implementation that enforces Pistis capability grants via a
+/// pluggable [`PistisAuthority`].
+///
+/// Before each tool execution, asks the authority whether the tool may run. On
+/// `Deny`, returns `GateDecision::Deny`. On `Allow`, forwards to the inner gate.
+pub struct PistisGate {
+    /// The capability-decision backend (local or Henosis-backed).
+    authority: Arc<dyn PistisAuthority>,
+    /// Inner gate consulted after the capability check passes.
+    inner: SharedGate,
+}
+
+/// Adds inherent behavior for `PistisGate`.
+impl PistisGate {
+    /// Construct a `PistisGate` over an explicit authority and inner gate.
+    ///
+    /// This is the general constructor. Use it to install the Henosis-backed
+    /// authority (`with_authority(Arc::new(HenosisAuthority::new(...)), inner)`)
+    /// or any custom backend.
+    pub fn with_authority(authority: Arc<dyn PistisAuthority>, inner: SharedGate) -> Self {
+        Self { authority, inner }
+    }
+
+    /// Construct a `PistisGate` from a standalone [`PistisClient`] and inner gate.
+    pub fn new(client: PistisClient, inner: SharedGate) -> Self {
+        Self::with_authority(Arc::new(LocalAuthority::new(client)), inner)
+    }
+
     /// Construct a `PistisGate` from task-local granted capabilities and an inner gate.
     ///
-    /// This is the execution-mode constructor used by Synapse when a task has
-    /// already been approved by Pistis and carries a concrete capability set.
+    /// This is the standalone execution-mode constructor used by Synapse when a
+    /// task has already been approved and carries a concrete capability set.
     pub fn from_granted_capabilities(
         granted: impl IntoIterator<Item = Capability>,
         inner: SharedGate,
     ) -> Self {
-        Self::new(PistisClient::new(granted), inner)
+        Self::with_authority(
+            Arc::new(LocalAuthority::from_granted_capabilities(granted)),
+            inner,
+        )
     }
 
     /// Convenience constructor for a permissive gate (all capabilities granted).
     ///
     /// Useful in development and tests.
     pub fn permissive(inner: SharedGate) -> Self {
-        Self::new(PistisClient::permissive(), inner)
+        Self::with_authority(Arc::new(LocalAuthority::permissive()), inner)
     }
 }
 
 /// Implements `ToolGate` behavior for `PistisGate`.
 #[async_trait::async_trait]
 impl ToolGate for PistisGate {
-    /// Check capabilities before the tool runs, then delegate to the inner gate.
+    /// Ask the authority before the tool runs, then delegate to the inner gate.
     ///
-    /// If the client's granted set is missing any required capability, returns
-    /// `GateDecision::Deny` with the name of the first missing capability.
+    /// If the authority denies, returns `GateDecision::Deny` with its reason.
     /// Otherwise forwards to `inner.before_execute`.
     async fn before_execute(&self, name: &str, params: &Value, cwd: &Path) -> GateDecision {
-        let required: &[Capability] = self.cap_map.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
-
-        if let Err(missing) = self.client.check(required) {
-            return GateDecision::Deny(format!(
-                "missing capability: {missing} (required by tool '{name}')"
-            ));
+        match self.authority.authorize_tool(name).await {
+            AuthorizationOutcome::Allow => self.inner.before_execute(name, params, cwd).await,
+            AuthorizationOutcome::Deny(reason) => GateDecision::Deny(reason),
         }
-
-        self.inner.before_execute(name, params, cwd).await
     }
 
     /// Delegate to the inner gate after execution. No capability logic needed here.
     async fn after_execute(&self, name: &str, params: &Value, result: &ToolResult, cwd: &Path) {
         self.inner.after_execute(name, params, result, cwd).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HenosisAuthority -- in-process henosis-pistis room-state backend
+// ---------------------------------------------------------------------------
+
+/// In-process Pistis authority backed by `henosis-pistis` room state.
+///
+/// Enabled by the `henosis-pistis` feature. Synapse running under Henosis
+/// installs this authority so tool gating runs through the same
+/// `authorize_capabilities` decision (admission + trust threshold + per-cap
+/// match) as the dispatcher's pistis gate, fail-closed when room state is absent.
+#[cfg(feature = "henosis-pistis")]
+pub mod henosis {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use henosis_pistis::authority::{
+        authorize_capabilities, CapabilityCheckRequest, CapabilityRequirement,
+    };
+    use henosis_pistis::model::ActionKind;
+    use henosis_pistis::{Clock, RoomStateSource, SystemClock};
+    use syntheos_contracts::PrincipalId;
+
+    use super::{capability_map, AuthorizationOutcome, Capability, PistisAuthority};
+
+    /// Capability authority backed by in-process henosis-pistis room state.
+    ///
+    /// Holds a room-state source, the principal the agent runs as, the room id,
+    /// a clock, and the action kind synapse tool calls are arbitrated under
+    /// (default [`ActionKind::Message`] -- a synapse tool call is an in-room
+    /// agent action). The principal is supplied at construction; agent-name ->
+    /// `PrincipalId` resolution is the caller's concern (Henosis wiring / Story
+    /// 4.4), not this gate's.
+    pub struct HenosisAuthority {
+        /// Where materialized room state is obtained.
+        source: Arc<dyn RoomStateSource>,
+        /// The principal whose admission/trust/capabilities are checked.
+        principal: PrincipalId,
+        /// The room whose authority state governs this session.
+        room: String,
+        /// Clock feeding the trust math (injected for deterministic tests).
+        clock: Arc<dyn Clock>,
+        /// The action kind synapse tool capabilities are required under.
+        action_kind: ActionKind,
+        /// Static tool-to-capability map (shared with the local authority).
+        cap_map: HashMap<&'static str, Vec<Capability>>,
+    }
+
+    /// Adds inherent behavior for `HenosisAuthority`.
+    impl HenosisAuthority {
+        /// Construct over a room-state source, principal, and room id, using the
+        /// system clock and [`ActionKind::Message`].
+        pub fn new(
+            source: Arc<dyn RoomStateSource>,
+            principal: PrincipalId,
+            room: impl Into<String>,
+        ) -> Self {
+            Self {
+                source,
+                principal,
+                room: room.into(),
+                clock: Arc::new(SystemClock),
+                action_kind: ActionKind::Message,
+                cap_map: capability_map(),
+            }
+        }
+
+        /// Override the clock (deterministic tests).
+        pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+            self.clock = clock;
+            self
+        }
+
+        /// Override the action kind synapse tool capabilities are required under.
+        pub fn with_action_kind(mut self, kind: ActionKind) -> Self {
+            self.action_kind = kind;
+            self
+        }
+    }
+
+    /// Implements the in-process Henosis capability check, fail-closed.
+    #[async_trait::async_trait]
+    impl PistisAuthority for HenosisAuthority {
+        /// Allow tools with no mapped requirement; otherwise authorize every
+        /// mapped capability against the materialized room state. A room with no
+        /// materialized authority state denies (fail-closed) -- Pistis cannot
+        /// verify, so it does not allow.
+        async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
+            let required: &[Capability] =
+                self.cap_map.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+            if required.is_empty() {
+                // Unknown / unrestricted tool -- not this authority's concern.
+                return AuthorizationOutcome::Allow;
+            }
+
+            let Some(state) = self.source.room_state(&self.room) else {
+                return AuthorizationOutcome::Deny(format!(
+                    "no pistis authority state for room {}",
+                    self.room
+                ));
+            };
+
+            let request = CapabilityCheckRequest {
+                principal: self.principal,
+                required: required
+                    .iter()
+                    .map(|cap| CapabilityRequirement {
+                        name: cap.as_str().to_owned(),
+                        action_kind: self.action_kind,
+                    })
+                    .collect(),
+            };
+
+            let decision = authorize_capabilities(&state, &request, self.clock.now());
+            if decision.allowed {
+                AuthorizationOutcome::Allow
+            } else {
+                AuthorizationOutcome::Deny(
+                    decision
+                        .reason
+                        .unwrap_or_else(|| "capability denied".to_owned()),
+                )
+            }
+        }
     }
 }
 
@@ -364,5 +573,154 @@ mod tests {
             .before_execute("totally_unknown_tool", &Value::Null, Path::new("/tmp"))
             .await;
         assert!(matches!(decision, GateDecision::Allow));
+    }
+
+    /// The `with_authority` constructor accepts any `PistisAuthority`; a custom
+    /// always-deny authority denies every tool.
+    #[tokio::test]
+    async fn with_authority_uses_custom_backend() {
+        struct DenyAll;
+        #[async_trait::async_trait]
+        impl PistisAuthority for DenyAll {
+            async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
+                AuthorizationOutcome::Deny(format!("policy: {name} forbidden"))
+            }
+        }
+        let gate = PistisGate::with_authority(Arc::new(DenyAll), Arc::new(PermissiveGate));
+        let decision = gate
+            .before_execute("read", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Henosis-backed authority tests (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "henosis-pistis"))]
+mod henosis_tests {
+    use super::henosis::HenosisAuthority;
+    use super::*;
+    use crate::tool::PermissiveGate;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use henosis_pistis::crypto::{PublicKey, SecretKey};
+    use henosis_pistis::gate::{Clock, InMemoryRoomStateSource};
+    use henosis_pistis::model::{
+        ActionKind, AdmittedPrincipal, Capability as PCapability, RoomPolicy,
+    };
+    use henosis_pistis::room::RoomState;
+    use syntheos_contracts::PrincipalId;
+    use time::OffsetDateTime;
+
+    /// A fixed clock so the trust math is deterministic.
+    struct FixedClock(OffsetDateTime);
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            self.0
+        }
+    }
+
+    /// A fresh public key.
+    fn pubkey() -> PublicKey {
+        SecretKey::generate().0
+    }
+
+    /// A room admitting `principal` holding the synapse `fs_read` and `bash`
+    /// capabilities under `ActionKind::Message`.
+    fn room_with(principal: PrincipalId) -> RoomState {
+        let mk = |name: &str| PCapability {
+            name: name.to_owned(),
+            action_kinds: BTreeSet::from([ActionKind::Message]),
+            granted_by: "operator".to_owned(),
+            expires_at: None,
+        };
+        RoomState::from_genesis(
+            RoomPolicy::default(),
+            [pubkey()].into_iter().collect(),
+            vec![AdmittedPrincipal::new(
+                principal,
+                pubkey(),
+                vec![mk(Capability::FS_READ), mk(Capability::BASH)],
+            )],
+        )
+    }
+
+    /// Build a Henosis-backed gate whose room "!r" admits `principal`.
+    fn gate_for(principal: PrincipalId) -> PistisGate {
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert("!r", room_with(principal));
+        let authority = HenosisAuthority::new(Arc::new(source), principal, "!r")
+            .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
+        PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate))
+    }
+
+    /// A held capability (`read` -> `fs_read`) is allowed.
+    #[tokio::test]
+    async fn henosis_allows_held_capability() {
+        let p = PrincipalId::new();
+        let gate = gate_for(p);
+        let decision = gate
+            .before_execute("read", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Allow));
+    }
+
+    /// A tool needing an unheld capability (`write` -> `fs_write`) is denied.
+    #[tokio::test]
+    async fn henosis_denies_unheld_capability() {
+        let p = PrincipalId::new();
+        let gate = gate_for(p);
+        let decision = gate
+            .before_execute("write", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+
+    /// A tool with no mapped requirement is allowed regardless of room state.
+    #[tokio::test]
+    async fn henosis_allows_unrestricted_tool() {
+        let p = PrincipalId::new();
+        let gate = gate_for(p);
+        let decision = gate
+            .before_execute("totally_unknown_tool", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Allow));
+    }
+
+    /// Fail-closed: an empty room-state source denies every restricted tool.
+    #[tokio::test]
+    async fn henosis_empty_room_state_denies() {
+        let p = PrincipalId::new();
+        let authority = HenosisAuthority::new(Arc::new(InMemoryRoomStateSource::new()), p, "!r")
+            .with_clock(Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)));
+        let gate = PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate));
+        let decision = gate
+            .before_execute("read", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(
+            matches!(decision, GateDecision::Deny(_)),
+            "empty authority must deny a restricted tool (fail-closed)"
+        );
+    }
+
+    /// An unadmitted principal is denied even for a tool whose capability the
+    /// room grants to someone else.
+    #[tokio::test]
+    async fn henosis_unadmitted_principal_denied() {
+        let admitted = PrincipalId::new();
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert("!r", room_with(admitted));
+        let intruder = PrincipalId::new();
+        let authority = HenosisAuthority::new(Arc::new(source), intruder, "!r")
+            .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
+        let gate = PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate));
+        let decision = gate
+            .before_execute("read", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Deny(_)));
     }
 }
