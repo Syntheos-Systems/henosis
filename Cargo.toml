@@ -25,6 +25,7 @@ members = [
     "crates/synapse-cron",
     "crates/synapse-cli",
     "crates/synapse-tui",
+    "crates/henosis-rift-server",
 ]
 
 [workspace.package]
