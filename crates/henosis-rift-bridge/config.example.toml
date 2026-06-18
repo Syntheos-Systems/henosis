@@ -1,0 +1,107 @@
+# Export Kleos credentials before running the bridge:
+#   export KLEOS_URL=http://127.0.0.1:4200
+#   export KLEOS_API_KEY=eg_your_key_here
+
+[rift]
+api_url = "http://localhost:3200"
+ws_url = "ws://localhost:3200/ws"
+jwt_secret = "your-jwt-secret-here"
+server_id = "00000000-0000-0000-0000-000000000000"
+channel_id = "00000000-0000-0000-0000-000000000000"
+pause_poll_secs = 5
+
+[bridge]
+cooldown_secs = 30
+turn_budget = 5
+thread_ceiling = 30
+context_window = 50
+jitter_range_ms = [2000, 8000]
+
+# --- Agent definitions ---
+
+# Agent using ClaudeCode executor (shells out to `claude -p`, no tool access)
+[[agents]]
+name = "Reviewer"
+username = "agent-reviewer"
+base_chance = 0.3
+system_prompt = "You are a code reviewer. Focus on correctness, edge cases, and maintainability."
+
+[agents.executor]
+type = "ClaudeCode"
+binary = "claude"
+model = "sonnet"
+
+# Agent using Synapse with Foundry Anthropic provider (full tool access)
+[[agents]]
+name = "Architect"
+username = "agent-architect"
+base_chance = 0.3
+system_prompt = "You are a software architect. Focus on system design, boundaries, and trade-offs."
+
+[agents.executor]
+type = "Synapse"
+provider = "foundry-anthropic"
+host = "your-foundry-host.example.com"
+token = "your-foundry-token"
+model = "claude-sonnet-4-6"
+max_tokens = 4096
+
+# Agent using Synapse with Claude Max provider (full tool access via Max subscription)
+[[agents]]
+name = "Builder"
+username = "agent-builder"
+base_chance = 0.3
+system_prompt = "You are a builder. You write code, run tests, and ship features."
+
+[agents.executor]
+type = "Synapse"
+provider = "claude-max"
+model = "claude-sonnet-4-6"
+max_tokens = 4096
+max_turns = 4
+cwd = "/path/to/agent/workspace"
+
+# --- Execution mode -------------------------------------------------------
+
+# Per-agent capability allowlist. Agents may only execute tasks whose required
+# capabilities are all listed here. Capability names: fs_read, fs_write, bash, network.
+[capabilities]
+architect = ["fs_read", "fs_write", "bash"]
+reviewer  = ["fs_read"]
+
+# Repositories an approved task may execute against. The workspace whose name
+# matches the project ("rift") is preferred; otherwise the first is used.
+[[workspaces]]
+name = "rift"
+path = "/path/to/rift"
+# cargo_target_dir = "/path/to/build-cache"   # optional
+
+# Execution runtime settings. Omit this block to disable execution mode entirely.
+[execution]
+worktrees_root = "/path/to/rift/.worktrees"
+max_concurrent_executions = 1
+approval_ttl_secs = 1800
+max_runtime_secs = 1800
+
+# Optional Pistis-backed authorization. When enabled, the bridge asks the
+# Pistis orchestrator whether an agent may execute the requested capabilities.
+[pistis]
+enabled = false
+orchestrator_url = "http://127.0.0.1:7070"
+auth_token_cred = "pistis/signer-token"
+room = "!pistis:example.com"
+
+# HTTP control server for approvals. Omit to disable; in-channel !approve still works.
+[control]
+bind_addr = "127.0.0.1:3210"
+auth_token = "set-me"   # require: Authorization: Bearer set-me
+
+# Optional Frameshift persona allocation. Absent disables personas entirely.
+# When present, agents are assigned thread-stable personas (with collision
+# avoidance and an optional challenger slot), and message-to-persona relevance
+# scales engagement. Each agent also gets a growth file under growth_root.
+# [personas]
+# library_path = "/path/to/frameshift/personas"
+# growth_root = "/path/to/rift/growth"
+# max_same_persona = 2
+# challenger_slot = true

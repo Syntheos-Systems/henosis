@@ -1,0 +1,342 @@
+//! HTTP + WS client for Rift server API.
+
+use futures_util::{SinkExt, StreamExt};
+use reqwest::Client;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use uuid::Uuid;
+
+use crate::auth::AgentAuthManager;
+use crate::error::BridgeError;
+use crate::types::RoomMessage;
+
+/// HTTP client for the Rift server REST API.
+pub struct RiftRestClient {
+    /// Underlying HTTP client.
+    client: Client,
+    /// Base URL of the Rift server (e.g., http://localhost:3200).
+    base_url: String,
+    /// Auth manager for issuing agent JWTs.
+    auth: AgentAuthManager,
+}
+
+/// Response from user registration.
+#[derive(Debug, Deserialize)]
+pub struct UserResponse {
+    /// Rift user ID.
+    pub id: Uuid,
+    /// Username.
+    pub username: String,
+    /// Whether the user is an agent.
+    pub is_agent: bool,
+}
+
+/// Response from sending a message.
+#[derive(Debug, Deserialize)]
+pub struct MessageResponse {
+    /// Message ID.
+    pub id: Uuid,
+    /// Channel the message was posted in.
+    pub channel_id: Uuid,
+    /// Author's user ID.
+    pub author_id: Uuid,
+    /// Message text content.
+    pub content: String,
+    /// Message type discriminator.
+    pub message_type: Option<String>,
+}
+
+/// Single message from the list_messages response.
+#[derive(Debug, Deserialize)]
+pub struct ListMessageResponse {
+    /// Message ID.
+    pub id: Uuid,
+    /// Channel ID.
+    pub channel_id: Uuid,
+    /// Author's user ID.
+    pub author_id: Uuid,
+    /// Author's username (may be absent in older data).
+    #[serde(default)]
+    pub author_username: Option<String>,
+    /// Message text content.
+    pub content: String,
+    /// Message type discriminator.
+    pub message_type: Option<String>,
+    /// ISO timestamp of message creation.
+    pub created_at: String,
+}
+
+/// Bridge status response from the pause endpoint.
+#[derive(Debug, Deserialize)]
+pub struct BridgeStatus {
+    /// Whether the bridge is paused.
+    pub paused: bool,
+}
+
+/// Implements REST operations used by the bridge daemon.
+impl RiftRestClient {
+    /// Create a new REST client for the given base URL.
+    pub fn new(base_url: String, auth: AgentAuthManager) -> Self {
+        Self {
+            client: Client::new(),
+            base_url,
+            auth,
+        }
+    }
+
+    /// Register an agent user. Returns existing user if username already taken.
+    pub async fn register_agent(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+    ) -> Result<UserResponse, BridgeError> {
+        let url = format!("{}/api/auth/register", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "username": username,
+                "email": format!("{}@agent.local", username),
+                "password": password,
+                "display_name": display_name,
+            }))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let user_id = body["user"]["id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    BridgeError::RiftApi("missing user id in register response".into())
+                })?;
+
+            Ok(UserResponse {
+                id: user_id,
+                username: username.to_string(),
+                is_agent: true,
+            })
+        } else if resp.status() == reqwest::StatusCode::CONFLICT {
+            self.login_agent(username, password).await
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(BridgeError::RiftApi(format!(
+                "register failed ({status}): {body}"
+            )))
+        }
+    }
+
+    /// Login an existing agent user to get their ID.
+    async fn login_agent(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<UserResponse, BridgeError> {
+        let url = format!("{}/api/auth/login", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "username": username,
+                "password": password,
+            }))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let user_id = body["user"]["id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| BridgeError::RiftApi("missing user id in login response".into()))?;
+
+            Ok(UserResponse {
+                id: user_id,
+                username: username.to_string(),
+                is_agent: true,
+            })
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(BridgeError::RiftApi(format!(
+                "login failed ({status}): {body}"
+            )))
+        }
+    }
+
+    /// Send a message to a channel as an agent.
+    pub async fn send_message(
+        &self,
+        agent_user_id: Uuid,
+        agent_username: &str,
+        channel_id: Uuid,
+        content: &str,
+    ) -> Result<MessageResponse, BridgeError> {
+        let token = self.auth.issue_token(agent_user_id, agent_username)?;
+        let url = format!("{}/api/channels/{}/messages", self.base_url, channel_id);
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(BridgeError::RiftApi(format!(
+                "send_message failed ({status}): {body}"
+            )))
+        }
+    }
+
+    /// Fetch recent messages from a channel.
+    pub async fn list_messages(
+        &self,
+        agent_user_id: Uuid,
+        agent_username: &str,
+        channel_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<ListMessageResponse>, BridgeError> {
+        let token = self.auth.issue_token(agent_user_id, agent_username)?;
+        let url = format!(
+            "{}/api/channels/{}/messages?limit={}",
+            self.base_url, channel_id, limit
+        );
+
+        let resp = self.client.get(&url).bearer_auth(&token).send().await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(BridgeError::RiftApi(format!(
+                "list_messages failed ({status}): {body}"
+            )))
+        }
+    }
+
+    /// Check if bridge is paused via the server's bridge control endpoint.
+    pub async fn is_paused(&self) -> Result<bool, BridgeError> {
+        let url = format!("{}/api/bridge/status", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+
+        if resp.status().is_success() {
+            let status: BridgeStatus = resp.json().await?;
+            Ok(status.paused)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Events received from the Rift WebSocket gateway.
+#[derive(Debug, Clone)]
+pub enum RiftWsEvent {
+    /// Gateway authenticated and ready.
+    Ready,
+    /// New message posted in a subscribed channel.
+    MessageCreate(RoomMessage),
+    /// WebSocket connection lost.
+    Disconnected,
+}
+
+/// Connect to Rift's WebSocket gateway and forward events to the channel.
+/// Reconnects automatically on disconnect.
+pub async fn ws_listen(
+    ws_url: String,
+    token: String,
+    server_ids: Vec<Uuid>,
+    event_tx: mpsc::Sender<RiftWsEvent>,
+) {
+    loop {
+        tracing::info!("connecting to Rift WebSocket at {}", ws_url);
+        match connect_and_listen(&ws_url, &token, &server_ids, &event_tx).await {
+            Ok(()) => tracing::info!("WebSocket connection closed cleanly"),
+            Err(e) => tracing::error!("WebSocket error: {e}"),
+        }
+        let _ = event_tx.send(RiftWsEvent::Disconnected).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Single WebSocket connection lifecycle: identify, subscribe, then forward events.
+async fn connect_and_listen(
+    ws_url: &str,
+    token: &str,
+    server_ids: &[Uuid],
+    event_tx: &mpsc::Sender<RiftWsEvent>,
+) -> Result<(), BridgeError> {
+    let (mut ws, _) = connect_async(ws_url)
+        .await
+        .map_err(|e| BridgeError::WebSocket(format!("connect failed: {e}")))?;
+
+    // Send Identify command with auth token.
+    let identify = serde_json::json!({
+        "type": "Identify",
+        "data": { "token": token }
+    });
+    ws.send(WsMessage::Text(identify.to_string().into()))
+        .await
+        .map_err(|e| BridgeError::WebSocket(format!("identify failed: {e}")))?;
+
+    // Wait for Ready event.
+    let ready_msg = ws
+        .next()
+        .await
+        .ok_or_else(|| BridgeError::WebSocket("connection closed before Ready".into()))?
+        .map_err(|e| BridgeError::WebSocket(format!("read error: {e}")))?;
+
+    if let WsMessage::Text(ref text) = ready_msg {
+        let val: serde_json::Value = serde_json::from_str(text.as_str())?;
+        if val["type"].as_str() != Some("Ready") {
+            return Err(BridgeError::WebSocket(format!(
+                "expected Ready, got: {}",
+                text.as_str()
+            )));
+        }
+    }
+    let _ = event_tx.send(RiftWsEvent::Ready).await;
+
+    // Subscribe to server channels.
+    let subscribe = serde_json::json!({
+        "type": "Subscribe",
+        "data": { "server_ids": server_ids }
+    });
+    ws.send(WsMessage::Text(subscribe.to_string().into()))
+        .await
+        .map_err(|e| BridgeError::WebSocket(format!("subscribe failed: {e}")))?;
+
+    tracing::info!("WebSocket connected and subscribed");
+
+    // Event forwarding loop.
+    while let Some(msg) = ws.next().await {
+        let msg = msg.map_err(|e| BridgeError::WebSocket(format!("read error: {e}")))?;
+
+        if let WsMessage::Text(ref text) = msg {
+            let val: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if val["type"].as_str() == Some("MessageCreate") {
+                if let Some(data) = val.get("data") {
+                    if let Ok(room_msg) = serde_json::from_value::<RoomMessage>(data.clone()) {
+                        let _ = event_tx.send(RiftWsEvent::MessageCreate(room_msg)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
