@@ -24,6 +24,8 @@ henosis-eidolon = { path = "../henosis-eidolon" }
 henosis-pistis = { path = "../henosis-pistis" }
 # The phylax authority: the real gate in the phylax slot (Story 3.6).
 henosis-phylax = { path = "../henosis-phylax" }
+# The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
+henosis-rift = { path = "../henosis-rift" }
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
 # HTTP surface.

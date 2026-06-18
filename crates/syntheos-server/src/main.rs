@@ -13,6 +13,7 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
+use henosis_rift::{Approver, RegistryApprover};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
@@ -104,10 +105,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the rest of the chain to decide.
     let pistis_source: Arc<dyn RoomStateSource> = Arc::new(InMemoryRoomStateSource::new());
 
+    // The human-in-the-loop authority is a REAL gate in the human slot (Story 4.6).
+    // Approval-required invocations block on this approver until a human decides
+    // (via Rift, which calls RegistryApprover::resolve out-of-band) or the deadline
+    // elapses and the gate denies (fail-closed). The deadline is configurable.
+    let approval_timeout_secs = std::env::var("SYNTHEOS_HUMAN_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    let human_approver: Arc<dyn Approver> =
+        Arc::new(RegistryApprover::new(Duration::from_secs(approval_timeout_secs)));
+
     let policy = EidolonPolicy::default();
     let dispatcher = Arc::new(
         Dispatcher::new(
-            live_gate_chain(&policy, thymus.clone(), pistis_source, phylax)?,
+            live_gate_chain(
+                &policy,
+                thymus.clone(),
+                pistis_source,
+                phylax,
+                bus.clone(),
+                human_approver,
+            )?,
             Box::new(DenyExecutor),
             bus.clone(),
         )?

@@ -18,6 +18,7 @@ use henosis_loom::{
 };
 use henosis_phylax::{PhylaxGate, PhylaxStore};
 use henosis_pistis::{PistisGate, RoomStateSource};
+use henosis_rift::{Approver, HumanGate};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
     SomaStats, SomaStore,
@@ -121,6 +122,8 @@ pub fn live_gate_chain(
     thymus: Arc<ThymusStore>,
     pistis_source: Arc<dyn RoomStateSource>,
     phylax: Option<Arc<PhylaxStore>>,
+    bus: Arc<AxonBus>,
+    human_approver: Arc<dyn Approver>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     let phylax_gate: Box<dyn Gate> = match phylax {
         Some(store) => Box::new(PhylaxGate::new(store)),
@@ -130,7 +133,11 @@ pub fn live_gate_chain(
         Box::new(PistisGate::new(pistis_source)),
         Box::new(DenyGate::new("plutus")),
         Box::new(eidolon_gate(policy, thymus)?),
-        Box::new(DenyGate::new("human")),
+        // The REAL human gate (Story 4.6): an approval-required invocation is
+        // escalated to a human (Axon notification) and blocks on the approver
+        // until they decide or it times out (fail-closed). Plutus is now the
+        // only remaining deny-stub.
+        Box::new(HumanGate::new(human_approver, bus)),
         phylax_gate,
     ])
 }
@@ -1603,6 +1610,10 @@ mod tests {
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
             None,
+            bus.clone(),
+            Arc::new(henosis_rift::RegistryApprover::new(
+                std::time::Duration::from_millis(5),
+            )),
         )
         .expect("valid default policy");
         let dispatcher =
@@ -1611,6 +1622,52 @@ mod tests {
         assert_eq!(
             dispatcher.gate_names(),
             ["pistis", "plutus", "eidolon", "human", "phylax"]
+        );
+    }
+
+    /// The human slot is the REAL HumanGate, not a deny-everything stub: an
+    /// invocation declaring no approval requirement passes it (a `DenyGate`
+    /// would reject it). Story 4.6 -- only plutus remains a deny-stub.
+    #[tokio::test]
+    async fn human_slot_is_real_gate_not_deny_stub() {
+        use syntheos_contracts::{GateDecision, GateRequest, RequestContext, ToolInvocation};
+
+        let bus = Arc::new(AxonBus::new());
+        let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        let chain = live_gate_chain(
+            &henosis_eidolon::EidolonPolicy::default(),
+            thymus,
+            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            None,
+            bus.clone(),
+            Arc::new(henosis_rift::RegistryApprover::new(
+                std::time::Duration::from_millis(5),
+            )),
+        )
+        .expect("valid default policy");
+
+        let human = &chain[3];
+        assert_eq!(human.name(), "human");
+        let req = GateRequest {
+            context: RequestContext {
+                tenant: TenantId::new(),
+                principal: PrincipalId::new(),
+                persona: None,
+                session: None,
+                room: None,
+                task: None,
+                workflow: None,
+            },
+            invocation: ToolInvocation {
+                tool: "kleos".to_owned(),
+                action: "memory_store".to_owned(),
+                args: serde_json::json!({}),
+            },
+        };
+        // The real HumanGate allows a no-approval invocation; a deny-stub would not.
+        assert_eq!(
+            human.check(&req).await.expect("gate decides"),
+            GateDecision::Allow
         );
     }
 
@@ -1658,6 +1715,10 @@ mod tests {
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
             Some(phylax),
+            bus.clone(),
+            Arc::new(henosis_rift::RegistryApprover::new(
+                std::time::Duration::from_millis(5),
+            )),
         )
         .expect("valid default policy");
         // The phylax slot is last; assert it is the real gate by exercising it.
@@ -1714,6 +1775,10 @@ mod tests {
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
             None,
+            bus.clone(),
+            Arc::new(henosis_rift::RegistryApprover::new(
+                std::time::Duration::from_millis(5),
+            )),
         )
         .expect("valid default policy");
         let dispatcher =

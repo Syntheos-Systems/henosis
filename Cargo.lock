@@ -4379,6 +4379,7 @@ dependencies = [
  "henosis-loom",
  "henosis-phylax",
  "henosis-pistis",
+ "henosis-rift",
  "henosis-soma",
  "henosis-thymus",
  "hex",
