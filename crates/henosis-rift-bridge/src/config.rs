@@ -30,6 +30,10 @@ pub struct BridgeConfig {
     pub control: Option<ControlConfig>,
     /// Optional Frameshift persona allocation settings. Absent disables personas.
     pub personas: Option<PersonaSettings>,
+    /// Optional in-process Kleos backend. Absent (or in_process=false) uses the
+    /// standalone HTTP client; present with in_process=true backs the bridge's
+    /// coordination with the in-process henosis kernel stores.
+    pub kleos: Option<KleosBackendConfig>,
 }
 
 /// Room-level Frameshift persona allocation settings.
@@ -50,6 +54,20 @@ pub struct PersonaSettings {
 /// Default cap on how many agents may share a persona.
 fn default_max_same_persona() -> usize {
     2
+}
+
+/// In-process Kleos backend settings (Story 4.4). When `in_process` is true the
+/// bridge opens henosis kernel stores instead of talking to Kleos over HTTP.
+#[derive(Debug, Deserialize, Clone)]
+pub struct KleosBackendConfig {
+    /// Route the bridge's Chiasm/Broca/memory ops through in-process kernel
+    /// stores instead of HttpKleosClient.
+    #[serde(default)]
+    pub in_process: bool,
+    /// Directory for the SQLite-backed Chiasm/Broca stores. Absent = ephemeral
+    /// in-memory stores (lost on restart).
+    #[serde(default)]
+    pub db_dir: Option<std::path::PathBuf>,
 }
 
 /// Connection to the Rift server.

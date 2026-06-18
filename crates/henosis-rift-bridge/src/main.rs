@@ -13,7 +13,7 @@ use henosis_rift_bridge::capability::{PistisOracle, StaticAllowlistOracle};
 use henosis_rift_bridge::config::BridgeConfig;
 use henosis_rift_bridge::execution::approval::ApprovalRegistry;
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
-use henosis_rift_bridge::kleos::HttpKleosClient;
+
 use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use henosis_rift_bridge::room::Room;
 
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create auth manager and REST client.
     let auth = AgentAuthManager::new(config.rift.jwt_secret.clone());
     let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
-    let kleos = Arc::new(HttpKleosClient::from_env()?);
+    let kleos = build_kleos_client(&config).await?;
 
     // Wire execution-mode dependencies from config.
     let oracle: Arc<dyn henosis_rift_bridge::capability::CapabilityOracle> = match &config.pistis {
@@ -165,6 +165,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+/// Select the bridge's Kleos backend from config: HTTP standalone (default) or
+/// the in-process henosis kernel stores.
+async fn build_kleos_client(
+    config: &BridgeConfig,
+) -> Result<Arc<dyn henosis_rift_bridge::kleos::KleosClient>, Box<dyn std::error::Error>> {
+    use henosis_rift_bridge::kleos::{HttpKleosClient, InProcessKleosClient};
+
+    let in_process = config
+        .kleos
+        .as_ref()
+        .map(|k| k.in_process)
+        .unwrap_or(false);
+
+    if !in_process {
+        return Ok(Arc::new(HttpKleosClient::from_env()?));
+    }
+
+    // In-process backend: open the henosis kernel stores (SQLite at db_dir, or
+    // ephemeral in-memory) on a shared Axon bus, plus a memory client to
+    // upstream Kleos for the two memory ops that have no in-process store.
+    use henosis_broca::BrocaStore;
+    use henosis_chiasm::ChiasmStore;
+    use henosis_memory_client::Client as MemoryClient;
+    use syntheos_axon::AxonBus;
+
+    let bus = Arc::new(AxonBus::new());
+    let (chiasm, broca) = match config.kleos.as_ref().and_then(|k| k.db_dir.clone()) {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)?;
+            (
+                ChiasmStore::open(dir.join("chiasm.db"), bus.clone())?,
+                BrocaStore::open(dir.join("broca.db"), bus)?,
+            )
+        }
+        None => (
+            ChiasmStore::open_in_memory(bus.clone())?,
+            BrocaStore::open_in_memory(bus)?,
+        ),
+    };
+
+    let kleos_url =
+        std::env::var("KLEOS_URL").unwrap_or_else(|_| "http://127.0.0.1:4200".to_string());
+    let api_key = std::env::var("KLEOS_API_KEY")
+        .or_else(|_| std::env::var("KLEOS_KEY"))
+        .ok();
+    let memory = Arc::new(MemoryClient::new(kleos_url, api_key, None));
+
+    let tenant = henosis_rift_bridge::identity::bridge_tenant();
+    let principal = henosis_rift_bridge::identity::principal_for_agent("rift-bridge");
+
+    tracing::info!("kleos backend: in-process henosis kernel stores");
+    Ok(Arc::new(InProcessKleosClient::new(
+        Arc::new(chiasm),
+        Arc::new(broca),
+        memory,
+        tenant,
+        principal,
+    )))
 }
 
 /// Resolve a `namespace/key` cred reference into the bearer token string it stores.

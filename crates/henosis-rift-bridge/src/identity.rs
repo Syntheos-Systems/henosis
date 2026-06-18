@@ -11,6 +11,7 @@
 //! Kleos seam so both resolve an agent to the same principal.
 
 use syntheos_contracts::PrincipalId;
+use syntheos_contracts::TenantId;
 use uuid::Uuid;
 
 /// Fixed namespace for hashing rift-bridge agent usernames into principals.
@@ -28,6 +29,14 @@ pub fn principal_for_agent(agent: &str) -> PrincipalId {
     PrincipalId::from_uuid(v8).expect("new_v8 always yields a v8 UUID")
 }
 
+/// Deterministic, registry-free tenant the in-process bridge writes under, so
+/// its Chiasm/Broca records land in one stable tenant across reboots. Same
+/// v5->v8 convention as `principal_for_agent`.
+pub fn bridge_tenant() -> TenantId {
+    let v5 = Uuid::new_v5(&RIFT_AGENT_NAMESPACE, b"rift-bridge-tenant");
+    TenantId::from_uuid(Uuid::new_v8(v5.into_bytes())).expect("new_v8 always yields a v8 UUID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,5 +51,11 @@ mod tests {
     #[test]
     fn distinct_agents_distinct_principals() {
         assert_ne!(principal_for_agent("architect"), principal_for_agent("scribe"));
+    }
+
+    /// The bridge tenant is deterministic across calls.
+    #[test]
+    fn bridge_tenant_is_deterministic() {
+        assert_eq!(super::bridge_tenant(), super::bridge_tenant());
     }
 }

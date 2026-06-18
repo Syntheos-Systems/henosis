@@ -61,6 +61,8 @@ henosis-broca = { path = "../henosis-broca" }
 # Memory ops have no in-process vector store yet, so they route to upstream
 # Kleos via the workspace memory client (generic signed HTTP).
 henosis-memory-client = { path = "../henosis-memory-client" }
+# AxonBus is required to open in-process Chiasm/Broca stores (main.rs backend).
+syntheos-axon = { path = "../syntheos-axon" }
 
 [dev-dependencies]
 # In-memory kernel stores need an AxonBus to construct in the trait tests.
