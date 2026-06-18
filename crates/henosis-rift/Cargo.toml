@@ -1,0 +1,23 @@
+# HumanGate over Rift approvals (Story 4.5). The synchronous "human" gate slot
+# in the dispatcher chain: escalates approval-required actions to a human via
+# Rift and blocks until they approve or it times out.
+[package]
+name = "henosis-rift"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syntheos-contracts = { path = "../syntheos-contracts" }
+syntheos-axon = { path = "../syntheos-axon" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Drive HumanGate through the real canonical dispatcher chain in tests.
+syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }

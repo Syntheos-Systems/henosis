@@ -1693,6 +1693,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-rift"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "syntheos-dispatch",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "henosis-rift-bridge"
 version = "0.1.0"
 dependencies = [
