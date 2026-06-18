@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "syntheos-server listening (pistis + eidolon live, phylax live when keyed; plutus/human deny-stubbed)");
+    tracing::info!(%addr, "syntheos-server listening (pistis + eidolon + human live, phylax live when keyed; only plutus deny-stubbed)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
