@@ -1,0 +1,315 @@
+// Background PageRank refresh job. Runs on a configurable interval and
+// recomputes scores for any user whose dirty_count has crossed the threshold
+// or whose last_refresh is older than the interval.
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+use crate::config::Config;
+use crate::db::Database;
+use crate::graph::pagerank::{
+    clear_pagerank_dirty, compute_pagerank_for_user, persist_pagerank_with_snapshot,
+    snapshot_pagerank_dirty,
+};
+
+/// Check whether the pagerank cache needs refreshing based on dirty_count or
+/// elapsed time since last_refresh. Returns active memory owners when a refresh
+/// is needed, empty vec otherwise. The singleton-row pagerank_dirty table
+/// replaced the old per-user dirty rows in migration 38, but shared-DB mode
+/// still needs each owner's graph computed separately.
+async fn dirty_users(db: &Database, threshold: u32, interval_secs: u64) -> crate::Result<Vec<i64>> {
+    let threshold_i64 = threshold as i64;
+    let interval_i64 = interval_secs as i64;
+    db.read(move |conn| {
+        let sql = format!(
+            "SELECT COUNT(*) FROM pagerank_dirty \
+             WHERE dirty_count >= ?1 \
+                OR last_refresh <= strftime('%s','now') - {interval_i64}",
+        );
+        let needs_refresh: i64 =
+            conn.query_row(&sql, rusqlite::params![threshold_i64], |row| row.get(0))?;
+        if needs_refresh == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT user_id FROM memories \
+             WHERE is_forgotten = 0 AND is_archived = 0 AND is_latest = 1 \
+             ORDER BY user_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let users = rows.collect::<std::result::Result<Vec<i64>, _>>()?;
+
+        if users.is_empty() {
+            Ok(vec![0i64])
+        } else {
+            Ok(users)
+        }
+    })
+    .await
+}
+
+/// Run a single refresh cycle: find dirty users, recompute + persist (bounded
+/// by the concurrency semaphore). Returns per-user (user_id, success) outcomes.
+async fn run_once(
+    db: &Arc<Database>,
+    config: &Config,
+    skip_until: &HashMap<i64, Instant>,
+) -> crate::Result<Vec<(i64, bool)>> {
+    let now = Instant::now();
+    let all_users = dirty_users(
+        db.as_ref(),
+        config.pagerank_dirty_threshold,
+        config.pagerank_refresh_interval_secs,
+    )
+    .await?;
+
+    // Skip users that are still in their backoff window.
+    let users: Vec<i64> = all_users
+        .into_iter()
+        .filter(|uid| skip_until.get(uid).map(|&t| now >= t).unwrap_or(true))
+        .collect();
+
+    if users.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // JOB-4: take ONE dirty snapshot for the whole refresh cycle, BEFORE any
+    // compute starts. The dirty_count is a singleton-row counter shared across
+    // all users; the previous code had each per-user task snapshot AND subtract
+    // it independently, so N users subtracted N*snapshot and any
+    // mark_pagerank_dirty that arrived mid-cycle was clamped away (graph updates
+    // silently lost). We now subtract this single snapshot exactly once, after
+    // the batch, so concurrent increments survive to schedule the next cycle.
+    let batch_snapshot = snapshot_pagerank_dirty(db.as_ref()).await?;
+
+    let sem = Arc::new(Semaphore::new(config.pagerank_max_concurrent));
+    let mut handles: Vec<(i64, _)> = Vec::with_capacity(users.len());
+
+    for user_id in users {
+        let db_arc = Arc::clone(db);
+        let sem_arc = Arc::clone(&sem);
+        let handle = tokio::spawn(async move {
+            // Acquire before doing work so at most max_concurrent tasks compute at once.
+            let _permit = sem_arc.acquire_owned().await;
+            match compute_pagerank_for_user(db_arc.as_ref(), user_id).await {
+                Ok(scores) => {
+                    // Persist scores only. Passing snapshot=0 leaves the shared
+                    // dirty counter untouched here; it is cleared once for the
+                    // whole batch below.
+                    if let Err(e) =
+                        persist_pagerank_with_snapshot(db_arc.as_ref(), &scores, 0).await
+                    {
+                        warn!(user_id, error = %e, "pagerank persist failed");
+                        return false;
+                    }
+                    info!(user_id, scores = scores.len(), "pagerank refreshed");
+                    true
+                }
+                Err(e) => {
+                    warn!(user_id, error = %e, "pagerank compute failed");
+                    false
+                }
+            }
+        });
+        handles.push((user_id, handle));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for (user_id, h) in handles {
+        match h.await {
+            Ok(success) => outcomes.push((user_id, success)),
+            Err(e) => {
+                error!(user_id, error = %e, "pagerank task panicked");
+                outcomes.push((user_id, false));
+            }
+        }
+    }
+
+    // Clear the single batch snapshot exactly once, and only if at least one
+    // user refreshed -- a total failure leaves the dirty signal in place so the
+    // next cycle retries instead of silently dropping it.
+    if outcomes.iter().any(|(_, ok)| *ok) {
+        if let Err(e) = clear_pagerank_dirty(db.as_ref(), batch_snapshot).await {
+            warn!(error = %e, "pagerank dirty clear failed");
+        }
+    }
+
+    Ok(outcomes)
+}
+
+/// Update per-user failure counters and retry windows from a refresh outcome batch.
+fn apply_refresh_outcomes(
+    outcomes: &[(i64, bool)],
+    failure_counts: &mut HashMap<i64, u32>,
+    skip_until: &mut HashMap<i64, Instant>,
+) {
+    let now = Instant::now();
+
+    for (user_id, success) in outcomes {
+        if *success {
+            failure_counts.remove(user_id);
+            skip_until.remove(user_id);
+        } else {
+            let failures = failure_counts.entry(*user_id).or_insert(0);
+            *failures += 1;
+            let backoff_mins = 2u64.pow((*failures).min(6));
+            let retry_at = now + Duration::from_secs(backoff_mins * 60);
+            skip_until.insert(*user_id, retry_at);
+            warn!(
+                user_id,
+                failures = *failures,
+                backoff_mins,
+                "pagerank backoff applied"
+            );
+        }
+    }
+}
+
+/// Spawn the background refresh loop. Returns a `CancellationToken` that,
+/// when cancelled, causes the loop to exit cleanly after its current cycle.
+///
+/// MT-F16: per-user exponential backoff on persistent failure. A user that
+/// fails N consecutive times is skipped for `2^min(N,6)` minutes before the
+/// next attempt.
+pub fn start_pagerank_refresh_job(
+    db: Arc<Database>,
+    config: Arc<Config>,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let interval = Duration::from_secs(config.pagerank_refresh_interval_secs.max(10));
+    let notify = db.pagerank_notify.clone();
+
+    let handle = tokio::spawn(async move {
+        info!(
+            interval_secs = config.pagerank_refresh_interval_secs,
+            "pagerank refresh job started"
+        );
+        // per-user failure counts and retry-after instants
+        let mut failure_counts: HashMap<i64, u32> = HashMap::new();
+        let mut skip_until: HashMap<i64, Instant> = HashMap::new();
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("pagerank refresh job shutting down");
+                    break;
+                }
+                _ = notify.notified() => {
+                    info!("pagerank refresh triggered by notify");
+                    match run_once(&db, &config, &skip_until).await {
+                        Ok(outcomes) => {
+                            let refreshed = outcomes.iter().filter(|(_, ok)| *ok).count();
+                            if refreshed > 0 {
+                                info!(users_refreshed = refreshed, "pagerank batch complete (notify)");
+                            }
+                            apply_refresh_outcomes(&outcomes, &mut failure_counts, &mut skip_until);
+                        }
+                        Err(e) => error!(error = %e, "pagerank notify cycle failed"),
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {
+                    match run_once(&db, &config, &skip_until).await {
+                        Ok(outcomes) => {
+                            let refreshed = outcomes.iter().filter(|(_, ok)| *ok).count();
+                            if refreshed > 0 {
+                                info!(users_refreshed = refreshed, "pagerank batch complete");
+                            }
+                            apply_refresh_outcomes(&outcomes, &mut failure_counts, &mut skip_until);
+                        }
+                        Err(e) => error!(error = %e, "pagerank refresh cycle failed"),
+                    }
+                }
+            }
+        }
+    });
+
+    (token, handle)
+}
+
+/// Unit tests for pagerank refresh scheduling and persistence.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory;
+    use crate::memory::types::StoreRequest;
+
+    /// Build a minimal memory store request for refresh tests.
+    fn store_request(content: &str, user_id: i64) -> StoreRequest {
+        StoreRequest {
+            content: content.to_string(),
+            category: "test".to_string(),
+            source: "test".to_string(),
+            user_id: Some(user_id),
+            ..Default::default()
+        }
+    }
+
+    /// Count persisted pagerank score rows.
+    async fn pagerank_count(db: &Database, _user_id: i64) -> i64 {
+        db.read(move |conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM memory_pagerank", [], |row| row.get(0))?)
+        })
+        .await
+        .expect("query pagerank count")
+    }
+
+    /// Verify notify-triggered outcomes use the same backoff bookkeeping as interval runs.
+    #[test]
+    fn apply_refresh_outcomes_updates_failure_state() {
+        let mut failure_counts = HashMap::new();
+        let mut skip_until = HashMap::new();
+        let outcomes = vec![(7, false), (8, true), (7, false)];
+
+        apply_refresh_outcomes(&outcomes, &mut failure_counts, &mut skip_until);
+
+        assert_eq!(failure_counts.get(&7), Some(&2));
+        assert!(!failure_counts.contains_key(&8));
+        assert!(skip_until.contains_key(&7));
+        assert!(!skip_until.contains_key(&8));
+    }
+
+    /// Verify a dirty user gets pagerank scores during one refresh pass.
+    #[tokio::test]
+    async fn run_once_populates_pagerank_for_dirty_user() {
+        let db = Arc::new(Database::connect_memory().await.expect("in-memory db"));
+        let user_id = 1;
+        let mut created = 0_i64;
+
+        for i in 0..100 {
+            let content = format!(
+                "background refresh node_{i} edge_{} branch_{} ring_{}",
+                i * 19,
+                i * 29,
+                i * 37
+            );
+            let stored = memory::store(db.as_ref(), store_request(&content, user_id), None, false)
+                .await
+                .expect("store memory");
+            if stored.created {
+                created += 1;
+            }
+        }
+
+        let config = Config {
+            pagerank_dirty_threshold: 100,
+            pagerank_refresh_interval_secs: 300,
+            pagerank_max_concurrent: 2,
+            ..Config::default()
+        };
+
+        let skip_until = std::collections::HashMap::new();
+        let outcomes = run_once(&db, &config, &skip_until)
+            .await
+            .expect("run refresh cycle");
+        let refreshed = outcomes.iter().filter(|(_, ok)| *ok).count();
+
+        assert_eq!(refreshed, 1);
+        assert_eq!(outcomes[0].0, user_id);
+        assert_eq!(pagerank_count(db.as_ref(), user_id).await, created);
+    }
+}

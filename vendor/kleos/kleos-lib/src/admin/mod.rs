@@ -1,0 +1,1022 @@
+//! Admin operations -- ported from TS admin/db.ts + admin/operations.ts
+
+pub mod types;
+
+use self::types::*;
+use crate::db::Database;
+use crate::Result;
+use chrono::Utc;
+use rusqlite::params;
+
+/// Map a role label onto the default scope set granted to a fresh API key for that role.
+fn scopes_for_role(role: &str) -> Vec<crate::auth::Scope> {
+    match role {
+        "admin" => vec![
+            crate::auth::Scope::Read,
+            crate::auth::Scope::Write,
+            crate::auth::Scope::Admin,
+        ],
+        "writer" => vec![crate::auth::Scope::Read, crate::auth::Scope::Write],
+        _ => vec![crate::auth::Scope::Read],
+    }
+}
+
+// --- Compact (VACUUM + ANALYZE) ---
+
+#[tracing::instrument(skip(db))]
+pub async fn compact(db: &Database) -> Result<CompactResult> {
+    let size_before: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    db.write(|conn| Ok(conn.execute_batch("VACUUM; ANALYZE")?))
+        .await?;
+
+    let size_after: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    Ok(CompactResult {
+        size_before,
+        size_after,
+        saved_bytes: size_before - size_after,
+    })
+}
+
+// --- GC -- garbage collection of forgotten/expired data ---
+
+#[tracing::instrument(skip(db))]
+pub async fn gc(db: &Database, user_id: Option<i64>) -> Result<GcResult> {
+    // Scope per-user GC to the caller: `gc(Some(uid))` must only reap that
+    // owner's rows. The arms were previously identical (the `_uid` param was
+    // dead), so a per-user GC ran an unscoped DELETE and reaped every tenant's
+    // forgotten/expired memories in shared (monolith) mode. The predicate is a
+    // no-op in a single-owner shard. `gc(None)` stays global maintenance.
+    let forgotten: i64 = db
+        .write(move |conn| {
+            let n = if let Some(uid) = user_id {
+                conn.execute(
+                    "DELETE FROM memories WHERE is_forgotten = 1 AND user_id = ?1",
+                    rusqlite::params![uid],
+                )?
+            } else {
+                conn.execute("DELETE FROM memories WHERE is_forgotten = 1", [])?
+            };
+            Ok(n as i64)
+        })
+        .await?;
+
+    let expired: i64 = db
+        .write(move |conn| {
+            let n = if let Some(uid) = user_id {
+                conn.execute(
+                    "DELETE FROM memories WHERE forget_after IS NOT NULL \
+                     AND forget_after < datetime('now') AND user_id = ?1",
+                    rusqlite::params![uid],
+                )
+                ?
+            } else {
+                conn.execute(
+                    "DELETE FROM memories WHERE forget_after IS NOT NULL AND forget_after < datetime('now')",
+                    [],
+                )
+                ?
+            };
+            Ok(n as i64)
+        })
+        .await?;
+
+    let orphaned = 0i64;
+
+    let old_audit: i64 = if user_id.is_none() {
+        db.write(|conn| {
+            let n = conn.execute(
+                "DELETE FROM audit_log WHERE created_at < datetime('now', '-90 days')",
+                [],
+            )?;
+            Ok(n as i64)
+        })
+        .await?
+    } else {
+        0
+    };
+
+    let total = forgotten + expired + orphaned + old_audit;
+    Ok(GcResult {
+        total_cleaned: total,
+        breakdown: GcBreakdown {
+            forgotten_memories: forgotten,
+            expired_memories: expired,
+            orphaned_embeddings: orphaned,
+            old_audit_entries: old_audit,
+        },
+    })
+}
+
+// --- Schema inspection ---
+
+#[tracing::instrument(skip(db))]
+pub async fn get_schema(db: &Database) -> Result<SchemaResult> {
+    let tables: Vec<SchemaTable> = db
+        .read(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master WHERE type = ?1 AND name NOT LIKE ?2 ORDER BY name",
+                )
+                ?;
+            let rows = stmt
+                .query_map(params!["table", "sqlite_%"], |row| {
+                    Ok(SchemaTable {
+                        name: row.get(0)?,
+                        sql: row.get(1)?,
+                    })
+                })
+                ?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                ?;
+            Ok(rows)
+        })
+        .await?;
+
+    let indexes: Vec<String> = db
+        .read(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT name FROM sqlite_master WHERE type = ?1 ORDER BY name")?;
+            let rows = stmt
+                .query_map(params!["index"], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?;
+
+    Ok(SchemaResult { tables, indexes })
+}
+
+// --- Maintenance mode ---
+
+#[tracing::instrument(skip(db))]
+pub async fn get_maintenance(db: &Database) -> Result<MaintenanceStatus> {
+    let row_opt: Option<(String, String)> = db
+        .read(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT value, updated_at FROM app_state WHERE key = ?1")?;
+            let mut rows = stmt.query(params!["maintenance_mode"])?;
+            if let Some(row) = rows.next()? {
+                let val: String = row.get(0)?;
+                let since: String = row.get(1)?;
+                Ok(Some((val, since)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+
+    match row_opt {
+        Some((val, since)) => {
+            let enabled = val == "1" || val == "true";
+            let message: Option<String> = db
+                .read(|conn| {
+                    let mut stmt = conn.prepare("SELECT value FROM app_state WHERE key = ?1")?;
+                    let mut rows = stmt.query(params!["maintenance_message"])?;
+                    if let Some(row) = rows.next()? {
+                        Ok(row.get(0)?)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
+            Ok(MaintenanceStatus {
+                enabled,
+                message,
+                since: Some(since),
+            })
+        }
+        None => Ok(MaintenanceStatus {
+            enabled: false,
+            message: None,
+            since: None,
+        }),
+    }
+}
+
+/// Toggle the server-wide maintenance flag and record the operator note.
+#[tracing::instrument(skip(db, message))]
+pub async fn set_maintenance(
+    db: &Database,
+    enabled: bool,
+    message: Option<&str>,
+) -> Result<MaintenanceStatus> {
+    let val = if enabled { "1" } else { "0" };
+    upsert_state(db, "maintenance_mode", val).await?;
+    if let Some(msg) = message {
+        upsert_state(db, "maintenance_message", msg).await?;
+    }
+    get_maintenance(db).await
+}
+
+// --- SLA ---
+
+#[tracing::instrument(skip(db))]
+pub async fn get_sla(db: &Database) -> Result<SlaResult> {
+    let targets = SlaTargets::default();
+
+    let total_requests: i64 = db
+        .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))?))
+        .await?;
+
+    let total_errors: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action LIKE '%error%'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    let error_rate = if total_requests > 0 {
+        (total_errors as f64 / total_requests as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(SlaResult {
+        targets,
+        current_uptime_pct: 100.0, // Would need monitoring data
+        current_error_rate_pct: error_rate,
+        total_requests,
+        total_errors,
+    })
+}
+
+// --- Usage / Tenants ---
+
+#[tracing::instrument(skip(db))]
+pub async fn get_usage(db: &Database) -> Result<Vec<UsageRow>> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.username, COALESCE(m.cnt, 0), COALESCE(c.cnt, 0), COALESCE(k.cnt, 0) \
+             FROM users u \
+             LEFT JOIN (SELECT 1 AS user_id, COUNT(*) as cnt FROM memories) m ON u.id = m.user_id \
+             LEFT JOIN (SELECT 0 as user_id, COUNT(*) as cnt FROM conversations) c ON u.id = c.user_id \
+             LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM api_keys WHERE is_active = 1 GROUP BY user_id) k ON u.id = k.user_id \
+             ORDER BY u.id",
+        )
+        ?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsageRow {
+                    user_id: row.get(0)?,
+                    username: row.get(1)?,
+                    memory_count: row.get(2)?,
+                    conversation_count: row.get(3)?,
+                    api_key_count: row.get(4)?,
+                })
+            })
+            ?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            ?;
+        Ok(rows)
+    })
+    .await
+}
+
+/// List every tenant known to the server with row counts and last-activity timestamps.
+#[tracing::instrument(skip(db))]
+pub async fn get_tenants(db: &Database) -> Result<Vec<TenantRow>> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.username, u.role, COALESCE(m.cnt, 0), COALESCE(k.cnt, 0), u.created_at \
+             FROM users u \
+             LEFT JOIN (SELECT 1 AS user_id, COUNT(*) as cnt FROM memories) m ON u.id = m.user_id \
+             LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM api_keys WHERE is_active = 1 GROUP BY user_id) k ON u.id = k.user_id \
+             ORDER BY u.id",
+        )
+        ?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TenantRow {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    role: row.get(2)?,
+                    memory_count: row.get(3)?,
+                    key_count: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            ?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            ?;
+        Ok(rows)
+    })
+    .await
+}
+
+// --- Provision / Deprovision ---
+
+#[tracing::instrument(skip(db, username, email, role), fields(username = %username, role = %role))]
+pub async fn provision_tenant(
+    db: &Database,
+    username: &str,
+    email: Option<&str>,
+    role: &str,
+) -> Result<ProvisionResult> {
+    let is_admin = if role == "admin" { 1i32 } else { 0i32 };
+    let username_owned = username.to_string();
+    let email_owned = email.map(|v| v.to_string());
+    let role_owned = role.to_string();
+
+    let (user_id, returned_username, space_id) = db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO users (username, email, role, is_admin) VALUES (?1, ?2, ?3, ?4)",
+                params![username_owned, email_owned, role_owned, is_admin],
+            )?;
+            let user_id = conn.last_insert_rowid();
+            let returned_username: String = conn.query_row(
+                "SELECT username FROM users WHERE id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )?;
+
+            conn.execute(
+                "INSERT INTO spaces (user_id, name, description) VALUES (?1, ?2, ?3)",
+                params![user_id, "default", Option::<String>::None],
+            )?;
+            let space_id = conn.last_insert_rowid();
+
+            Ok((user_id, returned_username, space_id))
+        })
+        .await?;
+
+    let scopes = scopes_for_role(role);
+    let (_key, raw) = crate::auth::create_key(db, user_id, "default", scopes, None).await?;
+    Ok(ProvisionResult {
+        user_id,
+        username: returned_username,
+        api_key: raw,
+        space_id,
+    })
+}
+
+/// Remove a tenant's monolith rows (keys, spaces, user record). Returns true if a row was removed.
+///
+/// # Deprecation
+/// This function only cleans monolith rows. Use `tenant::teardown::begin_deprovision`
+/// for full cross-store teardown (E1). This stub is retained for the degraded path
+/// when tenant_registry is None.
+#[tracing::instrument(skip(db))]
+pub async fn deprovision_tenant(db: &Database, user_id: i64) -> Result<bool> {
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE api_keys SET is_active = 0 WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute("DELETE FROM spaces WHERE user_id = ?1", params![user_id])?;
+        let affected = conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        Ok(affected > 0)
+    })
+    .await
+}
+
+// --- Checkpoint / Backup ---
+
+#[tracing::instrument(skip(db))]
+pub async fn checkpoint(db: &Database) -> Result<serde_json::Value> {
+    db.write(|conn| Ok(conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?))
+        .await?;
+    Ok(serde_json::json!({"status": "ok", "mode": "truncate"}))
+}
+
+/// Run an integrity check over the most recent on-disk backup artifact.
+#[tracing::instrument(skip(db))]
+pub async fn verify_backup(db: &Database) -> Result<BackupVerifyResult> {
+    let integrity: String = db
+        .read(|conn| Ok(conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?))
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    let ok = integrity == "ok";
+    Ok(BackupVerifyResult { integrity, ok })
+}
+
+// --- State key-value store ---
+
+#[tracing::instrument(skip(db), fields(key = %key))]
+pub async fn get_state(db: &Database, key: &str) -> Result<Option<StateRow>> {
+    let key_owned = key.to_string();
+    db.read(move |conn| {
+        let mut stmt =
+            conn.prepare("SELECT key, value, updated_at FROM app_state WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key_owned])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(StateRow {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                updated_at: row.get(2)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+}
+
+/// Insert or update a row in the shared key/value state table.
+#[tracing::instrument(skip(db, value), fields(key = %key, value_len = value.len()))]
+pub async fn upsert_state(db: &Database, key: &str, value: &str) -> Result<()> {
+    let key_owned = key.to_string();
+    let value_owned = value.to_string();
+    db.write(move |conn| {
+        conn.execute(
+            "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, datetime('now')) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key_owned, value_owned],
+        )
+        ?;
+        Ok(())
+    })
+    .await
+}
+
+/// Delete a row from the shared key/value state table by key.
+#[tracing::instrument(skip(db), fields(key = %key))]
+pub async fn delete_state(db: &Database, key: &str) -> Result<bool> {
+    let key_owned = key.to_string();
+    db.write(move |conn| {
+        let affected = conn.execute("DELETE FROM app_state WHERE key = ?1", params![key_owned])?;
+        Ok(affected > 0)
+    })
+    .await
+}
+
+/// Return every row in the shared key/value state table.
+#[tracing::instrument(skip(db))]
+pub async fn list_state(db: &Database) -> Result<Vec<StateRow>> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare("SELECT key, value, updated_at FROM app_state ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StateRow {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+// --- Export ---
+
+#[tracing::instrument(skip(db))]
+pub async fn export_user_data(db: &Database, user_id: i64) -> Result<UserExport> {
+    // Every table here carries user_id in both the monolith and tenant-shard
+    // schemas, so the predicate is a no-op in a single-owner shard and the
+    // tenant boundary in shared (monolith) mode where this runs on state.db.
+    let memories = export_table_user(
+        db,
+        "SELECT id, content, category, source, importance, tags, \
+         created_at, updated_at, space_id, is_archived \
+         FROM memories WHERE is_forgotten = 0 AND user_id = ?1 \
+         ORDER BY created_at DESC",
+        user_id,
+    )
+    .await?;
+    let conversations = export_table_user(
+        db,
+        "SELECT id, session_id, agent, title, metadata, started_at, updated_at \
+         FROM conversations WHERE user_id = ?1 ORDER BY started_at DESC",
+        user_id,
+    )
+    .await?;
+    let episodes = export_table_user(
+        db,
+        "SELECT id, title, summary, session_id, created_at \
+         FROM episodes WHERE user_id = ?1 ORDER BY created_at DESC",
+        user_id,
+    )
+    .await?;
+    let entities = export_table_user(
+        db,
+        "SELECT id, name, entity_type, description, metadata, created_at \
+         FROM entities WHERE user_id = ?1 ORDER BY name",
+        user_id,
+    )
+    .await?;
+    let facts = export_table_user(
+        db,
+        "SELECT id, memory_id, subject, predicate, object, confidence, created_at \
+         FROM structured_facts \
+         WHERE user_id = ?1 ORDER BY created_at DESC",
+        user_id,
+    )
+    .await?;
+    let preferences = export_table_user(
+        db,
+        "SELECT id, key, value, created_at, updated_at \
+         FROM user_preferences WHERE user_id = ?1 ORDER BY key",
+        user_id,
+    )
+    .await?;
+    // The real table is `skill_records`; there is no `skills` table in any
+    // schema, so the old query 500'd in sharded mode. `skill_records` has no
+    // `tags` column, so it is dropped from the projection; every remaining
+    // column exists in both the monolith and tenant-shard schemas. The
+    // `user_id` predicate scopes the export to the caller (a no-op in a
+    // single-owner shard, the tenant boundary in monolith).
+    let skills = export_table_user(
+        db,
+        "SELECT id, name, description, content, language, created_at \
+         FROM skill_records WHERE user_id = ?1 ORDER BY name",
+        user_id,
+    )
+    .await?;
+    Ok(UserExport {
+        version: "1.0".to_string(),
+        exported_at: Utc::now().to_rfc3339(),
+        user_id,
+        memories,
+        conversations,
+        episodes,
+        entities,
+        facts,
+        preferences,
+        skills,
+    })
+}
+
+/// Serialize all rows of one user-scoped table into the export blob format used by /admin/export.
+async fn export_table_user(
+    db: &Database,
+    sql: &str,
+    user_id: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let sql_owned = sql.to_string();
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&sql_owned)?;
+        // Capture the real column names before stepping rows: `column_name`
+        // borrows the statement, so collect owned strings up front, then take
+        // the `&mut` borrow that `query` needs. These names become the JSON
+        // keys so the export round-trips through the named-key import reader.
+        let column_names: Vec<String> = (0..stmt.column_count())
+            .map(|i| stmt.column_name(i).map(str::to_string))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows = stmt.query(params![user_id])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut obj = serde_json::Map::new();
+            // Serialize every column by its real SQLite type. The old path read
+            // each cell as `String` and broke on the first non-text column (the
+            // integer `id` at column 0), which emptied every export array. No
+            // row is dropped now: a NULL becomes JSON null, not a missing key.
+            for (i, name) in column_names.iter().enumerate() {
+                obj.insert(name.clone(), sqlite_value_to_json(row.get_ref(i)?));
+            }
+            result.push(serde_json::Value::Object(obj));
+        }
+        Ok(result)
+    })
+    .await
+}
+
+/// Convert one SQLite cell into its `serde_json::Value` equivalent, preserving
+/// the column's real storage class. Integers and reals map to JSON numbers,
+/// text to a string, NULL to JSON null, and a blob to a standard-base64 string
+/// so binary columns serialize deterministically. This replaces the prior
+/// read-everything-as-`String` path that errored on the integer `id` and
+/// dropped every row.
+fn sqlite_value_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => serde_json::Value::Number(i.into()),
+        // `from_f64` is `None` only for NaN/Inf, which SQLite cannot store in a
+        // REAL column; fall back to null rather than fabricating a number.
+        ValueRef::Real(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        ValueRef::Text(bytes) => {
+            serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+        }
+        ValueRef::Blob(bytes) => {
+            use base64::Engine;
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+    }
+}
+
+// --- Re-embed: clear embeddings so they get regenerated ---
+
+/// Clear embeddings on every live memory so ingestion regenerates them on
+/// next access. Both the legacy `embedding` BLOB column and the active
+/// `embedding_vec_1024` column are cleared; clearing only the legacy
+/// column would leave the live index serving stale vectors and is the
+/// bug pre-round-5 callers hit when swapping models.
+#[tracing::instrument(skip(db))]
+pub async fn reembed_all(db: &Database, user_id: Option<i64>) -> Result<i64> {
+    db.write(move |conn| {
+        // A per-user reembed must clear only that user's embeddings; in shared
+        // (monolith) mode the unscoped form would clear every tenant's. The
+        // user_id predicate is a no-op in a single-owner shard. user_id = None
+        // is the deliberate admin-wide reembed.
+        let n = if let Some(uid) = user_id {
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_vec_1024 = NULL \
+                 WHERE is_forgotten = 0 AND user_id = ?1",
+                params![uid],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_vec_1024 = NULL \
+                 WHERE is_forgotten = 0",
+                [],
+            )?
+        };
+        Ok(n as i64)
+    })
+    .await
+}
+
+// --- Backfill: fetch memories without structured facts ---
+
+#[allow(clippy::type_complexity)]
+#[tracing::instrument(skip(db))]
+pub async fn get_memories_without_facts(
+    db: &Database,
+    limit: i64,
+) -> Result<Vec<(i64, String, i64)>> {
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.content, 1 FROM memories m \
+                 WHERE m.is_forgotten = 0 \
+                 AND NOT EXISTS (SELECT 1 FROM structured_facts f WHERE f.memory_id = m.id) \
+                 LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+// --- Backfill: fetch memories without entity links ---
+
+/// Retrieve up to `limit` memory ids and content for memories that have no
+/// rows in `memory_entities`. Used by the entity backfill admin endpoint to
+/// process the historic gap. Returns `(memory_id, content)` pairs.
+///
+/// Only considers non-forgotten memories (`is_forgotten = 0`). Results are
+/// ordered by id ascending so the caller can page through the corpus by
+/// raising the offset or re-querying after each batch.
+#[tracing::instrument(skip(db))]
+pub async fn get_memories_without_entity_links(
+    db: &Database,
+    limit: i64,
+) -> Result<Vec<(i64, String)>> {
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.content FROM memories m \
+                 WHERE m.is_forgotten = 0 \
+                 AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id) \
+                 ORDER BY m.id ASC \
+                 LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+// --- Rebuild FTS index ---
+
+#[tracing::instrument(skip(db))]
+pub async fn rebuild_fts(db: &Database) -> Result<i64> {
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+            [],
+        )?;
+        Ok(())
+    })
+    .await?;
+
+    db.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))?))
+        .await
+}
+
+// --- Scale report ---
+
+#[tracing::instrument(skip(db))]
+pub async fn scale_report(db: &Database) -> Result<serde_json::Value> {
+    let tables = &[
+        "memories",
+        "conversations",
+        "messages",
+        "episodes",
+        "entities",
+        "structured_facts",
+        "skills",
+        "events",
+        "action_log",
+        "tasks",
+        "agents",
+        "api_keys",
+        "audit_log",
+        "webhooks",
+        "user_preferences",
+    ];
+    let mut counts = serde_json::Map::new();
+    for table in tables {
+        let sql = format!("SELECT COUNT(*) FROM {}", table);
+        let result = db
+            .read(move |conn| Ok(conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?))
+            .await;
+        match result {
+            Ok(count) => {
+                counts.insert(table.to_string(), serde_json::json!(count));
+            }
+            Err(_) => {
+                counts.insert(table.to_string(), serde_json::json!("table not found"));
+            }
+        }
+    }
+
+    let db_size: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    Ok(serde_json::json!({ "table_counts": counts, "database_size_bytes": db_size }))
+}
+
+// --- Cold storage stats ---
+
+#[tracing::instrument(skip(db))]
+pub async fn cold_storage_stats(db: &Database, days: i64) -> Result<serde_json::Value> {
+    let threshold = format!("-{} days", days);
+    let eligible: i64 = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE is_forgotten = 0 AND is_archived = 0 \
+                 AND created_at < datetime('now', ?1)",
+                params![threshold],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+    Ok(serde_json::json!({ "eligible_count": eligible, "threshold_days": days }))
+}
+
+// --- Crash-loop detection ---
+
+const CRASH_WINDOW_KEY: &str = "crash_window";
+const CRASH_WINDOW_SECONDS: i64 = 300; // 5 minutes
+const CRASH_THRESHOLD: usize = 3;
+
+/// Record the current timestamp as a crash/restart event.
+/// Prunes timestamps older than the 5-minute window before saving.
+#[tracing::instrument(skip(db))]
+pub async fn record_crash(db: &Database) -> Result<()> {
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::seconds(CRASH_WINDOW_SECONDS);
+
+    // Load existing timestamps.
+    let existing = match get_state(db, CRASH_WINDOW_KEY).await? {
+        Some(row) => serde_json::from_str::<Vec<String>>(&row.value).unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    // Keep only timestamps within the window, then append now.
+    let mut timestamps: Vec<String> = existing
+        .into_iter()
+        .filter(|ts| {
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) > cutoff)
+                .unwrap_or(false)
+        })
+        .collect();
+    timestamps.push(now.to_rfc3339());
+
+    let value = serde_json::to_string(&timestamps)
+        .map_err(|e| crate::EngError::Internal(format!("serialize crash window: {e}")))?;
+    upsert_state(db, CRASH_WINDOW_KEY, &value).await?;
+    Ok(())
+}
+
+/// Returns true when there have been >= 3 crash/restart events in the last 5 minutes.
+#[tracing::instrument(skip(db))]
+pub async fn should_enter_safe_mode(db: &Database) -> Result<bool> {
+    let cutoff = Utc::now() - chrono::Duration::seconds(CRASH_WINDOW_SECONDS);
+
+    let existing = match get_state(db, CRASH_WINDOW_KEY).await? {
+        Some(row) => serde_json::from_str::<Vec<String>>(&row.value).unwrap_or_default(),
+        None => return Ok(false),
+    };
+
+    let recent = existing
+        .iter()
+        .filter(|ts| {
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) > cutoff)
+                .unwrap_or(false)
+        })
+        .count();
+
+    Ok(recent >= CRASH_THRESHOLD)
+}
+
+/// Clear the crash window. Called when exiting safe mode manually.
+#[tracing::instrument(skip(db))]
+pub async fn clear_crash_window(db: &Database) -> Result<()> {
+    delete_state(db, CRASH_WINDOW_KEY).await?;
+    Ok(())
+}
+
+// --- Stats ---
+
+#[tracing::instrument(skip(db))]
+pub async fn get_stats(db: &Database) -> Result<serde_json::Value> {
+    let memory_count: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE is_forgotten = 0",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    let user_count: i64 = db
+        .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?))
+        .await?;
+
+    let key_count: i64 = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM api_keys WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    let conv_count: i64 = db
+        .read(
+            |conn| Ok(conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?),
+        )
+        .await?;
+
+    Ok(serde_json::json!({
+        "memories": memory_count,
+        "users": user_count,
+        "api_keys": key_count,
+        "conversations": conv_count,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    /// `gc(Some(uid))` must reap only that owner's forgotten/expired rows, never
+    /// another tenant's. Pins the monolith-mode BOLA fix: the dead `_uid` param
+    /// previously ran an unscoped DELETE for every caller.
+    #[tokio::test]
+    async fn gc_scopes_deletes_to_the_requested_user() {
+        let db = Database::connect_memory().await.expect("memory db");
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO memories (content, category, importance, user_id, is_forgotten) \
+                 VALUES ('mine', 'test', 5, 1, 1), ('theirs', 'test', 5, 2, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed forgotten rows for two users");
+
+        let res = gc(&db, Some(1)).await.expect("gc user 1");
+        assert_eq!(
+            res.breakdown.forgotten_memories, 1,
+            "only user 1's forgotten row should be reaped"
+        );
+
+        let survivors: i64 = db
+            .read(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM memories WHERE user_id = 2", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await
+            .expect("count user 2 rows");
+        assert_eq!(survivors, 1, "user 2's row must survive a scoped gc");
+    }
+
+    /// Exporting a row whose first column is the integer `id` and whose second
+    /// is the text `content` must populate BOTH keys. This pins the col-0 break
+    /// fix: the old serializer read `id` as `String`, errored, and dropped every
+    /// row, so each export array came back empty.
+    #[tokio::test]
+    async fn export_table_user_serializes_integer_and_text_columns() {
+        let db = Database::connect_memory().await.expect("memory db");
+
+        // Insert a synthetic memory owned by user 1 with known content.
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO memories (content, category, importance, user_id) \
+                 VALUES ('synthetic content', 'test', 5, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed memory");
+
+        let rows = export_table_user(
+            &db,
+            "SELECT id, content FROM memories WHERE user_id = ?1 ORDER BY id",
+            1,
+        )
+        .await
+        .expect("export rows");
+
+        assert_eq!(rows.len(), 1, "the seeded row must not be dropped");
+        let obj = rows[0].as_object().expect("row is a json object");
+        assert!(
+            obj.get("id").and_then(|v| v.as_i64()).is_some(),
+            "integer id column must serialize to a json number, got {:?}",
+            obj.get("id"),
+        );
+        assert_eq!(
+            obj.get("content").and_then(|v| v.as_str()),
+            Some("synthetic content"),
+            "text content column must serialize to its string value",
+        );
+    }
+
+    /// A NULL cell serializes to JSON null (a present key), not a dropped key,
+    /// and a non-text column never aborts the row.
+    #[tokio::test]
+    async fn export_table_user_keeps_null_columns_as_null() {
+        let db = Database::connect_memory().await.expect("memory db");
+
+        // `session_id` is left unset, so it stays NULL in the row.
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO memories (content, category, importance, user_id) \
+                 VALUES ('has null session', 'test', 5, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed memory");
+
+        let rows = export_table_user(
+            &db,
+            "SELECT id, session_id, content FROM memories WHERE user_id = ?1",
+            1,
+        )
+        .await
+        .expect("export rows");
+
+        assert_eq!(rows.len(), 1);
+        let obj = rows[0].as_object().expect("row is a json object");
+        assert!(
+            obj.contains_key("session_id"),
+            "null column must remain a present key",
+        );
+        assert!(
+            obj.get("session_id").map(|v| v.is_null()).unwrap_or(false),
+            "null column must serialize to json null",
+        );
+    }
+}

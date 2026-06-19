@@ -1,0 +1,114 @@
+use super::types::Digest;
+use crate::db::Database;
+use crate::Result;
+use rusqlite::params;
+
+/// Generate a digest summarizing recent memory activity for the given user.
+/// user_id is written to the digests row so that list_digests can scope by owner.
+#[tracing::instrument(skip(db), fields(user_id, period = %period))]
+pub async fn generate_digest(db: &Database, user_id: i64, period: &str) -> Result<Digest> {
+    let interval = match period {
+        "daily" => "-1 day",
+        "weekly" => "-7 days",
+        "monthly" => "-30 days",
+        _ => "-1 day",
+    };
+
+    let interval_owned = interval.to_string();
+    let period_owned = period.to_string();
+
+    // Fetch recent memories in the period
+    let (summaries, count) = db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, category, importance FROM memories \
+                     WHERE is_forgotten = 0 AND created_at >= datetime('now', ?1) \
+                     AND user_id = ?2 \
+                     ORDER BY importance DESC LIMIT 50",
+            )?;
+            let rows = stmt.query_map(params![interval_owned, user_id], |row| {
+                let content: String = row.get(1)?;
+                let category: String = row.get(2)?;
+                let importance: i32 = row.get(3)?;
+                Ok((content, category, importance))
+            })?;
+
+            let mut summaries: Vec<String> = Vec::new();
+            let mut count = 0i32;
+            for row in rows {
+                let (content, category, importance) = row?;
+                let truncated =
+                    crate::validation::truncate_on_char_boundary(&content, 100).to_string();
+                summaries.push(format!(
+                    "[{}] (importance:{}) {}",
+                    category, importance, truncated
+                ));
+                count += 1;
+            }
+            Ok((summaries, count))
+        })
+        .await?;
+
+    let digest_content = if summaries.is_empty() {
+        format!("No activity during this {} period.", period_owned)
+    } else {
+        format!(
+            "{} period summary ({} memories):\n{}",
+            period_owned,
+            count,
+            summaries.join("\n")
+        )
+    };
+
+    let interval_owned2 = interval.to_string();
+    let period_owned2 = period_owned.clone();
+    let digest_content_clone = digest_content.clone();
+
+    let id = db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO digests (period, content, memory_count, user_id, started_at, ended_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now', ?5), datetime('now'))",
+                params![period_owned2, digest_content_clone, count, user_id, interval_owned2],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await?;
+
+    Ok(Digest {
+        id,
+        period: period_owned,
+        content: digest_content,
+        memory_count: count,
+        user_id,
+        started_at: None,
+        ended_at: None,
+        created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+/// List existing digests for the given user, newest first.
+/// The WHERE user_id = ?1 predicate enforces single-DB isolation.
+#[tracing::instrument(skip(db), fields(user_id, limit))]
+pub async fn list_digests(db: &Database, user_id: i64, limit: usize) -> Result<Vec<Digest>> {
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, period, content, memory_count, user_id, started_at, ended_at, created_at \
+                 FROM digests WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![user_id, limit as i64], |row| {
+            Ok(Digest {
+                id: row.get(0)?,
+                period: row.get(1)?,
+                content: row.get(2)?,
+                memory_count: row.get(3)?,
+                user_id: row.get(4)?,
+                started_at: row.get(5)?,
+                ended_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .await
+}

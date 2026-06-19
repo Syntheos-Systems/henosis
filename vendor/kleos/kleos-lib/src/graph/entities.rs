@@ -1,0 +1,575 @@
+use super::cooccurrence::record_cooccurrence;
+use super::types::{CreateEntityRequest, Entity, EntityMemorySearchResult};
+use crate::db::Database;
+use crate::memory::fts::sanitize_fts_query;
+use crate::{EngError, Result};
+
+const ENTITY_COLUMNS: &str = "id, name, entity_type, description, aliases, space_id, confidence, occurrence_count, first_seen_at, last_seen_at, created_at";
+
+// `ENTITY_COLUMNS` deliberately omits user_id; every read scopes by it in the
+// WHERE clause, so the returned row is known to belong to `owner_user_id` and
+// the field is filled from that param rather than re-selected.
+fn row_to_entity(row: &rusqlite::Row<'_>, owner_user_id: i64) -> Result<Entity> {
+    Ok(Entity {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        entity_type: row.get(2)?,
+        description: row.get(3)?,
+        aliases: row.get(4)?,
+        user_id: owner_user_id,
+        space_id: row.get(5)?,
+        confidence: row.get(6)?,
+        occurrence_count: row.get(7)?,
+        first_seen_at: row.get(8)?,
+        last_seen_at: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+// -- Entity CRUD --
+
+/// Upsert an entity by (name, entity_type) owned by `user_id`. On conflict
+/// within that owner, increments occurrence_count and updates last_seen_at,
+/// then returns the stored entity. The owner is part of the UNIQUE key, so two
+/// users mentioning the same name get distinct rows (single-DB isolation).
+#[tracing::instrument(skip(db, req), fields(name = %req.name, user_id))]
+pub async fn create_entity(
+    db: &Database,
+    req: CreateEntityRequest,
+    user_id: i64,
+) -> Result<Entity> {
+    let entity_type = req.entity_type.unwrap_or_else(|| "general".to_string());
+    let aliases_json = match req.aliases {
+        Some(ref v) => Some(serde_json::to_string(v)?),
+        None => None,
+    };
+
+    let name_clone = req.name.clone();
+    let entity_type_clone = entity_type.clone();
+    let description = req.description.clone();
+    let space_id = req.space_id;
+
+    db.write(move |conn| {
+        conn.execute(
+            "INSERT INTO entities \
+             (name, entity_type, description, aliases, space_id, user_id, confidence, occurrence_count, \
+              first_seen_at, last_seen_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, 1, datetime('now'), datetime('now'), datetime('now')) \
+             ON CONFLICT(name, entity_type, user_id) DO UPDATE SET \
+               occurrence_count = occurrence_count + 1, \
+               last_seen_at = datetime('now')",
+            rusqlite::params![
+                name_clone,
+                entity_type_clone,
+                description,
+                aliases_json,
+                space_id,
+                user_id,
+            ],
+        )
+        ?;
+        Ok(())
+    })
+    .await?;
+
+    // Fetch the row that was just upserted
+    let entity = find_entity_by_name_type(db, &req.name, &entity_type, user_id)
+        .await?
+        .ok_or_else(|| {
+            EngError::Internal("entity upsert succeeded but fetch returned nothing".to_string())
+        })?;
+
+    Ok(entity)
+}
+
+/// Internal helper: look up an entity by (name, entity_type) owned by `user_id`.
+async fn find_entity_by_name_type(
+    db: &Database,
+    name: &str,
+    entity_type: &str,
+    user_id: i64,
+) -> Result<Option<Entity>> {
+    let name = name.to_string();
+    let entity_type = entity_type.to_string();
+    let query = format!(
+        "SELECT {} FROM entities WHERE name = ?1 AND entity_type = ?2 AND user_id = ?3 LIMIT 1",
+        ENTITY_COLUMNS
+    );
+
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(rusqlite::params![name, entity_type, user_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_entity(row, user_id)?)),
+            None => Ok(None),
+        }
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db))]
+pub async fn get_entity(db: &Database, id: i64, user_id: i64) -> Result<Entity> {
+    let query = format!(
+        "SELECT {} FROM entities WHERE id = ?1 AND user_id = ?2 LIMIT 1",
+        ENTITY_COLUMNS
+    );
+
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(rusqlite::params![id, user_id])?;
+        match rows.next()? {
+            Some(row) => row_to_entity(row, user_id),
+            None => Err(EngError::NotFound(format!("entity {}", id))),
+        }
+    })
+    .await
+}
+
+/// List entities owned by `user_id`, ordered by occurrence_count descending.
+#[tracing::instrument(skip(db))]
+pub async fn list_entities(
+    db: &Database,
+    user_id: i64,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<Entity>> {
+    let query = format!(
+        "SELECT {} FROM entities \
+         WHERE user_id = ?1 \
+         ORDER BY occurrence_count DESC \
+         LIMIT ?2 OFFSET ?3",
+        ENTITY_COLUMNS
+    );
+
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(rusqlite::params![user_id, limit as i64, offset as i64])?;
+        let mut entities = Vec::new();
+        while let Some(row) = rows.next()? {
+            entities.push(row_to_entity(row, user_id)?);
+        }
+        Ok(entities)
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db))]
+pub async fn delete_entity(db: &Database, id: i64, user_id: i64) -> Result<()> {
+    db.write(move |conn| {
+        let affected = conn.execute(
+            "DELETE FROM entities WHERE id = ?1 AND user_id = ?2",
+            rusqlite::params![id, user_id],
+        )?;
+        if affected == 0 {
+            return Err(EngError::NotFound(format!("entity {}", id)));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db, name, entity_type, description, metadata))]
+pub async fn update_entity(
+    db: &Database,
+    id: i64,
+    user_id: i64,
+    name: Option<&str>,
+    entity_type: Option<&str>,
+    description: Option<&str>,
+    metadata: Option<&str>,
+) -> Result<Entity> {
+    let mut sets = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    let mut idx = 1;
+
+    if let Some(value) = name {
+        sets.push(format!("name = ?{}", idx));
+        params.push(value.to_string().into());
+        idx += 1;
+    }
+    if let Some(value) = entity_type {
+        sets.push(format!("entity_type = ?{}", idx));
+        params.push(value.to_string().into());
+        idx += 1;
+    }
+    if let Some(value) = description {
+        sets.push(format!("description = ?{}", idx));
+        params.push(value.to_string().into());
+        idx += 1;
+    }
+    if let Some(value) = metadata {
+        sets.push(format!("metadata = ?{}", idx));
+        params.push(value.to_string().into());
+        idx += 1;
+    }
+
+    if sets.is_empty() {
+        return get_entity(db, id, user_id).await;
+    }
+
+    // The owner predicate scopes the UPDATE so a caller cannot mutate another
+    // user's entity in single-DB mode.
+    let sql = format!(
+        "UPDATE entities SET {}, updated_at = datetime('now') WHERE id = ?{} AND user_id = ?{}",
+        sets.join(", "),
+        idx,
+        idx + 1
+    );
+    params.push(id.into());
+    params.push(user_id.into());
+
+    db.write(move |conn| {
+        let affected = conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        if affected == 0 {
+            return Err(EngError::NotFound(format!("entity {}", id)));
+        }
+        Ok(())
+    })
+    .await?;
+
+    get_entity(db, id, user_id).await
+}
+
+// -- Entity Relationships --
+
+// -- Memory-Entity linking --
+
+/// Link a memory to an entity with a salience score. Silently ignores duplicates.
+#[tracing::instrument(skip(db))]
+pub async fn link_memory_entity(
+    db: &Database,
+    memory_id: i64,
+    entity_id: i64,
+    user_id: i64,
+    salience: f64,
+) -> Result<()> {
+    // Both the memory and the entity must belong to the caller; the owner
+    // predicates make that real in single-DB mode.
+    let count: i64 = db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) \
+                     FROM entities e \
+                     JOIN memories m ON m.id = ?1 \
+                     WHERE e.id = ?2 AND e.user_id = ?3 AND m.user_id = ?3",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![memory_id, entity_id, user_id])?;
+            match rows.next()? {
+                Some(row) => Ok(row.get(0)?),
+                None => Ok(0i64),
+            }
+        })
+        .await?;
+
+    if count == 0 {
+        return Err(EngError::NotFound(format!(
+            "memory {} or entity {} not found",
+            memory_id, entity_id
+        )));
+    }
+
+    db.write(move |conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, salience, created_at) \
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            rusqlite::params![memory_id, entity_id, salience],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db))]
+pub async fn unlink_memory_entity(
+    db: &Database,
+    memory_id: i64,
+    entity_id: i64,
+    user_id: i64,
+) -> Result<()> {
+    db.write(move |conn| {
+        let affected = conn.execute(
+            "DELETE FROM memory_entities \
+                 WHERE memory_id = ?1 AND entity_id = ?2 \
+                   AND EXISTS (SELECT 1 FROM memories WHERE id = ?1 AND user_id = ?3) \
+                   AND EXISTS (SELECT 1 FROM entities WHERE id = ?2 AND user_id = ?3)",
+            rusqlite::params![memory_id, entity_id, user_id],
+        )?;
+        if affected == 0 {
+            return Err(EngError::NotFound(format!(
+                "entity {} not linked to memory {}",
+                entity_id, memory_id
+            )));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db, query), fields(query_len = query.len()))]
+pub async fn search_entity_memories(
+    db: &Database,
+    entity_id: i64,
+    user_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<EntityMemorySearchResult>> {
+    // Sanitize query to prevent FTS5 syntax injection
+    let sanitized = sanitize_fts_query(query);
+    if sanitized.is_empty() {
+        return Ok(vec![]);
+    }
+
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.content, m.category, m.source, m.importance, m.created_at \
+                 FROM memories m \
+                 JOIN memory_entities me ON me.memory_id = m.id \
+                 WHERE me.entity_id = ?1 AND m.is_forgotten = 0 \
+                   AND m.is_archived = 0 AND m.is_latest = 1 AND m.user_id = ?4 \
+                   AND EXISTS (SELECT 1 FROM entities WHERE id = ?1 AND user_id = ?4) \
+                   AND m.id IN (SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?2) \
+                 ORDER BY m.importance DESC, m.created_at DESC \
+                 LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![entity_id, sanitized, limit, user_id])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            results.push(EntityMemorySearchResult {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                category: row.get(2)?,
+                source: row.get(3)?,
+                importance: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+        Ok(results)
+    })
+    .await
+}
+
+#[tracing::instrument(skip(db, relationship_type))]
+pub async fn delete_relationship(
+    db: &Database,
+    entity_id: i64,
+    target_entity_id: i64,
+    user_id: i64,
+    relationship_type: Option<&str>,
+) -> Result<()> {
+    // Both endpoints must belong to the caller (owner predicate on each EXISTS),
+    // so a caller cannot delete a relationship between entities it does not own.
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![entity_id.into(), target_entity_id.into(), user_id.into()];
+    let sql = if let Some(value) = relationship_type {
+        params.push(value.to_string().into());
+        "DELETE FROM entity_relationships \
+         WHERE source_entity_id = ?1 AND target_entity_id = ?2 \
+           AND EXISTS (SELECT 1 FROM entities WHERE id = ?1 AND user_id = ?3) \
+           AND EXISTS (SELECT 1 FROM entities WHERE id = ?2 AND user_id = ?3) \
+           AND relationship_type = ?4"
+            .to_string()
+    } else {
+        "DELETE FROM entity_relationships \
+         WHERE source_entity_id = ?1 AND target_entity_id = ?2 \
+           AND EXISTS (SELECT 1 FROM entities WHERE id = ?1 AND user_id = ?3) \
+           AND EXISTS (SELECT 1 FROM entities WHERE id = ?2 AND user_id = ?3)"
+            .to_string()
+    };
+
+    db.write(move |conn| {
+        let affected = conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        if affected == 0 {
+            return Err(EngError::NotFound(format!(
+                "relationship {} -> {} not found",
+                entity_id, target_entity_id
+            )));
+        }
+        Ok(())
+    })
+    .await
+}
+
+// -- Entity Extraction (simple heuristic) --
+
+/// Extract entities from free text using simple pattern rules.
+///
+/// Returns a deduplicated vec of (name, entity_type) pairs. Rules applied:
+/// 1. Runs of 2+ consecutive capitalized words -> "person_or_place"
+/// 2. Text inside double quotes -> "reference"
+/// 3. Text inside backticks -> "code"
+/// 4. All-uppercase words of 2+ chars (not a sentence start artifact) -> "acronym"
+///
+/// Deduplication is case-insensitive on the name.
+pub fn extract_entities(content: &str) -> Vec<(String, String)> {
+    let mut results: Vec<(String, String)> = Vec::new();
+    // Track seen names (lowercased) for deduplication
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut add = |name: String, entity_type: &str| {
+        let key = name.to_lowercase();
+        if !name.is_empty() && seen.insert(key) {
+            results.push((name, entity_type.to_string()));
+        }
+    };
+
+    // -- Rule 2: quoted strings (double quotes) --
+    // Do this before proper noun scan to avoid matching quoted text as proper nouns.
+    {
+        let mut rest = content;
+        while let Some(start) = rest.find('"') {
+            rest = &rest[start + 1..];
+            if let Some(end) = rest.find('"') {
+                let s = rest[..end].trim().to_string();
+                if !s.is_empty() {
+                    add(s, "reference");
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    // -- Rule 3: backtick-enclosed identifiers --
+    {
+        let mut rest = content;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            if let Some(end) = rest.find('`') {
+                let s = rest[..end].trim().to_string();
+                if !s.is_empty() {
+                    add(s, "code");
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    // -- Rules 1 & 4: scan whitespace-split tokens for proper nouns and acronyms --
+    // A token is a word candidate; strip leading/trailing punctuation for classification.
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw = tokens[i];
+        let word = strip_punctuation(raw);
+
+        if word.len() >= 2 && is_all_caps(word) {
+            // Rule 4: acronym
+            add(word.to_string(), "acronym");
+            i += 1;
+            continue;
+        }
+
+        if is_capitalized(word) {
+            // Rule 1: start of a capitalized run -- collect consecutive capitalized words
+            let mut run: Vec<&str> = vec![word];
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let next_raw = tokens[j];
+                let next_word = strip_punctuation(next_raw);
+                if is_capitalized(next_word) && !is_all_caps(next_word) {
+                    run.push(next_word);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if run.len() >= 2 {
+                let name = run.join(" ");
+                add(name, "person_or_place");
+                i = j;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    results
+}
+
+/// Return true if the word starts with an uppercase letter (first char uppercase).
+fn is_capitalized(word: &str) -> bool {
+    word.chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+}
+
+/// Return true if every alphabetic character in the word is uppercase and the
+/// word contains at least one alphabetic character.
+fn is_all_caps(word: &str) -> bool {
+    let has_alpha = word.chars().any(|c| c.is_alphabetic());
+    has_alpha
+        && word
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .all(|c| c.is_uppercase())
+}
+
+/// Strip common leading/trailing punctuation from a word slice without allocating.
+fn strip_punctuation(s: &str) -> &str {
+    let punct = |c: char| {
+        matches!(
+            c,
+            '.' | ','
+                | '!'
+                | '?'
+                | ';'
+                | ':'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '\''
+                | '"'
+                | '`'
+        )
+    };
+    s.trim_matches(punct)
+}
+
+// -- Combined extract + link --
+
+/// Extract entities from content, upsert each into the DB, link them to the
+/// given memory, and record pairwise co-occurrences. Returns the full entity
+/// list found in the content.
+#[tracing::instrument(skip(db, content), fields(content_len = content.len()))]
+pub async fn extract_and_link_entities(
+    db: &Database,
+    memory_id: i64,
+    content: &str,
+    user_id: i64,
+) -> Result<Vec<Entity>> {
+    let candidates = extract_entities(content);
+    let mut entities: Vec<Entity> = Vec::with_capacity(candidates.len());
+
+    for (name, entity_type) in &candidates {
+        let req = CreateEntityRequest {
+            name: name.clone(),
+            entity_type: Some(entity_type.clone()),
+            description: None,
+            aliases: None,
+            user_id: Some(user_id),
+            space_id: None,
+        };
+        let entity = create_entity(db, req, user_id).await?;
+        // Salience defaults to 1.0 for heuristic extraction
+        link_memory_entity(db, memory_id, entity.id, user_id, 1.0).await?;
+        entities.push(entity);
+    }
+
+    // Record pairwise co-occurrences for all entity pairs found in this memory.
+    // Pass user_id so single-DB installs can filter co-occurrences per user.
+    for a in 0..entities.len() {
+        for b in (a + 1)..entities.len() {
+            let _ = record_cooccurrence(db, entities[a].id, entities[b].id, user_id).await;
+        }
+    }
+
+    Ok(entities)
+}
