@@ -1,0 +1,6 @@
+# stub-scan allowlist -- extended-regex per line; matching HARD hits are demoted
+# from gate-failing to "accepted". Every entry MUST have a justification comment
+# and a corresponding row in scripts/known-incomplete.md. Keep this list SHORT;
+# the point is to fail on NEW half-wiring, not to silence everything.
+#
+# (none yet -- the HARD scan is currently clean; add entries only with a reason)

@@ -61,6 +61,12 @@ pub struct AppState {
     /// Feature-gated: present only under `--features cognition` so the default
     /// build never compiles the heavy ML stack. Additive -- nothing in the
     /// non-feature build references it.
+    ///
+    /// NOT WIRED YET: no route handler or service path reads this field; Wave 3
+    /// swaps the synapse-tools call sites onto it. And `main.rs` currently opens
+    /// it via `open_in_memory()`, so the store is VOLATILE (lost on restart)
+    /// until Wave 3/4 give it the persistent shared store. See
+    /// `scripts/known-incomplete.md` rows 3-5.
     #[cfg(feature = "cognition")]
     cognition: Arc<henosis_cognition::Cognition>,
 }
@@ -209,9 +215,14 @@ impl AppState {
         }
     }
 
-    /// The in-process cognitive core facade (Wave 2), for surfaces that read
-    /// memory / assemble context in process. Present only under the `cognition`
-    /// feature.
+    /// The in-process cognitive core facade (Wave 2). Present only under the
+    /// `cognition` feature.
+    ///
+    /// NO CALLER YET: as of Wave 2 nothing reads this -- cognitive ops still go
+    /// to Kleos :4200 over HTTP via the synapse-tools client; Wave 3 routes call
+    /// sites here. The handle from `main.rs` wraps an in-memory (volatile)
+    /// session, so any future caller must treat stored state as non-durable
+    /// until the persistent shared store lands (Wave 3/4).
     #[cfg(feature = "cognition")]
     pub fn cognition(&self) -> &Arc<henosis_cognition::Cognition> {
         &self.cognition

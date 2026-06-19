@@ -152,10 +152,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never constructs it. The lite session is an in-memory store with no
     // embedder and no background loops -- the runtime composition of "kleos
     // within Henosis without the whole stack".
+    //
+    // VOLATILE + UNREAD: open_in_memory() means stored state is lost on restart,
+    // and no route reads `state.cognition()` yet. Wave 3 routes call sites onto
+    // it; Wave 3/4 swap this for the persistent shared store. Until then this is
+    // a wired-but-inert handle (see scripts/known-incomplete.md rows 3-5).
     #[cfg(feature = "cognition")]
     let cognition = Arc::new(henosis_cognition::Cognition::open_in_memory().await?);
     #[cfg(feature = "cognition")]
-    tracing::info!("cognition core open (in-memory lite session)");
+    tracing::info!("cognition core open (in-memory lite session; volatile, not yet wired to routes)");
 
     let state = AppState::new(
         dispatcher,
