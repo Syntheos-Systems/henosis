@@ -1,0 +1,130 @@
+pub use super::types::{ProxyRequest, ProxyResponse};
+
+use std::collections::HashMap;
+
+use reqwest::Method;
+
+use crate::cred::client::{CreddClient, FetchSecretRequest, SecretAccessMode};
+use crate::db::Database;
+use crate::webhooks::resolve_and_validate_url;
+use crate::{EngError, Result};
+
+/// Response headers that must not be relayed from the upstream service back
+/// through the credential proxy. These carry upstream auth/session state
+/// (cookies, challenge headers) that belong to the proxy<->upstream leg only
+/// and would otherwise leak to, or be replayed by, the proxy caller.
+const STRIPPED_RESPONSE_HEADERS: &[&str] = &[
+    "set-cookie",
+    "set-cookie2",
+    "www-authenticate",
+    "proxy-authenticate",
+    "authorization",
+    "proxy-authorization",
+];
+
+/// True when an upstream response header should be dropped before forwarding.
+/// Comparison is case-insensitive; reqwest already lowercases header names.
+fn is_stripped_response_header(name: &str) -> bool {
+    STRIPPED_RESPONSE_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+impl CreddClient {
+    pub async fn proxy(
+        &self,
+        db: &Database,
+        user_id: i64,
+        agent: &str,
+        service: &str,
+        key: &str,
+        request: &ProxyRequest,
+    ) -> Result<ProxyResponse> {
+        // SECURITY (SSRF-DNS): validate the outbound URL against the SSRF
+        // blocklist (loopback, RFC1918, link-local, cloud-metadata, IPv6 ULA)
+        // AND resolve DNS to catch domains pointing at private IPs. Without
+        // this the admin credential proxy forwards any URL including
+        // 169.254.169.254/latest/meta-data.
+        // Test clients set `allow_loopback_proxy` so mock HTTP servers on
+        // 127.0.0.1 still work; production clients never do.
+        if !self.allow_loopback_proxy {
+            resolve_and_validate_url(&request.url)
+                .await
+                .map_err(|e| match e {
+                    EngError::InvalidInput(msg) => {
+                        EngError::InvalidInput(format!("cred proxy URL rejected: {}", msg))
+                    }
+                    other => other,
+                })?;
+        }
+
+        let secret = self
+            .fetch_secret_value(
+                db,
+                user_id,
+                agent,
+                FetchSecretRequest {
+                    service,
+                    key,
+                    mode: SecretAccessMode::Resolved,
+                    use_cache: false,
+                },
+            )
+            .await?;
+
+        let method = request
+            .method
+            .as_deref()
+            .unwrap_or("GET")
+            .parse::<Method>()
+            .map_err(|e| EngError::InvalidInput(format!("invalid proxy method: {}", e)))?;
+
+        let header_name = request
+            .auth_header
+            .clone()
+            .unwrap_or_else(|| "Authorization".to_string());
+        let header_value = match request.auth_scheme.as_deref() {
+            Some("") => secret,
+            Some(scheme) => format!("{} {}", scheme.trim(), secret),
+            None => format!("Bearer {}", secret),
+        };
+
+        let mut builder = self.request(method, &request.url);
+        if let Some(headers) = &request.headers {
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+        }
+        builder = builder.header(&header_name, header_value);
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| EngError::Internal(format!("proxy request failed: {}", e)))?;
+        let status = response.status().as_u16();
+
+        let mut headers = HashMap::new();
+        for (name, value) in response.headers().iter() {
+            if is_stripped_response_header(name.as_str()) {
+                continue;
+            }
+            if let Ok(text) = value.to_str() {
+                headers.insert(name.to_string(), text.to_string());
+            }
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| EngError::Internal(format!("proxy response read failed: {}", e)))?;
+
+        Ok(ProxyResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}

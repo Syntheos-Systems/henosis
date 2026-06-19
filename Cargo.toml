@@ -29,6 +29,10 @@ members = [
     "crates/henosis-rift-bridge",
     "crates/henosis-rift",
 ]
+# Kleos `kleos-lib` is vendored at vendor/kleos/ as a NESTED, EXCLUDED workspace. It resolves
+# against its own root (vendor/kleos/Cargo.toml), so excluding it keeps zero blast radius on
+# existing Henosis crates. See vendor/kleos/VENDOR.md.
+exclude = ["vendor/kleos"]
 
 [workspace.package]
 edition = "2021"
