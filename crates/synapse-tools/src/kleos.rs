@@ -332,11 +332,13 @@ impl AgentTool for KleosListTool {
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20);
         let mut path = format!("/list?limit={limit}");
+        // Percent-encode model-controlled values: a category/source containing &, =, #, or
+        // spaces would otherwise corrupt or rebind the query string.
         if let Some(cat) = params.get("category").and_then(|v| v.as_str()) {
-            path.push_str(&format!("&category={cat}"));
+            path.push_str(&format!("&category={}", urlencoding::encode(cat)));
         }
         if let Some(src) = params.get("source").and_then(|v| v.as_str()) {
-            path.push_str(&format!("&source={src}"));
+            path.push_str(&format!("&source={}", urlencoding::encode(src)));
         }
 
         match client().await?.get(&path).await {
@@ -1631,7 +1633,7 @@ impl AgentTool for HandoffRestoreTool {
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         let agent = params.get("agent").and_then(|v| v.as_str());
         let path = match agent {
-            Some(a) => format!("/handoffs/latest?agent={a}"),
+            Some(a) => format!("/handoffs/latest?agent={}", urlencoding::encode(a)),
             None => "/handoffs/latest".to_string(),
         };
 
@@ -1690,7 +1692,7 @@ impl AgentTool for HandoffSearchTool {
 
         match client()
             .await?
-            .get(&format!("/handoffs/search?q={query}"))
+            .get(&format!("/handoffs/search?q={}", urlencoding::encode(query)))
             .await
         {
             Ok(resp) => Ok(ToolResult {

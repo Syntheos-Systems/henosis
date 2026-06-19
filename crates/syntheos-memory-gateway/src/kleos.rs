@@ -114,19 +114,9 @@ impl KleosClient {
             format!("{}{}?{}", self.base_url, path, query)
         };
 
-        // Build the base request (method + URL). Only GET/POST are issued by
-        // this gateway; anything else is a programming error, so map a bad verb
-        // to an error rather than panicking on a future caller's typo.
-        let base_rb = match method {
-            "GET" => self.http.get(&url),
-            "POST" => self.http.post(&url),
-            other => {
-                let verb = other.parse::<reqwest::Method>().map_err(|e| {
-                    GatewayError::Signing(format!("unsupported HTTP method {other:?}: {e}"))
-                })?;
-                self.http.request(verb, &url)
-            }
-        };
+        // Build the base request (method + URL) via the shared helper, which maps an
+        // unsupported verb to an error rather than panicking on a future caller's typo.
+        let base_rb = self.base_request(method, &url)?;
 
         // Apply Content-Type, body, or any other caller-supplied decoration.
         let base_rb = build(base_rb);
@@ -143,13 +133,8 @@ impl KleosClient {
                     signer.clear_session();
                     tracing::debug!("session rejected (401), retrying with full signing");
 
-                    let base_rb2 = match method {
-                        "GET" => self.http.get(&url),
-                        "POST" => self.http.post(&url),
-                        _ => self
-                            .http
-                            .request(method.parse().expect("valid HTTP method"), &url),
-                    };
+                    // Same fail-with-error verb handling as the first attempt (no panic).
+                    let base_rb2 = self.base_request(method, &url)?;
                     let base_rb2 = build(base_rb2);
                     let headers = signer.sign_request(method, path, query, body)?;
                     let rb2 = headers.apply(base_rb2);
@@ -162,6 +147,26 @@ impl KleosClient {
 
         self.capture_session(&resp);
         Ok(resp)
+    }
+
+    /// Build the base request builder for a verb + URL. Only GET/POST are issued by this
+    /// gateway; any other verb is mapped to a `Signing` error rather than panicking. Shared by
+    /// the initial attempt and the 401 full-signing retry so neither path can panic on a typo.
+    fn base_request(
+        &self,
+        method: &str,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, GatewayError> {
+        Ok(match method {
+            "GET" => self.http.get(url),
+            "POST" => self.http.post(url),
+            other => {
+                let verb = other.parse::<reqwest::Method>().map_err(|e| {
+                    GatewayError::Signing(format!("unsupported HTTP method {other:?}: {e}"))
+                })?;
+                self.http.request(verb, url)
+            }
+        })
     }
 
     /// Turn a non-success upstream status into the matching gateway error,

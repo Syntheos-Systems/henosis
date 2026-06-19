@@ -220,10 +220,13 @@ impl AgentExecutor for SynapseExecutor {
         ]
     }
 
-    /// Return the declared sandbox from `base_config`.
+    /// The executor's self-reported sandbox.
     ///
-    /// The bridge enforces branch and directory constraints; the executor
-    /// relies on these values being set correctly by the caller at construction.
+    /// NOTE: `branch` is a hardcoded placeholder (`agent/synapse/unset`), NOT derived from
+    /// `base_config`. The real per-task worktree branch is computed by the bridge
+    /// (`sandbox::branch_name(agent, task_id)`), and this method is currently unread by the
+    /// supervised path. `working_dir` is `base_config.cwd`. Wire a real branch (or remove this
+    /// method) when the executor owns sandbox derivation. See scripts/known-incomplete.md row 16.
     fn sandbox(&self) -> ExecutionSandbox {
         ExecutionSandbox {
             branch: "agent/synapse/unset".into(),

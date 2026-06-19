@@ -221,6 +221,22 @@ impl Supervisor {
     pub fn new(config: SupervisorConfig, bus: Arc<AxonBus>) -> Result<Self, EidolonError> {
         let mut rules = Vec::with_capacity(config.rules.len());
         for rule in &config.rules {
+            // Fail-closed on unrunnable check types. Only RuleMatch and RetryLoop are
+            // rule-driven (rule_match.rs / retry_loop.rs iterate the rule set). ScopeViolation is
+            // driven by `allowed_paths`, not per-rule, and Drift has no detector (see module
+            // docs), so a rule declaring either could never fire. Accepting it silently is the
+            // same trap as a non-compiling pattern: reject it here rather than pretend it runs.
+            match rule.check_type {
+                CheckType::RuleMatch | CheckType::RetryLoop => {}
+                CheckType::ScopeViolation | CheckType::Drift => {
+                    return Err(EidolonError::InvalidPolicy(format!(
+                        "rule {:?} uses check_type {:?}, which has no rule-driven detector \
+                         (ScopeViolation is configured via allowed_paths; Drift is not \
+                         implemented). A rule that cannot run must not be silently accepted.",
+                        rule.id, rule.check_type
+                    )));
+                }
+            }
             let regex = if matches!(rule.check_type, CheckType::RuleMatch) {
                 Some(regex::Regex::new(&rule.pattern).map_err(|e| {
                     EidolonError::InvalidPolicy(format!(
@@ -542,6 +558,35 @@ mod tests {
         .err()
         .expect("invalid pattern must be rejected");
         assert!(matches!(err, EidolonError::InvalidPolicy(_)), "got {err:?}");
+    }
+
+    /// A rule whose check_type has no rule-driven detector (Drift, ScopeViolation) is rejected at
+    /// construction rather than silently accepted-and-never-run (fail-closed).
+    #[test]
+    fn unrunnable_check_type_rejected_at_construction() {
+        for ct in [CheckType::Drift, CheckType::ScopeViolation] {
+            let bus = Arc::new(AxonBus::new());
+            let err = Supervisor::new(
+                SupervisorConfig {
+                    watch_dir: std::env::temp_dir(),
+                    rules: vec![Rule {
+                        id: "unrunnable".into(),
+                        check_type: ct,
+                        pattern: String::new(),
+                        severity: Severity::Warning,
+                        cooldown_secs: 1,
+                        message: "never runs".into(),
+                    }],
+                    allowed_paths: Vec::new(),
+                    tenant: TenantId::new(),
+                    principal: PrincipalId::new(),
+                },
+                bus,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{ct:?} rule must be rejected at construction"));
+            assert!(matches!(err, EidolonError::InvalidPolicy(_)), "got {err:?}");
+        }
     }
 
     /// A force-push entry produces one typed violation event carrying the session id.
