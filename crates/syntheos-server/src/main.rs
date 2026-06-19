@@ -148,8 +148,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err),
     }
 
+    // The in-process cognitive core (Wave 2). Feature-gated: the default build
+    // never constructs it. The lite session is an in-memory store with no
+    // embedder and no background loops -- the runtime composition of "kleos
+    // within Henosis without the whole stack".
+    #[cfg(feature = "cognition")]
+    let cognition = Arc::new(henosis_cognition::Cognition::open_in_memory().await?);
+    #[cfg(feature = "cognition")]
+    tracing::info!("cognition core open (in-memory lite session)");
+
     let state = AppState::new(
-        dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+        dispatcher,
+        directory,
+        bus,
+        chiasm,
+        soma,
+        broca,
+        loom,
+        thymus,
+        #[cfg(feature = "cognition")]
+        cognition,
     );
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and

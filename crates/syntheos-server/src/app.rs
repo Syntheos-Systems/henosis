@@ -57,6 +57,12 @@ pub struct AppState {
     loom: Arc<LoomStore>,
     /// The Thymus quality store (Story 1.5).
     thymus: Arc<ThymusStore>,
+    /// The in-process cognitive core facade over vendored kleos-lib (Wave 2).
+    /// Feature-gated: present only under `--features cognition` so the default
+    /// build never compiles the heavy ML stack. Additive -- nothing in the
+    /// non-feature build references it.
+    #[cfg(feature = "cognition")]
+    cognition: Arc<henosis_cognition::Cognition>,
 }
 
 /// Adapts [`ThymusStore::agent_drift_flags`] to the Eidolon [`DriftSignal`] seam, giving the
@@ -187,6 +193,7 @@ impl AppState {
         broca: Arc<BrocaStore>,
         loom: Arc<LoomStore>,
         thymus: Arc<ThymusStore>,
+        #[cfg(feature = "cognition")] cognition: Arc<henosis_cognition::Cognition>,
     ) -> Self {
         Self {
             dispatcher,
@@ -197,7 +204,17 @@ impl AppState {
             broca,
             loom,
             thymus,
+            #[cfg(feature = "cognition")]
+            cognition,
         }
+    }
+
+    /// The in-process cognitive core facade (Wave 2), for surfaces that read
+    /// memory / assemble context in process. Present only under the `cognition`
+    /// feature.
+    #[cfg(feature = "cognition")]
+    pub fn cognition(&self) -> &Arc<henosis_cognition::Cognition> {
+        &self.cognition
     }
 
     /// The shared event bus, for surfaces (e.g. a future event stream) that subscribe to it.
@@ -1368,6 +1385,25 @@ mod tests {
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
+    /// Build an in-memory [`henosis_cognition::Cognition`] for the feature build's
+    /// test helpers. `Cognition::open_in_memory` is async; these helpers are sync
+    /// and run inside a `#[tokio::test]` runtime, so the open is driven on a
+    /// fresh thread with its own runtime to avoid a nested-runtime panic. The
+    /// resulting database keeps its own connection threads alive independent of
+    /// that runtime.
+    #[cfg(feature = "cognition")]
+    fn test_cognition() -> Arc<henosis_cognition::Cognition> {
+        let cog = std::thread::spawn(|| {
+            tokio::runtime::Runtime::new()
+                .expect("cognition test runtime")
+                .block_on(henosis_cognition::Cognition::open_in_memory())
+                .expect("in-memory cognition")
+        })
+        .join()
+        .expect("cognition build thread");
+        Arc::new(cog)
+    }
+
     /// Build app state over the real foundation (allow-all stub gates + echo executor, both from
     /// the test-only `stubs` feature) with an in-memory Chiasm store.
     fn test_state() -> AppState {
@@ -1393,7 +1429,16 @@ mod tests {
                 .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
         );
         AppState::new(
-            dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+            dispatcher,
+            directory,
+            bus,
+            chiasm,
+            soma,
+            broca,
+            loom,
+            thymus,
+            #[cfg(feature = "cognition")]
+            test_cognition(),
         )
     }
 
@@ -1421,7 +1466,16 @@ mod tests {
                 .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
         );
         AppState::new(
-            dispatcher, directory, bus, chiasm, soma, broca, loom, thymus,
+            dispatcher,
+            directory,
+            bus,
+            chiasm,
+            soma,
+            broca,
+            loom,
+            thymus,
+            #[cfg(feature = "cognition")]
+            test_cognition(),
         )
     }
 
@@ -1475,6 +1529,8 @@ mod tests {
             broca,
             loom,
             thymus.clone(),
+            #[cfg(feature = "cognition")]
+            test_cognition(),
         );
         (state, thymus)
     }
