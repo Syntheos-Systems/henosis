@@ -26,6 +26,10 @@ henosis-pistis = { path = "../henosis-pistis" }
 henosis-phylax = { path = "../henosis-phylax" }
 # The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
 henosis-rift = { path = "../henosis-rift" }
+# The cognitive core facade over vendored kleos-lib (Wave 2). OPTIONAL: only the
+# `cognition` feature pulls it -- and with it the heavy ML stack -- in, so the
+# default Henosis build stays free of ort/tokenizers/lancedb. Additive wiring.
+henosis-cognition = { path = "../henosis-cognition", optional = true }
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
 # HTTP surface.
@@ -55,4 +59,8 @@ syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
 
 [features]
 default = []
+# The in-process cognitive core (Wave 2). OFF by default so the standard build
+# does not compile the vendored kleos-lib ML stack; turning it on adds the
+# `cognition` field to AppState and pulls henosis-cognition in.
+cognition = ["dep:henosis-cognition"]
 # Real service surfaces land here as they are absorbed (e.g. "rift", "synapse", "hermes").

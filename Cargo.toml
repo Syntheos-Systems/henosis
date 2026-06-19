@@ -28,6 +28,7 @@ members = [
     "crates/henosis-rift-server",
     "crates/henosis-rift-bridge",
     "crates/henosis-rift",
+    "crates/henosis-cognition",
 ]
 # Kleos `kleos-lib` is vendored at vendor/kleos/ as a NESTED, EXCLUDED workspace. It resolves
 # against its own root (vendor/kleos/Cargo.toml), so excluding it keeps zero blast radius on
