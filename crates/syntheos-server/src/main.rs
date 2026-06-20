@@ -148,19 +148,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err),
     }
 
-    // The in-process cognitive core (Wave 2). Feature-gated: the default build
-    // never constructs it. The lite session is an in-memory store with no
-    // embedder and no background loops -- the runtime composition of "kleos
-    // within Henosis without the whole stack".
+    // The in-process cognitive core (Wave 2/3). Feature-gated: the default build
+    // never constructs it. The lite session has no embedder and no background
+    // loops -- the runtime composition of "kleos within Henosis without the whole
+    // stack".
     //
-    // VOLATILE + UNREAD: open_in_memory() means stored state is lost on restart,
-    // and no route reads `state.cognition()` yet. Wave 3 routes call sites onto
-    // it; Wave 3/4 swap this for the persistent shared store. Until then this is
-    // a wired-but-inert handle (see scripts/known-incomplete.md rows 3-5).
+    // PERSISTENT + WIRED (Wave 3): opened over a path-backed store
+    // (`SYNTHEOS_COGNITION_DB`, default `data/cognition.db`), so stored memory
+    // survives a restart, and the `/cognition/memory*` routes read it. The parent
+    // directory is created on boot. The facade surface is still partial (see
+    // scripts/known-incomplete.md row 3).
     #[cfg(feature = "cognition")]
-    let cognition = Arc::new(henosis_cognition::Cognition::open_in_memory().await?);
-    #[cfg(feature = "cognition")]
-    tracing::info!("cognition core open (in-memory lite session; volatile, not yet wired to routes)");
+    let cognition = {
+        let db_path = std::env::var("SYNTHEOS_COGNITION_DB")
+            .unwrap_or_else(|_| "data/cognition.db".to_string());
+        if let Some(parent) = std::path::Path::new(&db_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let cog = Arc::new(henosis_cognition::Cognition::open_path(&db_path).await?);
+        tracing::info!(%db_path, "cognition core open (persistent lite session; /cognition/memory* live)");
+        cog
+    };
 
     let state = AppState::new(
         dispatcher,

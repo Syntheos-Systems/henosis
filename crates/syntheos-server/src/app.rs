@@ -62,11 +62,11 @@ pub struct AppState {
     /// build never compiles the heavy ML stack. Additive -- nothing in the
     /// non-feature build references it.
     ///
-    /// NOT WIRED YET: no route handler or service path reads this field; Wave 3
-    /// swaps the synapse-tools call sites onto it. And `main.rs` currently opens
-    /// it via `open_in_memory()`, so the store is VOLATILE (lost on restart)
-    /// until Wave 3/4 give it the persistent shared store. See
-    /// `scripts/known-incomplete.md` rows 3-5.
+    /// WIRED (Wave 3): the `/cognition/memory` and `/cognition/memory/search`
+    /// routes read this field, and `main.rs` opens it over a persistent
+    /// path-backed store (`open_path`), so memory survives a restart. The facade
+    /// surface is still partial (memory/context/scratchpad/handoffs only); see
+    /// `scripts/known-incomplete.md` row 3.
     #[cfg(feature = "cognition")]
     cognition: Arc<henosis_cognition::Cognition>,
 }
@@ -218,11 +218,9 @@ impl AppState {
     /// The in-process cognitive core facade (Wave 2). Present only under the
     /// `cognition` feature.
     ///
-    /// NO CALLER YET: as of Wave 2 nothing reads this -- cognitive ops still go
-    /// to Kleos :4200 over HTTP via the synapse-tools client; Wave 3 routes call
-    /// sites here. The handle from `main.rs` wraps an in-memory (volatile)
-    /// session, so any future caller must treat stored state as non-durable
-    /// until the persistent shared store lands (Wave 3/4).
+    /// Read by the `/cognition/memory*` routes (Wave 3). The handle from
+    /// `main.rs` wraps a persistent path-backed session, so stored memory is
+    /// durable across restarts.
     #[cfg(feature = "cognition")]
     pub fn cognition(&self) -> &Arc<henosis_cognition::Cognition> {
         &self.cognition
@@ -237,7 +235,8 @@ impl AppState {
 /// Build the router: the Phase 0 surface (health, version, enroll, dispatch) plus the Phase 1
 /// Chiasm task and Soma presence surfaces.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    #[allow(unused_mut)]
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/enroll", post(enroll))
@@ -286,8 +285,116 @@ pub fn router(state: AppState) -> Router {
             "/thymus/drift",
             post(thymus_record_drift).get(thymus_list_drift),
         )
-        .route("/thymus/stats", get(thymus_stats))
-        .with_state(state)
+        .route("/thymus/stats", get(thymus_stats));
+
+    // The cognition surface (Wave 3): present only under the `cognition` feature,
+    // and the only routes that read `AppState::cognition()`. Mounted here so the
+    // default build's router is byte-for-byte unchanged.
+    #[cfg(feature = "cognition")]
+    {
+        router = router
+            .route("/cognition/memory", post(cognition_store))
+            .route("/cognition/memory/search", get(cognition_search));
+    }
+
+    router.with_state(state)
+}
+
+/// Map a [`henosis_cognition::CognitionError`] onto an HTTP status + message. The
+/// facade wraps `kleos-lib`'s error type opaquely, so every failure is a
+/// server-side `500` (there are no caller-distinguishable variants to surface).
+#[cfg(feature = "cognition")]
+fn cognition_error(e: henosis_cognition::CognitionError) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// Body for [`cognition_store`]: a memory to persist in the in-process cognitive
+/// core. `content` is required; the rest default the way `kleos-lib` does
+/// (`category = general`, `importance = 5`) with `source` defaulting to this
+/// server. The owner is the facade's single-user lite-session id, so the request
+/// carries no `user_id`.
+#[cfg(feature = "cognition")]
+#[derive(Debug, Deserialize)]
+pub struct CognitionStoreBody {
+    /// The memory text to store.
+    pub content: String,
+    /// Originating source marker (defaults to `syntheos-server`).
+    pub source: Option<String>,
+    /// Memory category (defaults to `general`).
+    pub category: Option<String>,
+    /// Optional tags.
+    pub tags: Option<Vec<String>>,
+    /// Importance 1-10 (defaults to 5).
+    pub importance: Option<i32>,
+}
+
+/// Store a memory in the in-process cognitive core, returning the row id and
+/// whether it was newly created (vs. deduplicated into an existing memory).
+#[cfg(feature = "cognition")]
+async fn cognition_store(
+    State(state): State<AppState>,
+    Json(body): Json<CognitionStoreBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let req = henosis_cognition::StoreRequest {
+        content: body.content,
+        source: body.source.unwrap_or_else(|| "syntheos-server".to_string()),
+        category: body.category.unwrap_or_else(|| "general".to_string()),
+        importance: body.importance.unwrap_or(5),
+        tags: body.tags,
+        ..Default::default()
+    };
+    let result = state
+        .cognition()
+        .memory_store(req)
+        .await
+        .map_err(cognition_error)?;
+    Ok(Json(serde_json::json!({
+        "id": result.id,
+        "created": result.created,
+        "duplicate_of": result.duplicate_of,
+    })))
+}
+
+/// Query string for [`cognition_search`]: the FTS query plus an optional result cap.
+#[cfg(feature = "cognition")]
+#[derive(Debug, Deserialize)]
+pub struct CognitionSearchQuery {
+    /// The search query (FTS when no embedder is attached).
+    pub query: String,
+    /// Maximum hits to return.
+    pub limit: Option<usize>,
+}
+
+/// Search the in-process cognitive core, returning a compact hit list. With no
+/// embedder attached (the lite session) this runs the FTS path.
+#[cfg(feature = "cognition")]
+async fn cognition_search(
+    State(state): State<AppState>,
+    Query(q): Query<CognitionSearchQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let req = henosis_cognition::SearchRequest {
+        query: q.query,
+        limit: q.limit,
+        ..Default::default()
+    };
+    let hits = state
+        .cognition()
+        .memory_search(req)
+        .await
+        .map_err(cognition_error)?;
+    let out = hits
+        .iter()
+        .map(|hit| {
+            serde_json::json!({
+                "id": hit.memory.id,
+                "content": hit.memory.content,
+                "source": hit.memory.source,
+                "category": hit.memory.category,
+                "score": hit.score,
+            })
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 /// Liveness probe.
@@ -2631,6 +2738,57 @@ mod tests {
                 .expect("reason string")
                 .contains("fail-closed"),
             "deny reason should state the fail-closed posture: {out}"
+        );
+    }
+
+    /// The Wave 3 wiring proof: a memory POSTed to `/cognition/memory` is then
+    /// returned by `/cognition/memory/search`, exercising the route ->
+    /// `AppState::cognition()` path end to end (FTS, in-memory test session).
+    #[cfg(feature = "cognition")]
+    #[tokio::test]
+    async fn cognition_store_then_search_round_trips_through_router() {
+        let state = test_state();
+
+        // Store a memory through the route.
+        let store_body = serde_json::json!({
+            "content": "Wave 3 wires the cognition route into AppState.",
+            "source": "cognition-route-test",
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cognition/memory")
+                    .header("content-type", "application/json")
+                    .body(Body::from(store_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stored["created"], true, "first store creates a memory");
+        let stored_id = stored["id"].as_i64().expect("memory id");
+
+        // Search returns it (FTS path; the test session has no embedder).
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/cognition/memory/search?query=cognition+route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let hits: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let hits = hits.as_array().expect("hit array");
+        assert!(
+            hits.iter().any(|h| h["id"].as_i64() == Some(stored_id)),
+            "search surfaces the stored memory: {hits:?}"
         );
     }
 }

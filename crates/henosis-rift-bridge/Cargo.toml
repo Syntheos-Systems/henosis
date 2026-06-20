@@ -58,11 +58,22 @@ frameshift-orchestrator = { path = "../../../frameshift/server/crates/frameshift
 # KleosClient trait with the henosis kernel stores instead of HTTP-to-Kleos.
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-broca = { path = "../henosis-broca" }
-# Memory ops have no in-process vector store yet, so they route to upstream
-# Kleos via the workspace memory client (generic signed HTTP).
+# Default memory backend: route the two memory ops to upstream Kleos via the
+# workspace memory client (generic signed HTTP). Under the `cognition` feature
+# the in-process cognition store replaces this for in-process memory (Wave 3).
 henosis-memory-client = { path = "../henosis-memory-client" }
 # AxonBus is required to open in-process Chiasm/Broca stores (main.rs backend).
 syntheos-axon = { path = "../syntheos-axon" }
+# The in-process cognition store (Wave 3). OPTIONAL: only the `cognition` feature
+# pulls it -- and with it the vendored kleos-lib ML stack -- in, so the default
+# bridge build stays free of ort/tokenizers/lancedb.
+henosis-cognition = { path = "../henosis-cognition", optional = true }
+
+[features]
+default = []
+# Route the bridge's in-process memory ops through the local cognition store
+# instead of HTTP-to-Kleos. Adds the CognitionMemoryBackend and pulls kleos-lib in.
+cognition = ["dep:henosis-cognition"]
 
 [dev-dependencies]
 # In-memory kernel stores need an AxonBus to construct in the trait tests.

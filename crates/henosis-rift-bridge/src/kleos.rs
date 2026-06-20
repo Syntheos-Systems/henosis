@@ -380,22 +380,194 @@ impl KleosClient for HttpKleosClient {
     }
 }
 
+/// One memory hit, transport-agnostic: the fields the bridge renders into its
+/// discussion context, normalized across the HTTP and cognition backends.
+#[derive(Debug, Clone)]
+pub struct MemoryRow {
+    /// Memory identifier (string, since the two backends carry different id types).
+    pub id: String,
+    /// Source marker (defaults to `unknown` when a backend omits it).
+    pub source: String,
+    /// Memory content text.
+    pub content: String,
+}
+
+/// The bridge's memory-backend seam: the two memory operations the in-process
+/// client needs, behind one trait so it can be backed either by upstream Kleos
+/// over HTTP ([`HttpMemoryBackend`]) or by the in-process cognition store
+/// ([`CognitionMemoryBackend`], `cognition` feature). Chiasm/Broca always run
+/// in-process; only memory had no in-process store before Wave 3.
+#[async_trait]
+pub trait BridgeMemory: Send + Sync {
+    /// Search memory for `query`, returning up to `limit` hits.
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRow>, BridgeError>;
+
+    /// Store one consensus memory (`category: decision`, `importance: 6`,
+    /// `source: rift-bridge`) with the given tags.
+    async fn store(&self, content: &str, tags: &[String]) -> Result<(), BridgeError>;
+}
+
+/// Memory backend over upstream Kleos via the workspace memory client (generic
+/// signed HTTP to `:4200`). The default backend, and the only one compiled into
+/// the bridge when the `cognition` feature is off.
+pub struct HttpMemoryBackend {
+    /// Memory client to upstream Kleos.
+    memory: Arc<MemoryClient>,
+}
+
+/// Construction for the HTTP memory backend.
+impl HttpMemoryBackend {
+    /// Wrap a memory client as the bridge's memory backend.
+    pub fn new(memory: Arc<MemoryClient>) -> Self {
+        Self { memory }
+    }
+}
+
+#[async_trait]
+impl BridgeMemory for HttpMemoryBackend {
+    /// Search via the upstream Kleos `/search` endpoint.
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRow>, BridgeError> {
+        let resp = self
+            .memory
+            .post("/search", json!({ "query": query, "limit": limit }))
+            .await
+            .map_err(BridgeError::Kleos)?;
+        let results = resp
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(results
+            .iter()
+            .map(|hit| {
+                let id = hit
+                    .get("id")
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                let source = hit
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let content = hit
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                MemoryRow {
+                    id,
+                    source,
+                    content,
+                }
+            })
+            .collect())
+    }
+
+    /// Store via the upstream Kleos `/store` endpoint.
+    ///
+    /// Posts the full body directly (rather than via a flattening client helper)
+    /// to preserve `category: decision` / `importance: 6`.
+    async fn store(&self, content: &str, tags: &[String]) -> Result<(), BridgeError> {
+        self.memory
+            .post(
+                "/store",
+                json!({
+                    "content": content,
+                    "category": "decision",
+                    "source": "rift-bridge",
+                    "importance": 6,
+                    "tags": tags,
+                }),
+            )
+            .await
+            .map_err(BridgeError::Kleos)?;
+        Ok(())
+    }
+}
+
+/// Memory backend over the in-process cognition store (vendored kleos-lib via
+/// the `henosis-cognition` facade). The Wave 3 in-process path: no HTTP, no
+/// `:4200` -- memory store and FTS search run against a local kleos-lib
+/// `Database` in the bridge process. Gated on the `cognition` feature so the
+/// default bridge build never compiles the heavy ML stack.
+#[cfg(feature = "cognition")]
+pub struct CognitionMemoryBackend {
+    /// The in-process cognitive core facade.
+    cognition: Arc<henosis_cognition::Cognition>,
+}
+
+#[cfg(feature = "cognition")]
+/// Construction for the cognition memory backend.
+impl CognitionMemoryBackend {
+    /// Wrap a cognition handle as the bridge's memory backend.
+    pub fn new(cognition: Arc<henosis_cognition::Cognition>) -> Self {
+        Self { cognition }
+    }
+}
+
+#[cfg(feature = "cognition")]
+#[async_trait]
+impl BridgeMemory for CognitionMemoryBackend {
+    /// Search the in-process cognition store (FTS when no embedder is attached).
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRow>, BridgeError> {
+        let req = henosis_cognition::SearchRequest {
+            query: query.to_string(),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        let hits = self
+            .cognition
+            .memory_search(req)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(hits
+            .iter()
+            .map(|hit| MemoryRow {
+                id: hit.memory.id.to_string(),
+                source: hit.memory.source.clone(),
+                content: hit.memory.content.clone(),
+            })
+            .collect())
+    }
+
+    /// Store a consensus memory in the in-process cognition store.
+    async fn store(&self, content: &str, tags: &[String]) -> Result<(), BridgeError> {
+        let req = henosis_cognition::StoreRequest {
+            content: content.to_string(),
+            source: "rift-bridge".to_string(),
+            category: "decision".to_string(),
+            importance: 6,
+            tags: Some(tags.to_vec()),
+            ..Default::default()
+        };
+        self.cognition
+            .memory_store(req)
+            .await
+            .map_err(|e| BridgeError::Kleos(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// In-process Kleos client: backs the bridge's [`KleosClient`] trait with the
 /// henosis kernel stores instead of HTTP-to-Kleos.
 ///
 /// Chiasm task operations and Broca activity run fully in-process against
-/// `ChiasmStore`/`BrocaStore`. Memory operations route to upstream Kleos via the
-/// workspace memory client, because no in-process vector store exists in the
-/// workspace yet. This is the in-Henosis counterpart to [`HttpKleosClient`],
-/// which stays the standalone-bridge path -- the same trait, two deployments
-/// (mirroring the standalone/Henosis split of the Synapse PistisGate authority).
+/// `ChiasmStore`/`BrocaStore`. Memory operations go through the [`BridgeMemory`]
+/// seam: upstream Kleos over HTTP by default, or the in-process cognition store
+/// under the `cognition` feature (Wave 3). This is the in-Henosis counterpart to
+/// [`HttpKleosClient`], which stays the standalone-bridge path -- the same trait,
+/// two deployments (mirroring the standalone/Henosis split of the Synapse
+/// PistisGate authority).
 pub struct InProcessKleosClient {
     /// In-process Chiasm task store.
     chiasm: Arc<ChiasmStore>,
     /// In-process Broca action/narration store.
     broca: Arc<BrocaStore>,
-    /// Memory client to upstream Kleos (generic signed HTTP).
-    memory: Arc<MemoryClient>,
+    /// The memory backend (HTTP to upstream Kleos, or in-process cognition).
+    memory: Arc<dyn BridgeMemory>,
     /// Tenant all bridge kernel writes belong to.
     tenant: TenantId,
     /// The bridge service principal: owner/scope for all bridge Chiasm
@@ -407,12 +579,12 @@ pub struct InProcessKleosClient {
 
 /// Construction for the in-process Kleos client.
 impl InProcessKleosClient {
-    /// Build from injected kernel store handles, a tenant, and the bridge
-    /// service principal.
+    /// Build from injected kernel store handles, a memory backend, a tenant, and
+    /// the bridge service principal.
     pub fn new(
         chiasm: Arc<ChiasmStore>,
         broca: Arc<BrocaStore>,
-        memory: Arc<MemoryClient>,
+        memory: Arc<dyn BridgeMemory>,
         tenant: TenantId,
         principal: PrincipalId,
     ) -> Self {
@@ -459,7 +631,8 @@ fn summarize_tasks(tasks: &[Task]) -> Option<String> {
 /// Implements the bridge-facing Kleos operations in-process over kernel stores.
 #[async_trait]
 impl KleosClient for InProcessKleosClient {
-    /// Search memory via the upstream Kleos memory client (no in-process store).
+    /// Search memory through the configured backend (upstream Kleos over HTTP, or
+    /// the in-process cognition store under the `cognition` feature).
     async fn search_memories(
         &self,
         project: &str,
@@ -476,30 +649,10 @@ impl KleosClient for InProcessKleosClient {
             project,
             build_memory_query(channel, &recent_refs)
         );
-        let resp = self
-            .memory
-            .post("/search", json!({ "query": query, "limit": limit }))
-            .await
-            .map_err(BridgeError::Kleos)?;
-        let results = resp
-            .get("results")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(results
-            .iter()
-            .map(|hit| {
-                let id = hit
-                    .get("id")
-                    .map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    })
-                    .unwrap_or_else(|| "?".to_string());
-                let source = hit.get("source").and_then(Value::as_str).unwrap_or("unknown");
-                let content = hit.get("content").and_then(Value::as_str).unwrap_or("");
-                format!("[memory:{id} source={source}] {content}")
-            })
+        let rows = self.memory.search(&query, limit).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| format!("[memory:{} source={}] {}", row.id, row.source, row.content))
             .collect())
     }
 
@@ -566,10 +719,9 @@ impl KleosClient for InProcessKleosClient {
         Ok(())
     }
 
-    /// Store a consensus memory via the upstream Kleos memory client.
-    ///
-    /// Preserves `category: decision` / `importance: 6` (the gateway client
-    /// would flatten these to general/5) by posting the full body directly.
+    /// Store a consensus memory through the configured backend. The backend keeps
+    /// `category: decision` / `importance: 6`; this method only ensures the
+    /// `project:<project>` tag is present.
     async fn store_consensus_memory(
         &self,
         project: &str,
@@ -581,20 +733,7 @@ impl KleosClient for InProcessKleosClient {
         if !all_tags.iter().any(|tag| tag == &project_tag) {
             all_tags.push(project_tag);
         }
-        self.memory
-            .post(
-                "/store",
-                json!({
-                    "content": content,
-                    "category": "decision",
-                    "source": "rift-bridge",
-                    "importance": 6,
-                    "tags": all_tags,
-                }),
-            )
-            .await
-            .map_err(BridgeError::Kleos)?;
-        Ok(())
+        self.memory.store(content, &all_tags).await
     }
 
     /// Create a human-blocked draft task in-process via `ChiasmStore`.
@@ -783,13 +922,16 @@ mod in_process_tests {
     use syntheos_axon::AxonBus;
     use syntheos_contracts::{PrincipalId, TenantId};
 
-    /// Build an in-process client over fresh in-memory stores. The memory client
-    /// points at an unused address; the tests below never call a memory method.
+    /// Build an in-process client over fresh in-memory stores. The HTTP memory
+    /// backend points at an unused address; the tests below never call a memory
+    /// method (the Chiasm/Broca paths are what is exercised here).
     fn client() -> (InProcessKleosClient, TenantId, PrincipalId) {
         let bus = Arc::new(AxonBus::new());
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).unwrap());
         let broca = Arc::new(BrocaStore::open_in_memory(bus).unwrap());
-        let memory = Arc::new(MemoryClient::new("http://127.0.0.1:1".to_string(), None, None));
+        let memory: Arc<dyn BridgeMemory> = Arc::new(HttpMemoryBackend::new(Arc::new(
+            MemoryClient::new("http://127.0.0.1:1".to_string(), None, None),
+        )));
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
         (

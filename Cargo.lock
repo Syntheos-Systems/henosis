@@ -3426,6 +3426,7 @@ dependencies = [
  "futures-util",
  "henosis-broca",
  "henosis-chiasm",
+ "henosis-cognition",
  "henosis-memory-client",
  "henosis-pistis",
  "jsonwebtoken",

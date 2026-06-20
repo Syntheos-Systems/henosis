@@ -185,11 +185,11 @@ async fn build_kleos_client(
     }
 
     // In-process backend: open the henosis kernel stores (SQLite at db_dir, or
-    // ephemeral in-memory) on a shared Axon bus, plus a memory client to
-    // upstream Kleos for the two memory ops that have no in-process store.
+    // ephemeral in-memory) on a shared Axon bus. Memory goes through the
+    // BridgeMemory seam (HTTP to upstream Kleos by default; the in-process
+    // cognition store under the `cognition` feature -- see build_memory_backend).
     use henosis_broca::BrocaStore;
     use henosis_chiasm::ChiasmStore;
-    use henosis_memory_client::Client as MemoryClient;
     use syntheos_axon::AxonBus;
 
     let bus = Arc::new(AxonBus::new());
@@ -207,12 +207,7 @@ async fn build_kleos_client(
         ),
     };
 
-    let kleos_url =
-        std::env::var("KLEOS_URL").unwrap_or_else(|_| "http://127.0.0.1:4200".to_string());
-    let api_key = std::env::var("KLEOS_API_KEY")
-        .or_else(|_| std::env::var("KLEOS_KEY"))
-        .ok();
-    let memory = Arc::new(MemoryClient::new(kleos_url, api_key, None));
+    let memory = build_memory_backend(config).await?;
 
     let tenant = henosis_rift_bridge::identity::bridge_tenant();
     let principal = henosis_rift_bridge::identity::principal_for_agent("rift-bridge");
@@ -225,6 +220,65 @@ async fn build_kleos_client(
         tenant,
         principal,
     )))
+}
+
+/// Build the in-process client's memory backend (the [`BridgeMemory`] seam).
+///
+/// Under the `cognition` feature, memory runs against a local kleos-lib store in
+/// the bridge process: persistent at `db_dir/cognition.db` when `db_dir` is set,
+/// else a volatile in-memory store. Without the feature, memory routes to
+/// upstream Kleos over HTTP (the pre-Wave-3 behavior).
+#[cfg(feature = "cognition")]
+async fn build_memory_backend(
+    config: &BridgeConfig,
+) -> Result<
+    Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>,
+    Box<dyn std::error::Error>,
+> {
+    use henosis_rift_bridge::kleos::CognitionMemoryBackend;
+
+    let cognition = match config.kleos.as_ref().and_then(|k| k.db_dir.clone()) {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("cognition.db");
+            let path = path
+                .to_str()
+                .ok_or("cognition db path is not valid UTF-8")?;
+            let cog = henosis_cognition::Cognition::open_path(path).await?;
+            tracing::info!(db = path, "kleos memory backend: in-process cognition store (persistent)");
+            cog
+        }
+        None => {
+            let cog = henosis_cognition::Cognition::open_in_memory().await?;
+            tracing::info!("kleos memory backend: in-process cognition store (in-memory, volatile)");
+            cog
+        }
+    };
+    Ok(Arc::new(CognitionMemoryBackend::new(Arc::new(cognition))))
+}
+
+/// Build the in-process client's memory backend over upstream Kleos via HTTP.
+/// The default (no `cognition` feature): the two memory ops have no in-process
+/// store and route to `:4200`.
+#[cfg(not(feature = "cognition"))]
+async fn build_memory_backend(
+    _config: &BridgeConfig,
+) -> Result<
+    Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>,
+    Box<dyn std::error::Error>,
+> {
+    use henosis_memory_client::Client as MemoryClient;
+    use henosis_rift_bridge::kleos::HttpMemoryBackend;
+
+    let kleos_url =
+        std::env::var("KLEOS_URL").unwrap_or_else(|_| "http://127.0.0.1:4200".to_string());
+    let api_key = std::env::var("KLEOS_API_KEY")
+        .or_else(|_| std::env::var("KLEOS_KEY"))
+        .ok();
+    tracing::info!("kleos memory backend: upstream Kleos over HTTP (cognition feature off)");
+    Ok(Arc::new(HttpMemoryBackend::new(Arc::new(MemoryClient::new(
+        kleos_url, api_key, None,
+    )))))
 }
 
 /// Resolve a `namespace/key` cred reference into the bearer token string it stores.

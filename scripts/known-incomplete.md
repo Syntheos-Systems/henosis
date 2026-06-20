@@ -6,16 +6,17 @@ close a row, delete it in the same commit.
 
 Rows 1-5 are deliberately-deferred build-plan wiring. Rows 6-18 came from the half-wiring audit
 (2026-06-18). Rows 11 (eidolon Drift fail-open), 12 (URL query encoding), and 15 (gateway
-401-retry panic) have since been FIXED and removed; row numbers are kept stable because code
-comments reference them. Severities are from the adversarial verification pass.
+401-retry panic) were FIXED and removed; Wave 3 closed row 5 (server cognition route + persistent
+store) and narrowed row 2 (bridge memory now runs in-process under `--features cognition`). Row
+numbers are kept stable because code comments reference them. Severities are from the adversarial
+verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
 | 1 | plan | plutus gate is a deny-stub (fail-closed deny; no quota/RBAC authority) | `syntheos-server/src/app.rs` `live_gate_chain`, `main.rs` | Phase 6 (Plutus authority) |
-| 2 | plan | rift bridge memory still HTTP-tunnels to :4200 (`InProcessKleosClient::search_memories`/`store_consensus_memory`) | `henosis-rift-bridge/src/kleos.rs` ~L463/573 | Wave 3 (rewire to `Cognition`) |
+| 2 | LOW | bridge in-process memory runs on the cognition store ONLY under `--features cognition`; the default build's in-process mode still HTTP-tunnels memory to :4200 (`HttpMemoryBackend`) -- cognition is optional, mirroring the server | `henosis-rift-bridge/src/{kleos.rs,main.rs}` (`BridgeMemory` seam) | the bridge ships with the cognition feature on by default, or HTTP memory is removed |
 | 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
-| 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith `open_in_memory()` session | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
-| 5 | plan | cognition is wired-but-inert + VOLATILE: no route reads `AppState::cognition()`, and `main.rs` opens `open_in_memory()` (state lost on restart) | `syntheos-server/src/{app.rs,main.rs}` | Wave 3 (route) / Wave 3-4 (persistent store) |
+| 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
 | 6 | MED | `cargo_target_dir` config accepted from TOML + documented but never forwarded to any spawned process env -- operator setting is silently ignored | `henosis-rift-bridge/src/config.rs:188` | inject `.env("CARGO_TARGET_DIR")` in sandbox/executor spawn, or remove the field |
 | 7 | MED | `prior_context: None` hardcoded; `SynapseExecutor` consumes the field, so prior context is dropped on every supervised/resumed run | `henosis-rift-bridge/src/execution/supervisor.rs:61` | `SupervisedTask` carries prior state and `run()` populates it |
 | 8 | MED | `UpdatePresence` WS command never persists status (in-memory only, lost on reconnect); `db::update_user_status` is dead code | `henosis-rift-server/src/ws/gateway.rs:281`, `db/mod.rs:108` | arm calls `update_user_status` before broadcasting |

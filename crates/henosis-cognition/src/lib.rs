@@ -24,19 +24,25 @@
 use std::sync::Arc;
 
 use kleos_lib::config::Config;
-use kleos_lib::context::types::{ContextOptions, ContextResult};
 use kleos_lib::db::Database;
-use kleos_lib::embeddings::EmbeddingProvider;
-use kleos_lib::handoffs::{
-    Handoff, HandoffFilters, HandoffStats, HandoffsDb, SearchResult as HandoffSearchResult,
+use kleos_lib::handoffs::HandoffsDb;
+use tokio::sync::Semaphore;
+
+// Re-export every `kleos-lib` type that appears in this facade's public API, so
+// embedding applications (syntheos-server, henosis-rift-bridge) can construct
+// requests and read results through `henosis_cognition::*` without taking a
+// direct dependency on the vendored `kleos-lib`.
+pub use kleos_lib::context::types::{ContextOptions, ContextResult};
+pub use kleos_lib::embeddings::EmbeddingProvider;
+pub use kleos_lib::handoffs::{
+    Handoff, HandoffFilters, HandoffStats, SearchResult as HandoffSearchResult,
     StoreParams as HandoffStoreParams, StoreResult as HandoffStoreResult,
 };
-use kleos_lib::llm::local::LocalModelClient;
-use kleos_lib::memory::types::{
+pub use kleos_lib::llm::local::LocalModelClient;
+pub use kleos_lib::memory::types::{
     ListOptions, Memory, SearchRequest, SearchResult, StoreRequest, StoreResult,
 };
-use kleos_lib::scratchpad::ScratchEntry;
-use tokio::sync::Semaphore;
+pub use kleos_lib::scratchpad::ScratchEntry;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -98,6 +104,23 @@ impl Cognition {
     pub async fn open_in_memory() -> Result<Self> {
         let db = Database::connect_memory().await?;
         Ok(Self::from_database(db))
+    }
+
+    /// Open a path-backed lite session: a persistent SQLite store at `db_path`
+    /// with NO embedder and NO Lance/ONNX vector index, so stored memory and
+    /// scratchpad state survive a restart. This is the durable counterpart to
+    /// [`open_in_memory`](Cognition::open_in_memory).
+    ///
+    /// The config disables the Lance vector index (`use_lance_index = false`),
+    /// keeping the session on the FTS-only search / recency context paths -- so
+    /// no LanceDB table is opened and the native ONNX runtime is not required.
+    /// Migrations run on open, so a fresh file lands at the current monolith
+    /// schema and an existing file is upgraded in place.
+    pub async fn open_path(db_path: &str) -> Result<Self> {
+        let mut config = Config::default();
+        config.db_path = db_path.to_string();
+        config.use_lance_index = false;
+        Self::connect(&config).await
     }
 
     /// Build the handle from an already-opened database (no embedder, no llm).
@@ -387,5 +410,49 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "phase");
         assert_eq!(entries[0].value, "wave2");
+    }
+
+    /// The durability proof: a memory stored through a path-backed session is
+    /// still searchable after the session is dropped and the same file reopened.
+    /// Uses the FTS path (no embedder), so no native ONNX/Lance library is built.
+    #[tokio::test]
+    async fn path_backed_session_persists_across_reopen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("cognition.db");
+        let db_path = db_path.to_str().expect("utf-8 path");
+
+        let stored_id = {
+            let cog = Cognition::open_path(db_path)
+                .await
+                .expect("open path-backed session");
+            let stored = cog
+                .memory_store(StoreRequest {
+                    content: "Wave 3 wires the bridge memory onto an in-process cognition store."
+                        .to_string(),
+                    source: "henosis-cognition-test".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("store memory");
+            assert!(stored.created, "first store creates a new memory");
+            stored.id
+            // `cog` drops here: the connection pool closes, leaving only the file.
+        };
+
+        // Reopen the same file: migrations are idempotent and the row survives.
+        let reopened = Cognition::open_path(db_path)
+            .await
+            .expect("reopen path-backed session");
+        let hits = reopened
+            .memory_search(SearchRequest {
+                query: "bridge memory cognition".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("search after reopen");
+        assert!(
+            hits.iter().any(|h| h.memory.id == stored_id),
+            "the persisted memory survives a reopen: {hits:?}"
+        );
     }
 }
