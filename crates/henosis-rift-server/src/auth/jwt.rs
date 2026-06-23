@@ -56,3 +56,27 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, AppError> {
     .map_err(|_| AppError::Unauthorized)?;
     Ok(data.claims)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Round-trips HS256 issuance through validation. Also exercises jsonwebtoken 10's runtime
+    // CryptoProvider auto-registration via the `rust_crypto` backend feature -- if no provider were
+    // selected, decode() would error at the verifier-factory call.
+    #[test]
+    fn access_token_round_trips() {
+        let uid = Uuid::new_v4();
+        let token = create_access_token(uid, "alice", "shared-secret").expect("encode");
+        let claims = validate_token(&token, "shared-secret").expect("decode");
+        assert_eq!(claims.sub, uid);
+        assert_eq!(claims.username, "alice");
+    }
+
+    // A token signed with one secret must not validate under another.
+    #[test]
+    fn wrong_secret_is_rejected() {
+        let token = create_access_token(Uuid::new_v4(), "bob", "secret-a").expect("encode");
+        assert!(validate_token(&token, "secret-b").is_err());
+    }
+}

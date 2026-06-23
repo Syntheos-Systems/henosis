@@ -16,8 +16,10 @@ tokio = { version = "1", features = ["full"] }
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
 
-# Auth
-jsonwebtoken = "9"
+# Auth. jsonwebtoken 10 fixes GHSA-h395-gr6q-cpjc (type-confusion auth bypass) and splits crypto
+# backends -- pick rust_crypto (pure-Rust HMAC/sha2) to match the workspace's RustCrypto stack and
+# avoid a C toolchain. HS256-from_secret API is unchanged from 9, so no code changes.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 argon2 = "0.5"
 
 # Serialization

@@ -33,7 +33,10 @@ members = [
 # Kleos `kleos-lib` is vendored at vendor/kleos/ as a NESTED, EXCLUDED workspace. It resolves
 # against its own root (vendor/kleos/Cargo.toml), so excluding it keeps zero blast radius on
 # existing Henosis crates. See vendor/kleos/VENDOR.md.
-exclude = ["vendor/kleos"]
+# vendor/sqlx is a [patch.crates-io] Postgres-only fork of the sqlx facade -- excluded so it is
+# not treated as a workspace member; it is pulled in only through the patch below. See
+# vendor/sqlx/VENDOR.md.
+exclude = ["vendor/kleos", "vendor/sqlx", "vendor/sqlx-macros-core"]
 
 [workspace.package]
 edition = "2021"
@@ -110,3 +113,17 @@ env_logger = "0.11"
 # Terminal UI for synapse-tui (ratatui renderer over a crossterm backend).
 ratatui = "0.29"
 crossterm = "0.28"
+
+# Postgres-only fork of the sqlx facade. Upstream sqlx declares `sqlx-sqlite` as an optional
+# dependency; cargo locks optional deps and enforces `links = "sqlite3"` uniqueness even with the
+# sqlite feature off, so sqlx 0.8.1+ (sqlx-sqlite needs libsqlite3-sys 0.30) cannot resolve against
+# our workspace-wide rusqlite 0.31 (libsqlite3-sys 0.28, incl. the pristine vendored kleos-lib).
+# This fork drops the sqlite/mysql backends so the Postgres stack advances to 0.8.6 -- pulling
+# rustls 0.23 / rustls-webpki 0.103.13 -- fixing GHSA-82j2 (HIGH) + GHSA-xmrp (MED) with rusqlite
+# untouched. See vendor/sqlx/VENDOR.md.
+[patch.crates-io]
+sqlx = { path = "vendor/sqlx" }
+# sqlx-macros-core ALSO declares sqlx-sqlite/sqlx-mysql as optional deps (compile-time query
+# checking), so the phantom sqlx-sqlite re-enters through the macros crate even with the facade
+# patched. This fork strips those backends too. Must move in lockstep with vendor/sqlx.
+sqlx-macros-core = { path = "vendor/sqlx-macros-core" }

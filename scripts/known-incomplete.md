@@ -29,3 +29,14 @@ verification pass.
 | 18 | MED | `synapse-tui` `/model` and `synapse-cli` provider-swap are silent no-ops that drop recognized command args with no user-visible notice | `synapse-tui/src/main.rs:273`, `synapse-cli/src/main.rs:489` | live model/provider switching, or surface a notice until then |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
+
+## Dependency advisories (not code half-wires)
+
+GitHub Dependabot remediation (2026-06-22). The rustls-webpki HIGH + 2 LOW, the SQLx MED, and the
+jsonwebtoken 3x MED were fixed by bumping the Postgres stack to sqlx 0.8.6 (via the vendored
+Postgres-only facade in `vendor/sqlx`, see its VENDOR.md) and jsonwebtoken to 10 (`rust_crypto`).
+One advisory remains, blocked upstream:
+
+| Advisory | Sev | Crate | Why unfixed | Closes when |
+|----------|-----|-------|-------------|-------------|
+| GHSA-rhfx-m35p-ff5j | LOW | `lru 0.12.5` | Pulled transitively by `ratatui 0.29` (synapse-tui) and `tantivy 0.24` (lancedb <- kleos-lib, cognition). Both pin `lru ^0.12`; the fix lands in `0.16.3`, unreachable without major ratatui/tantivy bumps and a vendored-kleos-lib edit. The bug is a Miri-level Stacked-Borrows UB in `IterMut`, not reachable in our usage. | ratatui/tantivy advance their `lru` pin (or kleos-lib's vendored version moves) |

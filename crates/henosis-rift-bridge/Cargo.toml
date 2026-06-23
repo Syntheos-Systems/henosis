@@ -22,8 +22,9 @@ henosis-pistis = { path = "../henosis-pistis" }
 syntheos-contracts = { path = "../syntheos-contracts" }
 urlencoding = "2"
 
-# Auth
-jsonwebtoken = "9"
+# Auth. jsonwebtoken 10 fixes GHSA-h395-gr6q-cpjc (type-confusion auth bypass) and splits crypto
+# backends -- pick rust_crypto to match the workspace's RustCrypto stack. HS256 API unchanged from 9.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
 # Types
 uuid = { version = "1", features = ["v4", "v5", "v8", "serde"] }
