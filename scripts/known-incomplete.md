@@ -13,8 +13,10 @@ real agent/timestamp columns) were FIXED and removed; row 6 (`cargo_target_dir` 
 the executor spawn via `ExecutionSandbox.cargo_target_dir`) was FIXED and removed, and row 7 was
 narrowed (the supervisor now threads `prior_context`; only the unbuilt resume data-source remains);
 row 13 (`ToolCompleted` now recovers the real tool name by correlating `ToolResult` to `ToolStart`
-on the shared tool-call id) was FIXED and removed. Row numbers are kept stable because code
-comments reference them. Severities are from the adversarial verification pass.
+on the shared tool-call id) and row 18 (`synapse-tui` `/model` now surfaces a notice in the focused
+transcript; `synapse-cli` provider-swap already notified) were FIXED and removed. Row numbers are
+kept stable because code comments reference them. Severities are from the adversarial verification
+pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
@@ -27,7 +29,6 @@ comments reference them. Severities are from the adversarial verification pass.
 | 14 | LOW | `ExecutionResult::Success` always carries `commit_hash:None` (no git integration); evidence/commit checks are meaningless | `synapse-core/src/executors/synapse_executor.rs:338` | probe git HEAD post-run, or doc that synapse-native never populates it |
 | 16 | LOW | `SynapseExecutor::sandbox()` returns a hardcoded placeholder branch and is unread by the bridge (doc now accurate; real branch = `sandbox::branch_name`) | `synapse-core/src/executors/synapse_executor.rs:227` | executor owns sandbox derivation AND a caller uses it |
 | 17 | LOW | `SynapseExecutor::health_check()` always returns `Ready` (disclosed placeholder); no production caller yet | `synapse-core/src/executors/synapse_executor.rs:347` | probe provider/Kleos AND a caller invokes it |
-| 18 | MED | `synapse-tui` `/model` and `synapse-cli` provider-swap are silent no-ops that drop recognized command args with no user-visible notice | `synapse-tui/src/main.rs:273`, `synapse-cli/src/main.rs:489` | live model/provider switching, or surface a notice until then |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

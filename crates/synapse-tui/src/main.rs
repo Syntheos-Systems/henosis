@@ -270,9 +270,19 @@ fn act(
                 app.focused = Some(s.id);
             }
         }
-        InputOutcome::SetModel(_model) => {
+        InputOutcome::SetModel(model) => {
             // v1: model is fixed at spawn via base_config. Live per-session model
-            // switching needs a manager setter -- deferred.
+            // switching needs a manager setter -- deferred. Surface a notice in the
+            // focused transcript instead of silently swallowing the command.
+            if let Some(id) = app.focused {
+                app.record_system(
+                    id,
+                    &format!(
+                        "/model: live switching to '{model}' is not supported yet \
+                         (model is fixed when the session is spawned)"
+                    ),
+                );
+            }
         }
         InputOutcome::OpenBrowser => {
             app.browser_open = true;
