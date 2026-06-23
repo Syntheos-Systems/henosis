@@ -46,8 +46,11 @@ optional = true
 [features]
 _rt-async-std = []
 _rt-tokio = []
-# Kept as an empty no-op feature: src cfg-gates sqlite re-exports on `_sqlite`, which is never
-# enabled here (the sqlite backend is gone), so those blocks compile out.
+# Kept as an empty no-op feature: src cfg-gates the sqlite re-exports on `_sqlite`, never enabled
+# here (the sqlite backend is gone), so those blocks compile out. The other removed backend features
+# (mysql / sqlite / sqlite-unbundled / sqlite-preupdate-hook) are still #[cfg]-referenced by the
+# upstream src; their now-"unexpected" cfg lint is capped via [lints] below, matching how cargo
+# treats registry deps.
 _sqlite = []
 _unstable-all-types = [
     "bigdecimal",
@@ -182,3 +185,10 @@ uuid = [
     "sqlx-macros?/uuid",
     "sqlx-postgres?/uuid",
 ]
+
+# This is a path dependency (via [patch.crates-io]), so cargo does NOT cap its lints the way it
+# does for registry deps. The upstream src #[cfg]-references the stripped mysql/sqlite backend
+# features, which now read as "unexpected" cfg values -- cap them so the vendored crate builds
+# as quietly as the upstream registry crate would.
+[lints.rust]
+unexpected_cfgs = "allow"
