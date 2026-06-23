@@ -26,6 +26,11 @@ pub struct SupervisedTask {
     pub sandbox: ExecutionSandbox,
     /// Granted capabilities.
     pub granted_capabilities: Vec<Capability>,
+    /// Optional prior context: a summary of partial work from a previous attempt,
+    /// threaded into the executor's `TaskContext` (crash-recovery resume path). The
+    /// first-attempt caller passes `None`; the resume path will populate it once it
+    /// exists. The supervisor must not discard it.
+    pub prior_context: Option<String>,
 }
 
 /// Drives a single `execute()` session: pumps progress to the room with rate
@@ -50,6 +55,7 @@ impl ExecutionSupervisor {
             description,
             sandbox,
             granted_capabilities,
+            prior_context,
         } = task;
 
         let max_runtime = sandbox.max_runtime_secs;
@@ -58,7 +64,7 @@ impl ExecutionSupervisor {
             description,
             sandbox,
             granted_capabilities,
-            prior_context: None,
+            prior_context,
         };
 
         let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
@@ -199,8 +205,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
-    /// Fake executor that emits two progress messages then succeeds.
-    struct FakeExecutor;
+    /// Fake executor that emits two progress messages then succeeds. Records the
+    /// `prior_context` it receives so tests can assert the supervisor threads it.
+    struct FakeExecutor {
+        /// Captures the prior_context the executor was handed.
+        seen_prior: Arc<Mutex<Option<String>>>,
+    }
 
     #[async_trait]
     impl AgentExecutor for FakeExecutor {
@@ -212,6 +222,7 @@ mod tests {
                 branch: "agent/a/task-1".into(),
                 working_dir: PathBuf::from("/tmp"),
                 max_runtime_secs: 0,
+                cargo_target_dir: None,
             }
         }
         async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
@@ -219,9 +230,10 @@ mod tests {
         }
         async fn execute(
             &self,
-            _task: TaskContext,
+            task: TaskContext,
             progress_tx: mpsc::Sender<ProgressUpdate>,
         ) -> Result<ExecutionResult> {
+            *self.seen_prior.lock().unwrap() = task.prior_context.clone();
             let _ = progress_tx
                 .send(ProgressUpdate::Message("step one".into()))
                 .await;
@@ -261,7 +273,10 @@ mod tests {
         let notifier: Arc<dyn RoomNotifier> = Arc::new(RecordingNotifier {
             posts: posts.clone(),
         });
-        let executor: Arc<dyn AgentExecutor> = Arc::new(FakeExecutor);
+        let seen_prior = Arc::new(Mutex::new(None));
+        let executor: Arc<dyn AgentExecutor> = Arc::new(FakeExecutor {
+            seen_prior: seen_prior.clone(),
+        });
 
         let supervisor = ExecutionSupervisor::new(notifier);
         let task = SupervisedTask {
@@ -272,8 +287,10 @@ mod tests {
                 branch: "agent/a/task-1".into(),
                 working_dir: PathBuf::from("/tmp"),
                 max_runtime_secs: 0,
+                cargo_target_dir: None,
             },
             granted_capabilities: vec![Capability::new(Capability::BASH)],
+            prior_context: Some("partial work from attempt 1".into()),
         };
 
         let result = supervisor.run(task).await;
@@ -282,6 +299,12 @@ mod tests {
             ExecutionResult::Success { summary, .. } => assert_eq!(summary, "did the thing"),
             ExecutionResult::Failed { .. } => panic!("should succeed"),
         }
+
+        // The supervisor must thread prior_context into the executor, not drop it.
+        assert_eq!(
+            seen_prior.lock().unwrap().as_deref(),
+            Some("partial work from attempt 1")
+        );
 
         let captured = posts.lock().unwrap();
         // At least the final summary post is present.

@@ -46,6 +46,10 @@ pub struct ExecutionSandbox {
     /// Wall-clock time limit in seconds for the full execution session.
     /// Zero means no limit (not recommended for production).
     pub max_runtime_secs: u64,
+    /// Optional `CARGO_TARGET_DIR` for the session, sourced from the workspace
+    /// config. Executors that shell out to build tooling export this so cargo
+    /// artifacts land off the source tree. `None` leaves the environment unset.
+    pub cargo_target_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +280,7 @@ mod tests {
             branch: "agent/a1/t1".into(),
             working_dir: PathBuf::from("/tmp"),
             max_runtime_secs: 300,
+            cargo_target_dir: None,
         };
         assert_eq!(sandbox.max_runtime_secs, 300);
 
@@ -306,6 +311,7 @@ mod tests {
                 branch: "agent/a1/t-001".into(),
                 working_dir: PathBuf::from("/tmp/work"),
                 max_runtime_secs: 600,
+                cargo_target_dir: None,
             },
             granted_capabilities: vec![Capability::new(Capability::BASH)],
             prior_context: None,

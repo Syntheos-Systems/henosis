@@ -120,6 +120,7 @@ impl AgentExecutor for OkExecutor {
             branch: "agent/a/task-777".into(),
             working_dir: PathBuf::from("/tmp"),
             max_runtime_secs: 0,
+            cargo_target_dir: None,
         }
     }
     async fn discuss(&self, _c: DiscussionContext) -> anyhow::Result<Option<AgentResponse>> {
@@ -202,8 +203,10 @@ async fn test_full_propose_approve_execute_flow() {
             branch: "agent/architect/task-777".into(),
             working_dir: PathBuf::from("/tmp"),
             max_runtime_secs: 0,
+            cargo_target_dir: None,
         },
         granted_capabilities: pending.granted_capabilities.clone(),
+        prior_context: None,
     };
     let result = supervisor.run(task).await;
     assert!(matches!(result, ExecutionResult::Success { .. }));

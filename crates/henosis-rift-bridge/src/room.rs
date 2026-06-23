@@ -649,6 +649,9 @@ impl Room {
             description: proposal.scope_summary.clone(),
             sandbox,
             granted_capabilities: proposal.granted_capabilities.clone(),
+            // First attempt against a fresh worktree: no prior work to resume. The
+            // crash-recovery path will source a partial-work summary here.
+            prior_context: None,
         };
 
         // Spawn so the event loop is not blocked by a long execution.

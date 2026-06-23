@@ -232,6 +232,9 @@ impl AgentExecutor for SynapseExecutor {
             branch: "agent/synapse/unset".into(),
             working_dir: self.base_config.cwd.clone(),
             max_runtime_secs: 3600,
+            // Synapse-native execution runs through providers, not subprocess builds, so it
+            // exports no CARGO_TARGET_DIR; the bridge populates this for spawning executors.
+            cargo_target_dir: None,
         }
     }
 
@@ -477,6 +480,7 @@ mod tests {
                 branch: "agent/synapse/task-1".into(),
                 working_dir: PathBuf::from("/tmp/task-1"),
                 max_runtime_secs: 60,
+                cargo_target_dir: None,
             },
             granted_capabilities,
             prior_context: None,

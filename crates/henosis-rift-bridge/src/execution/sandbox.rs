@@ -86,6 +86,9 @@ impl SandboxManager {
             branch,
             working_dir: path,
             max_runtime_secs: self.max_runtime_secs,
+            // Forward the operator's per-workspace CARGO_TARGET_DIR so spawning executors
+            // keep build artifacts off the source tree.
+            cargo_target_dir: workspace.cargo_target_dir.clone(),
         })
     }
 }

@@ -67,6 +67,8 @@ impl AgentExecutor for ClaudeCodeExecutor {
             branch: "agent/claude-code/unset".into(),
             working_dir: PathBuf::from("/tmp"),
             max_runtime_secs: 600,
+            // Placeholder sandbox; the real one (with CARGO_TARGET_DIR) comes from the bridge.
+            cargo_target_dir: None,
         }
     }
 
@@ -111,6 +113,11 @@ impl AgentExecutor for ClaudeCodeExecutor {
         let mut cmd = self.base_cmd();
         cmd.arg(&task.description);
         cmd.current_dir(&task.sandbox.working_dir);
+        // Honor the workspace's configured CARGO_TARGET_DIR so the agent's cargo builds write
+        // off the source tree. Unset when the workspace did not configure one.
+        if let Some(target_dir) = &task.sandbox.cargo_target_dir {
+            cmd.env("CARGO_TARGET_DIR", target_dir);
+        }
 
         let output = cmd.output().await?;
 
