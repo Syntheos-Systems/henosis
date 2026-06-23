@@ -351,6 +351,9 @@ impl AgentExecutor for SynapseExecutor {
 
         Ok(ExecutionResult::Success {
             summary: text.lines().next().unwrap_or("task complete").to_string(),
+            // Synapse-native execution streams through a provider and never creates git
+            // commits itself, so there is no commit hash to report (always None by design).
+            // Subprocess executors (e.g. ClaudeCode) detect commits via git HEAD instead.
             commit_hash: None,
             evidence: if text.is_empty() { None } else { Some(text) },
         })

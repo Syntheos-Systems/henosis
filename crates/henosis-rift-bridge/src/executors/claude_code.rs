@@ -14,6 +14,24 @@ use crate::executor::{
     HealthStatus, ProgressUpdate, TaskContext,
 };
 
+/// Return the worktree's current HEAD commit hash, or `None` if `dir` is not a git
+/// repository or the command fails. Used to detect whether an execution committed work.
+async fn git_head(dir: &std::path::Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!hash.is_empty()).then_some(hash)
+}
+
 /// Executor that shells out to the `claude` CLI.
 ///
 /// Discussion mode: runs `claude -p` with a formatted prompt.
@@ -110,6 +128,10 @@ impl AgentExecutor for ClaudeCodeExecutor {
             )))
             .await;
 
+        // Record HEAD before the run so we can report a commit hash only when the agent
+        // actually advanced it (committed work), not just echo the worktree's base commit.
+        let head_before = git_head(&task.sandbox.working_dir).await;
+
         let mut cmd = self.base_cmd();
         cmd.arg(&task.description);
         cmd.current_dir(&task.sandbox.working_dir);
@@ -125,9 +147,14 @@ impl AgentExecutor for ClaudeCodeExecutor {
         let _ = progress_tx.send(ProgressUpdate::Done).await;
 
         if output.status.success() {
+            // Report the resulting commit only if HEAD moved -- i.e. the agent committed.
+            let commit_hash = match git_head(&task.sandbox.working_dir).await {
+                Some(after) if Some(&after) != head_before.as_ref() => Some(after),
+                _ => None,
+            };
             Ok(ExecutionResult::Success {
                 summary: stdout.lines().next().unwrap_or("task complete").to_string(),
-                commit_hash: None,
+                commit_hash,
                 evidence: if stdout.is_empty() {
                     None
                 } else {
