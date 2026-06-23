@@ -234,19 +234,20 @@ pub async fn list_dms(
     let channels = db::get_user_dm_channels(&pool, auth.user_id).await?;
     let result: Vec<DmChannelInfo> = channels
         .into_iter()
-        .map(|(dm_id, user_id, username, display_name, avatar_url)| DmChannelInfo {
-            id: dm_id,
-            recipient: PublicUser {
-                id: user_id,
-                username,
-                display_name,
-                avatar_url,
-                status: "offline".into(),
-                about: None,
-                // DM channel listing query does not fetch agent flag; default to false.
-                is_agent: false,
+        .map(
+            |(dm_id, user_id, username, display_name, avatar_url, status, is_agent)| DmChannelInfo {
+                id: dm_id,
+                recipient: PublicUser {
+                    id: user_id,
+                    username,
+                    display_name,
+                    avatar_url,
+                    status,
+                    about: None,
+                    is_agent,
+                },
             },
-        })
+        )
         .collect();
 
     Ok(Json(result))

@@ -937,10 +937,11 @@ pub async fn get_or_create_dm_channel(
 pub async fn get_user_dm_channels(
     pool: &PgPool,
     user_id: Uuid,
-) -> Result<Vec<(Uuid, Uuid, String, Option<String>, Option<String>)>, sqlx::Error> {
-    // Returns: (dm_channel_id, other_user_id, username, display_name, avatar_url)
+) -> Result<Vec<(Uuid, Uuid, String, Option<String>, Option<String>, String, bool)>, sqlx::Error> {
+    // Returns: (dm_channel_id, other_user_id, username, display_name, avatar_url, status, is_agent)
     sqlx::query_as(
-        r#"SELECT dp1.dm_channel_id, dp2.user_id, u.username, u.display_name, u.avatar_url
+        r#"SELECT dp1.dm_channel_id, dp2.user_id, u.username, u.display_name, u.avatar_url,
+                  u.status, u.is_agent
            FROM dm_participants dp1
            INNER JOIN dm_participants dp2 ON dp1.dm_channel_id = dp2.dm_channel_id AND dp2.user_id != dp1.user_id
            INNER JOIN users u ON dp2.user_id = u.id
