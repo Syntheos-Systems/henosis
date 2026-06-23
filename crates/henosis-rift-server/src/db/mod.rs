@@ -299,7 +299,9 @@ pub async fn get_server_members(
     // Return as flat rows, assemble in caller
     let rows = sqlx::query_as::<_, MemberWithUser>(
         r#"SELECT m.server_id, m.user_id, m.nickname, m.joined_at,
-                  u.username, u.display_name, u.avatar_url, u.status
+                  u.username, u.display_name, u.avatar_url, u.status,
+                  u.about, u.created_at, u.updated_at,
+                  u.is_agent, u.executor_type, u.agent_roster_id
            FROM members m
            INNER JOIN users u ON m.user_id = u.id
            WHERE m.server_id = $1
@@ -326,13 +328,12 @@ pub async fn get_server_members(
                     password_hash: String::new(),
                     avatar_url: r.avatar_url,
                     status: r.status,
-                    about: None,
-                    created_at: r.joined_at, // placeholder
-                    updated_at: r.joined_at,
-                    // Agent fields not fetched in member list query; default to non-agent.
-                    is_agent: false,
-                    executor_type: None,
-                    agent_roster_id: None,
+                    about: r.about,
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
+                    is_agent: r.is_agent,
+                    executor_type: r.executor_type,
+                    agent_roster_id: r.agent_roster_id,
                 },
             )
         })
@@ -349,6 +350,12 @@ struct MemberWithUser {
     display_name: Option<String>,
     avatar_url: Option<String>,
     status: String,
+    about: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    is_agent: bool,
+    executor_type: Option<String>,
+    agent_roster_id: Option<String>,
 }
 
 pub async fn is_member(

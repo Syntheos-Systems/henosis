@@ -279,7 +279,13 @@ impl Gateway {
                                         });
                                     }
                                     GatewayCommand::UpdatePresence { status } => {
-                                        // Broadcast to all servers this user is in
+                                        // Persist the new status so it survives reconnect, then
+                                        // broadcast to all servers this user is in. Persistence is
+                                        // best-effort: a DB error is logged but still broadcast,
+                                        // since presence is ephemeral UX rather than authoritative.
+                                        if let Err(e) = crate::db::update_user_status(&pool, session.user_id, &status).await {
+                                            tracing::warn!(user_id = %session.user_id, error = %e, "failed to persist presence update");
+                                        }
                                         let event = GatewayEvent::PresenceUpdate {
                                             user_id: session.user_id,
                                             status,
