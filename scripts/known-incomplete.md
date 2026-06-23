@@ -11,9 +11,10 @@ store) and narrowed row 2 (bridge memory now runs in-process under `--features c
 (UpdatePresence now persists via `update_user_status`) and 9 (`get_server_members` now SELECTs the
 real agent/timestamp columns) were FIXED and removed; row 6 (`cargo_target_dir` now forwarded to
 the executor spawn via `ExecutionSandbox.cargo_target_dir`) was FIXED and removed, and row 7 was
-narrowed (the supervisor now threads `prior_context`; only the unbuilt resume data-source remains).
-Row numbers are kept stable because code comments reference them. Severities are from the
-adversarial verification pass.
+narrowed (the supervisor now threads `prior_context`; only the unbuilt resume data-source remains);
+row 13 (`ToolCompleted` now recovers the real tool name by correlating `ToolResult` to `ToolStart`
+on the shared tool-call id) was FIXED and removed. Row numbers are kept stable because code
+comments reference them. Severities are from the adversarial verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
@@ -23,7 +24,6 @@ adversarial verification pass.
 | 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
 | 7 | LOW | supervisor now THREADS `prior_context` into the executor (`ExecutionSandbox.cargo_target_dir` analog) -- no longer dropped -- but no caller populates it: the crash-recovery resume path that would supply a partial-work summary is unbuilt, so it is `None` in practice | `henosis-rift-bridge/src/room.rs:646` (first-attempt caller) | a resume path detects partial work and passes it as `prior_context` |
 | 10 | LOW | `list_dms` hardcodes every recipient `status:"offline"` + non-agent; the query omits `u.status`/`u.is_agent` | `henosis-rift-server/src/routes/users.rs:244`, `db/mod.rs:936` | query SELECTs and threads `u.status`, `u.is_agent` |
-| 13 | MED | `ToolCompleted` progress event carries literal `"tool"` placeholder name -- tool-name correlation lost for consumers | `synapse-core/src/executors/synapse_executor.rs:307` | track the `ToolStart` name and reuse it |
 | 14 | LOW | `ExecutionResult::Success` always carries `commit_hash:None` (no git integration); evidence/commit checks are meaningless | `synapse-core/src/executors/synapse_executor.rs:338` | probe git HEAD post-run, or doc that synapse-native never populates it |
 | 16 | LOW | `SynapseExecutor::sandbox()` returns a hardcoded placeholder branch and is unread by the bridge (doc now accurate; real branch = `sandbox::branch_name`) | `synapse-core/src/executors/synapse_executor.rs:227` | executor owns sandbox derivation AND a caller uses it |
 | 17 | LOW | `SynapseExecutor::health_check()` always returns `Ready` (disclosed placeholder); no production caller yet | `synapse-core/src/executors/synapse_executor.rs:347` | probe provider/Kleos AND a caller invokes it |

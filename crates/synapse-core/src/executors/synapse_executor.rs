@@ -288,32 +288,42 @@ impl AgentExecutor for SynapseExecutor {
         let mut text = String::new();
         let mut errored = false;
         let mut error_reason = String::new();
+        // Correlates ToolResult back to its ToolStart by id, so ToolCompleted carries the
+        // real tool name instead of a placeholder. Keyed by the tool-call id both events share.
+        let mut tool_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         while let Some(event) = stream.next().await {
             match &event {
                 AgentEvent::Text(delta) => {
                     text.push_str(delta);
                 }
-                AgentEvent::ToolStart { name, .. }
+                AgentEvent::ToolStart { id, name } => {
+                    tool_names.insert(id.clone(), name.clone());
                     if progress_tx
                         .send(ProgressUpdate::ToolStarted {
                             tool_name: name.clone(),
                         })
                         .await
-                        .is_err() =>
-                {
-                    // If the bridge dropped the receiver, abort.
-                    return Ok(ExecutionResult::Failed {
-                        reason: "bridge disconnected during execution".into(),
-                        partial_work: true,
-                    });
+                        .is_err()
+                    {
+                        // If the bridge dropped the receiver, abort.
+                        return Ok(ExecutionResult::Failed {
+                            reason: "bridge disconnected during execution".into(),
+                            partial_work: true,
+                        });
+                    }
                 }
-                AgentEvent::ToolStart { .. } => {}
-                AgentEvent::ToolResult { is_error, .. } => {
-                    // ToolResult carries no tool name -- emit with placeholder.
+                AgentEvent::ToolResult { id, is_error, .. } => {
+                    // Recover the tool name from the matching ToolStart; fall back to a
+                    // placeholder only if the start was never seen.
+                    let tool_name = tool_names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| "tool".into());
                     let _ = progress_tx
                         .send(ProgressUpdate::ToolCompleted {
-                            tool_name: "tool".into(),
+                            tool_name,
                             is_error: *is_error,
                         })
                         .await;
