@@ -53,7 +53,7 @@ synapse-tools = { path = "../synapse-tools" }
 anyhow = "1"
 
 # Frameshift persona selection engine (local development path dependency)
-frameshift-orchestrator = { path = "../../../frameshift/server/crates/frameshift-orchestrator" }
+frameshift-orchestrator = { path = "../../../frameshift/crates/frameshift-orchestrator" }
 
 # In-process Kleos seam (Story 4.4 step 3): InProcessKleosClient backs the
 # KleosClient trait with the henosis kernel stores instead of HTTP-to-Kleos.

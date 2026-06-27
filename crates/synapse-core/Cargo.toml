@@ -22,7 +22,7 @@ dashmap = { workspace = true }
 # In-process persona ranking (Story 4.3): replaces the `frameshift select`
 # subprocess. Stays an external path dep outside the henosis workspace tree
 # (copy-and-own boundary); rift-bridge consumes the same crate the same way.
-frameshift-orchestrator = { path = "../../../frameshift/server/crates/frameshift-orchestrator" }
+frameshift-orchestrator = { path = "../../../frameshift/crates/frameshift-orchestrator" }
 
 [dev-dependencies]
 tempfile = "3"
