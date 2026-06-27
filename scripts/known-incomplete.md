@@ -17,8 +17,13 @@ on the shared tool-call id) and row 18 (`synapse-tui` `/model` now surfaces a no
 transcript; `synapse-cli` provider-swap already notified) were FIXED and removed; row 10
 (`list_dms` now SELECTs the real `u.status`/`u.is_agent`) and row 14 (the ClaudeCode executor now
 reports `commit_hash` by diffing git HEAD across the run; synapse-native never commits, documented)
-were FIXED and removed. Row numbers are kept stable because code comments reference them. Severities
-are from the adversarial verification pass.
+were FIXED and removed; row 17 (`SynapseExecutor::health_check` now validates static config --
+model/max_tokens/max_turns -- and the bridge runs a health preflight in `Room::execute_approved`
+before spawning, blocking the task when not `Ready`) and row 16 (the executor's `sandbox()` is now
+read as runtime policy: the bridge clamps the worktree's `max_runtime_secs` to the executor's
+declared ceiling via `execution::preflight::apply_runtime_policy`) were FIXED and removed. Row
+numbers are kept stable because code comments reference them. Severities are from the adversarial
+verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
@@ -26,9 +31,7 @@ are from the adversarial verification pass.
 | 2 | LOW | bridge in-process memory runs on the cognition store ONLY under `--features cognition`; the default build's in-process mode still HTTP-tunnels memory to :4200 (`HttpMemoryBackend`) -- cognition is optional, mirroring the server | `henosis-rift-bridge/src/{kleos.rs,main.rs}` (`BridgeMemory` seam) | the bridge ships with the cognition feature on by default, or HTTP memory is removed |
 | 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
 | 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
-| 7 | LOW | supervisor now THREADS `prior_context` into the executor (`ExecutionSandbox.cargo_target_dir` analog) -- no longer dropped -- but no caller populates it: the crash-recovery resume path that would supply a partial-work summary is unbuilt, so it is `None` in practice | `henosis-rift-bridge/src/room.rs:646` (first-attempt caller) | a resume path detects partial work and passes it as `prior_context` |
-| 16 | LOW | `SynapseExecutor::sandbox()` returns a hardcoded placeholder branch and is unread by the bridge (doc now accurate; real branch = `sandbox::branch_name`) | `synapse-core/src/executors/synapse_executor.rs:227` | executor owns sandbox derivation AND a caller uses it |
-| 17 | LOW | `SynapseExecutor::health_check()` always returns `Ready` (disclosed placeholder); no production caller yet | `synapse-core/src/executors/synapse_executor.rs:347` | probe provider/Kleos AND a caller invokes it |
+| 7 | LOW | supervisor now THREADS `prior_context` into the executor (`ExecutionSandbox.cargo_target_dir` analog) -- no longer dropped -- but no caller populates it: the crash-recovery resume path that would supply a partial-work summary is unbuilt, so it is `None` in practice | `henosis-rift-bridge/src/room.rs:695` (first-attempt caller) | a resume path detects partial work and passes it as `prior_context` |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

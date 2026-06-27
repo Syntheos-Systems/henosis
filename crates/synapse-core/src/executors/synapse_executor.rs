@@ -220,17 +220,23 @@ impl AgentExecutor for SynapseExecutor {
         ]
     }
 
-    /// The executor's self-reported sandbox.
+    /// The executor's runtime policy.
     ///
-    /// NOTE: `branch` is a hardcoded placeholder (`agent/synapse/unset`), NOT derived from
-    /// `base_config`. The real per-task worktree branch is computed by the bridge
-    /// (`sandbox::branch_name(agent, task_id)`), and this method is currently unread by the
-    /// supervised path. `working_dir` is `base_config.cwd`. Wire a real branch (or remove this
-    /// method) when the executor owns sandbox derivation. See scripts/known-incomplete.md row 16.
+    /// `sandbox()` takes no `task_id`, so it cannot (and must not) derive a real
+    /// per-task worktree: branch isolation, the worktree path, and
+    /// `CARGO_TARGET_DIR` are filesystem concerns the bridge owns
+    /// (`SandboxManager` + `sandbox::branch_name`). The meaningful field the
+    /// bridge reads from this method is `max_runtime_secs` -- the executor's
+    /// self-declared wall-clock ceiling, which the bridge clamps the worktree's
+    /// limit down to (see `execution::preflight::apply_runtime_policy`). The
+    /// `branch`/`working_dir` returned here are advisory defaults the bridge
+    /// always overrides.
     fn sandbox(&self) -> ExecutionSandbox {
         ExecutionSandbox {
-            branch: "agent/synapse/unset".into(),
+            // Advisory only -- the bridge derives the real branch from the task id.
+            branch: "agent/synapse".into(),
             working_dir: self.base_config.cwd.clone(),
+            // Runtime policy: Synapse provider sessions get up to an hour.
             max_runtime_secs: 3600,
             // Synapse-native execution runs through providers, not subprocess builds, so it
             // exports no CARGO_TARGET_DIR; the bridge populates this for spawning executors.
@@ -359,11 +365,26 @@ impl AgentExecutor for SynapseExecutor {
         })
     }
 
-    /// Return `HealthStatus::Ready`.
+    /// Validate static readiness, returning `Unavailable` on misconfiguration.
     ///
-    /// Placeholder implementation. A future revision will probe the provider
-    /// and verify Kleos reachability before returning `Ready`.
+    /// This does NOT probe the provider over the network: the `Provider` trait
+    /// exposes no ping, and a real round-trip is a paid LLM call -- unacceptable
+    /// on the periodic heartbeat the bridge runs this on. The executor also
+    /// holds no Kleos handle, so Kleos reachability is out of scope here. What
+    /// it can verify cheaply is that the cloned `base_config` is runnable: a
+    /// model is set and the token/turn budgets are non-zero. A misconfigured
+    /// executor is reported `Unavailable` so the bridge blocks the spawn before
+    /// creating a worktree.
     async fn health_check(&self) -> Result<HealthStatus> {
+        if self.base_config.model.trim().is_empty() {
+            return Ok(HealthStatus::Unavailable("no model configured".into()));
+        }
+        if self.base_config.max_tokens == 0 {
+            return Ok(HealthStatus::Unavailable("max_tokens is 0".into()));
+        }
+        if self.base_config.max_turns == 0 {
+            return Ok(HealthStatus::Unavailable("max_turns is 0".into()));
+        }
         Ok(HealthStatus::Ready)
     }
 }
@@ -500,12 +521,47 @@ mod tests {
         }
     }
 
-    /// `health_check` returns `Ready` without any network calls.
+    /// `health_check` returns `Ready` when the base config is well-formed.
     #[tokio::test]
     async fn health_check_returns_ready() {
         let executor = make_executor();
         let status = executor.health_check().await.expect("health_check failed");
         assert_eq!(status, HealthStatus::Ready);
+    }
+
+    /// `health_check` reports `Unavailable` when no model is configured.
+    #[tokio::test]
+    async fn health_check_unavailable_when_model_empty() {
+        let mut executor = make_executor();
+        executor.base_config.model = "   ".into();
+        let status = executor.health_check().await.expect("health_check failed");
+        assert!(matches!(status, HealthStatus::Unavailable(_)));
+    }
+
+    /// `health_check` reports `Unavailable` when the token budget is zero.
+    #[tokio::test]
+    async fn health_check_unavailable_when_max_tokens_zero() {
+        let mut executor = make_executor();
+        executor.base_config.max_tokens = 0;
+        let status = executor.health_check().await.expect("health_check failed");
+        assert!(matches!(status, HealthStatus::Unavailable(_)));
+    }
+
+    /// `health_check` reports `Unavailable` when the turn budget is zero.
+    #[tokio::test]
+    async fn health_check_unavailable_when_max_turns_zero() {
+        let mut executor = make_executor();
+        executor.base_config.max_turns = 0;
+        let status = executor.health_check().await.expect("health_check failed");
+        assert!(matches!(status, HealthStatus::Unavailable(_)));
+    }
+
+    /// `sandbox` declares the executor's runtime policy (a non-zero ceiling the
+    /// bridge clamps against), even though branch/path are bridge-derived.
+    #[test]
+    fn sandbox_declares_runtime_policy() {
+        let executor = make_executor();
+        assert!(executor.sandbox().max_runtime_secs > 0);
     }
 
     /// `required_capabilities` returns a non-empty list.

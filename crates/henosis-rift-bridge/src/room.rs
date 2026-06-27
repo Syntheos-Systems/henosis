@@ -18,6 +18,7 @@ use crate::error::BridgeError;
 use crate::execution::approval::ApprovalRegistry;
 use crate::execution::command::{parse_control_command, ControlCommand};
 use crate::execution::coordinator::ProposalCoordinator;
+use crate::execution::preflight::{apply_runtime_policy, health_preflight, Preflight};
 use crate::execution::sandbox::{resolve_workspace, SandboxManager};
 use crate::execution::supervisor::{ExecutionSupervisor, SupervisedTask};
 use crate::execution::{PendingProposal, RiftRoomNotifier, RoomNotifier};
@@ -607,6 +608,49 @@ impl Room {
             }
         };
 
+        // Health preflight before creating any worktree: the executor's runtime
+        // must be ready, or the task is blocked rather than spawned into a dead
+        // runtime (AgentExecutor contract: health_check is called before spawn).
+        let health = match executor.health_check().await {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = self
+                    .kleos
+                    .update_task_status(
+                        &proposal.task_id,
+                        "blocked",
+                        &format!("health check failed: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        match health_preflight(health) {
+            Preflight::Proceed => {}
+            Preflight::ProceedDegraded(reason) => {
+                tracing::warn!(
+                    "executor for {} is degraded but proceeding: {reason}",
+                    proposal.agent
+                );
+            }
+            Preflight::Block(reason) => {
+                tracing::error!(
+                    "executor for {} unavailable, blocking task {}: {reason}",
+                    proposal.agent,
+                    proposal.task_id
+                );
+                let _ = self
+                    .kleos
+                    .update_task_status(
+                        &proposal.task_id,
+                        "blocked",
+                        &format!("executor unavailable: {reason}"),
+                    )
+                    .await;
+                return;
+            }
+        }
+
         let workspace = match resolve_workspace(&self.workspaces, &proposal.workspace) {
             Some(w) => w,
             None => {
@@ -638,6 +682,11 @@ impl Room {
                 return;
             }
         };
+
+        // Clamp the worktree's wall-clock limit to the executor's declared
+        // runtime policy: the bridge owns branch/path, the executor owns its
+        // ceiling (never above the operator-configured limit).
+        let sandbox = apply_runtime_policy(sandbox, &executor.sandbox());
 
         let supervisor = self.supervisor.clone();
         let semaphore = self.exec_semaphore.clone();
