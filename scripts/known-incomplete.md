@@ -7,7 +7,7 @@ close a row, delete it in the same commit.
 Rows 1-5 are deliberately-deferred build-plan wiring. Rows 6-18 came from the half-wiring audit
 (2026-06-18). Rows 11 (eidolon Drift fail-open), 12 (URL query encoding), and 15 (gateway
 401-retry panic) were FIXED and removed; Wave 3 closed row 5 (server cognition route + persistent
-store) and narrowed row 2 (bridge memory now runs in-process under `--features cognition`); rows 8
+store) and narrowed row 2; rows 8
 (UpdatePresence now persists via `update_user_status`) and 9 (`get_server_members` now SELECTs the
 real agent/timestamp columns) were FIXED and removed; row 6 (`cargo_target_dir` now forwarded to
 the executor spawn via `ExecutionSandbox.cargo_target_dir`) was FIXED and removed, and row 7 (the
@@ -23,14 +23,19 @@ were FIXED and removed; row 17 (`SynapseExecutor::health_check` now validates st
 model/max_tokens/max_turns -- and the bridge runs a health preflight in `Room::execute_approved`
 before spawning, blocking the task when not `Ready`) and row 16 (the executor's `sandbox()` is now
 read as runtime policy: the bridge clamps the worktree's `max_runtime_secs` to the executor's
-declared ceiling via `execution::preflight::apply_runtime_policy`) were FIXED and removed. Row
-numbers are kept stable because code comments reference them. Severities are from the adversarial
-verification pass.
+declared ceiling via `execution::preflight::apply_runtime_policy`) were FIXED and removed. Row 2
+was RESOLVED as deliberate design (not a half-wire) and removed: the bridge's HTTP-default memory
+path is the intended architecture, not an incomplete wire. In-process cognition memory is opt-in
+via `--features cognition` (which pulls the vendored kleos-lib ML stack in), exactly mirroring
+syntheos-server, so the default build stays ML-free; KLEOS :4200 coexists permanently (Zan,
+2026-06-18), so routing default-build memory to :4200 over HTTP is a chosen tradeoff, not a TODO.
+Both `HttpMemoryBackend` and `CognitionMemoryBackend` are fully wired and selected at compile time.
+Row numbers are kept stable because code comments reference them. Severities are from the
+adversarial verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
 | 1 | plan | plutus gate is a deny-stub (fail-closed deny; no quota/RBAC authority) | `syntheos-server/src/app.rs` `live_gate_chain`, `main.rs` | Phase 6 (Plutus authority) |
-| 2 | LOW | bridge in-process memory runs on the cognition store ONLY under `--features cognition`; the default build's in-process mode still HTTP-tunnels memory to :4200 (`HttpMemoryBackend`) -- cognition is optional, mirroring the server | `henosis-rift-bridge/src/{kleos.rs,main.rs}` (`BridgeMemory` seam) | the bridge ships with the cognition feature on by default, or HTTP memory is removed |
 | 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
 | 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
 
