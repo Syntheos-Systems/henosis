@@ -10,8 +10,10 @@ Rows 1-5 are deliberately-deferred build-plan wiring. Rows 6-18 came from the ha
 store) and narrowed row 2 (bridge memory now runs in-process under `--features cognition`); rows 8
 (UpdatePresence now persists via `update_user_status`) and 9 (`get_server_members` now SELECTs the
 real agent/timestamp columns) were FIXED and removed; row 6 (`cargo_target_dir` now forwarded to
-the executor spawn via `ExecutionSandbox.cargo_target_dir`) was FIXED and removed, and row 7 was
-narrowed (the supervisor now threads `prior_context`; only the unbuilt resume data-source remains);
+the executor spawn via `ExecutionSandbox.cargo_target_dir`) was FIXED and removed, and row 7 (the
+supervisor now retries a partial-work failure once against the same worktree, threading a resume
+summary -- failure reason plus the partial commits -- as `prior_context` via `execution::resume`)
+was FIXED and removed;
 row 13 (`ToolCompleted` now recovers the real tool name by correlating `ToolResult` to `ToolStart`
 on the shared tool-call id) and row 18 (`synapse-tui` `/model` now surfaces a notice in the focused
 transcript; `synapse-cli` provider-swap already notified) were FIXED and removed; row 10
@@ -31,7 +33,6 @@ verification pass.
 | 2 | LOW | bridge in-process memory runs on the cognition store ONLY under `--features cognition`; the default build's in-process mode still HTTP-tunnels memory to :4200 (`HttpMemoryBackend`) -- cognition is optional, mirroring the server | `henosis-rift-bridge/src/{kleos.rs,main.rs}` (`BridgeMemory` seam) | the bridge ships with the cognition feature on by default, or HTTP memory is removed |
 | 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
 | 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
-| 7 | LOW | supervisor now THREADS `prior_context` into the executor (`ExecutionSandbox.cargo_target_dir` analog) -- no longer dropped -- but no caller populates it: the crash-recovery resume path that would supply a partial-work summary is unbuilt, so it is `None` in practice | `henosis-rift-bridge/src/room.rs:695` (first-attempt caller) | a resume path detects partial work and passes it as `prior_context` |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

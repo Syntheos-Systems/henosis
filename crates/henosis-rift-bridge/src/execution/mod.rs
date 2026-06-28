@@ -4,6 +4,7 @@ pub mod approval;
 pub mod command;
 pub mod coordinator;
 pub mod preflight;
+pub mod resume;
 pub mod sandbox;
 pub mod supervisor;
 
