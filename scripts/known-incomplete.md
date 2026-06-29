@@ -30,12 +30,18 @@ via `--features cognition` (which pulls the vendored kleos-lib ML stack in), exa
 syntheos-server, so the default build stays ML-free; KLEOS :4200 coexists permanently (Zan,
 2026-06-18), so routing default-build memory to :4200 over HTTP is a chosen tradeoff, not a TODO.
 Both `HttpMemoryBackend` and `CognitionMemoryBackend` are fully wired and selected at compile time.
+Row 1 (plutus gate was a fail-closed deny-stub) was FIXED and removed: the new
+henosis-plutus kernel authority backs a real PlutusGate doing org-status -> RBAC
+-> hard-quota -> rate-limit checks, fail-closed at every step (no Allow-on-error
+path), replacing the deny-stub in the plutus slot. All five gate slots now run
+real gates. Billing (Stripe/X402) is deliberately NOT part of this -- it is a
+separate later effort and is not needed for the gate slot to be real.
+
 Row numbers are kept stable because code comments reference them. Severities are from the
 adversarial verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
-| 1 | plan | plutus gate is a deny-stub (fail-closed deny; no quota/RBAC authority) | `syntheos-server/src/app.rs` `live_gate_chain`, `main.rs` | Phase 6 (Plutus authority) |
 | 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
 | 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
 
