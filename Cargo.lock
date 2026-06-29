@@ -3275,6 +3275,7 @@ name = "henosis-cognition"
 version = "0.1.0"
 dependencies = [
  "kleos-lib",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3384,6 +3385,22 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "henosis-plutus"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "syntheos-contracts",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -7844,6 +7861,7 @@ dependencies = [
  "henosis-loom",
  "henosis-phylax",
  "henosis-pistis",
+ "henosis-plutus",
  "henosis-rift",
  "henosis-soma",
  "henosis-thymus",
