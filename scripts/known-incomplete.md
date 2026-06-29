@@ -71,8 +71,11 @@ were from the adversarial verification pass.
 GitHub Dependabot remediation (2026-06-22). The rustls-webpki HIGH + 2 LOW, the SQLx MED, and the
 jsonwebtoken 3x MED were fixed by bumping the Postgres stack to sqlx 0.8.6 (via the vendored
 Postgres-only facade in `vendor/sqlx`, see its VENDOR.md) and jsonwebtoken to 10 (`rust_crypto`).
-One advisory remains, blocked upstream:
+Two advisories remain, both blocked upstream behind the pristine vendored `kleos-lib`
+(the opentelemetry one surfaced 2026-06-29 from a fresh disclosure on a pre-existing
+transitive dep, not introduced by any Henosis change):
 
 | Advisory | Sev | Crate | Why unfixed | Closes when |
 |----------|-----|-------|-------------|-------------|
+| GHSA-w9wp-h8wv-79jx | MED | `opentelemetry_sdk 0.27.1` | Pulled transitively by the vendored `kleos-lib` (`opentelemetry` / `opentelemetry-otlp` / `tracing-opentelemetry`), which is PRISTINE and cannot be bumped without a re-vendor. The bug is unbounded memory allocation in W3C Baggage propagation -- a code path Henosis never exercises: `kleos-lib` compiles only under `--features cognition`, and the facade uses its memory/search/context surface, not OTel baggage. | the vendored `kleos-lib` advances its opentelemetry pin (or upstream kleos-lib bumps it) |
 | GHSA-rhfx-m35p-ff5j | LOW | `lru 0.12.5` | Pulled transitively by `ratatui 0.29` (synapse-tui) and `tantivy 0.24` (lancedb <- kleos-lib, cognition). Both pin `lru ^0.12`; the fix lands in `0.16.3`, unreachable without major ratatui/tantivy bumps and a vendored-kleos-lib edit. The bug is a Miri-level Stacked-Borrows UB in `IterMut`, not reachable in our usage. | ratatui/tantivy advance their `lru` pin (or kleos-lib's vendored version moves) |
