@@ -139,6 +139,123 @@ pub fn set_dot_path(
     }
 }
 
+/// The dispatch seam that the composition layer (syntheos-server) implements to connect a
+/// Hephaestus step to the in-process Hephaestus executor.
+///
+/// Defined here in the kernel crate so [`HephaestusStepExecutor`] can live in henosis-loom
+/// without a compile-time dependency on henosis-hephaestus. The real implementation
+/// (`HephaestusRuntimeDispatch` in syntheos-server) holds the hephaestus `AppState` and
+/// calls `run_task_to_completion` from henosis-hephaestus. Tests use a fake implementation.
+#[async_trait]
+pub trait HephaestusDispatch: Send + Sync {
+    /// Submit `input` to the Hephaestus executor and await a terminal result.
+    ///
+    /// Returns the step output JSON on success, or an error message on failure.
+    /// The `input` is the merged step payload: `StepContext::input` overlaid with
+    /// `StepContext::config` (config keys win). The dispatch implementation extracts
+    /// the `"input"` string key as the agent task prompt; other keys map to
+    /// `CreateTaskBody` fields (`agent`, `project`, `system`, etc.).
+    async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String>;
+}
+
+/// Inline executor for [`StepType::Hephaestus`] steps.
+///
+/// Delegates to the [`HephaestusDispatch`] implementation supplied at construction time.
+/// In production the dispatch is `HephaestusRuntimeDispatch` (syntheos-server); in tests
+/// it is a fake implementation that avoids the LLM call entirely.
+///
+/// `execute` merges the step config over the step input (config keys win) and forwards the
+/// combined payload to the dispatch. The config can pin the agent prompt with
+/// `{"input": "..."}` or supply `agent`, `project`, `system` overrides.
+pub struct HephaestusStepExecutor<D: HephaestusDispatch> {
+    /// The Hephaestus dispatch implementation (real or fake).
+    dispatch: D,
+}
+
+/// Methods for `HephaestusStepExecutor`.
+impl<D: HephaestusDispatch> HephaestusStepExecutor<D> {
+    /// Wrap a dispatch implementation.
+    pub fn new(dispatch: D) -> Self {
+        Self { dispatch }
+    }
+}
+
+#[async_trait]
+impl<D: HephaestusDispatch + 'static> StepExecutor for HephaestusStepExecutor<D> {
+    /// Claims only [`StepType::Hephaestus`] steps.
+    fn handles(&self, step_type: StepType) -> bool {
+        step_type == StepType::Hephaestus
+    }
+
+    /// Merge config over input and forward to the dispatch; the result becomes the step output.
+    async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
+        // Start from the step input (run input overlaid with dependency outputs).
+        let mut payload = match ctx.input {
+            serde_json::Value::Object(map) => map.clone(),
+            other => {
+                // Non-object input: wrap it under "input" so the dispatch can find it.
+                let mut m = serde_json::Map::new();
+                m.insert("input".to_string(), other.clone());
+                m
+            }
+        };
+        // Overlay config keys (config wins on overlap, so the step definition can
+        // pin specific fields such as the agent prompt or the target project).
+        if let Some(cfg_obj) = ctx.config.as_object() {
+            for (k, v) in cfg_obj {
+                payload.insert(k.clone(), v.clone());
+            }
+        }
+        self.dispatch.run(serde_json::Value::Object(payload)).await
+    }
+}
+
+/// A composite executor that delegates to the first member whose [`StepExecutor::handles`]
+/// returns true.
+///
+/// Used in the composition layer (syntheos-server) to bundle the built-in
+/// [`TransformExecutor`] with a [`HephaestusStepExecutor`] without replacing either.
+/// Ordering matters: the first executor that claims a type wins. An unclaimed type is
+/// left for external completion (the existing Loom behavior).
+pub struct CompositeStepExecutor {
+    /// Ordered executors; first match wins. Must be non-empty for useful behavior.
+    executors: Vec<Box<dyn StepExecutor>>,
+}
+
+/// Methods for `CompositeStepExecutor`.
+impl CompositeStepExecutor {
+    /// Build from an ordered list of executors.
+    pub fn new(executors: Vec<Box<dyn StepExecutor>>) -> Self {
+        Self { executors }
+    }
+}
+
+#[async_trait]
+impl StepExecutor for CompositeStepExecutor {
+    /// Returns true if any member executor handles `step_type`.
+    fn handles(&self, step_type: StepType) -> bool {
+        self.executors.iter().any(|e| e.handles(step_type))
+    }
+
+    /// Delegates to the first member that handles the step type.
+    ///
+    /// Returns an error if no member claims the type (caller should check `handles` first,
+    /// but this is a safe fallback).
+    async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
+        // Copy step_type before the loop so it is available after ctx is potentially moved.
+        let step_type = ctx.step_type;
+        for executor in &self.executors {
+            if executor.handles(step_type) {
+                return executor.execute(ctx).await;
+            }
+        }
+        Err(format!(
+            "no executor handles step type {:?}",
+            step_type.as_str()
+        ))
+    }
+}
+
 /// Replace `{{path}}` placeholders in `template` with values resolved from `vars` (strings
 /// verbatim, `Null` as empty, anything else via its JSON text).
 pub fn interpolate(template: &str, vars: &serde_json::Value) -> String {
@@ -190,6 +307,95 @@ mod tests {
             interpolate("hi {{who}} x{{n}} ({{gone}})", &vars),
             "hi loom x3 ()"
         );
+    }
+
+    /// Fake dispatch that echoes the input back as the output with a marker field added.
+    struct FakeDispatch;
+
+    #[async_trait]
+    impl HephaestusDispatch for FakeDispatch {
+        /// Echo the input JSON, adding `"dispatched": true` to confirm this ran.
+        async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+            let mut out = match input {
+                serde_json::Value::Object(m) => m,
+                other => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("value".to_string(), other);
+                    m
+                }
+            };
+            out.insert("dispatched".to_string(), serde_json::Value::Bool(true));
+            Ok(serde_json::Value::Object(out))
+        }
+    }
+
+    /// A HephaestusStepExecutor with FakeDispatch runs a Hephaestus step and records output.
+    #[tokio::test]
+    async fn hephaestus_step_executor_runs_and_records_output() {
+        let exec = HephaestusStepExecutor::new(FakeDispatch);
+        let input = serde_json::json!({"task": "summarise"});
+        let config = serde_json::json!({"input": "please summarise", "agent": "test-agent"});
+        let ctx = StepContext {
+            run_id: RunId::new(),
+            step_id: 1,
+            name: "call-hephaestus",
+            step_type: StepType::Hephaestus,
+            config: Box::leak(Box::new(config)),
+            input: &input,
+            timeout_ms: 5000,
+        };
+        // handles() should claim Hephaestus steps.
+        assert!(exec.handles(StepType::Hephaestus));
+        assert!(!exec.handles(StepType::Transform));
+
+        let result = exec.execute(ctx).await.unwrap();
+        // Config keys overlay input; "input" and "agent" come from config, "task" from input.
+        assert_eq!(result["input"], "please summarise");
+        assert_eq!(result["agent"], "test-agent");
+        assert_eq!(result["task"], "summarise");
+        assert_eq!(result["dispatched"], true);
+    }
+
+    /// CompositeStepExecutor delegates to the right member and handles both Transform and Hephaestus.
+    #[tokio::test]
+    async fn composite_executor_delegates_correctly() {
+        let composite = CompositeStepExecutor::new(vec![
+            Box::new(TransformExecutor),
+            Box::new(HephaestusStepExecutor::new(FakeDispatch)),
+        ]);
+
+        assert!(composite.handles(StepType::Transform));
+        assert!(composite.handles(StepType::Hephaestus));
+        assert!(!composite.handles(StepType::Action));
+
+        let input = serde_json::json!({"src": {"v": 7}});
+        let transform_config = serde_json::from_str(r#"{"mapping": {"out.v": "src.v"}}"#).unwrap();
+        let transform_ctx = StepContext {
+            run_id: RunId::new(),
+            step_id: 1,
+            name: "t",
+            step_type: StepType::Transform,
+            config: Box::leak(Box::new(transform_config)),
+            input: &input,
+            timeout_ms: 1000,
+        };
+        let transform_out = composite.execute(transform_ctx).await.unwrap();
+        assert_eq!(transform_out, serde_json::json!({"out": {"v": 7}}));
+
+        let heph_input = serde_json::json!({"prompt": "hello"});
+        let heph_config = serde_json::json!({});
+        let heph_ctx = StepContext {
+            run_id: RunId::new(),
+            step_id: 2,
+            name: "h",
+            step_type: StepType::Hephaestus,
+            config: Box::leak(Box::new(heph_config)),
+            input: &heph_input,
+            timeout_ms: 1000,
+        };
+        let heph_out = composite.execute(heph_ctx).await.unwrap();
+        assert_eq!(heph_out["dispatched"], true);
+        assert_eq!(heph_out["prompt"], "hello");
     }
 
     /// The transform executor's three modes: mapping, template, pass-through.

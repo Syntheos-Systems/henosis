@@ -39,7 +39,8 @@ pub use events::{
     WORKFLOW_CHANNEL,
 };
 pub use executor::{
-    interpolate, resolve_dot_path, set_dot_path, StepContext, StepExecutor, TransformExecutor,
+    interpolate, resolve_dot_path, set_dot_path, CompositeStepExecutor, HephaestusDispatch,
+    HephaestusStepExecutor, StepContext, StepExecutor, TransformExecutor,
 };
 pub use model::{
     LogEntry, LogLevel, LoomStats, NewWorkflow, Run, RunFilter, RunStatus, Step, StepDef,

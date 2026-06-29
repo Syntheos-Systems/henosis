@@ -1982,4 +1982,62 @@ mod tests {
         }
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[tokio::test]
+    /// A workflow with a Hephaestus step persists and reloads with the correct step type.
+    ///
+    /// Verifies the full round-trip: workflow definition -> SQLite -> reload, and that
+    /// creating a run instantiates the step row with the `hephaestus` token. The store
+    /// under test has only the TransformExecutor attached, so the Hephaestus step stays
+    /// Running (no executor claims it); the test only validates persistence, not execution.
+    async fn hephaestus_step_persists_and_reloads() {
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let wf = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "heph-roundtrip".to_string(),
+                description: None,
+                steps: vec![StepDef {
+                    name: "call-agent".to_string(),
+                    step_type: StepType::Hephaestus,
+                    config: Some(serde_json::json!({"input": "summarise X"})),
+                    depends_on: None,
+                    max_retries: Some(0),
+                    timeout_ms: Some(60_000),
+                }],
+            })
+            .await
+            .expect("create workflow");
+
+        // Reload the workflow definition and verify the step type survived the round-trip.
+        let reloaded = store
+            .get_workflow(principal, wf.id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            reloaded.steps[0].step_type,
+            StepType::Hephaestus,
+            "step_type round-trips through serde + SQLite"
+        );
+
+        // Create a run: the engine starts the step (no executor claims it, so it stays Running).
+        let run = store
+            .create_run(principal, wf.id, None)
+            .await
+            .expect("run");
+        assert_eq!(run.status, RunStatus::Running, "waiting on unclaimed step");
+
+        // Verify the step instance row carries the hephaestus token.
+        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].step_type,
+            StepType::Hephaestus,
+            "step instance persists hephaestus type"
+        );
+        assert_eq!(steps[0].status, StepStatus::Running);
+    }
 }

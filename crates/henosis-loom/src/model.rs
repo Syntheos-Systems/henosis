@@ -17,8 +17,10 @@ use crate::error::LoomError;
 /// The kind of work a step performs.
 ///
 /// Serializes snake_case, matching the Kleos type strings. `Transform` runs inline via the
-/// built-in executor; `Webhook`/`Llm` wait for their executors (Hermes/Synapse, Phases 4-5);
-/// the rest complete externally via [`crate::LoomStore::complete_step`].
+/// built-in executor; `Hephaestus` dispatches in-process to the absorbed agent executor
+/// (Phase 5, story 5.5) via the [`crate::HephaestusDispatch`] seam; `Webhook`/`Llm` wait
+/// for their executors (Hermes/Synapse, Phases 4-5); the rest complete externally via
+/// [`crate::LoomStore::complete_step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepType {
@@ -36,6 +38,12 @@ pub enum StepType {
     Llm,
     /// A pure JSON transform, executed inline by [`crate::TransformExecutor`].
     Transform,
+    /// An agent task dispatched in-process to the Hephaestus executor (Phase 5, story 5.5).
+    ///
+    /// The [`crate::HephaestusDispatch`] seam in the kernel crate keeps henosis-loom free of a
+    /// runtime dependency on henosis-hephaestus; the real implementation lives in
+    /// syntheos-server (the composition layer that depends on both).
+    Hephaestus,
 }
 
 impl StepType {
@@ -49,6 +57,7 @@ impl StepType {
             StepType::Webhook => "webhook",
             StepType::Llm => "llm",
             StepType::Transform => "transform",
+            StepType::Hephaestus => "hephaestus",
         }
     }
 
@@ -62,6 +71,7 @@ impl StepType {
             "webhook" => Ok(StepType::Webhook),
             "llm" => Ok(StepType::Llm),
             "transform" => Ok(StepType::Transform),
+            "hephaestus" => Ok(StepType::Hephaestus),
             other => Err(LoomError::InvalidStatus(other.to_string())),
         }
     }
