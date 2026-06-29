@@ -58,3 +58,10 @@ hmac = { workspace = true }
 [dev-dependencies]
 # HTTP mock server for adapter integration tests
 wiremock = "0.6"
+
+[features]
+# Adapter integration tests (wiremock-mocked GraphQL/REST endpoints) compile only
+# under this feature so the default test suite needs no network. Declared here so
+# the `cfg(feature = "integration-tests")` gates compile cleanly (no unexpected-cfg
+# warning); enable with `--features integration-tests` to exercise them.
+integration-tests = []

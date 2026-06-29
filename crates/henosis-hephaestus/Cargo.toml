@@ -50,7 +50,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
+# Note: the upstream [profile.release] is intentionally dropped -- profile
+# sections on a non-root workspace member are ignored; the root Cargo.toml owns
+# release profile settings for the whole workspace.
