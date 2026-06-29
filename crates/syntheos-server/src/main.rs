@@ -4,13 +4,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
 use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
 use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
-use henosis_loom::{LoomStore, TransformExecutor};
+use henosis_loom::{CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor};
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
 use henosis_plutus::{PlutusStore, PolicyBackend};
@@ -30,6 +31,81 @@ use tracing_subscriber::EnvFilter;
 /// Largest request body the server accepts, in bytes (1 MiB). Phase 0 payloads are small JSON;
 /// anything bigger is rejected before it can exhaust memory.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Bridges the Loom [`HephaestusDispatch`] seam to the in-process Hephaestus executor.
+///
+/// Constructed once at server boot from `henosis_hephaestus::Config::from_env()` and held
+/// inside a [`HephaestusStepExecutor`] that is composed with [`TransformExecutor`] into the
+/// [`CompositeStepExecutor`] attached to the [`LoomStore`].
+///
+/// When a Loom workflow step of type `hephaestus` runs, [`Self::run`] is called with the
+/// step's merged input (run input overlaid with dep outputs, then overlaid with step config).
+/// The payload is mapped to a [`henosis_hephaestus::CreateTaskBody`] and forwarded to
+/// [`henosis_hephaestus::run_task_to_completion`], which blocks until the agent loop finishes.
+///
+/// If hephaestus is not configured (e.g. no `HEPHAESTUS_ANTHROPIC_TOKEN` / provider creds),
+/// the AppState still constructs successfully but individual task executions will fail with
+/// a provider-auth error, which propagates back as `Err(message)` and burns the step's
+/// retry budget with a meaningful error. This is explicitly NOT a silent stub -- the error
+/// message identifies the misconfiguration rather than pretending the step succeeded.
+struct HephaestusRuntimeDispatch {
+    /// The hephaestus application state: clients (auth, LLM, Hermes, Kleos), task store, SSE hub.
+    state: henosis_hephaestus::AppState,
+}
+
+#[async_trait]
+impl HephaestusDispatch for HephaestusRuntimeDispatch {
+    /// Forward the step payload to the in-process Hephaestus executor and await the result.
+    ///
+    /// Extracts `"input"` from the payload as the agent task prompt (falling back to the
+    /// serialized payload if absent) and optional fields `agent`, `project`, `title`,
+    /// `tenant_id`, `system`, `verify_command` from the same object. Maps the terminal
+    /// [`henosis_hephaestus::TaskRecord`] to a JSON output on success or an error string on failure.
+    async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        // Extract the agent prompt: prefer the "input" string key so step config can pin it.
+        let prompt = input
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| input.to_string());
+
+        /// Extract an optional string field from a JSON object.
+        fn opt_str(v: &serde_json::Value, key: &str) -> Option<String> {
+            v.get(key).and_then(|s| s.as_str()).map(String::from)
+        }
+
+        let body = henosis_hephaestus::CreateTaskBody {
+            input: prompt,
+            agent: opt_str(&input, "agent"),
+            project: opt_str(&input, "project"),
+            title: opt_str(&input, "title"),
+            tenant_id: opt_str(&input, "tenant_id"),
+            system: opt_str(&input, "system"),
+            verify_command: opt_str(&input, "verify_command"),
+        };
+
+        let record = henosis_hephaestus::run_task_to_completion(self.state.clone(), body)
+            .await
+            .map_err(|e| format!("hephaestus pre-flight: {e}"))?;
+
+        match record.status {
+            henosis_hephaestus::TaskStatus::Completed => Ok(serde_json::json!({
+                "task_id": record.id,
+                "status": "completed",
+                "output": record.output.unwrap_or_default(),
+            })),
+            henosis_hephaestus::TaskStatus::Failed => Err(format!(
+                "hephaestus task {} failed: {}",
+                record.id,
+                record.error.unwrap_or_else(|| "unknown".to_string())
+            )),
+            other => Err(format!(
+                "hephaestus task {} in unexpected state: {:?}",
+                record.id, other
+            )),
+        }
+    }
+}
 
 /// How long a single request may run before the server answers `408 Request Timeout`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,13 +144,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broca_db = db_path("SYNTHEOS_BROCA_DB", "data/broca.sqlite")?;
     let broca = Arc::new(BrocaStore::open(&broca_db, bus.clone())?);
     tracing::info!(path = %broca_db, "broca narration log open");
-    // The built-in transform executor runs pure-JSON steps inline; Hephaestus swaps in the
-    // real executor in Phase 5.
+    // Build the in-process Hephaestus executor from env (Config::from_env). If provider
+    // credentials are absent the AppState still constructs and attaches; individual task
+    // executions will fail with a meaningful auth error rather than silently succeeding.
+    let heph_state =
+        henosis_hephaestus::build_state(henosis_hephaestus::Config::from_env());
+    let heph_dispatch = HephaestusRuntimeDispatch { state: heph_state };
+
+    // CompositeStepExecutor: Transform handles pure-JSON steps inline; Hephaestus dispatches
+    // agent tasks to the in-process executor (story 5.5). First-match wins; unclaimed types
+    // (action, decision, wait, ...) stay Running for external completion via complete_step.
     let loom_db = db_path("SYNTHEOS_LOOM_DB", "data/loom.sqlite")?;
     let loom = Arc::new(
-        LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(TransformExecutor)),
+        LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(
+            CompositeStepExecutor::new(vec![
+                Box::new(TransformExecutor),
+                Box::new(HephaestusStepExecutor::new(heph_dispatch)),
+            ]),
+        )),
     );
-    tracing::info!(path = %loom_db, "loom workflow engine open");
+    tracing::info!(path = %loom_db, "loom workflow engine open (composite executor: transform + hephaestus)");
     // Evaluations and drift propagate into the agents' Soma presence via the sink adapter.
     let thymus_db = db_path("SYNTHEOS_THYMUS_DB", "data/thymus.sqlite")?;
     let thymus = Arc::new(

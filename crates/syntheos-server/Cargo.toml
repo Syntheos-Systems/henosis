@@ -17,6 +17,8 @@ henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
 henosis-loom = { path = "../henosis-loom" }
+# Phase 5 / story 5.5: in-process Hephaestus executor wired into the Loom CompositeStepExecutor.
+henosis-hephaestus = { path = "../henosis-hephaestus" }
 henosis-thymus = { path = "../henosis-thymus" }
 # The eidolon authority: the real gate in the eidolon slot + the output filter (Story 2.6).
 henosis-eidolon = { path = "../henosis-eidolon" }
