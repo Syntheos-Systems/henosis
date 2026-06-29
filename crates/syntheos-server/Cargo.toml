@@ -26,6 +26,8 @@ henosis-pistis = { path = "../henosis-pistis" }
 henosis-phylax = { path = "../henosis-phylax" }
 # The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
 henosis-rift = { path = "../henosis-rift" }
+# The Plutus policy authority: the real gate in the plutus slot (Story 6.x / row 1).
+henosis-plutus = { path = "../henosis-plutus" }
 # The cognitive core facade over vendored kleos-lib (Wave 2). OPTIONAL: only the
 # `cognition` feature pulls it -- and with it the heavy ML stack -- in, so the
 # default Henosis build stays free of ort/tokenizers/lancedb. Additive wiring.
@@ -56,6 +58,9 @@ tower = { version = "0.5", features = ["util"] }
 # Tests opt into the allow-all stub chain; the non-default `stubs` feature never reaches a
 # normal (release) build of the binary.
 syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
+# Exposes MockPolicyBackend and FrozenClock so gate-chain tests can exercise PlutusGate
+# without a live Postgres connection.
+henosis-plutus = { path = "../henosis-plutus", features = ["test-helpers"] }
 
 [features]
 default = []

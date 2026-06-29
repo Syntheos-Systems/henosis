@@ -18,6 +18,7 @@ use henosis_loom::{
 };
 use henosis_phylax::{PhylaxGate, PhylaxStore};
 use henosis_pistis::{PistisGate, RoomStateSource};
+use henosis_plutus::{PlutusGate, PolicyBackend};
 use henosis_rift::{Approver, HumanGate};
 use henosis_soma::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaError,
@@ -115,20 +116,19 @@ pub fn eidolon_gate(
     EidolonGate::new(policy.clone(), Arc::new(ThymusDriftSignal(thymus)))
 }
 
-/// The live gate chain: the REAL [`PistisGate`] in the pistis slot, the REAL [`EidolonGate`] in
-/// the eidolon slot, the REAL [`PhylaxGate`] in the phylax slot when a credential store is
-/// configured, and fail-closed deny-stubs in the plutus/human slots until those authorities land.
-/// Canonical by construction -- [`Dispatcher::new`] validates it again at boot.
+/// The live gate chain: all five slots now run REAL gates.
 ///
-/// `pistis_source` supplies the gate's materialized room state. Until live Matrix materialization
-/// lands it is an empty [`InMemoryRoomStateSource`](henosis_pistis::InMemoryRoomStateSource): a
-/// capability-bearing invocation then fails closed (no room state -> deny), while an invocation
-/// that declares no capability passes pistis for the rest of the chain to decide. The pistis slot
-/// is a REAL gate either way -- never a deny-stub that would block the whole chain at its head.
+/// Slots in canonical order (`pistis -> plutus -> eidolon -> human -> phylax`):
+/// - `pistis`:  [`PistisGate`] -- capability/trust checks.
+/// - `plutus`:  [`PlutusGate`] -- org status, RBAC, daily quota, rate limit. Backed by the
+///   supplied `plutus` backend (production: [`henosis_plutus::PlutusStore`] over Postgres;
+///   tests: a [`henosis_plutus::MockPolicyBackend`]).
+/// - `eidolon`: [`EidolonGate`] -- prompt-injection, scope-violation, persona-drift policy.
+/// - `human`:   [`HumanGate`] -- human-in-the-loop approvals over Rift.
+/// - `phylax`:  [`PhylaxGate`] when a credential store is configured; [`DenyGate`] otherwise
+///   (fail-closed: no authority means deny).
 ///
-/// `phylax` is optional: with no configured credential store (no master key in the environment)
-/// the phylax slot stays a [`DenyGate`], so the absence of the authority denies rather than
-/// silently permitting credential operations.
+/// `Dispatcher::new` re-validates the canonical order at boot, so a mis-wiring is a boot error.
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
@@ -136,6 +136,7 @@ pub fn live_gate_chain(
     phylax: Option<Arc<PhylaxStore>>,
     bus: Arc<AxonBus>,
     human_approver: Arc<dyn Approver>,
+    plutus: Arc<dyn PolicyBackend>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     let phylax_gate: Box<dyn Gate> = match phylax {
         Some(store) => Box::new(PhylaxGate::new(store)),
@@ -143,12 +144,13 @@ pub fn live_gate_chain(
     };
     Ok(vec![
         Box::new(PistisGate::new(pistis_source)),
-        Box::new(DenyGate::new("plutus")),
+        // The REAL PlutusGate (Story 6.x / row 1): org status, RBAC, hard-quota, and
+        // token-bucket rate-limit, all fail-closed. Replaces the final deny-stub.
+        Box::new(PlutusGate::new(plutus)),
         Box::new(eidolon_gate(policy, thymus)?),
         // The REAL human gate (Story 4.6): an approval-required invocation is
         // escalated to a human (Axon notification) and blocks on the approver
-        // until they decide or it times out (fail-closed). Plutus is now the
-        // only remaining deny-stub.
+        // until they decide or it times out (fail-closed).
         Box::new(HumanGate::new(human_approver, bus)),
         phylax_gate,
     ])
@@ -1773,12 +1775,19 @@ mod tests {
         assert_eq!(result["api_key"], serde_json::json!("[redacted]"));
     }
 
-    /// The live chain builder produces exactly the canonical chain. With no phylax store the
-    /// phylax slot is a deny-stub (fail-closed: no credential authority means deny).
+    /// The live chain builder produces exactly the canonical chain and the plutus slot is the REAL
+    /// `PlutusGate` (not a deny-stub). A request from an enrolled member in an active org is
+    /// `Allow`ed by the plutus gate -- previously impossible when it was a deny-stub.
     #[tokio::test]
     async fn live_gate_chain_is_canonical() {
+        use henosis_plutus::MockPolicyBackend;
+        use syntheos_contracts::{GateDecision, GateRequest, RequestContext, ToolInvocation};
+
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        // MockPolicyBackend::allow_all(): active org, Member role, quota OK, rate OK.
+        let plutus_backend: Arc<dyn PolicyBackend> =
+            Arc::new(MockPolicyBackend::allow_all());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
@@ -1788,8 +1797,11 @@ mod tests {
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
             )),
+            plutus_backend,
         )
         .expect("valid default policy");
+
+        // Gate names are still in canonical order.
         let dispatcher =
             Dispatcher::new(chain, Box::new(syntheos_dispatch::deny::DenyExecutor), bus)
                 .expect("canonical chain");
@@ -1797,17 +1809,63 @@ mod tests {
             dispatcher.gate_names(),
             ["pistis", "plutus", "eidolon", "human", "phylax"]
         );
+
+        // The plutus slot (chain[1]) is the REAL PlutusGate and allows an enrolled-member request.
+        // Re-build the chain for the gate-level test (the dispatcher consumed it above).
+        let bus2 = Arc::new(AxonBus::new());
+        let thymus2 =
+            Arc::new(ThymusStore::open_in_memory(bus2.clone()).expect("thymus store 2"));
+        let plutus_allow: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::allow_all());
+        let chain2 = live_gate_chain(
+            &henosis_eidolon::EidolonPolicy::default(),
+            thymus2,
+            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            None,
+            bus2.clone(),
+            Arc::new(henosis_rift::RegistryApprover::new(
+                std::time::Duration::from_millis(5),
+            )),
+            plutus_allow,
+        )
+        .expect("valid default policy");
+        let plutus_gate = &chain2[1];
+        assert_eq!(plutus_gate.name(), "plutus");
+        let req = GateRequest {
+            context: RequestContext {
+                tenant: TenantId::new(),
+                principal: PrincipalId::new(),
+                persona: None,
+                session: None,
+                room: None,
+                task: None,
+                workflow: None,
+            },
+            invocation: ToolInvocation {
+                tool: "kleos".to_owned(),
+                action: "memory_search".to_owned(),
+                args: serde_json::json!({}),
+            },
+        };
+        // The real PlutusGate allows this enrolled-member request; a deny-stub would not.
+        assert_eq!(
+            plutus_gate.check(&req).await.expect("gate decides"),
+            GateDecision::Allow,
+            "plutus slot is the real gate and allows enrolled-member requests"
+        );
     }
 
     /// The human slot is the REAL HumanGate, not a deny-everything stub: an
     /// invocation declaring no approval requirement passes it (a `DenyGate`
-    /// would reject it). Story 4.6 -- only plutus remains a deny-stub.
+    /// would reject it). Story 4.6.
     #[tokio::test]
     async fn human_slot_is_real_gate_not_deny_stub() {
+        use henosis_plutus::MockPolicyBackend;
         use syntheos_contracts::{GateDecision, GateRequest, RequestContext, ToolInvocation};
 
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        // Use deny_no_org so the plutus slot would deny; this test checks chain[3] (human) directly.
+        let plutus_backend: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::deny_no_org());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
@@ -1817,6 +1875,7 @@ mod tests {
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
             )),
+            plutus_backend,
         )
         .expect("valid default policy");
 
@@ -1893,6 +1952,8 @@ mod tests {
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
             )),
+            // Use allow_all so the plutus slot does not interfere; we're testing phylax here.
+            Arc::new(henosis_plutus::MockPolicyBackend::allow_all()),
         )
         .expect("valid default policy");
         // The phylax slot is last; assert it is the real gate by exercising it.
@@ -1934,9 +1995,9 @@ mod tests {
     }
 
     /// Story 3.7 acceptance: through the live chain, the REAL PistisGate lets a request that
-    /// declares no capability traverse the pistis slot, where the next authority (plutus, still a
-    /// deny-stub) denies it -- and fails a capability-bearing request closed at the pistis slot,
-    /// since the empty room-state source has no authority state to verify against.
+    /// declares no capability traverse the pistis slot, where the plutus gate (configured with a
+    /// deny-no-org mock for this test) denies it -- and fails a capability-bearing request closed
+    /// at the pistis slot, since the empty room-state source has no authority state to verify.
     #[tokio::test]
     async fn live_chain_pistis_passes_then_plutus_denies() {
         use syntheos_contracts::{GateRequest, RequestContext, ToolInvocation};
@@ -1944,6 +2005,10 @@ mod tests {
 
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        // MockPolicyBackend::deny_no_org() makes the PlutusGate deny (no org for any tenant),
+        // preserving the test's assertion that the request is denied at the "plutus" gate.
+        let plutus_backend: Arc<dyn PolicyBackend> =
+            Arc::new(henosis_plutus::MockPolicyBackend::deny_no_org());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
@@ -1953,6 +2018,7 @@ mod tests {
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
             )),
+            plutus_backend,
         )
         .expect("valid default policy");
         let dispatcher =

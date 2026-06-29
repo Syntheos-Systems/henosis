@@ -13,6 +13,7 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{LoomStore, TransformExecutor};
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
+use henosis_plutus::{PlutusStore, PolicyBackend};
 use henosis_rift::{Approver, RegistryApprover};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
@@ -82,12 +83,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(path = %thymus_db, "thymus quality store open");
 
-    // The Phase 3 dispatcher: the REAL PistisGate in the pistis slot (Story 3.3) and the REAL
-    // EidolonGate in the eidolon slot (its drift policy reads the Thymus store), fail-closed
-    // deny-stubs in the plutus/human slots until those authorities land, the deny executor (no
-    // real executor until Hermes, Phase 5), and the eidolon output filter scrubbing credential
-    // fields from any executor result. `Dispatcher::new` re-validates the chain is exactly
-    // canonical at boot.
+    // The Plutus policy authority (Story 6.x / row 1): a real gate replacing the last deny-stub.
+    // Org/role/quota state persists in Postgres at SYNTHEOS_PLUTUS_DB (required). On first boot
+    // the operator principal is bootstrapped into a default org so the dispatch path is usable;
+    // subsequent orgs/members are managed through Plutus APIs.
+    // SYNTHEOS_PLUTUS_OPERATOR_TENANT + SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL are required for
+    // the bootstrap. If the org already exists, bootstrap is a no-op.
+    let plutus_url = std::env::var("SYNTHEOS_PLUTUS_DB").map_err(|_| {
+        "SYNTHEOS_PLUTUS_DB is required: set to a Postgres connection URL (e.g. postgres://user:pw@host/plutus)"
+    })?;
+    let plutus_store = PlutusStore::open(&plutus_url).await.map_err(|e| {
+        format!("plutus store open failed: {e}")
+    })?;
+    plutus_store.bootstrap_operator_org_if_absent().await.map_err(|e| {
+        format!("plutus operator bootstrap: {e}")
+    })?;
+    let plutus: Arc<dyn PolicyBackend> = Arc::new(plutus_store);
+    tracing::info!(url = %plutus_url, "plutus policy authority open (real gate in plutus slot)");
+
+    // The dispatcher gate chain: all five slots now run REAL gates (pistis, plutus, eidolon,
+    // human, phylax-when-keyed). The plutus slot is the real PlutusGate (Story 6.x / row 1).
     // The phylax credential authority is opt-in and fail-closed: it activates only when a master
     // key is configured (SYNTHEOS_PHYLAX_KEY). Absent a key, the phylax slot stays a deny-stub so
     // no credential operation is silently permitted.
@@ -126,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 phylax,
                 bus.clone(),
                 human_approver,
+                plutus,
             )?,
             Box::new(DenyExecutor),
             bus.clone(),
@@ -197,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "syntheos-server listening (pistis + eidolon + human live, phylax live when keyed; only plutus deny-stubbed)");
+    tracing::info!(%addr, "syntheos-server listening (all five gate slots real: pistis, plutus, eidolon, human, phylax-when-keyed)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

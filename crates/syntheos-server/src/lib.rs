@@ -10,12 +10,12 @@
 //! `POST /dispatch`. The dispatch route runs an action through the real gate chain, so the whole
 //! stack is exercised fail-closed end-to-end over the wire.
 //!
-//! The gate chain ([`live_gate_chain`]) now runs REAL gates in four of five slots: PistisGate
-//! (capability/trust, Story 3.3), the EidolonGate (prompt-injection, scope-violation, and
-//! persona-drift policy read from Thymus via the [`ThymusDriftSignal`] adapter, Story 2.6),
-//! HumanGate (human-in-the-loop approvals over Rift, Story 4.6), and PhylaxGate (credential
-//! resolution, Story 3.6, when `SYNTHEOS_PHYLAX_KEY` is set). Only the plutus slot remains a
-//! fail-closed deny-stub until the Plutus quota/RBAC authority lands (Phase 6). The
+//! The gate chain ([`live_gate_chain`]) now runs REAL gates in all five slots: PistisGate
+//! (capability/trust, Story 3.3), PlutusGate (org status, RBAC, daily quota, rate limit, Story
+//! 6.x / row 1), EidolonGate (prompt-injection, scope-violation, and persona-drift policy read
+//! from Thymus via the [`ThymusDriftSignal`] adapter, Story 2.6), HumanGate (human-in-the-loop
+//! approvals over Rift, Story 4.6), and PhylaxGate (credential resolution, Story 3.6, when
+//! `SYNTHEOS_PHYLAX_KEY` is set). All five gate slots are real -- no deny-stubs remain. The
 //! `EidolonOutputFilter` is wired into the dispatcher's output slot, scrubbing credential-bearing
 //! fields from executor results.
 //!
