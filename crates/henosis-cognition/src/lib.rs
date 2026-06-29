@@ -59,6 +59,7 @@ pub use kleos_lib::graph::types::{
     EntityMemorySearchResult, GraphBuildOptions, GraphBuildResult, CommunitiesResult,
     CommunityStats, PageRankResult, PageRankUpdateResult,
 };
+pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -623,6 +624,51 @@ impl Cognition {
     pub async fn graph_community_stats(&self) -> Result<Vec<CommunityStats>> {
         Ok(kleos_lib::graph::communities::get_community_stats(&self.db, self.user_id).await?)
     }
+
+    // -- Brain pass-throughs ---------------------------------------------------
+
+    /// List all Hopfield patterns persisted for the session user.
+    /// Each pattern corresponds to a stored memory embedding in the brain substrate.
+    pub async fn brain_list_patterns(&self) -> Result<Vec<BrainPattern>> {
+        Ok(
+            kleos_lib::brain::hopfield::pattern::list_patterns(&self.db, self.user_id).await?,
+        )
+    }
+
+    /// Fetch a single Hopfield pattern by id for the session user.
+    pub async fn brain_get_pattern(&self, id: i64) -> Result<BrainPattern> {
+        Ok(
+            kleos_lib::brain::hopfield::pattern::get_pattern(&self.db, id, self.user_id).await?,
+        )
+    }
+
+    /// Count the total number of brain edges (associative links) for the session user.
+    pub async fn brain_count_edges(&self) -> Result<i64> {
+        Ok(kleos_lib::brain::hopfield::edges::count_edges(&self.db, self.user_id).await?)
+    }
+
+    /// Fetch edges originating from a given brain pattern for the session user.
+    pub async fn brain_get_edges_from(&self, source_id: i64) -> Result<Vec<BrainEdge>> {
+        Ok(
+            kleos_lib::brain::hopfield::edges::get_edges_from(&self.db, source_id, self.user_id)
+                .await?,
+        )
+    }
+
+    /// Decay all brain edge weights by `rate` for the session user.
+    /// Returns the number of edges decayed.
+    pub async fn brain_decay_edges(&self, rate: f32) -> Result<usize> {
+        Ok(kleos_lib::brain::hopfield::edges::decay_edges(&self.db, self.user_id, rate).await?)
+    }
+
+    /// Prune brain edges below `threshold` weight for the session user.
+    /// Returns the number of edges removed.
+    pub async fn brain_prune_edges(&self, threshold: f32) -> Result<usize> {
+        Ok(
+            kleos_lib::brain::hopfield::edges::prune_edges(&self.db, self.user_id, threshold)
+                .await?,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +759,18 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Brain pass-throughs smoke test: a fresh DB has zero edges and zero patterns.
+    #[tokio::test]
+    async fn lite_session_brain_smoke() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        let edge_count = cog.brain_count_edges().await.expect("brain_count_edges");
+        assert_eq!(edge_count, 0, "new DB has no brain edges");
+        let patterns = cog.brain_list_patterns().await.expect("brain_list_patterns");
+        assert!(patterns.is_empty(), "new DB has no brain patterns");
     }
 
     /// Graph pass-throughs round-trip: create an entity, fetch it by id, then compute pagerank.
