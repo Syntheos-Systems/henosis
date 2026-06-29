@@ -163,43 +163,28 @@ pub struct AppState {
     pub streams: Arc<StreamHub>,
 }
 
-/// Axum handler for `POST /tasks`. Validates the body, fails fast if no
-/// provider token is available, creates the task record, and spawns the
-/// executor loop asynchronously.
-pub async fn create_task(
-    State(state): State<AppState>,
-    Json(body): Json<CreateTaskBody>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if body.input.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "input is required" })),
-        ));
-    }
-
-    // Fail fast if no provider can yield a token.
-    if let Err(e) = state
-        .clients
-        .anthropic_token(body.tenant_id.as_deref())
-        .await
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": e.to_string() })),
-        ));
-    }
-
+/// Core task setup and execution, shared by [`create_task`] and [`run_task_to_completion`].
+///
+/// Creates the task record (including agent-forge spec registration), inserts it into the
+/// store, mirrors it to Kleos, pre-registers the SSE sink, and then drives [`run_task`] to
+/// completion. Returns when the task reaches a terminal state (Completed or Failed).
+///
+/// Callers are responsible for computing `agent`, `project`, and `title` from the body
+/// and config before calling this function, and for performing any pre-flight validation
+/// (empty-input check, provider-token check) so HTTP callers get immediate errors.
+async fn execute_task(
+    state: AppState,
+    id: String,
+    agent: String,
+    project: String,
+    title: String,
+    body: CreateTaskBody,
+) {
     let cfg = state.clients.config();
     let now = Utc::now();
-    let id = Uuid::new_v4().to_string();
-    let agent = body.agent.unwrap_or_else(|| cfg.chiasm_agent.clone());
-    let project = body.project.unwrap_or_else(|| cfg.chiasm_project.clone());
-    let title = body
-        .title
-        .unwrap_or_else(|| format!("hephaestus task {}", &id[..8]));
 
     // Register the task in agent-forge before any work begins. Best-effort:
-    // failure does not prevent the task from running, but the spec_id is
+    // a failure does not prevent the task from running, but the spec_id is
     // captured on the record so the audit trail links back.
     let spec_id = if cfg.agent_forge_enabled {
         state
@@ -215,7 +200,7 @@ pub async fn create_task(
         id: id.clone(),
         status: TaskStatus::Accepted,
         tenant_id: body.tenant_id.clone(),
-        agent: agent.clone(),
+        agent,
         project: project.clone(),
         title: title.clone(),
         input: body.input.clone(),
@@ -231,20 +216,112 @@ pub async fn create_task(
     state.store.insert(rec.clone()).await;
     state.clients.kleos_store_task(&rec).await;
 
-    // Pre-register the SSE broadcast channel so a client that GETs
-    // /tasks/{id}/stream immediately after a successful POST sees the
-    // channel even if the spawned task has not yet reached its first
-    // `streams.sink()` call. The sink itself remains a no-op when no
-    // subscribers are attached.
+    // Pre-register the SSE broadcast channel so a client that subscribes
+    // to /tasks/{id}/stream immediately after creation sees the channel
+    // even if the executor has not yet reached its first `streams.sink()` call.
     let _ = state.streams.sink(&id).await;
 
+    run_task(state, id, project, title, body.tenant_id, body.system, body.input).await;
+}
+
+/// Submit a task and run it to a terminal state in-process, returning the final [`TaskRecord`].
+///
+/// This is the entry point for in-process callers -- notably the Loom Hephaestus step
+/// executor in syntheos-server -- that need to dispatch an agent task and block until it
+/// completes or fails. Unlike the HTTP `POST /tasks` handler, this function awaits the full
+/// execution loop before returning.
+///
+/// The axum [`create_task`] handler shares the same [`execute_task`] core (via
+/// `tokio::spawn`) so task setup logic is not duplicated.
+///
+/// Returns `Err(message)` only for pre-flight failures (empty input, no provider token);
+/// a task that starts running and then fails returns `Ok(record)` with
+/// `record.status == TaskStatus::Failed`.
+pub async fn run_task_to_completion(
+    state: AppState,
+    body: CreateTaskBody,
+) -> Result<TaskRecord, String> {
+    if body.input.trim().is_empty() {
+        return Err("input is required".to_string());
+    }
+
+    // Fail fast: verify the provider can yield a token before creating any record.
+    state
+        .clients
+        .anthropic_token(body.tenant_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let cfg = state.clients.config();
+    let id = Uuid::new_v4().to_string();
+    let agent = body.agent.clone().unwrap_or_else(|| cfg.chiasm_agent.clone());
+    let project = body
+        .project
+        .clone()
+        .unwrap_or_else(|| cfg.chiasm_project.clone());
+    let title = body
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("hephaestus task {}", &id[..8]));
+
+    // Drive execute_task directly (no spawn) -- awaits the terminal state in-process.
+    execute_task(state.clone(), id.clone(), agent, project, title, body).await;
+
+    // Read and return the final record. The store must have it unless something
+    // went catastrophically wrong inside execute_task.
+    state
+        .store
+        .get(&id)
+        .await
+        .ok_or_else(|| "task record vanished after execution".to_string())
+}
+
+/// Axum handler for `POST /tasks`. Validates the body, fails fast if no provider token is
+/// available, then spawns [`execute_task`] asynchronously and returns 202 Accepted immediately.
+///
+/// The 202 response carries the task id so the caller can poll `GET /tasks/{id}` or subscribe
+/// to `GET /tasks/{id}/stream` for the terminal state.
+pub async fn create_task(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTaskBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if body.input.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "input is required" })),
+        ));
+    }
+
+    // Fail fast at submission time so HTTP callers get an immediate error (503) rather
+    // than a task that starts and immediately fails.
+    if let Err(e) = state
+        .clients
+        .anthropic_token(body.tenant_id.as_deref())
+        .await
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": e.to_string() })),
+        ));
+    }
+
+    let cfg = state.clients.config();
+    let id = Uuid::new_v4().to_string();
+    let agent = body.agent.clone().unwrap_or_else(|| cfg.chiasm_agent.clone());
+    let project = body
+        .project
+        .clone()
+        .unwrap_or_else(|| cfg.chiasm_project.clone());
+    let title = body
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("hephaestus task {}", &id[..8]));
+
+    // Spawn execute_task (the shared core) so the HTTP response is immediate.
     let state_spawn = state.clone();
     let id_spawn = id.clone();
-    let input = body.input.clone();
-    let tenant = body.tenant_id.clone();
-    let system = body.system.clone();
     tokio::spawn(async move {
-        run_task(state_spawn, id_spawn, project, title, tenant, system, input).await;
+        execute_task(state_spawn, id_spawn, agent, project, title, body).await;
     });
 
     Ok((

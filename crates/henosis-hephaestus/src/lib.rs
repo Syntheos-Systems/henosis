@@ -29,7 +29,7 @@ use tracing::info;
 
 pub use clients::Clients;
 pub use config::Config;
-pub use tasks::{AppState, TaskRecord, TaskStatus, TaskStore};
+pub use tasks::{run_task_to_completion, AppState, CreateTaskBody, TaskRecord, TaskStatus, TaskStore};
 
 /// Canonical service name used in logs, health responses, and version output.
 pub const SERVICE: &str = "hephaestus";
