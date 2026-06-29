@@ -1,0 +1,37 @@
+[package]
+name = "henosis-plutus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Plutus: the policy authority for the dispatcher gate chain -- org status, RBAC, quota, and rate-limit enforcement."
+
+[dependencies]
+# Gate/GateRequest/GateDecision/GateError contract plus TenantId/PrincipalId/ToolInvocation.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# Object-safe async Gate impl.
+async-trait.workspace = true
+# PlutusError via thiserror derive.
+thiserror.workspace = true
+# Serialization for OrgStatus/Role/QuotaTier text columns.
+serde = { workspace = true }
+# UUID type for Postgres columns; as_uuid() bridging.
+uuid.workspace = true
+# Postgres backend via sqlx. Workspace dep: runtime-tokio + tls-rustls + postgres + macros + migrate + uuid.
+# Runtime queries (sqlx::query/sqlx::query_as) keep cargo build DB-free -- no DATABASE_URL needed.
+sqlx = { workspace = true }
+# Structured logging for store operations and bootstrap.
+tracing.workspace = true
+# DateTime<Utc> for rate-limit token-bucket clock injection.
+chrono = "0.4"
+
+[dev-dependencies]
+# #[tokio::test] runtime for async store and gate tests.
+tokio = { workspace = true }
+# serde_json::json! macro for ToolInvocation args in gate tests.
+serde_json.workspace = true
+
+[features]
+# Exposes MockPolicyBackend and FrozenClock so external test modules (e.g. syntheos-server) can
+# build a PlutusGate backed by a configurable mock without a live Postgres connection.
+test-helpers = []
