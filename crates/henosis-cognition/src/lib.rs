@@ -53,6 +53,7 @@ pub use kleos_lib::skills::{
     CreateSkillRequest, EvolutionFeedRow, ExecutionRecord, Skill, SkillJudgment, SkillKind,
     ToolQuality, UpdateSkillRequest,
 };
+pub use kleos_lib::personality::{StoredProfile, StoredSignal};
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -479,6 +480,60 @@ impl Cognition {
     pub async fn skill_get_lineage(&self, skill_id: i64) -> Result<Vec<i64>> {
         Ok(kleos_lib::skills::get_lineage(&self.db, skill_id, self.user_id).await?)
     }
+
+    // -- Personality pass-throughs ---------------------------------------------
+
+    /// Store a personality signal for the session user.
+    /// `signal_type` names the trait dimension (e.g. "focus", "openness").
+    /// `value` is a scalar intensity in [0, 1]. `evidence` and `agent` are optional.
+    pub async fn personality_store_signal(
+        &self,
+        signal_type: &str,
+        value: f64,
+        evidence: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<StoredSignal> {
+        Ok(
+            kleos_lib::personality::store_signal(
+                &self.db,
+                signal_type,
+                value,
+                evidence,
+                self.user_id,
+                agent,
+            )
+            .await?,
+        )
+    }
+
+    /// List the most recent personality signals for the session user (up to `limit`).
+    pub async fn personality_list_signals(&self, limit: usize) -> Result<Vec<StoredSignal>> {
+        Ok(kleos_lib::personality::list_signals(&self.db, self.user_id, limit).await?)
+    }
+
+    /// Retrieve (or lazily compute) the stored personality profile for the session user.
+    pub async fn personality_get_profile(&self) -> Result<StoredProfile> {
+        Ok(kleos_lib::personality::get_profile(&self.db, self.user_id).await?)
+    }
+
+    /// Recompute and persist the personality profile for the session user from stored signals.
+    pub async fn personality_update_profile(&self) -> Result<StoredProfile> {
+        Ok(kleos_lib::personality::update_profile(&self.db, self.user_id).await?)
+    }
+
+    /// Return the personality profile and staleness flag for injection, or `None`
+    /// when no profile has been persisted yet for the session user.
+    pub async fn personality_get_profile_for_injection(
+        &self,
+    ) -> Result<Option<(String, bool)>> {
+        Ok(kleos_lib::personality::get_profile_for_injection(&self.db, self.user_id).await?)
+    }
+
+    /// Detect personality signals in `content` using rule-based extraction.
+    /// Pure function -- no database interaction.
+    pub fn personality_detect_signals(&self, content: &str) -> Vec<(String, f64)> {
+        kleos_lib::personality::detect_signals(content)
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +624,23 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Personality pass-throughs round-trip: store a signal, then list it back.
+    #[tokio::test]
+    async fn lite_session_personality_round_trip() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        cog.personality_store_signal("focus", 0.8, Some("test evidence"), None)
+            .await
+            .expect("store personality signal");
+        let signals = cog
+            .personality_list_signals(10)
+            .await
+            .expect("list personality signals");
+        assert!(!signals.is_empty(), "stored signal is present in list");
+        assert_eq!(signals[0].signal_type, "focus");
     }
 
     /// Skills pass-throughs round-trip: create a skill, then get it back by id.
