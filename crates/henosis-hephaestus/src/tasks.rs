@@ -172,13 +172,19 @@ pub struct AppState {
 /// Callers are responsible for computing `agent`, `project`, and `title` from the body
 /// and config before calling this function, and for performing any pre-flight validation
 /// (empty-input check, provider-token check) so HTTP callers get immediate errors.
-async fn execute_task(
-    state: AppState,
-    id: String,
+/// Synchronous task setup: registers the agent-forge spec, builds and stores the
+/// [`TaskRecord`], mirrors it to Kleos, and pre-registers the SSE broadcast sink.
+///
+/// This is the part that MUST complete before the HTTP `POST /tasks` handler returns,
+/// so a client subscribing to `GET /tasks/{id}/stream` immediately after the 202 finds
+/// both the task record and its stream channel (otherwise it races the executor and 404s).
+async fn setup_task(
+    state: &AppState,
+    id: &str,
     agent: String,
-    project: String,
-    title: String,
-    body: CreateTaskBody,
+    project: &str,
+    title: &str,
+    body: &CreateTaskBody,
 ) {
     let cfg = state.clients.config();
     let now = Utc::now();
@@ -190,19 +196,19 @@ async fn execute_task(
         state
             .clients
             .agent_forge()
-            .spec_task(&id, &title, &body.input)
+            .spec_task(id, title, &body.input)
             .await
     } else {
         None
     };
 
     let rec = TaskRecord {
-        id: id.clone(),
+        id: id.to_string(),
         status: TaskStatus::Accepted,
         tenant_id: body.tenant_id.clone(),
         agent,
-        project: project.clone(),
-        title: title.clone(),
+        project: project.to_string(),
+        title: title.to_string(),
         input: body.input.clone(),
         system: body.system.clone(),
         output: None,
@@ -219,8 +225,18 @@ async fn execute_task(
     // Pre-register the SSE broadcast channel so a client that subscribes
     // to /tasks/{id}/stream immediately after creation sees the channel
     // even if the executor has not yet reached its first `streams.sink()` call.
-    let _ = state.streams.sink(&id).await;
+    let _ = state.streams.sink(id).await;
+}
 
+async fn execute_task(
+    state: AppState,
+    id: String,
+    agent: String,
+    project: String,
+    title: String,
+    body: CreateTaskBody,
+) {
+    setup_task(&state, &id, agent, &project, &title, &body).await;
     run_task(state, id, project, title, body.tenant_id, body.system, body.input).await;
 }
 
@@ -317,11 +333,25 @@ pub async fn create_task(
         .clone()
         .unwrap_or_else(|| format!("hephaestus task {}", &id[..8]));
 
-    // Spawn execute_task (the shared core) so the HTTP response is immediate.
+    // Setup synchronously (store insert + SSE sink registration) so a client that
+    // subscribes to /tasks/{id}/stream immediately after the 202 finds the task and its
+    // stream channel. Only the run loop is spawned, so the HTTP response stays immediate.
+    setup_task(&state, &id, agent, &project, &title, &body).await;
     let state_spawn = state.clone();
     let id_spawn = id.clone();
+    let project_spawn = project.clone();
+    let title_spawn = title.clone();
     tokio::spawn(async move {
-        execute_task(state_spawn, id_spawn, agent, project, title, body).await;
+        run_task(
+            state_spawn,
+            id_spawn,
+            project_spawn,
+            title_spawn,
+            body.tenant_id,
+            body.system,
+            body.input,
+        )
+        .await;
     });
 
     Ok((
