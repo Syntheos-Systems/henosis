@@ -1,0 +1,60 @@
+# Absorbed from ~/projects/hermes (Phase 5 / Story 5.1, copy-and-own). Upstream hermes stays standalone; this is a snapshot wired into the henosis workspace.
+[package]
+name = "henosis-hermes"
+version = "0.1.0"
+edition = "2021"
+description = "Unified tool gateway for Syntheos Agent OS (absorbed from hermes, Phase 5)"
+license = "Elastic-2.0"
+
+[lib]
+name = "henosis_hermes"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[[bin]]
+name = "hermes-codegen"
+path = "src/bin/hermes_codegen.rs"
+
+[dependencies]
+# Web framework and server
+axum = { workspace = true }
+tokio = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+# YAML parsing for the hermes-codegen binary (OpenAPI spec input)
+serde_yaml = "0.9"
+
+# HTTP client (OAuth token fetch, upstream adapter calls, Axon publish)
+reqwest = { workspace = true }
+
+# IDs and timestamps
+uuid = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Async trait support for the Tool trait object
+async-trait = { workspace = true }
+
+# Base64 encoding (OAuth token handling, attachment encoding)
+base64 = { workspace = true }
+
+# Cryptography: HMAC-SHA256 for webhook signature verification and audit arg hashing
+sha2 = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+
+[dev-dependencies]
+# HTTP mock server for adapter integration tests
+wiremock = "0.6"
