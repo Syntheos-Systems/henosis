@@ -30,20 +30,39 @@ via `--features cognition` (which pulls the vendored kleos-lib ML stack in), exa
 syntheos-server, so the default build stays ML-free; KLEOS :4200 coexists permanently (Zan,
 2026-06-18), so routing default-build memory to :4200 over HTTP is a chosen tradeoff, not a TODO.
 Both `HttpMemoryBackend` and `CognitionMemoryBackend` are fully wired and selected at compile time.
-Row 1 (plutus gate was a fail-closed deny-stub) was FIXED and removed: the new
-henosis-plutus kernel authority backs a real PlutusGate doing org-status -> RBAC
--> hard-quota -> rate-limit checks, fail-closed at every step (no Allow-on-error
-path), replacing the deny-stub in the plutus slot. All five gate slots now run
-real gates. Billing (Stripe/X402) is deliberately NOT part of this -- it is a
-separate later effort and is not needed for the gate slot to be real.
 
-Row numbers are kept stable because code comments reference them. Severities are from the
-adversarial verification pass.
+The final three deferred build-plan rows were closed 2026-06-29:
+
+Row 1 (plutus gate was a fail-closed deny-stub) was FIXED and removed: the new
+`henosis-plutus` kernel authority backs a real `PlutusGate` doing org-status -> RBAC
+-> hard-quota -> rate-limit checks, fail-closed at every step (no Allow-on-error
+path), replacing the deny-stub in the plutus slot. All five gate slots now run real
+gates. Storage is Postgres via sqlx (Zan, D1); the gate depends on a `PolicyBackend`
+trait so its fail-closed matrix is unit-tested with no live DB. Billing (Stripe/X402)
+is deliberately NOT part of this -- a separate later effort, not needed for the slot
+to be real.
+
+Row 3 (cognition facade was a PARTIAL surface) was FIXED and removed: the facade now
+covers all the named surfaces -- memory, context, scratchpad, handoffs, skills,
+personality, graph, brain, intelligence, and forge -- as thin pass-throughs over
+vendored `kleos-lib`, each with a round-trip or smoke test. Re-exports expose the
+required kleos-lib types through `henosis_cognition::*` so callers never take a direct
+dependency on the vendored crate. All of it stays feature-gated, so default builds
+remain ML-free.
+
+Row 4 (handoff facade needed the tenant schema) was FIXED and removed: the facade
+gained tenant-backed constructors `open_tenant_memory` / `open_tenant_path` over
+`kleos-lib`'s `Database::open_tenant*`, which run the tenant migration chain (handoffs
+`schema_v43` included), so the `handoffs_*` pass-throughs now round-trip against a
+tenant session (in-memory and path-backed reopen both tested). The monolith lite
+session is unchanged and stays memory + scratchpad only.
+
+As of 2026-06-29 every ledger row is closed -- the table below is empty. Row numbers
+were kept stable while rows were open because code comments referenced them. Severities
+were from the adversarial verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
-| 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
-| 4 | plan | handoff facade methods need the tenant schema (schema_v43); unexercised against the monolith session (`open_in_memory`/`open_path` both run the monolith migration chain, not the tenant one) | `henosis-cognition/src/lib.rs` | Wave 4 (tenant-backed store) |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

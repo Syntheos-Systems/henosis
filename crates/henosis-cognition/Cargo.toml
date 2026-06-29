@@ -18,6 +18,8 @@ kleos-lib = { path = "../../vendor/kleos/kleos-lib" }
 tokio = { workspace = true }
 # The facade error type wraps kleos-lib's `EngError`.
 thiserror = { workspace = true }
+# forge pass-through return values are JSON blobs returned directly from kleos-lib.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The lightweight-session round-trip test opens a tempfile-backed store.
