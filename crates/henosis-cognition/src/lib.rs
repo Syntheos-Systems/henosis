@@ -49,6 +49,10 @@ pub use kleos_lib::memory::types::{
     ListOptions, Memory, SearchRequest, SearchResult, StoreRequest, StoreResult,
 };
 pub use kleos_lib::scratchpad::ScratchEntry;
+pub use kleos_lib::skills::{
+    CreateSkillRequest, EvolutionFeedRow, ExecutionRecord, Skill, SkillJudgment, SkillKind,
+    ToolQuality, UpdateSkillRequest,
+};
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -363,6 +367,118 @@ impl Cognition {
     pub async fn handoffs_stats(&self) -> Result<HandoffStats> {
         Ok(self.handoffs().stats(self.user_id).await?)
     }
+
+    // -- Skills pass-throughs --------------------------------------------------
+
+    /// Create a skill for the session user. Forwards to `kleos_lib::skills::create_skill`.
+    /// Sets `req.user_id` to the session user when the caller leaves it unset.
+    pub async fn skill_create(&self, mut req: CreateSkillRequest) -> Result<Skill> {
+        if req.user_id.is_none() {
+            req.user_id = Some(self.user_id);
+        }
+        Ok(kleos_lib::skills::create_skill(&self.db, req).await?)
+    }
+
+    /// Fetch one skill by id for the session user.
+    pub async fn skill_get(&self, id: i64) -> Result<Skill> {
+        Ok(kleos_lib::skills::get_skill(&self.db, id, self.user_id).await?)
+    }
+
+    /// List active skills for the session user. Optionally filter by agent.
+    pub async fn skill_list(
+        &self,
+        agent: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Skill>> {
+        Ok(kleos_lib::skills::list_skills(&self.db, self.user_id, agent, limit, offset).await?)
+    }
+
+    /// Apply a partial update to a skill owned by the session user.
+    pub async fn skill_update(&self, id: i64, req: UpdateSkillRequest) -> Result<Skill> {
+        Ok(kleos_lib::skills::update_skill(&self.db, id, req, self.user_id).await?)
+    }
+
+    /// Recompute a skill's derived fields for the session user.
+    pub async fn skill_recompute(&self, id: i64) -> Result<Skill> {
+        Ok(kleos_lib::skills::recompute_skill(&self.db, id, self.user_id).await?)
+    }
+
+    /// Delete a skill owned by the session user.
+    pub async fn skill_delete(&self, id: i64) -> Result<()> {
+        Ok(kleos_lib::skills::delete_skill(&self.db, id, self.user_id).await?)
+    }
+
+    /// Record one execution attempt for a skill owned by the session user.
+    pub async fn skill_record_execution(
+        &self,
+        skill_id: i64,
+        success: bool,
+        duration_ms: Option<f64>,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        Ok(kleos_lib::skills::record_execution(
+            &self.db,
+            skill_id,
+            self.user_id,
+            success,
+            duration_ms,
+            error_type,
+            error_message,
+        )
+        .await?)
+    }
+
+    /// Fetch execution history for a skill owned by the session user.
+    pub async fn skill_get_executions(
+        &self,
+        skill_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ExecutionRecord>> {
+        Ok(kleos_lib::skills::get_executions(&self.db, skill_id, self.user_id, limit).await?)
+    }
+
+    /// Add a judgment score to a skill owned by the session user.
+    pub async fn skill_add_judgment(
+        &self,
+        skill_id: i64,
+        judge_agent: &str,
+        score: f64,
+        rationale: Option<&str>,
+    ) -> Result<SkillJudgment> {
+        Ok(kleos_lib::skills::add_judgment(
+            &self.db,
+            skill_id,
+            self.user_id,
+            judge_agent,
+            score,
+            rationale,
+        )
+        .await?)
+    }
+
+    /// List all judgments for a skill owned by the session user.
+    pub async fn skill_get_judgments(&self, skill_id: i64) -> Result<Vec<SkillJudgment>> {
+        Ok(kleos_lib::skills::get_judgments(&self.db, skill_id, self.user_id).await?)
+    }
+
+    /// List recent evolutions for skills owned by the session user.
+    pub async fn skill_list_recent_evolutions(
+        &self,
+        since_hours: u32,
+        limit: usize,
+    ) -> Result<Vec<EvolutionFeedRow>> {
+        Ok(
+            kleos_lib::skills::list_recent_evolutions(&self.db, self.user_id, since_hours, limit)
+                .await?,
+        )
+    }
+
+    /// Fetch the ancestry chain of a skill owned by the session user.
+    pub async fn skill_get_lineage(&self, skill_id: i64) -> Result<Vec<i64>> {
+        Ok(kleos_lib::skills::get_lineage(&self.db, skill_id, self.user_id).await?)
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +569,36 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Skills pass-throughs round-trip: create a skill, then get it back by id.
+    #[tokio::test]
+    async fn lite_session_skills_round_trip() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        let created = cog
+            .skill_create(CreateSkillRequest {
+                name: "test-skill".to_string(),
+                agent: "test-agent".to_string(),
+                description: Some("A test skill for the round-trip proof.".to_string()),
+                code: "echo hello".to_string(),
+                language: Some("bash".to_string()),
+                parent_skill_id: None,
+                metadata: None,
+                user_id: None,
+                tags: None,
+                tool_deps: None,
+                kind: None,
+                source_plugin: None,
+                source_path: None,
+                content_hash: None,
+            })
+            .await
+            .expect("create skill");
+        let fetched = cog.skill_get(created.id).await.expect("get skill");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.name, "test-skill");
     }
 
     /// The lightweight-session proof: against an in-memory store with NO embedder
