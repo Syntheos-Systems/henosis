@@ -60,6 +60,9 @@ pub use kleos_lib::graph::types::{
     CommunityStats, PageRankResult, PageRankUpdateResult,
 };
 pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
+pub use kleos_lib::intelligence::types::{
+    CausalAncestor, CausalChain, CausalLink, Contradiction, Digest, MemoryHealthReport, Reflection,
+};
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -669,6 +672,48 @@ impl Cognition {
                 .await?,
         )
     }
+
+    // -- Intelligence pass-throughs --------------------------------------------
+
+    /// Return a health report for the session user's memory corpus: counts,
+    /// duplicate flags, freshness stats, and importance distribution.
+    pub async fn intelligence_memory_health(&self) -> Result<MemoryHealthReport> {
+        Ok(kleos_lib::intelligence::health::memory_health(&self.db, self.user_id).await?)
+    }
+
+    /// Scan all memory pairs for semantic contradictions and return the set
+    /// found. Runs a DB-only FTS comparison; no LLM is required.
+    pub async fn intelligence_scan_contradictions(&self) -> Result<Vec<Contradiction>> {
+        Ok(
+            kleos_lib::intelligence::contradiction::scan_all_contradictions(
+                &self.db,
+                self.user_id,
+            )
+            .await?,
+        )
+    }
+
+    /// List stored reflections for the session user, newest first.
+    pub async fn intelligence_list_reflections(&self, limit: usize) -> Result<Vec<Reflection>> {
+        Ok(
+            kleos_lib::intelligence::reflections::list_reflections(&self.db, self.user_id, limit)
+                .await?,
+        )
+    }
+
+    /// List stored causal chains for the session user, newest first.
+    pub async fn intelligence_list_causal_chains(&self, limit: usize) -> Result<Vec<CausalChain>> {
+        Ok(
+            kleos_lib::intelligence::causal::list_chains(&self.db, self.user_id, limit).await?,
+        )
+    }
+
+    /// List stored periodic digests for the session user, newest first.
+    pub async fn intelligence_list_digests(&self, limit: usize) -> Result<Vec<Digest>> {
+        Ok(
+            kleos_lib::intelligence::digests::list_digests(&self.db, self.user_id, limit).await?,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -759,6 +804,24 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Intelligence pass-throughs smoke test: memory_health and contradiction scan succeed on empty DB.
+    #[tokio::test]
+    async fn lite_session_intelligence_smoke() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        let health = cog
+            .intelligence_memory_health()
+            .await
+            .expect("intelligence_memory_health");
+        assert_eq!(health.total_memories, 0, "fresh DB has no memories");
+        let contradictions = cog
+            .intelligence_scan_contradictions()
+            .await
+            .expect("intelligence_scan_contradictions");
+        assert!(contradictions.is_empty(), "fresh DB has no contradictions");
     }
 
     /// Brain pass-throughs smoke test: a fresh DB has zero edges and zero patterns.
