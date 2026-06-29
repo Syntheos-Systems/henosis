@@ -13,8 +13,16 @@
 //! the structural change; renaming to `complete` / `resume` is a follow-up.
 
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+use henosis_hermes::{
+    circuit::CircuitRegistry,
+    credd_client::CreddClient,
+    registry::build_registry,
+    tool::{InvokeContext, ProviderBases},
+};
 
 use crate::agent_forge::AgentForgeClient;
 use crate::anthropic_auth::{AuthError, ProviderChain};
@@ -89,7 +97,9 @@ pub struct Clients {
 impl Clients {
     /// Construct from a Config. Builds a single shared reqwest client used
     /// by every dependent client so the connection pool is unified across
-    /// LLM, Hermes, gate checks, Kleos, Chiasm, and Axon.
+    /// LLM, gate checks, Kleos, Chiasm, and Axon. Hermes is dispatched
+    /// in-process (story 5.4); `cfg.hermes_url` is retained in Config for
+    /// backwards compatibility but is no longer used here.
     pub fn new(cfg: Config) -> Self {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(2))
@@ -97,7 +107,30 @@ impl Clients {
             .build()
             .expect("reqwest client build");
         let auth = ProviderChain::from_config(&cfg);
-        let hermes = HermesClient::new(&cfg.hermes_url, http.clone());
+
+        // Build the in-process Hermes invoker. credd URL and token are read
+        // from environment variables matching Hermes's own config conventions so
+        // Hephaestus and Hermes share the same credd endpoint without duplicating
+        // the values in Hephaestus's Config struct.
+        let credd_url = std::env::var("CREDD_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:4400".to_string());
+        let credd_token = std::env::var("HERMES_CREDD_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let hermes_public_url = std::env::var("HERMES_PUBLIC_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let credd = Arc::new(CreddClient::new(credd_url, credd_token));
+        let registry = Arc::new(build_registry());
+        let circuits = Arc::new(CircuitRegistry::new());
+        let ctx = InvokeContext {
+            credd,
+            bases: ProviderBases::default(),
+            hermes_public_url,
+        };
+        let hermes = HermesClient::new(registry, circuits, ctx);
+
         let gate = GateClient::new(&cfg.eidolon_url, http.clone());
         let agent_forge =
             AgentForgeClient::new(cfg.agent_forge_bin.clone(), cfg.agent_forge_db.clone());

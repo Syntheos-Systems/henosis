@@ -258,18 +258,10 @@ async fn happy_path_three_step_loop() {
         .mount(&mocks.anthropic)
         .await;
 
-    // Hermes returns success for the tool invoke.
-    Mock::given(method("POST"))
-        .and(path("/tools/fake_tool/invoke"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "tool_id": "fake_tool",
-            "success": true,
-            "result": {"echo": "hi"},
-            "error": null,
-            "duration_ms": 1
-        })))
-        .mount(&mocks.hermes)
-        .await;
+    // No Hermes HTTP mock needed: story 5.4 dispatches tools in-process.
+    // `fake_tool` is not in the Hermes registry, so the in-process path
+    // returns a structured tool_not_found error which the LLM receives as
+    // a tool_result and then ends the turn normally.
 
     let (base, _state) = spawn_app(mocks.config()).await;
     let client = reqwest::Client::new();
@@ -295,16 +287,18 @@ async fn happy_path_three_step_loop() {
         Some("thinking...done")
     );
 
-    // Hermes was actually invoked.
-    let hermes_hits = mocks
+    // Verify in-process dispatch: the mock Hermes HTTP server must have
+    // received zero requests (tool was invoked in-process, not over HTTP).
+    let hermes_http_hits = mocks
         .hermes
         .received_requests()
         .await
         .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.url.path() == "/tools/fake_tool/invoke")
-        .count();
-    assert!(hermes_hits >= 1, "expected hermes to be invoked");
+        .len();
+    assert_eq!(
+        hermes_http_hits, 0,
+        "expected 0 HTTP requests to Hermes (in-process dispatch active), got {hermes_http_hits}"
+    );
 
     // Anthropic was called at least twice (tool turn + end_turn).
     let llm_hits = mocks

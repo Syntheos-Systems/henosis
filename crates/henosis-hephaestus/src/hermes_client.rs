@@ -1,13 +1,24 @@
-//! HTTP client for the Hermes tool gateway. Every call returns a `ToolResult`
-//! even on transport failure so the LLM always receives a structured response
-//! it can reason about.
+//! In-process Hermes tool dispatch. Replaces the former HTTP client (story 5.4).
+//!
+//! `HermesClient` now holds an `Arc<ToolRegistry>`, a `CircuitRegistry`, and an
+//! `InvokeContext` assembled at startup. `call_tool` looks up the tool by name in
+//! the registry and calls `invoke_with_circuit` directly -- no HTTP round-trip.
+//!
+//! The `ToolResult`, `ToolDef`, and `builtin_tools` items are kept in this module
+//! because `tasks.rs` and `orchestrator.rs` import them here; their shapes are
+//! unchanged.
 
-use std::time::Duration;
+use std::sync::Arc;
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
+
+use henosis_hermes::{
+    ToolRegistry,
+    circuit::{CircuitRegistry, invoke_with_circuit},
+    tool::{InvokeContext, InvokeRequest},
+};
 
 /// Tool definition serialized into Anthropic's tool format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,48 +42,29 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Hermes' invoke response shape (mirrors `hermes::tool::InvokeResponse`).
-#[derive(Debug, Deserialize)]
-struct HermesInvokeResponse {
-    /// Hermes-assigned tool invocation id. Not used by this client.
-    #[allow(dead_code)]
-    tool_id: Option<String>,
-    /// True if the tool executed without transport or dispatch failure.
-    success: bool,
-    /// Tool output on success.
-    result: Option<Value>,
-    /// Tool error payload on failure.
-    error: Option<Value>,
-    /// Wall-clock tool execution time in milliseconds. Informational only.
-    #[allow(dead_code)]
-    duration_ms: Option<u64>,
-}
-
-/// HTTP client for the Hermes tool gateway.
+/// In-process Hermes tool invoker. Holds a fully-built registry, a circuit
+/// breaker registry, and the per-invocation context (credd client + provider
+/// base URLs). Replaces the former `reqwest`-backed HTTP client.
 pub struct HermesClient {
-    /// Base URL of the Hermes service (no trailing slash).
-    pub base_url: String,
-    /// Shared reqwest client for connection-pool reuse.
-    pub http: Client,
-    /// Per-request timeout. Defaults to 30s to accommodate slow tools.
-    pub timeout: Duration,
+    /// The populated tool registry from `henosis_hermes::registry::build_registry`.
+    registry: Arc<ToolRegistry>,
+    /// Per-provider circuit breaker state.
+    circuits: Arc<CircuitRegistry>,
+    /// Shared invocation context threaded into every `invoke_with_circuit` call.
+    ctx: InvokeContext,
 }
 
 impl HermesClient {
-    /// Construct a Hermes client. Trims trailing slashes from `base_url` so
-    /// callers do not have to be consistent about trailing-slash presence.
-    pub fn new(base_url: &str, http: Client) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            http,
-            timeout: Duration::from_secs(30),
-        }
+    /// Construct an in-process Hermes client. The caller is responsible for
+    /// building the registry, circuits, and context before calling this.
+    pub fn new(registry: Arc<ToolRegistry>, circuits: Arc<CircuitRegistry>, ctx: InvokeContext) -> Self {
+        Self { registry, circuits, ctx }
     }
 
-    /// Dispatch a tool call to Hermes' POST /tools/{tool_id}/invoke.
-    /// Always returns a `ToolResult` -- transport failures are surfaced as
-    /// `is_error: true` with a structured `{code, message, hint}` envelope so
-    /// the LLM can react to them.
+    /// Dispatch a tool call in-process through the Hermes registry and circuit
+    /// breaker. Returns a `ToolResult` in all cases -- unknown tools and
+    /// invocation failures surface as `is_error: true` with a structured
+    /// `{code, message}` envelope so the LLM can reason about them.
     pub async fn call_tool(
         &self,
         tool_name: &str,
@@ -80,62 +72,33 @@ impl HermesClient {
         tenant_id: Option<&str>,
         tool_input: &Value,
     ) -> ToolResult {
-        let url = format!("{}/tools/{}/invoke", self.base_url, tool_name);
-        let body = json!({
-            "tenant_id": tenant_id,
-            "args": tool_input,
-        });
-
-        let resp = self
-            .http
-            .post(&url)
-            .timeout(self.timeout)
-            .json(&body)
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(tool = tool_name, error = %e, "hermes transport failure");
-                return error_result(tool_use_id, "hermes_transport", &e.to_string());
-            }
-        };
-
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return error_result(
-                tool_use_id,
-                "tool_not_found",
-                &format!("hermes does not know tool '{tool_name}'"),
-            );
-        }
-
-        if !status.is_success() {
-            warn!(tool = tool_name, %status, body = %text, "hermes non-2xx");
-            return error_result(
-                tool_use_id,
-                "hermes_http_error",
-                &format!("status={status}: {text}"),
-            );
-        }
-
-        let parsed: HermesInvokeResponse = match serde_json::from_str(&text) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(tool = tool_name, error = %e, body = %text, "hermes invalid response");
+        // Resolve the tool from the registry; surface a structured error for
+        // unknown tool names (matches the former HTTP 404 response semantics).
+        let tool = match self.registry.get(tool_name) {
+            Some(t) => t,
+            None => {
+                warn!(tool = tool_name, "hermes in-process: tool not found in registry");
                 return error_result(
                     tool_use_id,
-                    "hermes_invalid_response",
-                    &format!("could not parse: {e}"),
+                    "tool_not_found",
+                    &format!("hermes does not know tool '{tool_name}'"),
                 );
             }
         };
 
-        if parsed.success {
-            let content = parsed
+        let req = InvokeRequest {
+            tenant_id: tenant_id.map(String::from),
+            args: tool_input.clone(),
+        };
+
+        // Build a per-call context that threads the tenant_id through. The
+        // underlying InvokeContext is Clone so we can cheaply specialise it.
+        let ctx = self.ctx.clone();
+
+        let (resp, _retries) = invoke_with_circuit(&self.circuits, &tool, tool_name, &ctx, req).await;
+
+        if resp.success {
+            let content = resp
                 .result
                 .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()))
                 .unwrap_or_default();
@@ -145,7 +108,7 @@ impl HermesClient {
                 is_error: false,
             }
         } else {
-            let err_payload = parsed
+            let err_payload = resp
                 .error
                 .unwrap_or_else(|| json!({"code": "unknown", "message": "tool returned failure"}));
             let content =
@@ -160,7 +123,7 @@ impl HermesClient {
 }
 
 /// Build a structured-error `ToolResult` so the LLM sees `{code, message}`
-/// content even on transport failures.
+/// content even on dispatch failures.
 fn error_result(tool_use_id: &str, code: &str, message: &str) -> ToolResult {
     let envelope = json!({ "code": code, "message": message });
     ToolResult {

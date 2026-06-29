@@ -12,6 +12,9 @@ license = "Elastic-2.0"
 # Path convention matches every other synapse consumer in the workspace.
 synapse-provider = { path = "../synapse-provider" }
 
+# Hermes tool gateway -- in-process dispatch (story 5.4). HTTP path removed.
+henosis-hermes = { path = "../henosis-hermes" }
+
 # Web + async runtime
 axum = { workspace = true, features = ["macros"] }
 tokio = { workspace = true }

@@ -76,7 +76,11 @@ pub struct Config {
     pub llm_timeout: Duration,
     /// Base URL of the Eidolon gate service.
     pub eidolon_url: String,
-    /// Base URL of the Hermes tool gateway.
+    /// Base URL of the Hermes tool gateway. Retained for backwards compat with
+    /// existing Config literals (e.g. tests); no longer used for HTTP dispatch
+    /// since story 5.4 wired Hermes in-process. Field reads `HERMES_URL` from
+    /// the environment; callers may leave it at the default.
+    #[allow(dead_code)]
     pub hermes_url: String,
     /// Full Anthropic Messages API URL (may include `?beta=true`).
     pub anthropic_url: String,
