@@ -106,6 +106,19 @@ impl Cognition {
         Ok(Self::from_database(db))
     }
 
+    /// Open a tenant-backed in-memory cognitive core for tests and lightweight
+    /// library use.
+    ///
+    /// Backed by [`Database::open_tenant_memory`], which runs the TENANT migration
+    /// chain (not the monolith one), so the handoffs table set (`schema_v43`) is
+    /// present and the `handoffs_*` pass-throughs are meaningful. Use this instead
+    /// of [`open_in_memory`](Cognition::open_in_memory) whenever a session needs
+    /// handoffs; the monolith lite session carries only memory + scratchpad tables.
+    pub async fn open_tenant_memory() -> Result<Self> {
+        let db = Database::open_tenant_memory().await?;
+        Ok(Self::from_database(db))
+    }
+
     /// Open a path-backed lite session: a persistent SQLite store at `db_path`
     /// with NO embedder and NO Lance/ONNX vector index, so stored memory and
     /// scratchpad state survive a restart. This is the durable counterpart to
@@ -334,6 +347,46 @@ mod tests {
     use super::*;
     use kleos_lib::context::types::ContextOptions;
     use kleos_lib::memory::types::{SearchRequest, StoreRequest};
+
+    /// A handoff stored through a tenant-backed session round-trips: the tenant
+    /// migration chain (schema_v43) creates the handoffs tables the monolith lite
+    /// session lacks, so `handoffs_store` -> `handoffs_latest` succeeds. This is the
+    /// proof that closes ledger row 4.
+    #[tokio::test]
+    async fn tenant_session_handoff_round_trip() {
+        let cog = Cognition::open_tenant_memory()
+            .await
+            .expect("open tenant-backed in-memory cognitive core");
+
+        let stored = cog
+            .handoffs_store(HandoffStoreParams {
+                project: "henosis".to_string(),
+                content: "Row 4: tenant-backed handoffs now work end to end.".to_string(),
+                branch: None,
+                directory: None,
+                agent: None,
+                handoff_type: None,
+                session_id: None,
+                model: None,
+                host: None,
+                metadata: None,
+            })
+            .await
+            .expect("store handoff against the tenant schema");
+        let stored_id = stored.id.expect("store returns a row id");
+        assert!(stored_id > 0, "a real handoff id is assigned");
+
+        let latest = cog
+            .handoffs_latest(HandoffFilters {
+                project: Some("henosis".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch latest handoff")
+            .expect("a handoff exists");
+        assert_eq!(latest.id, stored_id);
+        assert!(latest.content.contains("tenant-backed handoffs"));
+    }
 
     /// The lightweight-session proof: against an in-memory store with NO embedder
     /// and NO server, `memory_store` a record -> `memory_search` (FTS) returns it
