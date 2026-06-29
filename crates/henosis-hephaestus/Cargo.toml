@@ -1,0 +1,56 @@
+# Absorbed from ~/projects/hephaestus (Phase 5 / Story 5.3, copy-and-own). Upstream hephaestus stays standalone; this is a snapshot wired into the henosis workspace.
+[package]
+name = "henosis-hephaestus"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Stateful agent executor for henosis"
+license = "Elastic-2.0"
+
+[dependencies]
+# Synapse provider trait + types -- already a workspace member at crates/synapse-provider.
+# Path convention matches every other synapse consumer in the workspace.
+synapse-provider = { path = "../synapse-provider" }
+
+# Web + async runtime
+axum = { workspace = true, features = ["macros"] }
+tokio = { workspace = true }
+# BroadcastStream lives behind the "sync" feature; extend the workspace decl.
+tokio-stream = { workspace = true, features = ["sync"] }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP client (rustls so we don't drag in OpenSSL). "stream" adds the bytes-stream
+# response body feature used by the SSE streaming path.
+reqwest = { workspace = true, features = ["stream"] }
+
+# SSE plumbing -- mirrors synapse-provider's choice so streaming behavior is identical.
+reqwest-eventsource = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+
+# Misc utilities
+uuid = { workspace = true }
+# chrono not declared in [workspace.dependencies]; pin locally to match upstream.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+anyhow = { workspace = true }
+# thiserror 2 is a semver break from the workspace-pinned 1.x; declare locally
+# rather than fighting the workspace pin. Cargo resolves both versions independently.
+thiserror = "2"
+dirs = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
