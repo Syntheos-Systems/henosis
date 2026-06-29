@@ -20,6 +20,12 @@
 //! the FTS path and [`Cognition::assemble_context`] falls back to its FTS /
 //! recency layers; neither constructs an ONNX session, so the native
 //! `libonnxruntime` is not required to build, test, or run the lite session.
+//!
+//! Two session flavors are available: **monolith** (`open_in_memory` /
+//! `open_path`) runs the system migration chain and carries memory + scratchpad
+//! tables; **tenant** (`open_tenant_memory` / `open_tenant_path`) runs the
+//! tenant migration chain and additionally carries the handoffs table set
+//! (`schema_v43`) as well as skills, brain, forge, graph, and personality tables.
 
 use std::sync::Arc;
 
@@ -134,6 +140,20 @@ impl Cognition {
         config.db_path = db_path.to_string();
         config.use_lance_index = false;
         Self::connect(&config).await
+    }
+
+    /// Open a durable tenant-backed session at `db_path`, owned by `owner_user_id`.
+    ///
+    /// Backed by [`Database::open_tenant`] with no vector index and no encryption,
+    /// so the file lands at the current TENANT schema (handoffs `schema_v43`
+    /// included) and is upgraded in place on reopen. `owner_user_id` is threaded
+    /// into the tenant migration chain so the memory-core `user_id` re-add can
+    /// backfill existing rows to the owner. This is the durable counterpart to
+    /// [`open_tenant_memory`](Cognition::open_tenant_memory); use it whenever a
+    /// persistent session needs handoffs.
+    pub async fn open_tenant_path(db_path: &str, owner_user_id: i64) -> Result<Self> {
+        let db = Database::open_tenant(db_path, None, None, Some(owner_user_id)).await?;
+        Ok(Self::from_database(db).with_user_id(owner_user_id))
     }
 
     /// Build the handle from an already-opened database (no embedder, no llm).
@@ -301,9 +321,12 @@ impl Cognition {
 
     /// Build a [`HandoffsDb`] over the shared database and gc semaphore.
     ///
-    /// The handoffs table set ships in the tenant schema (schema_v43), so these
-    /// pass-throughs are meaningful against a tenant-backed [`Database`]; the
-    /// monolith lite session carries only memory + scratchpad tables.
+    /// The handoffs table set ships in the tenant schema (`schema_v43`), so these
+    /// pass-throughs are meaningful only on a tenant-backed [`Database`] -- open
+    /// the session with [`open_tenant_memory`](Cognition::open_tenant_memory) or
+    /// [`open_tenant_path`](Cognition::open_tenant_path). The monolith lite session
+    /// ([`open_in_memory`](Cognition::open_in_memory) / [`open_path`](Cognition::open_path))
+    /// carries only memory + scratchpad tables, and a handoff call against it errors.
     fn handoffs(&self) -> HandoffsDb {
         HandoffsDb::new(self.db.clone(), self.handoff_gc_sem.clone())
     }
@@ -386,6 +409,50 @@ mod tests {
             .expect("a handoff exists");
         assert_eq!(latest.id, stored_id);
         assert!(latest.content.contains("tenant-backed handoffs"));
+    }
+
+    /// A handoff stored through a path-backed tenant session survives a drop and
+    /// reopen: the tenant schema persists to the file and reopen is idempotent.
+    #[tokio::test]
+    async fn tenant_path_session_handoff_persists_across_reopen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("tenant.db");
+        let db_path = db_path.to_str().expect("utf-8 path");
+
+        let stored_id = {
+            let cog = Cognition::open_tenant_path(db_path, DEFAULT_USER_ID)
+                .await
+                .expect("open path-backed tenant session");
+            let stored = cog
+                .handoffs_store(HandoffStoreParams {
+                    project: "henosis".to_string(),
+                    content: "Durable tenant handoff for the reopen proof.".to_string(),
+                    branch: None,
+                    directory: None,
+                    agent: None,
+                    handoff_type: None,
+                    session_id: None,
+                    model: None,
+                    host: None,
+                    metadata: None,
+                })
+                .await
+                .expect("store handoff");
+            stored.id.expect("store returns a row id")
+        };
+
+        let reopened = Cognition::open_tenant_path(db_path, DEFAULT_USER_ID)
+            .await
+            .expect("reopen path-backed tenant session");
+        let latest = reopened
+            .handoffs_latest(HandoffFilters {
+                project: Some("henosis".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("fetch latest after reopen")
+            .expect("the persisted handoff survives");
+        assert_eq!(latest.id, stored_id);
     }
 
     /// The lightweight-session proof: against an in-memory store with NO embedder
