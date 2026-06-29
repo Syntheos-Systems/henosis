@@ -54,6 +54,11 @@ pub use kleos_lib::skills::{
     ToolQuality, UpdateSkillRequest,
 };
 pub use kleos_lib::personality::{StoredProfile, StoredSignal};
+pub use kleos_lib::graph::types::{
+    CreateEntityRequest, CreateRelationshipRequest, Entity, EntityRelationship,
+    EntityMemorySearchResult, GraphBuildOptions, GraphBuildResult, CommunitiesResult,
+    CommunityStats, PageRankResult, PageRankUpdateResult,
+};
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -534,6 +539,90 @@ impl Cognition {
     pub fn personality_detect_signals(&self, content: &str) -> Vec<(String, f64)> {
         kleos_lib::personality::detect_signals(content)
     }
+
+    // -- Graph pass-throughs ---------------------------------------------------
+
+    /// Upsert a graph entity owned by the session user. On name+type conflict,
+    /// increments the occurrence count and refreshes `last_seen_at`.
+    pub async fn graph_create_entity(&self, req: CreateEntityRequest) -> Result<Entity> {
+        Ok(kleos_lib::graph::entities::create_entity(&self.db, req, self.user_id).await?)
+    }
+
+    /// Fetch one entity by id for the session user.
+    pub async fn graph_get_entity(&self, id: i64) -> Result<Entity> {
+        Ok(kleos_lib::graph::entities::get_entity(&self.db, id, self.user_id).await?)
+    }
+
+    /// List entities for the session user ordered by occurrence count.
+    pub async fn graph_list_entities(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Entity>> {
+        Ok(
+            kleos_lib::graph::entities::list_entities(&self.db, self.user_id, limit, offset)
+                .await?,
+        )
+    }
+
+    /// Delete a graph entity owned by the session user.
+    pub async fn graph_delete_entity(&self, id: i64) -> Result<()> {
+        Ok(kleos_lib::graph::entities::delete_entity(&self.db, id, self.user_id).await?)
+    }
+
+    /// Search memories linked to a given entity for the session user using FTS.
+    pub async fn graph_search_entity_memories(
+        &self,
+        entity_id: i64,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<EntityMemorySearchResult>> {
+        Ok(kleos_lib::graph::entities::search_entity_memories(
+            &self.db,
+            entity_id,
+            self.user_id,
+            query,
+            limit,
+        )
+        .await?)
+    }
+
+    /// Compute PageRank scores over the session user's memory graph.
+    /// `damping` is typically 0.85; `max_iterations` is a convergence cap.
+    pub async fn graph_compute_pagerank(
+        &self,
+        damping: f64,
+        max_iterations: u32,
+    ) -> Result<PageRankResult> {
+        Ok(
+            kleos_lib::graph::pagerank::compute_pagerank(
+                &self.db,
+                self.user_id,
+                damping,
+                max_iterations,
+            )
+            .await?,
+        )
+    }
+
+    /// Recompute and persist PageRank scores for the session user.
+    pub async fn graph_update_pagerank(&self) -> Result<PageRankUpdateResult> {
+        Ok(kleos_lib::graph::pagerank::update_pagerank_scores(&self.db, self.user_id).await?)
+    }
+
+    /// Detect Louvain communities in the session user's memory graph.
+    /// `max_iterations` caps the Louvain optimization passes (clamped to 100 internally).
+    pub async fn graph_detect_communities(&self, max_iterations: u32) -> Result<CommunitiesResult> {
+        Ok(
+            kleos_lib::graph::communities::detect_communities(&self.db, self.user_id, max_iterations)
+                .await?,
+        )
+    }
+
+    /// Return community membership statistics for the session user.
+    pub async fn graph_community_stats(&self) -> Result<Vec<CommunityStats>> {
+        Ok(kleos_lib::graph::communities::get_community_stats(&self.db, self.user_id).await?)
+    }
 }
 
 #[cfg(test)]
@@ -624,6 +713,37 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Graph pass-throughs round-trip: create an entity, fetch it by id, then compute pagerank.
+    #[tokio::test]
+    async fn lite_session_graph_round_trip() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        let created = cog
+            .graph_create_entity(CreateEntityRequest {
+                name: "Henosis".to_string(),
+                entity_type: Some("project".to_string()),
+                description: Some("The Henosis AI platform.".to_string()),
+                aliases: None,
+                user_id: None,
+                space_id: None,
+            })
+            .await
+            .expect("create graph entity");
+        let fetched = cog
+            .graph_get_entity(created.id)
+            .await
+            .expect("get graph entity");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.name, "Henosis");
+        // Pagerank over an empty graph completes without error.
+        let pr = cog
+            .graph_compute_pagerank(0.85, 10)
+            .await
+            .expect("compute pagerank");
+        let _ = pr;
     }
 
     /// Personality pass-throughs round-trip: store a signal, then list it back.
