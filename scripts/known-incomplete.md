@@ -36,13 +36,19 @@ gained tenant-backed constructors `open_tenant_memory` / `open_tenant_path` over
 (handoffs `schema_v43` included), so the `handoffs_*` pass-throughs now round-trip
 against a tenant session (in-memory and path-backed reopen both tested). The
 monolith lite session is unchanged and stays memory + scratchpad only.
+Row 3 (cognition facade partial surface) was FIXED and removed: the facade now
+covers all eight surfaces -- memory, context, scratchpad, handoffs, skills,
+personality, graph, brain, intelligence, and forge -- as thin pass-throughs over
+vendored `kleos-lib`. Every surface has a round-trip or smoke test. Re-exports
+expose all required kleos-lib types through `henosis_cognition::*` so callers
+never take a direct dependency on the vendored crate. Forge methods return
+`serde_json::Value` matching the kleos-lib convention.
 Row numbers are kept stable because code comments reference them. Severities are from the
 adversarial verification pass.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
 | 1 | plan | plutus gate is a deny-stub (fail-closed deny; no quota/RBAC authority) | `syntheos-server/src/app.rs` `live_gate_chain`, `main.rs` | Phase 6 (Plutus authority) |
-| 3 | plan | cognition facade is a PARTIAL surface: memory/context/scratchpad/handoffs only -- no brain/graph/intelligence/personality/skills/forge | `henosis-cognition/src/lib.rs` | later waves |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

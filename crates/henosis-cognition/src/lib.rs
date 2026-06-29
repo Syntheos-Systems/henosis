@@ -63,6 +63,7 @@ pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallRe
 pub use kleos_lib::intelligence::types::{
     CausalAncestor, CausalChain, CausalLink, Contradiction, Digest, MemoryHealthReport, Reflection,
 };
+pub use kleos_lib::forge::approaches::ApproachItem;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -714,6 +715,156 @@ impl Cognition {
             kleos_lib::intelligence::digests::list_digests(&self.db, self.user_id, limit).await?,
         )
     }
+
+    // -- Forge pass-throughs ---------------------------------------------------
+
+    /// Record a new task spec in `forge_specs` and return its JSON descriptor.
+    /// Enforces: minimum 2 acceptance criteria, minimum 3 edge cases, and a
+    /// valid `task_type` (feature / bugfix / refactor / test / docs / chore).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forge_spec_task(
+        &self,
+        session_id: Option<&str>,
+        task_description: String,
+        task_type: String,
+        acceptance_criteria: Vec<String>,
+        interface_contract: String,
+        edge_cases: Vec<String>,
+        files_to_touch: Option<Vec<String>>,
+        dependencies: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::spec::spec_task(
+            &self.db,
+            self.user_id,
+            session_id,
+            task_description,
+            task_type,
+            acceptance_criteria,
+            interface_contract,
+            edge_cases,
+            files_to_touch,
+            dependencies,
+        )
+        .await?)
+    }
+
+    /// Persist a pre-fix hypothesis to `forge_hypotheses` and return its JSON.
+    /// `confidence` must be in [0.0, 1.0]; defaults to 0.7 if `None`.
+    pub async fn forge_log_hypothesis(
+        &self,
+        session_id: Option<&str>,
+        bug_description: String,
+        hypothesis: String,
+        confidence: Option<f64>,
+        spec_id: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::hypothesis::log_hypothesis(
+            &self.db,
+            self.user_id,
+            session_id,
+            bug_description,
+            hypothesis,
+            confidence,
+            spec_id,
+        )
+        .await?)
+    }
+
+    /// Close an open hypothesis with its outcome (`correct` / `incorrect` / `partial`).
+    pub async fn forge_log_outcome(
+        &self,
+        hypothesis_id: String,
+        outcome: String,
+        notes: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::hypothesis::log_outcome(
+            &self.db,
+            self.user_id,
+            hypothesis_id,
+            outcome,
+            notes,
+        )
+        .await?)
+    }
+
+    /// Record two or more named design alternatives in `forge_approaches` and
+    /// return a structured comparison. `chosen_index` marks the selected option.
+    pub async fn forge_consider_approaches(
+        &self,
+        spec_id: Option<String>,
+        problem: String,
+        approaches: Vec<ApproachItem>,
+        chosen_index: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::approaches::consider_approaches(
+            &self.db,
+            self.user_id,
+            spec_id,
+            problem,
+            approaches,
+            chosen_index,
+        )
+        .await?)
+    }
+
+    /// Persist a client-side verification run result to `forge_verifications`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forge_record_verification(
+        &self,
+        spec_id: Option<String>,
+        command: String,
+        exit_code: i32,
+        success: bool,
+        duration_ms: Option<i64>,
+        criteria_index: Option<i64>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::verify::record_verification(
+            &self.db,
+            self.user_id,
+            spec_id,
+            command,
+            exit_code,
+            success,
+            duration_ms,
+            criteria_index,
+            stdout,
+            stderr,
+        )
+        .await?)
+    }
+
+    /// Record a mid-session discovery in `forge_session_learns`.
+    pub async fn forge_session_learn(
+        &self,
+        discovery: String,
+        context: Option<String>,
+        tags: Option<Vec<String>>,
+        spec_id: Option<String>,
+    ) -> Result<serde_json::Value> {
+        Ok(kleos_lib::forge::session::session_learn(
+            &self.db,
+            self.user_id,
+            discovery,
+            context,
+            tags,
+            spec_id,
+        )
+        .await?)
+    }
+
+    /// Search past session learnings by keyword. Returns up to `limit` matches.
+    pub async fn forge_session_recall(
+        &self,
+        query: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        Ok(
+            kleos_lib::forge::session::session_recall(&self.db, self.user_id, query, limit)
+                .await?,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -804,6 +955,50 @@ mod tests {
             .expect("fetch latest after reopen")
             .expect("the persisted handoff survives");
         assert_eq!(latest.id, stored_id);
+    }
+
+    /// Forge pass-throughs smoke test: spec_task, log_hypothesis, and session_learn round-trip.
+    #[tokio::test]
+    async fn lite_session_forge_round_trip() {
+        let cog = Cognition::open_in_memory()
+            .await
+            .expect("open cognitive core");
+        // spec_task requires min 2 criteria and min 3 edge cases.
+        let spec = cog
+            .forge_spec_task(
+                None,
+                "add a foo widget".into(),
+                "feature".into(),
+                vec!["foo widget appears".into(), "foo widget saves state".into()],
+                "fn foo_widget() -> Widget".into(),
+                vec!["empty state".into(), "max items".into(), "concurrent writes".into()],
+                None,
+                None,
+            )
+            .await
+            .expect("forge_spec_task");
+        let spec_id = spec["id"].as_str().expect("spec id").to_string();
+        assert!(spec_id.starts_with("spec_"), "id prefix is spec_");
+
+        let hyp = cog
+            .forge_log_hypothesis(
+                None,
+                "widget does not save".into(),
+                "state key is wrong".into(),
+                Some(0.8),
+                Some(spec_id),
+            )
+            .await
+            .expect("forge_log_hypothesis");
+        assert!(hyp["id"].as_str().expect("hyp id").starts_with("hyp_"));
+
+        let learned = cog
+            .forge_session_learn("db key must use uuid not name".into(), None, None, None)
+            .await
+            .expect("forge_session_learn");
+        assert!(
+            learned["id"].as_str().expect("learn id").starts_with("learn_")
+        );
     }
 
     /// Intelligence pass-throughs smoke test: memory_health and contradiction scan succeed on empty DB.
