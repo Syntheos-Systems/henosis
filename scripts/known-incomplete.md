@@ -37,7 +37,7 @@ Row 1 (plutus gate was a fail-closed deny-stub) was FIXED and removed: the new
 `henosis-plutus` kernel authority backs a real `PlutusGate` doing org-status -> RBAC
 -> hard-quota -> rate-limit checks, fail-closed at every step (no Allow-on-error
 path), replacing the deny-stub in the plutus slot. All five gate slots now run real
-gates. Storage is Postgres via sqlx (Zan, D1); the gate depends on a `PolicyBackend`
+gates. Storage is Postgres via sqlx (operator decision D1); the gate depends on a `PolicyBackend`
 trait so its fail-closed matrix is unit-tested with no live DB. Billing (Stripe/X402)
 is deliberately NOT part of this -- a separate later effort, not needed for the slot
 to be real.
