@@ -22,10 +22,12 @@
 //! it maps onto. Not tenancy, roles, quota, grants, or scopes (Plutus / Pistis / Phylax own
 //! those). No update, delete, or revocation yet.
 
+pub mod accounts;
 pub mod directory;
 pub mod error;
 pub mod sqlite;
 
+pub use accounts::OperatorAccount;
 pub use directory::{InMemoryDirectory, PrincipalDirectory};
 pub use error::DirectoryError;
 pub use sqlite::SqliteDirectory;

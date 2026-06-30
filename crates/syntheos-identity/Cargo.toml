@@ -18,6 +18,10 @@ thiserror.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 # PrincipalKind is stored as its serde string form.
 serde_json.workspace = true
+# Argon2id password hashing for operator-account credentials (Task 1 / Athena plan A).
+# Version pinned to match henosis-rift-server. Default features include password-hash
+# re-exports; rand_core::OsRng + SaltString::generate are available at this version.
+argon2 = { version = "0.5", features = ["std"] }
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test].

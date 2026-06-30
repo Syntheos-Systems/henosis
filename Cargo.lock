@@ -3335,6 +3335,7 @@ dependencies = [
  "dirs 5.0.1",
  "eventsource-stream",
  "futures",
+ "henosis-hermes",
  "reqwest",
  "reqwest-eventsource",
  "serde",
@@ -7902,6 +7903,7 @@ dependencies = [
 name = "syntheos-identity"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "async-trait",
  "rusqlite",
  "serde_json",
@@ -7944,6 +7946,7 @@ dependencies = [
  "henosis-chiasm",
  "henosis-cognition",
  "henosis-eidolon",
+ "henosis-hephaestus",
  "henosis-loom",
  "henosis-phylax",
  "henosis-pistis",

@@ -26,14 +26,18 @@ use crate::error::DirectoryError;
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only: never edit a shipped
 /// entry; add a new `(version, sql)` pair and a matching `migrations/Vn__*.sql` file.
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__principals.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__principals.sql")),
+    (2, include_str!("../migrations/V2__operator_accounts.sql")),
+];
 
 /// A persistent [`PrincipalDirectory`] backed by a single SQLite database.
 ///
 /// Share it as `Arc<SqliteDirectory>` or `Arc<dyn PrincipalDirectory>`; all methods take `&self`.
 pub struct SqliteDirectory {
     /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send` but not `Sync`).
-    conn: Mutex<Connection>,
+    /// `pub(crate)` so sibling modules (e.g. `accounts`) can add `impl SqliteDirectory` blocks.
+    pub(crate) conn: Mutex<Connection>,
 }
 
 /// Map a generic rusqlite error to an opaque backend error.
