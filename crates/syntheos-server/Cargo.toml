@@ -41,7 +41,7 @@ thiserror.workspace = true
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
 # HTTP surface.
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 # Global concurrency cap on the HTTP surface (resource-limit hardening).
 tower = { version = "0.5", features = ["limit"] }
 # Per-request timeout layer (resource-limit hardening).
@@ -61,6 +61,11 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # ServiceExt::oneshot drives the router in handler tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# WS client for the ws.rs integration test (ws_forwards_org_matching_events).
+# Version 0.26 is already in the workspace Cargo.lock via henosis-rift-bridge.
+tokio-tungstenite = { version = "0.26" }
+# StreamExt::next() on the tungstenite WebSocketStream in ws.rs tests.
+futures = { workspace = true }
 # Tests opt into the allow-all stub chain; the non-default `stubs` feature never reaches a
 # normal (release) build of the binary.
 syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }

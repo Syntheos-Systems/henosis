@@ -16,6 +16,8 @@ use std::sync::Arc;
 pub mod auth;
 pub mod dashboard;
 pub mod rbac;
+/// The WebSocket event hub: `GET /ws` streaming org-filtered AxonBus events (Task 6).
+pub mod ws;
 
 /// Shared state for every operator route handler.
 ///
