@@ -8,12 +8,13 @@
 //! Submodule layout (tasks add submodules as they land):
 //! - [`auth`]: JWT claims, sign/decode, `OperatorError` (Task 2).
 //! - `rbac` (Task 4): `OperatorAuth` extractor + `require(perm)`.
-//! - `dashboard` (Task 5): `GET /api/dashboard` composition.
+//! - [`dashboard`]: `GET /api/dashboard` composition (Task 5).
 //! - `ws` (Task 6): `GET /ws` WebSocket hub over [`syntheos_axon::AxonBus`].
 
 use std::sync::Arc;
 
 pub mod auth;
+pub mod dashboard;
 pub mod rbac;
 
 /// Shared state for every operator route handler.
@@ -27,9 +28,14 @@ pub struct OperatorState {
     /// Consumed by Task 3 (login handler) and Task 7 (bootstrap).
     pub accounts: Arc<syntheos_identity::SqliteDirectory>,
 
-    /// The Plutus policy store (RBAC, org status, quotas).
-    /// Consumed by Task 3 (org/role resolution) and Task 4 (RBAC extractor).
-    pub plutus: Arc<henosis_plutus::PlutusStore>,
+    /// The Plutus policy backend (RBAC, org status, quotas).
+    ///
+    /// Typed as `Arc<dyn PolicyBackend>` so handler tests can build a real
+    /// `OperatorState` with a `MockPolicyBackend` instead of a live Postgres
+    /// connection. In production `main.rs` wraps a `PlutusStore`, which
+    /// implements `PolicyBackend`. Task 3 (login) and Task 4 (RBAC extractor)
+    /// consume this field; `&*state.plutus` coerces to `&dyn PolicyBackend`.
+    pub plutus: Arc<dyn henosis_plutus::PolicyBackend>,
 
     /// The raw HS256 signing secret.  All operator JWTs are signed and verified
     /// with this key.  Task 2 uses it; Task 3 passes it to `sign`/`decode`.
