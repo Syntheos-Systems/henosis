@@ -304,6 +304,27 @@ impl PolicyBackend for PlutusStore {
         }
     }
 
+    /// Resolve which tenant (org) `principal` belongs to via their membership row.
+    ///
+    /// Executes `SELECT tenant_id FROM org_member WHERE principal_id = $1 LIMIT 1`.
+    /// Returns `Ok(Some(tenant))` when a membership row exists, or `Ok(None)` when
+    /// the principal has no org membership. Used by the operator login flow to map
+    /// a verified principal to its org before checking org status and role.
+    async fn tenant_for_principal(&self, principal: PrincipalId) -> Result<Option<TenantId>> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT tenant_id FROM org_member WHERE principal_id = $1 LIMIT 1",
+        )
+        .bind(principal.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some((uuid,)) => TenantId::from_uuid(uuid)
+                .map(Some)
+                .map_err(|e| PlutusError::Store(e.to_string())),
+        }
+    }
+
     /// Atomically increment the daily usage counter and return whether the result is within quota.
     ///
     /// Uses a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING used` (D1 rule 4).

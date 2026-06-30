@@ -52,7 +52,7 @@ impl std::fmt::Display for OrgStatus {
     }
 }
 
-/// The four reads `PlutusGate` needs from a policy authority.
+/// The policy reads `PlutusGate` and the operator login flow need from a policy authority.
 ///
 /// Production impl: `PlutusStore` over Postgres.
 /// Test impl: `MockPolicyBackend` (no live DB required).
@@ -71,6 +71,14 @@ pub trait PolicyBackend: Send + Sync {
     ///
     /// Returns `Ok(None)` when the principal is not a member of the org (no membership = deny).
     async fn member_role(&self, tenant: TenantId, principal: PrincipalId) -> Result<Option<Role>>;
+
+    /// Resolve which tenant (org) `principal` belongs to by finding their membership row.
+    ///
+    /// Executes `SELECT tenant_id FROM org_member WHERE principal_id = ? LIMIT 1`.
+    /// Returns `Ok(Some(tenant))` when the principal has a membership, or `Ok(None)` when
+    /// no membership row exists (no org = deny login). Used by the operator login flow to
+    /// map a verified principal to its org before checking org status and role.
+    async fn tenant_for_principal(&self, principal: PrincipalId) -> Result<Option<TenantId>>;
 
     /// Atomically increment the daily usage counter for `dimension` by `amount`
     /// and return whether the result is within the org's configured limit.
@@ -108,6 +116,9 @@ pub struct MockPolicyBackend {
     pub org: Option<OrgStatus>,
     /// Member role to return. `None` means the principal is not a member.
     pub role: Option<Role>,
+    /// Tenant to return from `tenant_for_principal`. `None` means no membership row
+    /// exists for the queried principal (no org membership = deny login).
+    pub tenant: Option<TenantId>,
     /// Whether `check_and_increment` reports the quota as allowed.
     pub quota_ok: bool,
     /// Whether `rate_limit_ok` reports the rate limit as not exhausted.
@@ -119,22 +130,29 @@ pub struct MockPolicyBackend {
 /// Constructors for the common mock scenarios used in gate tests.
 #[cfg(any(test, feature = "test-helpers"))]
 impl MockPolicyBackend {
-    /// Active org, Member-role principal, quota OK, rate limit OK. Produces `Allow`.
+    /// Active org, Member-role principal, a fresh tenant, quota OK, rate limit OK. Produces `Allow`.
+    ///
+    /// The `tenant` field is set to a fresh `TenantId::new()` so that
+    /// `tenant_for_principal` returns a consistent non-None value that callers can
+    /// read back via `mock.tenant.unwrap()` to assert the resolved org in login tests.
     pub fn allow_all() -> Self {
         Self {
             org: Some(OrgStatus::Active),
             role: Some(Role::Member),
+            tenant: Some(TenantId::new()),
             quota_ok: true,
             rate_ok: true,
             error: false,
         }
     }
 
-    /// No org found for the tenant. Gate step 1 denies.
+    /// No org found for the tenant. The principal has a membership row pointing to a tenant,
+    /// but `org_status` returns `None`. Gate step 1 denies.
     pub fn deny_no_org() -> Self {
         Self {
             org: None,
             role: None,
+            tenant: Some(TenantId::new()),
             quota_ok: true,
             rate_ok: true,
             error: false,
@@ -146,28 +164,32 @@ impl MockPolicyBackend {
         Self {
             org: Some(OrgStatus::Suspended),
             role: Some(Role::Member),
+            tenant: Some(TenantId::new()),
             quota_ok: true,
             rate_ok: true,
             error: false,
         }
     }
 
-    /// Active org but the principal is not a member. Gate step 2 denies.
+    /// Active org but the principal is not a member: no membership row exists so
+    /// `tenant_for_principal` returns `None`. Gate step 2 denies; login step 2 denies.
     pub fn deny_no_member() -> Self {
         Self {
             org: Some(OrgStatus::Active),
             role: None,
+            tenant: None,
             quota_ok: true,
             rate_ok: true,
             error: false,
         }
     }
 
-    /// Active org, specified role (e.g. Viewer to test RBAC denial). Gate step 2 may deny.
+    /// Active org, specified role (e.g. `Viewer` to test RBAC denial). Gate step 2 may deny.
     pub fn with_role(role: Role) -> Self {
         Self {
             org: Some(OrgStatus::Active),
             role: Some(role),
+            tenant: Some(TenantId::new()),
             quota_ok: true,
             rate_ok: true,
             error: false,
@@ -179,6 +201,7 @@ impl MockPolicyBackend {
         Self {
             org: Some(OrgStatus::Active),
             role: Some(Role::Member),
+            tenant: Some(TenantId::new()),
             quota_ok: false,
             rate_ok: true,
             error: false,
@@ -190,6 +213,7 @@ impl MockPolicyBackend {
         Self {
             org: Some(OrgStatus::Active),
             role: Some(Role::Member),
+            tenant: Some(TenantId::new()),
             quota_ok: true,
             rate_ok: false,
             error: false,
@@ -201,6 +225,7 @@ impl MockPolicyBackend {
         Self {
             org: None,
             role: None,
+            tenant: None,
             quota_ok: false,
             rate_ok: false,
             error: true,
@@ -230,6 +255,17 @@ impl PolicyBackend for MockPolicyBackend {
             return Err(crate::PlutusError::Store("mock error".into()));
         }
         Ok(self.role)
+    }
+
+    /// Return the configured tenant for the principal, or an error when `self.error` is set.
+    ///
+    /// Returns `self.tenant`, which is `None` for `deny_no_member()` (no membership row)
+    /// and `Some(tenant)` for all allow-path presets.
+    async fn tenant_for_principal(&self, _principal: PrincipalId) -> Result<Option<TenantId>> {
+        if self.error {
+            return Err(crate::PlutusError::Store("mock error".into()));
+        }
+        Ok(self.tenant)
     }
 
     /// Return a `QuotaOutcome` reflecting `self.quota_ok`, or an error when `self.error` is set.
