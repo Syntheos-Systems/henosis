@@ -14,14 +14,16 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor};
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
-use henosis_plutus::{PlutusStore, PolicyBackend};
+use henosis_plutus::{PlutusStore, PolicyBackend, QuotaTier};
 use henosis_rift::{Approver, RegistryApprover};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
+use syntheos_contracts::{PrincipalKind, TenantId};
 use syntheos_dispatch::deny::DenyExecutor;
 use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
+use syntheos_server::operator::OperatorState;
 use syntheos_server::{live_gate_chain, SomaQualitySink};
 use syntheos_server::{router, AppState};
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -128,7 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // an in-memory directory would orphan every projection row on restart.
     let bus = Arc::new(AxonBus::new());
     let identity_db = db_path("SYNTHEOS_IDENTITY_DB", "data/identity.sqlite")?;
-    let directory: Arc<dyn PrincipalDirectory> = Arc::new(SqliteDirectory::open(&identity_db)?);
+    // Keep a concrete Arc<SqliteDirectory> so the operator bootstrap and OperatorState
+    // can call the accounts API (create_account, get_account, verify_login) which are
+    // defined on SqliteDirectory directly, not on the PrincipalDirectory trait.
+    let directory_store = Arc::new(SqliteDirectory::open(&identity_db)?);
+    let directory: Arc<dyn PrincipalDirectory> = directory_store.clone();
     tracing::info!(path = %identity_db, "principal directory open");
 
     // Phase 1 kernel services: persistent SQLite at configurable paths (migrations apply on
@@ -181,13 +187,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plutus_url = std::env::var("SYNTHEOS_PLUTUS_DB").map_err(|_| {
         "SYNTHEOS_PLUTUS_DB is required: set to a Postgres connection URL (e.g. postgres://user:pw@host/plutus)"
     })?;
-    let plutus_store = PlutusStore::open(&plutus_url).await.map_err(|e| {
+    // Wrap PlutusStore in Arc before the trait-object coercion so the concrete handle
+    // remains available for the operator bootstrap (create_org, add_member).
+    let plutus_store = Arc::new(PlutusStore::open(&plutus_url).await.map_err(|e| {
         format!("plutus store open failed: {e}")
-    })?;
+    })?);
     plutus_store.bootstrap_operator_org_if_absent().await.map_err(|e| {
         format!("plutus operator bootstrap: {e}")
     })?;
-    let plutus: Arc<dyn PolicyBackend> = Arc::new(plutus_store);
+    let plutus: Arc<dyn PolicyBackend> = plutus_store.clone();
     tracing::info!(url = %plutus_url, "plutus policy authority open (real gate in plutus slot)");
 
     // The dispatcher gate chain: all five slots now run REAL gates (pistis, plutus, eidolon,
@@ -277,18 +285,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cog
     };
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         dispatcher,
         directory,
-        bus,
-        chiasm,
-        soma,
-        broca,
-        loom,
-        thymus,
+        bus.clone(),
+        chiasm.clone(),
+        soma.clone(),
+        broca.clone(),
+        loom.clone(),
+        thymus.clone(),
         #[cfg(feature = "cognition")]
         cognition,
     );
+
+    // Mount the operator surface when SYNTHEOS_OPERATOR_JWT_SECRET is configured.
+    // A set-but-invalid secret is a hard boot error so misconfiguration is never silent.
+    if let Some(op_state) = operator_state_from_env(
+        directory_store.clone(),
+        plutus_store.clone(),
+        soma.clone(),
+        chiasm.clone(),
+        broca.clone(),
+        thymus.clone(),
+        loom.clone(),
+        bus.clone(),
+    )
+    .await?
+    {
+        // Bootstrap the first operator account when the bootstrap env vars are set.
+        bootstrap_operator_if_configured(&directory_store, &plutus_store).await?;
+        state = state.with_operator(op_state);
+        tracing::info!("operator surface enabled: /api/auth/*, /api/dashboard, /ws");
+    }
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
@@ -389,6 +417,137 @@ fn supervisor_from_env(
         },
         bus,
     )?))
+}
+
+/// Build an [`OperatorState`] from the environment when
+/// `SYNTHEOS_OPERATOR_JWT_SECRET` is set.
+///
+/// Returns `Ok(None)` when the variable is unset -- the operator surface is
+/// disabled and the kernel server behaves exactly as before.
+///
+/// Returns `Err` when the variable IS set but is malformed or decodes to fewer
+/// than 32 bytes. A misconfigured secret is always a hard boot error so the
+/// operator surface is never silently absent when an operator intended it enabled.
+///
+/// Secret encoding: if the value is a valid even-length lowercase or uppercase
+/// hex string it is decoded as hex (64 chars -> 32 bytes). Otherwise the raw
+/// UTF-8 bytes are used as-is. Both paths require >= 32 bytes.
+#[allow(clippy::too_many_arguments)]
+async fn operator_state_from_env(
+    directory_store: Arc<SqliteDirectory>,
+    plutus_store: Arc<PlutusStore>,
+    soma: Arc<SomaStore>,
+    chiasm: Arc<ChiasmStore>,
+    broca: Arc<BrocaStore>,
+    thymus: Arc<ThymusStore>,
+    loom: Arc<LoomStore>,
+    bus: Arc<AxonBus>,
+) -> Result<Option<OperatorState>, Box<dyn std::error::Error>> {
+    // Unset -> operator surface disabled; kernel server unchanged.
+    let raw = match std::env::var("SYNTHEOS_OPERATOR_JWT_SECRET") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(None),
+    };
+
+    // Attempt hex decoding first; fall back to raw UTF-8 bytes.
+    let secret_bytes: Vec<u8> =
+        if raw.len() % 2 == 0 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            hex::decode(raw.trim())
+                .map_err(|e| format!("SYNTHEOS_OPERATOR_JWT_SECRET hex decode failed: {e}"))?
+        } else {
+            raw.into_bytes()
+        };
+
+    // A set-but-too-short secret is a hard boot error -- never a silent fallback.
+    if secret_bytes.len() < 32 {
+        return Err(
+            "SYNTHEOS_OPERATOR_JWT_SECRET must be >= 32 bytes (64 hex chars or 32+ ASCII chars)"
+                .into(),
+        );
+    }
+
+    // Build OperatorState sharing the same Arcs the kernel uses.
+    let op_state = OperatorState {
+        accounts: directory_store,
+        plutus: plutus_store,
+        jwt_secret: Arc::new(secret_bytes),
+        soma,
+        chiasm,
+        broca,
+        thymus,
+        loom,
+        axon: bus,
+    };
+
+    Ok(Some(op_state))
+}
+
+/// Bootstrap the first operator account when the bootstrap environment variables
+/// are present and the account does not yet exist.
+///
+/// Reads:
+/// - `SYNTHEOS_OPERATOR_BOOTSTRAP_EMAIL` -- the email address to create.
+/// - `SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD` -- the plaintext password to hash.
+///
+/// When both are set AND no account for that email exists yet:
+/// 1. Enroll a new `Human` principal in the identity directory.
+/// 2. Create a Plutus org (`Enterprise` tier) with the new principal as `Owner`.
+/// 3. Create the operator account in the identity store (argon2id-hashed password).
+///
+/// Idempotent: if the account already exists the whole block is skipped.
+/// On a second boot the account row is present; no duplicate enroll or org creation.
+///
+/// This function is exercised by the manual launch checklist (Plan B), not a unit test.
+async fn bootstrap_operator_if_configured(
+    directory: &SqliteDirectory,
+    plutus_store: &PlutusStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let email = match std::env::var("SYNTHEOS_OPERATOR_BOOTSTRAP_EMAIL") {
+        Ok(e) if !e.is_empty() => e,
+        _ => return Ok(()), // bootstrap env var not set; nothing to do
+    };
+    let password = match std::env::var("SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return Ok(()), // bootstrap env var not set; nothing to do
+    };
+
+    // Idempotency check: if the account already exists, skip everything.
+    if directory
+        .get_account(&email)
+        .map_err(|e| format!("bootstrap get_account: {e}"))?
+        .is_some()
+    {
+        tracing::debug!(email, "operator account already exists; skipping bootstrap");
+        return Ok(());
+    }
+
+    // 1. Enroll a new principal for this operator account.
+    let principal = directory
+        .enroll(PrincipalKind::Human, Some(format!("operator:{email}")))
+        .await
+        .map_err(|e| format!("bootstrap enroll: {e}"))?;
+
+    // 2. Create a Plutus org with the new principal as Owner.
+    //    A fresh TenantId is generated; it is logged so the operator knows their org UUID.
+    let tenant = TenantId::new();
+    plutus_store
+        .create_org(tenant, "operator", principal.id, QuotaTier::Enterprise)
+        .await
+        .map_err(|e| format!("bootstrap create_org: {e}"))?;
+
+    // 3. Create the account in the SQLite accounts store (argon2id hash applied inside).
+    directory
+        .create_account(&email, &password, principal.id)
+        .map_err(|e| format!("bootstrap create_account: {e}"))?;
+
+    tracing::info!(
+        email,
+        principal_id = %principal.id,
+        tenant_id    = %tenant,
+        "operator bootstrap complete: account created (Owner in new Enterprise org)"
+    );
+
+    Ok(())
 }
 
 /// Resolve a service database path from `var` (default `default`), creating the parent

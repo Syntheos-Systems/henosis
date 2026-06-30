@@ -70,6 +70,10 @@ pub struct AppState {
     /// `scripts/known-incomplete.md` row 3.
     #[cfg(feature = "cognition")]
     cognition: Arc<henosis_cognition::Cognition>,
+    /// The operator API state. `None` when `SYNTHEOS_OPERATOR_JWT_SECRET` is unset
+    /// (the default kernel server is unchanged). `Some` causes `router()` to merge
+    /// the operator surface (`/api/auth/*`, `/api/dashboard`, `/ws`).
+    operator: Option<crate::operator::OperatorState>,
 }
 
 /// Adapts [`ThymusStore::agent_drift_flags`] to the Eidolon [`DriftSignal`] seam, giving the
@@ -214,7 +218,19 @@ impl AppState {
             thymus,
             #[cfg(feature = "cognition")]
             cognition,
+            // Operator surface is disabled by default; enabled via `with_operator`.
+            operator: None,
         }
+    }
+
+    /// Attach an [`crate::operator::OperatorState`] to this application state.
+    ///
+    /// Calling this causes [`router`] to merge the operator surface
+    /// (`/api/auth/*`, `/api/dashboard`, `/ws`) into the kernel router.
+    /// When not called, the routes are absent and the kernel server is unchanged.
+    pub fn with_operator(mut self, op: crate::operator::OperatorState) -> Self {
+        self.operator = Some(op);
+        self
     }
 
     /// The in-process cognitive core facade (Wave 2). Present only under the
@@ -235,8 +251,15 @@ impl AppState {
 }
 
 /// Build the router: the Phase 0 surface (health, version, enroll, dispatch) plus the Phase 1
-/// Chiasm task and Soma presence surfaces.
+/// Chiasm task and Soma presence surfaces, optionally merged with the operator API.
+///
+/// When `state.operator` is `Some`, the operator surface (`/api/auth/*`,
+/// `/api/dashboard`, `/ws`) is merged into the kernel router. When `None`
+/// (the default), the kernel router is returned unchanged.
 pub fn router(state: AppState) -> Router {
+    // Extract the operator state before AppState is consumed by with_state.
+    let operator = state.operator.clone();
+
     #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/health", get(health))
@@ -299,7 +322,16 @@ pub fn router(state: AppState) -> Router {
             .route("/cognition/memory/search", get(cognition_search));
     }
 
-    router.with_state(state)
+    let mut app = router.with_state(state);
+
+    // Conditionally merge the operator surface. When `operator` is `None` (the
+    // default -- `SYNTHEOS_OPERATOR_JWT_SECRET` unset), the kernel router is
+    // returned unchanged so the default server behaves exactly as before.
+    if let Some(op) = operator {
+        app = app.merge(crate::operator::operator_router(op));
+    }
+
+    app
 }
 
 /// Map a [`henosis_cognition::CognitionError`] onto an HTTP status + message. The
@@ -2804,6 +2836,68 @@ mod tests {
                 .expect("reason string")
                 .contains("fail-closed"),
             "deny reason should state the fail-closed posture: {out}"
+        );
+    }
+
+    /// `GET /api/dashboard` is 404 when the operator surface is not configured
+    /// (default kernel server unchanged), and 401 when it IS configured but no
+    /// Bearer token is present (route is mounted, auth gate fires).
+    ///
+    /// This is the Task 7 acceptance test: gated mount behaviour.
+    #[tokio::test]
+    async fn operator_surface_mounts_only_when_configured() {
+        use crate::operator::OperatorState;
+        use henosis_plutus::MockPolicyBackend;
+
+        // -- Without operator state: the route is absent -> 404. --
+        let no_op_response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot no-op");
+        assert_eq!(
+            no_op_response.status(),
+            StatusCode::NOT_FOUND,
+            "default router must 404 on /api/dashboard (operator surface not mounted)"
+        );
+
+        // -- With operator state: the route is mounted -> 401 (no token). --
+        let bus = Arc::new(AxonBus::new());
+        // Concrete SqliteDirectory handle for both accounts and directory roles.
+        let dir_inner =
+            Arc::new(syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts dir"));
+        let dir: Arc<dyn PrincipalDirectory> = dir_inner.clone();
+        let op_state = OperatorState {
+            accounts: dir_inner,
+            plutus: Arc::new(MockPolicyBackend::allow_all()),
+            jwt_secret: Arc::new(b"task7-test-secret-32bytes-padded!".to_vec()),
+            soma: Arc::new(SomaStore::open_in_memory(bus.clone(), dir.clone()).expect("soma")),
+            chiasm: Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm")),
+            broca: Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca")),
+            thymus: Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus")),
+            loom: Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom")),
+            axon: bus,
+        };
+
+        let with_op_response = router(test_state().with_operator(op_state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot with-op");
+        assert_eq!(
+            with_op_response.status(),
+            StatusCode::UNAUTHORIZED,
+            "operator router must 401 on /api/dashboard when no Bearer token is supplied"
         );
     }
 
