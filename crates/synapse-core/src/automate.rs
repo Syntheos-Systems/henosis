@@ -253,7 +253,6 @@ mod tests {
                 lexical: 0.0,
                 intent: 0.0,
                 capability: 0.0,
-                context: 0.0,
             },
         }
     }
