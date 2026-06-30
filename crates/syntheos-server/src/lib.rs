@@ -37,6 +37,12 @@
 
 pub mod app;
 
+/// The operator API: JWT auth, RBAC extractor, dashboard, and WebSocket hub.
+///
+/// Additive -- the default kernel server is unchanged when [`operator::OperatorState`]
+/// is not constructed. Routes mount conditionally (Task 7).
+pub mod operator;
+
 pub use app::{
     eidolon_gate, live_gate_chain, router, AppState, BrocaFeedQuery, BrocaLogRequest,
     BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery, ChiasmOwnerQuery, EnrollRequest,

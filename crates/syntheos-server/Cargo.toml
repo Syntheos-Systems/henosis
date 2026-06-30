@@ -34,6 +34,10 @@ henosis-plutus = { path = "../henosis-plutus" }
 # `cognition` feature pulls it -- and with it the heavy ML stack -- in, so the
 # default Henosis build stays free of ort/tokenizers/lancedb. Additive wiring.
 henosis-cognition = { path = "../henosis-cognition", optional = true }
+# JWT session tokens for the operator API surface (HS256 via pure-Rust crypto).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# Structured error types for the operator surface.
+thiserror.workspace = true
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
 # HTTP surface.
