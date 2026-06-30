@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 pub mod auth;
+pub mod rbac;
 
 /// Shared state for every operator route handler.
 ///
