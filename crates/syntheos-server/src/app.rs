@@ -2882,6 +2882,8 @@ mod tests {
             thymus: Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus")),
             loom: Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom")),
             axon: bus,
+            // Not exercised by this test; empty allow-list is fine (no Origin header is sent).
+            cors_origins: Arc::new(vec![]),
         };
 
         let with_op_response = router(test_state().with_operator(op_state))
@@ -2899,6 +2901,61 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "operator router must 401 on /api/dashboard when no Bearer token is supplied"
         );
+    }
+
+    /// A CORS preflight (`OPTIONS` + `Origin` + `Access-Control-Request-Method`) against
+    /// `/api/auth/login` from an allow-listed origin gets a 2xx response carrying
+    /// `Access-Control-Allow-Origin` for that origin -- the exact request a browser/webview
+    /// client (the Athena Tauri app, the Vite dev server) sends before a JSON POST with an
+    /// `Authorization` header. Regression test for the CORS fix: before it, this 405'd with
+    /// no ACAO header and every browser client was hard-blocked.
+    #[tokio::test]
+    async fn operator_preflight_allows_configured_origin() {
+        use crate::operator::OperatorState;
+        use henosis_plutus::MockPolicyBackend;
+
+        let bus = Arc::new(AxonBus::new());
+        let dir_inner =
+            Arc::new(syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts dir"));
+        let dir: Arc<dyn PrincipalDirectory> = dir_inner.clone();
+        let allowed_origin = "http://localhost:5173";
+        let op_state = OperatorState {
+            accounts: dir_inner,
+            plutus: Arc::new(MockPolicyBackend::allow_all()),
+            jwt_secret: Arc::new(b"cors-preflight-test-secret-32by!".to_vec()),
+            soma: Arc::new(SomaStore::open_in_memory(bus.clone(), dir.clone()).expect("soma")),
+            chiasm: Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm")),
+            broca: Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca")),
+            thymus: Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus")),
+            loom: Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom")),
+            axon: bus,
+            cors_origins: Arc::new(vec![axum::http::HeaderValue::from_static(allowed_origin)]),
+        };
+
+        let response = router(test_state().with_operator(op_state))
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/auth/login")
+                    .header("origin", allowed_origin)
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type,authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot preflight");
+
+        assert!(
+            response.status().is_success(),
+            "preflight must not 405: got {}",
+            response.status()
+        );
+        let acao = response
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("Access-Control-Allow-Origin header must be present on an allowed preflight");
+        assert_eq!(acao.to_str().unwrap(), allowed_origin);
     }
 
     /// The Wave 3 wiring proof: a memory POSTed to `/cognition/memory` is then

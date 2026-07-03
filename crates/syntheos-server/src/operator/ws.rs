@@ -328,6 +328,8 @@ mod tests {
             thymus,
             loom,
             axon: bus.clone(),
+            // Not exercised by these handler-level tests (no CORS preflight involved).
+            cors_origins: Arc::new(vec![]),
         };
         (state, org, jwt_secret, bus)
     }

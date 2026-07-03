@@ -44,8 +44,9 @@ hex.workspace = true
 axum = { workspace = true, features = ["ws"] }
 # Global concurrency cap on the HTTP surface (resource-limit hardening).
 tower = { version = "0.5", features = ["limit"] }
-# Per-request timeout layer (resource-limit hardening).
-tower-http = { version = "0.6", features = ["timeout"] }
+# Per-request timeout layer (resource-limit hardening); "cors" backs the operator surface's
+# browser/webview CORS layer (Athena Tauri app + Vite dev server preflight support).
+tower-http = { version = "0.6", features = ["timeout", "cors"] }
 # Full runtime: the binary needs rt, net, signal, and macros.
 tokio = { workspace = true }
 # EnrollRequest body.

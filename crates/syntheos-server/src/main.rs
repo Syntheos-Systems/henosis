@@ -466,6 +466,13 @@ async fn operator_state_from_env(
         );
     }
 
+    // Resolve the browser/webview CORS allow-list (SYNTHEOS_OPERATOR_CORS_ORIGINS, defaults to
+    // the Tauri webview origins). Validated here, alongside the JWT secret above, so a malformed
+    // entry is a hard boot error rather than a silent "every browser client is blocked" surprise
+    // discovered later at request time.
+    let cors_origins = syntheos_server::operator::cors_origins_from_env()
+        .map_err(|e| format!("SYNTHEOS_OPERATOR_CORS_ORIGINS: {e}"))?;
+
     // Build OperatorState sharing the same Arcs the kernel uses.
     let op_state = OperatorState {
         accounts: directory_store,
@@ -477,6 +484,7 @@ async fn operator_state_from_env(
         thymus,
         loom,
         axon: bus,
+        cors_origins: Arc::new(cors_origins),
     };
 
     Ok(Some(op_state))
