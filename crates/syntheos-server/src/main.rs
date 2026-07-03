@@ -196,7 +196,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("plutus operator bootstrap: {e}")
     })?;
     let plutus: Arc<dyn PolicyBackend> = plutus_store.clone();
-    tracing::info!(url = %plutus_url, "plutus policy authority open (real gate in plutus slot)");
+    // Log the redacted form only -- the raw URL carries the Postgres password in its userinfo
+    // and must never reach the log stream (info-level logs routinely end up in aggregators/disk
+    // with looser access control than the secret itself).
+    tracing::info!(
+        url = %redact_postgres_password(&plutus_url),
+        "plutus policy authority open (real gate in plutus slot)"
+    );
 
     // The dispatcher gate chain: all five slots now run REAL gates (pistis, plutus, eidolon,
     // human, phylax-when-keyed). The plutus slot is the real PlutusGate (Story 6.x / row 1).
@@ -568,6 +574,86 @@ fn db_path(var: &str, default: &str) -> Result<String, std::io::Error> {
         }
     }
     Ok(path)
+}
+
+/// The fallback logged in place of a connection string this function cannot confidently parse.
+/// Never the raw input -- an unrecognized shape might still carry a password we failed to find.
+const REDACTED_URL_PLACEHOLDER: &str = "<redacted: unparseable connection string>";
+
+/// Mask the password in a Postgres connection URL's userinfo before it is safe to log.
+///
+/// `postgres://user:pw@host/db` becomes `postgres://user:***@host/db` -- the host and database
+/// stay visible (useful for diagnosing which instance a log line refers to) while the password
+/// never appears in the output. A URL with no userinfo, or userinfo with no password, is
+/// returned unchanged (there is nothing to redact). A string this function cannot confidently
+/// recognize as `scheme://...` falls back to [`REDACTED_URL_PLACEHOLDER`] rather than risk
+/// leaking a password hiding in a shape it did not anticipate.
+fn redact_postgres_password(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return REDACTED_URL_PLACEHOLDER.to_string();
+    };
+    let scheme = &url[..scheme_end + 3];
+    let rest = &url[scheme_end + 3..];
+
+    // The authority (userinfo@host:port) ends at the first '/' or '?' after the scheme; the
+    // rest (path/query) is passed through untouched.
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+
+    // The last '@' in the authority separates userinfo from host (a password could itself
+    // contain '@', though that is unusual for an unencoded connection string).
+    let Some(at_idx) = authority.rfind('@') else {
+        return url.to_string(); // no userinfo at all -- nothing to redact
+    };
+    let userinfo = &authority[..at_idx];
+    let host_part = &authority[at_idx..]; // includes the leading '@'
+
+    match userinfo.find(':') {
+        Some(colon_idx) => {
+            let user = &userinfo[..colon_idx];
+            format!("{scheme}{user}:***{host_part}{tail}")
+        }
+        // Userinfo present but no ':pw' -- e.g. `postgres://user@host/db`. Nothing to redact.
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for [`redact_postgres_password`].
+mod redact_tests {
+    use super::*;
+
+    /// A standard `user:pw@host/db` URL has its password replaced with `***`; host and
+    /// database stay visible for diagnostics.
+    #[test]
+    fn redact_postgres_password_masks_password() {
+        let redacted = redact_postgres_password("postgres://plutus:hunter2@db.internal:5432/plutus");
+        assert_eq!(redacted, "postgres://plutus:***@db.internal:5432/plutus");
+    }
+
+    /// A URL with a user but no password is returned unchanged -- there is nothing to redact.
+    #[test]
+    fn redact_postgres_password_leaves_url_without_password_unchanged() {
+        let url = "postgres://plutus@db.internal:5432/plutus";
+        assert_eq!(redact_postgres_password(url), url);
+    }
+
+    /// A URL with no userinfo at all (no `@`) is returned unchanged.
+    #[test]
+    fn redact_postgres_password_leaves_url_without_userinfo_unchanged() {
+        let url = "postgres://db.internal:5432/plutus";
+        assert_eq!(redact_postgres_password(url), url);
+    }
+
+    /// A string with no recognizable `scheme://` falls back to the generic placeholder --
+    /// never the raw (possibly password-bearing) input.
+    #[test]
+    fn redact_postgres_password_falls_back_to_placeholder_for_unparseable_input() {
+        let redacted = redact_postgres_password("not a connection string at all");
+        assert_eq!(redacted, REDACTED_URL_PLACEHOLDER);
+        assert!(!redacted.contains("not a connection string"));
+    }
 }
 
 /// Resolve when a shutdown signal is received, so `axum` can drain in-flight requests.
