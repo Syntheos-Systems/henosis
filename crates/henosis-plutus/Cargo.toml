@@ -24,6 +24,14 @@ sqlx = { workspace = true }
 tracing.workspace = true
 # DateTime<Utc> for rate-limit token-bucket clock injection.
 chrono = "0.4"
+# Stripe webhook signature verification: keyed HMAC over the raw request body.
+hmac.workspace = true
+# Stripe webhook signature verification: HMAC-SHA256 digest algorithm.
+sha2.workspace = true
+# Stripe webhook signature verification: constant-time comparison of v1 signature candidates.
+subtle.workspace = true
+# Stripe webhook signature verification: hex-decode the v1 values carried in the header.
+hex.workspace = true
 
 [dev-dependencies]
 # #[tokio::test] runtime for async store and gate tests.

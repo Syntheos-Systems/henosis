@@ -1,7 +1,9 @@
 //! `henosis-plutus`: the policy authority for the dispatcher gate chain.
 //!
 //! Provides [`PlutusStore`] (orgs, memberships, roles, quotas, usage) and
-//! [`PlutusGate`], the real `Gate` that replaces the plutus deny-stub.
+//! [`PlutusGate`], the real `Gate` that replaces the plutus deny-stub. The
+//! [`billing`] module hosts Stripe-facing billing primitives, starting with
+//! webhook signature verification.
 //!
 //! The gate check is a four-step fail-closed pipeline:
 //! 1. Org must exist and be active.
@@ -14,6 +16,7 @@
 
 pub mod action_map;
 pub mod backend;
+pub mod billing;
 pub mod gate;
 pub mod quota;
 pub mod rbac;
@@ -23,6 +26,7 @@ pub use action_map::{map_invocation, ActionClass};
 pub use backend::{OrgStatus, PolicyBackend};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use backend::MockPolicyBackend;
+pub use billing::{verify_stripe_signature, SignatureError, DEFAULT_TOLERANCE_SECS};
 pub use gate::{Clock, PlutusGate, WallClock};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use gate::FrozenClock;

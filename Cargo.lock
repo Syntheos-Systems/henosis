@@ -3467,9 +3467,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "subtle",
  "syntheos-contracts",
  "thiserror 1.0.69",
  "tokio",
