@@ -433,30 +433,50 @@ fn supervisor_from_env(
     )?))
 }
 
+/// Validate a raw `SYNTHEOS_STRIPE_WEBHOOK_SECRET` value.
+///
+/// `None` means the variable was unset: the Stripe webhook is not mounted and the kernel server
+/// behaves exactly as before.
+///
+/// A set-but-blank secret is an `Err`. An empty HMAC key is still a *valid* HMAC key (HMAC
+/// accepts any key length), so a blank secret would not fail loudly -- it would quietly stand up
+/// a public webhook that anyone able to compute `HMAC("", payload)` could forge. That is a hard
+/// boot error, matching the operator surface's posture: a misconfigured secret must never
+/// degrade into a quietly-insecure one.
+///
+/// A valid secret is returned verbatim. It is deliberately never trimmed: the trimmed and
+/// untrimmed strings are different HMAC keys, so silently trimming would produce a server that
+/// rejects every genuine Stripe delivery for a reason no log would explain.
+///
+/// Split out from [`billing_state_from_env`] so this policy is unit-testable without a live
+/// Postgres connection to build a `PlutusStore` from.
+fn validated_webhook_secret(raw: Option<String>) -> Result<Option<String>, String> {
+    match raw {
+        None => Ok(None),
+        Some(secret) if secret.trim().is_empty() => Err(
+            "SYNTHEOS_STRIPE_WEBHOOK_SECRET is set but empty: unset it to disable the billing \
+             webhook, or set it to the Stripe endpoint signing secret"
+                .to_string(),
+        ),
+        Some(secret) => Ok(Some(secret)),
+    }
+}
+
 /// Build a [`BillingState`] from the environment when `SYNTHEOS_STRIPE_WEBHOOK_SECRET` is set.
 ///
-/// Returns `Ok(None)` when the variable is unset -- the Stripe webhook is not mounted and the
-/// kernel server behaves exactly as before.
-///
-/// Returns `Err` when the variable IS set but is empty or whitespace-only. An empty HMAC key
-/// would still verify signatures (HMAC accepts any key length), so a blank secret would silently
-/// expose a webhook that anyone able to compute `HMAC("", payload)` could forge. That is a hard
-/// boot error, matching the operator surface's posture: a misconfigured secret must never be a
-/// quietly-degraded one. The value is otherwise passed through verbatim -- never trimmed, since
-/// the trimmed and untrimmed strings are different HMAC keys.
+/// Returns `Ok(None)` when the variable is absent. Returns `Err` when it is present but blank
+/// (see [`validated_webhook_secret`]), or when it is present but not valid Unicode -- the latter
+/// is a hard error rather than a silent "unset", so a mangled secret can never leave the webhook
+/// quietly unmounted when an operator intended it enabled.
 fn billing_state_from_env(
     plutus_store: Arc<PlutusStore>,
 ) -> Result<Option<BillingState>, Box<dyn std::error::Error>> {
-    match std::env::var("SYNTHEOS_STRIPE_WEBHOOK_SECRET") {
-        // Unset -> billing webhook disabled; kernel server unchanged.
-        Err(_) => Ok(None),
-        Ok(secret) if secret.trim().is_empty() => Err(
-            "SYNTHEOS_STRIPE_WEBHOOK_SECRET is set but empty: unset it to disable the billing \
-             webhook, or set it to the Stripe endpoint signing secret"
-                .into(),
-        ),
-        Ok(secret) => Ok(Some(BillingState::new(plutus_store, secret))),
-    }
+    let raw = match std::env::var("SYNTHEOS_STRIPE_WEBHOOK_SECRET") {
+        Ok(secret) => Some(secret),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("SYNTHEOS_STRIPE_WEBHOOK_SECRET: {e}").into()),
+    };
+    Ok(validated_webhook_secret(raw)?.map(|secret| BillingState::new(plutus_store, secret)))
 }
 
 /// Build an [`OperatorState`] from the environment when
@@ -650,6 +670,42 @@ fn redact_postgres_password(url: &str) -> String {
         }
         // Userinfo present but no ':pw' -- e.g. `postgres://user@host/db`. Nothing to redact.
         None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the `SYNTHEOS_STRIPE_WEBHOOK_SECRET` boot policy.
+mod billing_env_tests {
+    use super::*;
+
+    /// An absent variable disables the webhook rather than failing the boot.
+    #[test]
+    fn absent_secret_disables_the_webhook() {
+        assert_eq!(validated_webhook_secret(None).expect("absent is ok"), None);
+    }
+
+    /// An empty secret is a hard boot error: an empty HMAC key still verifies signatures, so
+    /// accepting it would stand up a forgeable public webhook.
+    #[test]
+    fn empty_secret_is_a_hard_boot_error() {
+        assert!(validated_webhook_secret(Some(String::new())).is_err());
+    }
+
+    /// A whitespace-only secret is equally a boot error, not a usable key.
+    #[test]
+    fn whitespace_only_secret_is_a_hard_boot_error() {
+        assert!(validated_webhook_secret(Some("   \t\n".to_string())).is_err());
+    }
+
+    /// A real secret is passed through byte-for-byte. Trimming it would change the HMAC key
+    /// and silently reject every genuine Stripe delivery.
+    #[test]
+    fn valid_secret_is_never_trimmed() {
+        let padded = " whsec_abc ".to_string();
+        assert_eq!(
+            validated_webhook_secret(Some(padded.clone())).expect("valid"),
+            Some(padded)
+        );
     }
 }
 
