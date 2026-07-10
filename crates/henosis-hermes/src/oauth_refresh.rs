@@ -46,6 +46,12 @@ impl RefreshRegistry {
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
+
+    /// Whether no pairs are registered. Paired with [`Self::len`] so a caller can skip a
+    /// daemon tick without allocating a snapshot.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
 }
 
 /// Google OAuth client credentials used for token refresh.
