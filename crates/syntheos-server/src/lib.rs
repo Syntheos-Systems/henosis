@@ -37,6 +37,12 @@
 
 pub mod app;
 
+/// The Stripe billing webhook: `POST /billing/stripe/webhook` (Story 6.4a).
+///
+/// Additive -- the default kernel server is unchanged when [`billing::BillingState`] is not
+/// constructed (`SYNTHEOS_STRIPE_WEBHOOK_SECRET` unset), and the route 404s.
+pub mod billing;
+
 /// The operator API: JWT auth, RBAC extractor, dashboard, and WebSocket hub.
 ///
 /// Additive -- the default kernel server is unchanged when [`operator::OperatorState`]

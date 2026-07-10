@@ -23,6 +23,7 @@ use syntheos_contracts::{PrincipalKind, TenantId};
 use syntheos_dispatch::deny::DenyExecutor;
 use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
+use syntheos_server::billing::BillingState;
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{live_gate_chain, SomaQualitySink};
 use syntheos_server::{router, AppState};
@@ -324,6 +325,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("operator surface enabled: /api/auth/*, /api/dashboard, /ws");
     }
 
+    // Mount the Stripe billing webhook when SYNTHEOS_STRIPE_WEBHOOK_SECRET is configured.
+    // A set-but-empty secret is a hard boot error so misconfiguration is never silent.
+    if let Some(billing_state) = billing_state_from_env(plutus_store.clone())? {
+        state = state.with_billing(billing_state);
+        tracing::info!("stripe billing webhook enabled: POST /billing/stripe/webhook");
+    }
+
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
     let app = router(state)
@@ -423,6 +431,32 @@ fn supervisor_from_env(
         },
         bus,
     )?))
+}
+
+/// Build a [`BillingState`] from the environment when `SYNTHEOS_STRIPE_WEBHOOK_SECRET` is set.
+///
+/// Returns `Ok(None)` when the variable is unset -- the Stripe webhook is not mounted and the
+/// kernel server behaves exactly as before.
+///
+/// Returns `Err` when the variable IS set but is empty or whitespace-only. An empty HMAC key
+/// would still verify signatures (HMAC accepts any key length), so a blank secret would silently
+/// expose a webhook that anyone able to compute `HMAC("", payload)` could forge. That is a hard
+/// boot error, matching the operator surface's posture: a misconfigured secret must never be a
+/// quietly-degraded one. The value is otherwise passed through verbatim -- never trimmed, since
+/// the trimmed and untrimmed strings are different HMAC keys.
+fn billing_state_from_env(
+    plutus_store: Arc<PlutusStore>,
+) -> Result<Option<BillingState>, Box<dyn std::error::Error>> {
+    match std::env::var("SYNTHEOS_STRIPE_WEBHOOK_SECRET") {
+        // Unset -> billing webhook disabled; kernel server unchanged.
+        Err(_) => Ok(None),
+        Ok(secret) if secret.trim().is_empty() => Err(
+            "SYNTHEOS_STRIPE_WEBHOOK_SECRET is set but empty: unset it to disable the billing \
+             webhook, or set it to the Stripe endpoint signing secret"
+                .into(),
+        ),
+        Ok(secret) => Ok(Some(BillingState::new(plutus_store, secret))),
+    }
 }
 
 /// Build an [`OperatorState`] from the environment when

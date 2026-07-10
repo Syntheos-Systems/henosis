@@ -197,9 +197,28 @@ pub fn verify_stripe_signature(
     }
 }
 
+/// Compute a valid `Stripe-Signature` header value for `body` at `timestamp`.
+///
+/// Mirrors the production HMAC construction exactly, so tests are self-generating and never
+/// embed a signature or secret captured from anywhere real. Exposed under
+/// `#[cfg(any(test, feature = "test-helpers"))]` -- the same posture as `FrozenClock` -- so
+/// external test modules (e.g. `syntheos-server`'s webhook route tests) can sign a fixture
+/// body without taking their own dependency on `hmac`/`sha2`. Never compiled into a release
+/// build: a signing oracle has no place in the shipped binary.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn sign_stripe_payload(secret: &str, timestamp: i64, body: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(format!("{timestamp}.").as_bytes());
+    mac.update(body);
+    let sig = hex::encode(mac.finalize().into_bytes());
+    format!("t={timestamp},v1={sig}")
+}
+
 /// Tests for the `Stripe-Signature` parser and the constant-time verifier.
 #[cfg(test)]
 mod tests {
+    use super::sign_stripe_payload as sign;
     use super::*;
     use chrono::TimeZone;
 
@@ -211,18 +230,6 @@ mod tests {
     /// depending on the system clock.
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap()
-    }
-
-    /// Compute a valid Stripe-style `Stripe-Signature` header for `secret`, `timestamp`,
-    /// and `body`, mirroring the production HMAC construction exactly. This makes the
-    /// tests self-generating: no hardcoded secret or signature from anywhere real.
-    fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-        mac.update(format!("{timestamp}.").as_bytes());
-        mac.update(body);
-        let sig = hex::encode(mac.finalize().into_bytes());
-        format!("t={timestamp},v1={sig}")
     }
 
     /// A valid signature over the exact body is accepted.

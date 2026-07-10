@@ -31,6 +31,8 @@ pub use billing::{
     BillingEventRecord, BillingOutcome, DecideError, Entitlement, EntitlementSource,
     EntitlementStatus, SignatureError, StripeEvent, DEFAULT_TOLERANCE_SECS,
 };
+#[cfg(any(test, feature = "test-helpers"))]
+pub use billing::sign_stripe_payload;
 pub use gate::{Clock, PlutusGate, WallClock};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use gate::FrozenClock;

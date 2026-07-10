@@ -40,6 +40,9 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 thiserror.workspace = true
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
+# `now` for the Stripe webhook signature tolerance window (Story 6.4a). Pinned directly,
+# matching henosis-plutus, which owns the verifier this clock is handed to.
+chrono = "0.4"
 # HTTP surface.
 axum = { workspace = true, features = ["ws"] }
 # Global concurrency cap on the HTTP surface (resource-limit hardening).

@@ -74,6 +74,10 @@ pub struct AppState {
     /// (the default kernel server is unchanged). `Some` causes `router()` to merge
     /// the operator surface (`/api/auth/*`, `/api/dashboard`, `/ws`).
     operator: Option<crate::operator::OperatorState>,
+    /// The Stripe billing webhook state. `None` when `SYNTHEOS_STRIPE_WEBHOOK_SECRET` is
+    /// unset (the default kernel server is unchanged). `Some` causes `router()` to merge
+    /// `POST /billing/stripe/webhook`.
+    billing: Option<crate::billing::BillingState>,
 }
 
 /// Adapts [`ThymusStore::agent_drift_flags`] to the Eidolon [`DriftSignal`] seam, giving the
@@ -220,6 +224,8 @@ impl AppState {
             cognition,
             // Operator surface is disabled by default; enabled via `with_operator`.
             operator: None,
+            // Billing webhook is disabled by default; enabled via `with_billing`.
+            billing: None,
         }
     }
 
@@ -230,6 +236,16 @@ impl AppState {
     /// When not called, the routes are absent and the kernel server is unchanged.
     pub fn with_operator(mut self, op: crate::operator::OperatorState) -> Self {
         self.operator = Some(op);
+        self
+    }
+
+    /// Attach a [`crate::billing::BillingState`] to this application state.
+    ///
+    /// Calling this causes [`router`] to merge the Stripe webhook surface
+    /// (`POST /billing/stripe/webhook`) into the kernel router. When not called, the route
+    /// is absent and the kernel server is unchanged.
+    pub fn with_billing(mut self, billing: crate::billing::BillingState) -> Self {
+        self.billing = Some(billing);
         self
     }
 
@@ -257,8 +273,9 @@ impl AppState {
 /// `/api/dashboard`, `/ws`) is merged into the kernel router. When `None`
 /// (the default), the kernel router is returned unchanged.
 pub fn router(state: AppState) -> Router {
-    // Extract the operator state before AppState is consumed by with_state.
+    // Extract the conditional surfaces before AppState is consumed by with_state.
     let operator = state.operator.clone();
+    let billing = state.billing.clone();
 
     #[allow(unused_mut)]
     let mut router = Router::new()
@@ -329,6 +346,13 @@ pub fn router(state: AppState) -> Router {
     // returned unchanged so the default server behaves exactly as before.
     if let Some(op) = operator {
         app = app.merge(crate::operator::operator_router(op));
+    }
+
+    // Conditionally merge the Stripe billing webhook. When `billing` is `None` (the default --
+    // `SYNTHEOS_STRIPE_WEBHOOK_SECRET` unset), `POST /billing/stripe/webhook` does not exist
+    // and the kernel router is unchanged.
+    if let Some(b) = billing {
+        app = app.merge(crate::billing::billing_router(b));
     }
 
     app
@@ -2109,6 +2133,26 @@ mod tests {
             .await
             .expect("collect body");
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// The Stripe webhook route does not exist unless `with_billing` was called.
+    ///
+    /// This is the absence half of the env gate: with `SYNTHEOS_STRIPE_WEBHOOK_SECRET` unset,
+    /// `main.rs` never builds a `BillingState`, so an unauthenticated caller cannot reach the
+    /// billing surface at all -- it 404s rather than 400s.
+    #[tokio::test]
+    async fn billing_webhook_absent_without_billing_state() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/billing/stripe/webhook")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
