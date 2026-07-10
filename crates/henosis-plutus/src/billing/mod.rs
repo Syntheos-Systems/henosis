@@ -1,14 +1,20 @@
 //! Plutus billing surface (Story 6.4a): Stripe-facing billing primitives.
 //!
-//! [`signature`] verifies inbound Stripe webhook deliveries. This module also hosts the
-//! entitlement domain types that back `org.plan_tier`: [`Entitlement`] (a tier grant sourced
-//! from either a live Stripe subscription or a manual operator grant), [`EntitlementStatus`],
-//! [`EntitlementSource`], and [`BillingEventRecord`] (the idempotency-log row shape). The
-//! corresponding storage lives on `PlutusStore` in `crate::store`; this module owns only the
-//! pure data types and their text-form parsing, mirroring how `crate::quota` owns `QuotaTier`.
+//! [`signature`] verifies inbound Stripe webhook deliveries; [`pipeline`] then decides what a
+//! verified event means and applies it to an org's entitlement, tier, and quota. This module
+//! also hosts the entitlement domain types that back `org.plan_tier`: [`Entitlement`] (a tier
+//! grant sourced from either a live Stripe subscription or a manual operator grant),
+//! [`EntitlementStatus`], [`EntitlementSource`], and [`BillingEventRecord`] (the
+//! idempotency-log row shape). The corresponding storage lives on `PlutusStore` in
+//! `crate::store`; this module owns only the pure data types and their text-form parsing,
+//! mirroring how `crate::quota` owns `QuotaTier`.
 
+pub mod pipeline;
 pub mod signature;
 
+pub use pipeline::{
+    apply_decision, decide, parse_event, BillingDecision, BillingOutcome, DecideError, StripeEvent,
+};
 pub use signature::{verify_stripe_signature, SignatureError, DEFAULT_TOLERANCE_SECS};
 
 use std::fmt;

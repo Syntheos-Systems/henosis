@@ -32,12 +32,12 @@ sha2.workspace = true
 subtle.workspace = true
 # Stripe webhook signature verification: hex-decode the v1 values carried in the header.
 hex.workspace = true
+# Stripe webhook event pipeline: parse and route the event JSON Stripe posts to us.
+serde_json.workspace = true
 
 [dev-dependencies]
 # #[tokio::test] runtime for async store and gate tests.
 tokio = { workspace = true }
-# serde_json::json! macro for ToolInvocation args in gate tests.
-serde_json.workspace = true
 
 [features]
 # Exposes MockPolicyBackend and FrozenClock so external test modules (e.g. syntheos-server) can

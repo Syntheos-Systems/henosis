@@ -27,8 +27,9 @@ pub use backend::{OrgStatus, PolicyBackend};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use backend::MockPolicyBackend;
 pub use billing::{
-    verify_stripe_signature, BillingEventRecord, Entitlement, EntitlementSource,
-    EntitlementStatus, SignatureError, DEFAULT_TOLERANCE_SECS,
+    apply_decision, decide, parse_event, verify_stripe_signature, BillingDecision,
+    BillingEventRecord, BillingOutcome, DecideError, Entitlement, EntitlementSource,
+    EntitlementStatus, SignatureError, StripeEvent, DEFAULT_TOLERANCE_SECS,
 };
 pub use gate::{Clock, PlutusGate, WallClock};
 #[cfg(any(test, feature = "test-helpers"))]
