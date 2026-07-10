@@ -248,11 +248,18 @@ mod tests {
             score,
             confidence: 0.0,
             rationale: format!("{persona} {score}"),
+            // Every field is listed explicitly rather than spread from a default: this struct
+            // comes from the out-of-workspace `frameshift-orchestrator` path dependency, which
+            // has now grown fields twice (`context`, then `semantic`). It derives no `Default`,
+            // so an exhaustive literal is the only option -- and it makes the next upstream
+            // field a compile error here, which is exactly the signal we want.
             components: ScoreComponents {
                 language: 0.0,
                 lexical: 0.0,
                 intent: 0.0,
                 capability: 0.0,
+                context: 0.0,
+                semantic: 0.0,
             },
         }
     }
