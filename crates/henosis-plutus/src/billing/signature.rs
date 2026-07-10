@@ -152,17 +152,14 @@ pub fn verify_stripe_signature(
     // Tolerance check happens before any HMAC computation: an out-of-window timestamp is
     // rejected without spending time hashing the body. Use checked arithmetic throughout
     // so an absurd `t` (attacker-controlled) cannot overflow-panic on subtraction or abs.
-    let skew = match now.timestamp().checked_sub(parsed.timestamp) {
-        Some(diff) => match diff.checked_abs() {
-            Some(abs) => abs,
-            // diff == i64::MIN: abs() would itself overflow. An absurd t this far from
-            // `now` is certainly out of tolerance, so fail closed with a saturated skew.
-            None => i64::MAX,
-        },
-        // Subtraction overflowed (an absurd t near i64::MIN/MAX against a normal `now`).
-        // Fail closed rather than panic.
-        None => i64::MAX,
-    };
+    // Either step can overflow on an absurd, attacker-supplied `t`: the subtraction when `t`
+    // sits near i64::MIN/MAX, and `abs` when the difference is exactly i64::MIN. Both saturate
+    // to i64::MAX, which is certainly outside the tolerance window -- fail closed, never panic.
+    let skew = now
+        .timestamp()
+        .checked_sub(parsed.timestamp)
+        .and_then(i64::checked_abs)
+        .unwrap_or(i64::MAX);
     if skew > DEFAULT_TOLERANCE_SECS {
         return Err(SignatureError::TimestampOutOfTolerance { skew_secs: skew });
     }

@@ -19,6 +19,20 @@ use crate::quota::{QuotaConfig, QuotaDimension, QuotaOutcome, QuotaTier};
 use crate::rbac::Role;
 use crate::{PlutusError, Result};
 
+/// One `entitlement` row as sqlx decodes it, before it is parsed into an [`Entitlement`].
+///
+/// Named because the raw tuple (id, tenant_id, tier, source, subscription_id, status,
+/// period_end) is wide enough that clippy rightly refuses to read it inline.
+type EntitlementRow = (
+    i64,
+    Uuid,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
 /// The Postgres-backed policy store.
 ///
 /// Wraps a `PgPool` connection pool. Migrations are applied on `open`; subsequent calls
@@ -579,7 +593,7 @@ impl PlutusStore {
         &self,
         subscription_id: &str,
     ) -> Result<Option<Entitlement>> {
-        let row: Option<(i64, Uuid, String, String, Option<String>, String, Option<String>)> =
+        let row: Option<EntitlementRow> =
             sqlx::query_as(
                 r#"SELECT id, tenant_id, tier, source, stripe_subscription_id, status,
                           current_period_end
@@ -634,7 +648,7 @@ impl PolicyBackend for PlutusStore {
         match row {
             None => Ok(None),
             Some((s,)) => {
-                let status = OrgStatus::from_str(&s).map_err(|e| PlutusError::Store(e))?;
+                let status = OrgStatus::from_str(&s).map_err(PlutusError::Store)?;
                 Ok(Some(status))
             }
         }
