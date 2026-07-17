@@ -11,10 +11,24 @@ channel_id = "00000000-0000-0000-0000-000000000000"
 pause_poll_secs = 5
 
 [bridge]
-cooldown_secs = 30
-turn_budget = 5
-thread_ceiling = 30
+cooldown_secs = 30        # min seconds between two posts by the SAME agent
+turn_budget = 5           # max turns per agent per topic
+thread_ceiling = 30       # hard cap on total agent posts per topic
 context_window = 50
+# Compose slots (spec P1): each agent composes inside its own window
+# [slot_index * slot_width_ms, + slot_jitter_ms]. Jitter must stay below the
+# width or it is clamped -- overlapping windows are the bug this replaces.
+slot_width_ms = 6000
+slot_jitter_ms = 4000
+# Agent-to-agent conversation: max cascade rounds one inbound message can
+# trigger (budgets/ceiling/cooldown/consensus also bound each round).
+max_cascade_rounds = 8
+# Cross-agent echo suppression threshold (Jaccard token overlap, 0.0-1.0).
+echo_similarity_threshold = 0.5
+# Per-peer-response probability multiplier for non-addressed agents.
+peer_response_damp = 0.4
+# DEPRECATED: shared jitter range, replaced by the slot geometry above.
+# Still parsed so old configs load; no longer used.
 jitter_range_ms = [2000, 8000]
 
 # --- Agent definitions ---

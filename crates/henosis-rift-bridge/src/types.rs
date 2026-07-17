@@ -19,6 +19,7 @@ pub enum MessageType {
     System,
 }
 
+/// Implements the database string mapping for message types.
 impl MessageType {
     /// Database string representation.
     pub fn as_str(&self) -> &'static str {
@@ -61,16 +62,13 @@ pub struct AgentResponse {
     pub content: String,
 }
 
-/// Current state of an agent in the room.
+/// Current state of an agent in the room. Cooldown is not a state: it is
+/// enforced from each agent's last-post timestamp during round planning, so
+/// no sweep is needed to return agents to Idle.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentState {
     /// Ready to respond to messages.
     Idle,
     /// Currently generating a response.
     Thinking,
-    /// Cooling down after a recent post.
-    Cooldown {
-        /// When the cooldown expires.
-        until: DateTime<Utc>,
-    },
 }

@@ -3,6 +3,7 @@
 //! Provisions agent users in Rift from config and tracks their runtime state.
 
 use std::collections::HashMap;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::config::AgentConfig;
@@ -27,8 +28,14 @@ pub struct RegisteredAgent {
     pub system_prompt: String,
     /// Current runtime state.
     pub state: AgentState,
-    /// Number of turns this agent has taken in the current topic.
-    pub turns_in_topic: u32,
+    /// Stable position in the config roster; derives this agent's compose
+    /// slot so its timing window never overlaps another agent's (spec P1).
+    pub slot_index: usize,
+    /// Room turn at which this agent last posted (None = never posted).
+    /// Feeds true turns-since-last-post recency (fixes finding N1).
+    pub last_posted_turn: Option<u64>,
+    /// Wall-clock instant of this agent's last post, for cooldown pacing.
+    pub last_post_at: Option<Instant>,
 }
 
 /// Manages the pool of agent users in Rift.
@@ -47,7 +54,7 @@ impl AgentRoster {
     ) -> Result<Self, BridgeError> {
         let mut agents = HashMap::new();
 
-        for config in configs {
+        for (slot_index, config) in configs.iter().enumerate() {
             // Deterministic password derived from username.
             // Agents never authenticate themselves -- the bridge issues tokens.
             let password = format!("agent-internal-{}", config.username);
@@ -73,12 +80,23 @@ impl AgentRoster {
                     base_chance: config.base_chance,
                     system_prompt: config.system_prompt.clone(),
                     state: AgentState::Idle,
-                    turns_in_topic: 0,
+                    slot_index,
+                    last_posted_turn: None,
+                    last_post_at: None,
                 },
             );
         }
 
         Ok(Self { agents })
+    }
+
+    /// Test-only constructor building a roster from pre-made agents without
+    /// touching the Rift network.
+    #[cfg(test)]
+    pub(crate) fn from_agents(agents: Vec<RegisteredAgent>) -> Self {
+        Self {
+            agents: agents.into_iter().map(|a| (a.id, a)).collect(),
+        }
     }
 
     /// Iterate over all registered agents.
@@ -145,7 +163,9 @@ mod tests {
                 base_chance: 0.3,
                 system_prompt: "You are a reviewer.".to_string(),
                 state: AgentState::Idle,
-                turns_in_topic: 0,
+                slot_index: 0,
+                last_posted_turn: None,
+                last_post_at: None,
             },
         );
 

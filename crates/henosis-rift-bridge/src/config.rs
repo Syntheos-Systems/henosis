@@ -90,7 +90,8 @@ pub struct RiftConfig {
 /// Bridge daemon settings.
 #[derive(Debug, Deserialize)]
 pub struct BridgeDaemonConfig {
-    /// Minimum delay between agent posts in seconds.
+    /// Minimum seconds between two posts by the SAME agent (hard pacing
+    /// floor, enforced during round planning).
     pub cooldown_secs: u64,
     /// Maximum turns per agent per topic before budget exhaustion.
     pub turn_budget: u32,
@@ -98,8 +99,62 @@ pub struct BridgeDaemonConfig {
     pub thread_ceiling: u32,
     /// Number of recent messages to include in context.
     pub context_window: usize,
-    /// Delay range for jittered response timing (min_ms, max_ms).
+    /// DEPRECATED (spec F2): the shared jitter range guaranteed compose
+    /// collisions. Parsed for config compatibility, no longer used; slot
+    /// geometry below replaces it.
+    #[serde(default = "default_jitter_range_ms")]
     pub jitter_range_ms: (u64, u64),
+    /// Width of each agent's compose slot in milliseconds (spec P1).
+    #[serde(default = "default_slot_width_ms")]
+    pub slot_width_ms: u64,
+    /// Jitter drawn inside an agent's own slot, in milliseconds. Must stay
+    /// below `slot_width_ms`; the turn manager clamps it if not.
+    #[serde(default = "default_slot_jitter_ms")]
+    pub slot_jitter_ms: u64,
+    /// Maximum agent-to-agent cascade rounds a single inbound message may
+    /// trigger (each round is bounded by budgets and the thread ceiling).
+    #[serde(default = "default_max_cascade_rounds")]
+    pub max_cascade_rounds: u32,
+    /// Token-overlap similarity at or above which a candidate response is
+    /// suppressed as a cross-agent echo (spec P3).
+    #[serde(default = "default_echo_similarity_threshold")]
+    pub echo_similarity_threshold: f64,
+    /// Per-peer-response probability multiplier for agents not directly
+    /// addressed (spec P2).
+    #[serde(default = "default_peer_response_damp")]
+    pub peer_response_damp: f64,
+}
+
+/// Default legacy jitter range (unused at runtime, kept for parse compatibility).
+fn default_jitter_range_ms() -> (u64, u64) {
+    (2000, 8000)
+}
+
+/// Default compose slot width: mirrors the botcore production fix
+/// (6-second cascading windows).
+fn default_slot_width_ms() -> u64 {
+    6000
+}
+
+/// Default in-slot jitter: 4s of natural feel inside a 6s window, leaving a
+/// 2s guard gap between consecutive slots.
+fn default_slot_jitter_ms() -> u64 {
+    4000
+}
+
+/// Default cascade round cap per inbound message.
+fn default_max_cascade_rounds() -> u32 {
+    8
+}
+
+/// Default echo suppression threshold (Jaccard over content tokens).
+fn default_echo_similarity_threshold() -> f64 {
+    0.5
+}
+
+/// Default peer-response damping multiplier.
+fn default_peer_response_damp() -> f64 {
+    0.4
 }
 
 /// Provides default daemon settings used when callers construct configs programmatically.
@@ -111,7 +166,12 @@ impl Default for BridgeDaemonConfig {
             turn_budget: 5,
             thread_ceiling: 30,
             context_window: 50,
-            jitter_range_ms: (2000, 8000),
+            jitter_range_ms: default_jitter_range_ms(),
+            slot_width_ms: default_slot_width_ms(),
+            slot_jitter_ms: default_slot_jitter_ms(),
+            max_cascade_rounds: default_max_cascade_rounds(),
+            echo_similarity_threshold: default_echo_similarity_threshold(),
+            peer_response_damp: default_peer_response_damp(),
         }
     }
 }
@@ -332,5 +392,11 @@ mod tests {
         assert!(config.execution.is_none());
         assert!(config.pistis.is_none());
         assert!(config.control.is_none());
+        // Legacy configs predate the slot/cascade/echo knobs: defaults apply.
+        assert_eq!(config.bridge.slot_width_ms, 6000);
+        assert_eq!(config.bridge.slot_jitter_ms, 4000);
+        assert_eq!(config.bridge.max_cascade_rounds, 8);
+        assert!((config.bridge.echo_similarity_threshold - 0.5).abs() < 1e-9);
+        assert!((config.bridge.peer_response_damp - 0.4).abs() < 1e-9);
     }
 }

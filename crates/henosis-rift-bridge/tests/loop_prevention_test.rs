@@ -56,20 +56,27 @@ fn test_agreement_tracking() {
     assert!(guard.has_consensus());
 }
 
-/// Verifies explicit pass markers are detected without matching normal prose.
+/// Verifies pass markers are anchored to the first non-empty line (spec P5).
+/// A trailing or mid-prose [PASS] no longer counts: bare substring matching
+/// was finding F6, the bug class behind botcore's isNoReply incident.
 #[test]
 fn test_pass_detection() {
     let guard = LoopGuard::new(5, 30);
     assert!(guard.is_pass("[PASS]"));
-    assert!(guard.is_pass("I don't have anything to add. [PASS]"));
+    assert!(guard.is_pass("[PASS] nothing to add"));
+    assert!(!guard.is_pass("I don't have anything to add. [PASS]"));
     assert!(!guard.is_pass("I think we should pass on this feature"));
+    assert!(!guard.is_pass("should I emit [PASS] here?"));
 }
 
-/// Verifies explicit agreement markers are detected without matching normal prose.
+/// Verifies agreement markers count only at a line start (spec P5), so an
+/// agent discussing the protocol does not accidentally vote.
 #[test]
 fn test_agree_detection() {
     let guard = LoopGuard::new(5, 30);
     assert!(guard.contains_agreement("[AGREE] That sounds right."));
-    assert!(guard.contains_agreement("I think so too [AGREE]"));
+    assert!(guard.contains_agreement("Solid plan overall.\n[AGREE] shipping it."));
+    assert!(!guard.contains_agreement("I think so too [AGREE]"));
     assert!(!guard.contains_agreement("I don't agree with that"));
+    assert!(!guard.contains_agreement("should I emit [AGREE] here?"));
 }
