@@ -119,3 +119,29 @@ auth_token = "set-me"   # require: Authorization: Bearer set-me
 # growth_root = "/path/to/rift/growth"
 # max_same_persona = 2
 # challenger_slot = true
+
+# Optional OpenAI-compatible embeddings endpoint. When present, echo
+# suppression uses cosine similarity (catches paraphrased echoes token
+# overlap misses) and exhausted topics damp semantically similar re-triggers.
+# Absent = token-overlap detection only. Works with OpenAI, TEI, and Ollama.
+# [embedding]
+# url = "http://127.0.0.1:11434/v1/embeddings"
+# model = "bge-m3"
+# api_key_env = "EMBEDDING_API_KEY"   # env var holding the bearer token; omit for local endpoints
+# semantic_threshold = 0.85           # cosine at/above which a candidate is an echo
+# reignition_threshold = 0.85         # cosine at/above which a trigger reignites an exhausted topic
+# reignition_damp = 0.3               # engagement multiplier on reignited topics (1.0 disables)
+# reignition_ttl_secs = 21600         # how long an exhausted topic stays live (6h)
+
+# Optional stimulus injector: wakes the room with project signals instead of
+# waiting for a human. Sources: scheduled reflection after inactivity, Chiasm
+# active-task changes, and git HEAD movement in the declared [[workspaces]].
+# Stimuli are announced as "[STIMULUS] ..." posts, sanitized, per-source
+# cooled down, and globally rate capped. Omit (or enabled = false) to disable.
+# [stimulus]
+# enabled = true
+# poll_secs = 60                # seconds between source polls
+# reflection_after_secs = 14400 # room inactivity before a reflection prompt (4h)
+# chiasm_cooldown_secs = 900    # min spacing between task-change stimuli
+# git_cooldown_secs = 300       # min spacing between commit stimuli
+# max_per_hour = 6              # global cap across all stimulus kinds

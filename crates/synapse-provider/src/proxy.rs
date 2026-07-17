@@ -193,20 +193,34 @@ pub(crate) fn build_request_with(req: &ChatRequest, max_completion_tokens: bool)
             });
         }
     }
-    // Convert Anthropic-format tool schemas to OpenAI format.
-    // Anthropic: { name, description, input_schema }
-    // OpenAI:    { type: "function", function: { name, description, parameters } }
+    // Convert flat tool schemas to OpenAI format.
+    // Anthropic shape:        { name, description, input_schema }
+    // Flattened OpenAI shape: { name, description, parameters }
+    //
+    // Both reach here (callers that unwrap OpenAI `{type:"function",..}` tools
+    // keep the key `parameters`). Reading only `input_schema` silently
+    // substituted an empty `{}`, which strict validators (DeepSeek) reject
+    // outright -- the 2026-07-16 silent-bots incident. Accept either key, and
+    // fall back to a VALID empty object schema, never bare `{}`.
     let tools = req.tools.as_ref().map(|tools| {
-        tools.iter().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.get("name").cloned().unwrap_or_default(),
-                    "description": t.get("description").cloned().unwrap_or_default(),
-                    "parameters": t.get("input_schema").cloned().unwrap_or(Value::Object(Default::default())),
-                }
+        tools
+            .iter()
+            .map(|t| {
+                let schema = t
+                    .get("input_schema")
+                    .or_else(|| t.get("parameters"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name").cloned().unwrap_or_default(),
+                        "description": t.get("description").cloned().unwrap_or_default(),
+                        "parameters": schema,
+                    }
+                })
             })
-        }).collect::<Vec<_>>()
+            .collect::<Vec<_>>()
     });
 
     OaiRequest {
@@ -431,6 +445,71 @@ mod tests {
         assert_eq!(oai.messages[0].content.as_deref(), Some("hello"));
         assert!(oai.messages[0].tool_calls.is_none());
         assert!(oai.messages[0].tool_call_id.is_none());
+    }
+
+    /// A tool carrying OpenAI's `parameters` key (rather than Anthropic's
+    /// `input_schema`) must keep its schema on the wire: reading only
+    /// `input_schema` emitted an empty `{}` and strict validators (DeepSeek)
+    /// rejected the whole request, silencing every tool-carrying caller.
+    #[test]
+    fn build_request_keeps_schema_from_flattened_openai_tool() {
+        let mut req = make_request(vec![ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }]);
+        req.tools = Some(vec![json!({
+            "name": "search_memory",
+            "description": "Search long-term memory.",
+            "parameters": {
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            },
+        })]);
+
+        let oai = build_request(&req);
+        let params = &oai.tools.as_ref().expect("tools present")[0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["query"]["type"], "string");
+        assert_eq!(params["required"][0], "query");
+    }
+
+    /// Anthropic-native callers supply `input_schema`; that path must keep
+    /// working unchanged.
+    #[test]
+    fn build_request_keeps_schema_from_anthropic_tool() {
+        let mut req = make_request(vec![ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }]);
+        req.tools = Some(vec![json!({
+            "name": "store_memory",
+            "description": "Save a fact.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "content": { "type": "string" } },
+            },
+        })]);
+
+        let oai = build_request(&req);
+        let params = &oai.tools.as_ref().expect("tools present")[0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["content"]["type"], "string");
+    }
+
+    /// With neither key present, emit a VALID empty schema rather than `{}`,
+    /// which strict validators reject.
+    #[test]
+    fn build_request_schemaless_tool_still_valid() {
+        let mut req = make_request(vec![ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }]);
+        req.tools = Some(vec![json!({ "name": "ping", "description": "ping" })]);
+
+        let oai = build_request(&req);
+        let params = &oai.tools.as_ref().expect("tools present")[0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
     }
 
     #[test]

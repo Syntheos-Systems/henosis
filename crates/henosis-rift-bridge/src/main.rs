@@ -6,13 +6,17 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use henosis_rift_bridge::auth::AgentAuthManager;
 use henosis_rift_bridge::capability::{PistisOracle, StaticAllowlistOracle};
-use henosis_rift_bridge::config::BridgeConfig;
+use henosis_rift_bridge::config::{BridgeConfig, EmbeddingConfig};
+use henosis_rift_bridge::embedding::{Embedder, OpenAiEmbedder};
 use henosis_rift_bridge::execution::approval::ApprovalRegistry;
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
+use henosis_rift_bridge::stimulus::{
+    ChiasmTaskSource, GitHeadSource, ReflectionSource, Stimulus, StimulusInjector, StimulusSource,
+};
 
 use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use henosis_rift_bridge::room::Room;
@@ -63,8 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let approval_registry = ApprovalRegistry::new(approval_ttl_secs);
     let sandbox_manager = Arc::new(SandboxManager::new(worktrees_root, max_runtime_secs));
 
-    // Channel carrying control-server approvals to the event loop.
-    let (approved_tx, mut approved_rx) =
+    // Channel carrying control-server approvals to the drain task.
+    let (approved_tx, approved_rx) =
         mpsc::channel::<henosis_rift_bridge::execution::PendingProposal>(64);
 
     // Optionally spawn the HTTP control server (shares the approval registry).
@@ -80,12 +84,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keep the original sender alive so `approved_rx` never sees all senders dropped.
     let _approved_tx = approved_tx;
 
+    // Optional embedding endpoint: powers semantic echo suppression and
+    // topic-reignition damping. Absent = token-overlap detection only.
+    let (embedder, embedding_cfg) = build_embedder(&config.embedding);
+
+    // Stimulus wiring needs pieces that move into the room below.
+    let stimulus_settings = config.stimulus.clone();
+    let workspace_paths: Vec<(String, PathBuf)> = config
+        .workspaces
+        .iter()
+        .map(|w| (w.name.clone(), w.path.clone()))
+        .collect();
+
     // Create room (provisions agent users in Rift).
     let mut room = Room::new(
         &config.agents,
         config.bridge,
         rift.clone(),
-        kleos,
+        kleos.clone(),
         "rift".to_string(),
         config.rift.channel_id,
         oracle,
@@ -94,6 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sandbox_manager,
         max_concurrent,
         config.personas,
+        embedder,
+        embedding_cfg,
     )
     .await?;
 
@@ -118,13 +136,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_listen(ws_url, ws_token, server_ids, event_tx).await;
     });
 
-    // Pause check interval.
+    // Pause state as a watch channel: one poller task owns the HTTP check;
+    // the event loop, cascades, approval drain, and stimulus injector all
+    // read (and react to) the same state without polling Rift themselves.
     let pause_interval = std::time::Duration::from_secs(config.rift.pause_poll_secs.unwrap_or(5));
-    let mut paused = false;
+    let (pause_tx, pause_rx) = watch::channel(false);
+    {
+        let rift = rift.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(pause_interval).await;
+                match rift.is_paused().await {
+                    Ok(p) => {
+                        // Send only on transitions: watch::Sender::send marks
+                        // the value changed unconditionally, and an
+                        // every-poll send would wake every changed() waiter
+                        // (slot waits, the approvals drain) each cycle.
+                        if *pause_tx.borrow() != p {
+                            tracing::info!("bridge paused state changed: {p}");
+                            if pause_tx.send(p).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to check pause status: {e}"),
+                }
+            }
+        });
+    }
+
+    let dispatcher = room.dispatcher();
+
+    // Approvals drain task: dispatches control-server approvals the moment
+    // they arrive, cascade or no cascade. While paused, approvals are HELD
+    // and dispatched on unpause -- the old loop silently dropped them.
+    // KNOWN LIMITATION: a held proposal left the registry when it was
+    // approved, so it is invisible to /control/approvals and cannot be
+    // rejected until it dispatches; holding beats the old silent drop, and
+    // making holds observable needs a registry re-insert API (future work).
+    {
+        let dispatcher = dispatcher.clone();
+        let mut pause_rx = pause_rx.clone();
+        let mut approved_rx = approved_rx;
+        tokio::spawn(async move {
+            let mut held: Vec<henosis_rift_bridge::execution::PendingProposal> = Vec::new();
+            loop {
+                tokio::select! {
+                    maybe = approved_rx.recv() => match maybe {
+                        Some(proposal) => {
+                            if *pause_rx.borrow() {
+                                tracing::info!("bridge paused, holding approval {}", proposal.id);
+                                held.push(proposal);
+                            } else {
+                                dispatcher.execute_approved(proposal);
+                            }
+                        }
+                        None => return,
+                    },
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        if !*pause_rx.borrow() {
+                            for proposal in held.drain(..) {
+                                tracing::info!("dispatching held approval {}", proposal.id);
+                                dispatcher.execute_approved(proposal);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Expired-approval sweep task (was inline in the old event loop).
+    {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(pause_interval).await;
+                dispatcher.sweep_expired_approvals().await;
+            }
+        });
+    }
+
+    // Room-activity watch feeding the stimulus injector's reflection timer.
+    let (activity_tx, activity_rx) = watch::channel(std::time::Instant::now());
+
+    // Stimulus channel into the event loop. The keepalive clone means recv()
+    // never yields None when the injector is disabled or stops.
+    let (stim_tx, mut stim_rx) = mpsc::channel::<Stimulus>(16);
+    let _stim_keepalive = stim_tx.clone();
+    if let Some(settings) = stimulus_settings.filter(|s| s.enabled) {
+        let mut sources: Vec<Box<dyn StimulusSource>> = vec![
+            Box::new(ReflectionSource::new(std::time::Duration::from_secs(
+                settings.reflection_after_secs,
+            ))),
+            Box::new(ChiasmTaskSource::new(kleos.clone(), "rift".to_string())),
+        ];
+        if !workspace_paths.is_empty() {
+            sources.push(Box::new(GitHeadSource::new(workspace_paths)));
+        }
+        let injector = StimulusInjector::new(
+            &settings,
+            sources,
+            stim_tx,
+            activity_rx,
+            pause_rx.clone(),
+        );
+        tokio::spawn(injector.run());
+        tracing::info!("stimulus injector running");
+    }
+
+    // Cascades borrow their own pause receiver so slot waits can watch it.
+    let mut cascade_pause_rx = pause_rx.clone();
 
     tracing::info!("bridge is running");
 
-    // Main event loop: select between WS events and pause polling.
+    // Main event loop: WS events and stimuli. Approvals, pause polling, and
+    // expiry sweeps live on their own tasks, so a long conversation cascade
+    // no longer delays any of them; cascades themselves stay responsive via
+    // the event receiver and pause watch passed into handle_message.
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
@@ -133,36 +265,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tracing::info!("WebSocket ready");
                     }
                     RiftWsEvent::MessageCreate(msg) => {
-                        if paused {
+                        let _ = activity_tx.send(std::time::Instant::now());
+                        if *pause_rx.borrow() {
                             tracing::debug!("bridge paused, ignoring message");
                             continue;
                         }
-                        if let Err(e) = room.handle_message(msg).await {
+                        if let Err(e) = room
+                            .handle_message(msg, &mut event_rx, &mut cascade_pause_rx)
+                            .await
+                        {
                             tracing::error!("error handling message: {e}");
                         }
+                        // A cascade consumes events internally for its whole
+                        // duration; stamp activity again at its end so the
+                        // reflection idle timer never runs on a timestamp
+                        // from before a long conversation.
+                        let _ = activity_tx.send(std::time::Instant::now());
                     }
                     RiftWsEvent::Disconnected => {
                         tracing::warn!("WebSocket disconnected, will reconnect");
                     }
                 }
             }
-            Some(proposal) = approved_rx.recv() => {
-                if !paused {
-                    room.execute_approved(proposal).await;
+            Some(stim) = stim_rx.recv() => {
+                if *pause_rx.borrow() {
+                    tracing::debug!("bridge paused, dropping stimulus");
+                    continue;
                 }
+                tracing::info!("injecting {} stimulus", stim.kind.as_str());
+                let _ = activity_tx.send(std::time::Instant::now());
+                if let Err(e) = room
+                    .handle_stimulus(stim, &mut event_rx, &mut cascade_pause_rx)
+                    .await
+                {
+                    tracing::error!("error handling stimulus: {e}");
+                }
+                // Same end-of-cascade stamp as the message arm.
+                let _ = activity_tx.send(std::time::Instant::now());
             }
-            _ = tokio::time::sleep(pause_interval) => {
-                room.sweep_expired_approvals().await;
-                match rift.is_paused().await {
-                    Ok(p) => {
-                        if p != paused {
-                            paused = p;
-                            tracing::info!("bridge paused state changed: {paused}");
-                        }
+        }
+    }
+}
+
+/// Build the optional embedder from config: resolve the API key env var if
+/// named, and log which detection tier the bridge runs with.
+fn build_embedder(
+    config: &Option<EmbeddingConfig>,
+) -> (Option<Arc<dyn Embedder>>, Option<EmbeddingConfig>) {
+    match config {
+        Some(cfg) => {
+            let api_key = match &cfg.api_key_env {
+                Some(var) => match std::env::var(var) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        tracing::warn!(
+                            "embedding api_key_env {var} is not set; calling endpoint without auth"
+                        );
+                        None
                     }
-                    Err(e) => tracing::warn!("failed to check pause status: {e}"),
-                }
-            }
+                },
+                None => None,
+            };
+            tracing::info!(
+                "semantic echo/loop detection enabled via {} ({})",
+                cfg.url,
+                cfg.model
+            );
+            (
+                Some(Arc::new(OpenAiEmbedder::new(
+                    cfg.url.clone(),
+                    cfg.model.clone(),
+                    api_key,
+                ))),
+                Some(cfg.clone()),
+            )
+        }
+        None => {
+            tracing::info!("no embedding endpoint configured; echo detection is token-overlap only");
+            (None, None)
         }
     }
 }

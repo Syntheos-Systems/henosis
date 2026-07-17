@@ -68,6 +68,19 @@ pub fn build_synapse_executor(
             ProviderConfig::Anthropic { api_key: key }
         }
         "anthropic-auto" => ProviderConfig::AnthropicAuto,
+        // Generic OpenAI-compatible endpoint (DeepSeek, TEI-fronted models,
+        // vLLM, ...): `host` is the base URL, key from config or env. This is
+        // the cheap-agent path for live room testing.
+        "proxy" | "openai" => {
+            let base_url = host.context("proxy provider requires 'host' (the base URL)")?;
+            let key = api_key
+                .or_else(|| std::env::var("SYNAPSE_PROXY_KEY").ok())
+                .context("proxy provider requires 'api_key' or SYNAPSE_PROXY_KEY env var")?;
+            ProviderConfig::Proxy {
+                base_url,
+                api_key: key,
+            }
+        }
         other => bail!("unknown provider type: {other}"),
     };
 

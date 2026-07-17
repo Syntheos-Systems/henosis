@@ -34,6 +34,107 @@ pub struct BridgeConfig {
     /// standalone HTTP client; present with in_process=true backs the bridge's
     /// coordination with the in-process henosis kernel stores.
     pub kleos: Option<KleosBackendConfig>,
+    /// Optional embedding endpoint for semantic echo/loop detection.
+    /// Absent = token-overlap detection only (the pre-embedding behavior).
+    pub embedding: Option<EmbeddingConfig>,
+    /// Optional stimulus injector settings. Absent (or enabled=false)
+    /// disables injection entirely.
+    pub stimulus: Option<StimulusSettings>,
+}
+
+/// OpenAI-compatible embeddings endpoint powering the semantic tier of echo
+/// suppression and topic-reignition damping (design spec P4 closing; parent
+/// design memory 27272).
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmbeddingConfig {
+    /// Full endpoint URL (e.g. `http://127.0.0.1:11434/v1/embeddings`).
+    pub url: String,
+    /// Model identifier passed to the endpoint.
+    pub model: String,
+    /// Name of the environment variable holding the bearer token, if the
+    /// endpoint needs one. Local TEI/Ollama endpoints typically do not.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Cosine similarity at or above which a candidate response is an echo
+    /// of a recent peer post (parent design: 0.85).
+    #[serde(default = "default_semantic_threshold")]
+    pub semantic_threshold: f64,
+    /// Cosine similarity at or above which a fresh trigger counts as
+    /// reigniting a recently exhausted topic.
+    #[serde(default = "default_semantic_threshold")]
+    pub reignition_threshold: f64,
+    /// Engagement multiplier applied to every agent while a cascade runs on
+    /// a reignited topic (1.0 disables damping).
+    #[serde(default = "default_reignition_damp")]
+    pub reignition_damp: f64,
+    /// Seconds an exhausted topic stays live for reignition matching.
+    #[serde(default = "default_reignition_ttl_secs")]
+    pub reignition_ttl_secs: u64,
+}
+
+/// Default cosine threshold for both echo and reignition matching.
+fn default_semantic_threshold() -> f64 {
+    0.85
+}
+
+/// Default reignition engagement damp.
+fn default_reignition_damp() -> f64 {
+    0.3
+}
+
+/// Default lifetime of an exhausted-topic record (6 hours).
+fn default_reignition_ttl_secs() -> u64 {
+    21600
+}
+
+/// Stimulus injector settings (parent design memory 27272: scheduled
+/// reflection, project signals, per-type cooldowns, rate limiting).
+#[derive(Debug, Deserialize, Clone)]
+pub struct StimulusSettings {
+    /// Master switch; false keeps the injector fully absent.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between source poll cycles.
+    #[serde(default = "default_stimulus_poll_secs")]
+    pub poll_secs: u64,
+    /// Room inactivity in seconds before a reflection prompt fires; also the
+    /// reflection refire cooldown (parent design: 4 hours).
+    #[serde(default = "default_reflection_after_secs")]
+    pub reflection_after_secs: u64,
+    /// Minimum seconds between two Chiasm task-change stimuli.
+    #[serde(default = "default_chiasm_cooldown_secs")]
+    pub chiasm_cooldown_secs: u64,
+    /// Minimum seconds between two git commit stimuli.
+    #[serde(default = "default_git_cooldown_secs")]
+    pub git_cooldown_secs: u64,
+    /// Global cap on stimuli per rolling hour, across all kinds.
+    #[serde(default = "default_stimulus_max_per_hour")]
+    pub max_per_hour: u32,
+}
+
+/// Default seconds between stimulus poll cycles.
+fn default_stimulus_poll_secs() -> u64 {
+    60
+}
+
+/// Default reflection inactivity window (4 hours, parent design).
+fn default_reflection_after_secs() -> u64 {
+    14400
+}
+
+/// Default Chiasm stimulus cooldown (15 minutes).
+fn default_chiasm_cooldown_secs() -> u64 {
+    900
+}
+
+/// Default git stimulus cooldown (5 minutes).
+fn default_git_cooldown_secs() -> u64 {
+    300
+}
+
+/// Default global stimulus rate cap per hour.
+fn default_stimulus_max_per_hour() -> u32 {
+    6
 }
 
 /// Room-level Frameshift persona allocation settings.
@@ -398,5 +499,59 @@ mod tests {
         assert_eq!(config.bridge.max_cascade_rounds, 8);
         assert!((config.bridge.echo_similarity_threshold - 0.5).abs() < 1e-9);
         assert!((config.bridge.peer_response_damp - 0.4).abs() < 1e-9);
+        // Legacy configs also predate the embedding and stimulus blocks:
+        // both must stay absent, preserving pre-embedding behavior.
+        assert!(config.embedding.is_none());
+        assert!(config.stimulus.is_none());
+    }
+
+    /// Verifies the embedding and stimulus blocks parse with defaults filled.
+    #[test]
+    fn test_embedding_and_stimulus_blocks_parse() {
+        let toml = r#"
+            [rift]
+            api_url = "http://localhost:3200"
+            ws_url = "ws://localhost:3200/ws"
+            jwt_secret = "secret"
+            server_id = "00000000-0000-0000-0000-000000000001"
+            channel_id = "00000000-0000-0000-0000-000000000002"
+
+            [bridge]
+            cooldown_secs = 30
+            turn_budget = 5
+            thread_ceiling = 30
+            context_window = 50
+
+            [embedding]
+            url = "http://127.0.0.1:11434/v1/embeddings"
+            model = "bge-m3"
+
+            [stimulus]
+            enabled = true
+            poll_secs = 30
+
+            [[agents]]
+            name = "Architect"
+            username = "architect"
+            base_chance = 0.5
+            system_prompt = "You are an architect."
+            executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+        "#;
+
+        let config: BridgeConfig = toml::from_str(toml).expect("config should parse");
+        let emb = config.embedding.expect("embedding block");
+        assert_eq!(emb.model, "bge-m3");
+        assert!(emb.api_key_env.is_none());
+        assert!((emb.semantic_threshold - 0.85).abs() < 1e-9);
+        assert!((emb.reignition_threshold - 0.85).abs() < 1e-9);
+        assert!((emb.reignition_damp - 0.3).abs() < 1e-9);
+        assert_eq!(emb.reignition_ttl_secs, 21600);
+        let stim = config.stimulus.expect("stimulus block");
+        assert!(stim.enabled);
+        assert_eq!(stim.poll_secs, 30);
+        assert_eq!(stim.reflection_after_secs, 14400);
+        assert_eq!(stim.chiasm_cooldown_secs, 900);
+        assert_eq!(stim.git_cooldown_secs, 300);
+        assert_eq!(stim.max_per_hour, 6);
     }
 }

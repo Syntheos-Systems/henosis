@@ -1,5 +1,7 @@
 //! Rift agent bridge library.
 
+/// Approval dispatch decoupled from room state (immediate execution).
+pub mod approval_dispatch;
 /// Agent JWT issuance for Rift API calls.
 pub mod auth;
 /// Capability oracles gating execution proposals.
@@ -10,8 +12,10 @@ pub mod config;
 pub mod context;
 /// HTTP control server (approval endpoint).
 pub mod control;
-/// Cross-agent echo suppression (token-overlap similarity).
+/// Cross-agent echo suppression (token-overlap and embedding tiers).
 pub mod echo;
+/// Optional text-embedding capability (semantic echo/loop detection).
+pub mod embedding;
 /// Probabilistic engagement engine.
 pub mod engagement;
 /// Bridge error types.
@@ -30,6 +34,8 @@ pub mod loop_prevention;
 pub mod rift_client;
 /// Room state machine driving the conversation cascade.
 pub mod room;
+/// Stimulus injection (reflection, task, and git signals).
+pub mod stimulus;
 /// Per-agent growth file store.
 pub mod growth;
 /// Bridge tenant and principal identity helpers.

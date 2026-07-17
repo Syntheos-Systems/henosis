@@ -14,12 +14,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
+use crate::approval_dispatch::ApprovalDispatcher;
 use crate::capability::CapabilityOracle;
-use crate::config::{AgentConfig, BridgeDaemonConfig, ExecutorConfig, PersonaSettings, WorkspaceConfig};
+use crate::config::{
+    AgentConfig, BridgeDaemonConfig, EmbeddingConfig, ExecutorConfig, PersonaSettings,
+    WorkspaceConfig,
+};
 use crate::context::build_discussion_context;
-use crate::echo;
+use crate::echo::EchoDetector;
+use crate::embedding::{cosine, Embedder};
 use crate::engagement::{EngagementEngine, EngagementInputs};
 use crate::growth::GrowthStore;
 use crate::persona_alloc::{PersonaAllocator, PersonaAssignment};
@@ -28,16 +34,16 @@ use crate::error::BridgeError;
 use crate::execution::approval::ApprovalRegistry;
 use crate::execution::command::{parse_control_command, ControlCommand};
 use crate::execution::coordinator::ProposalCoordinator;
-use crate::execution::preflight::{apply_runtime_policy, health_preflight, Preflight};
-use crate::execution::sandbox::{resolve_workspace, SandboxManager};
-use crate::execution::supervisor::{ExecutionSupervisor, SupervisedTask};
-use crate::execution::{PendingProposal, RiftRoomNotifier, RoomNotifier};
+use crate::execution::sandbox::SandboxManager;
+use crate::execution::supervisor::ExecutionSupervisor;
+use crate::execution::{RiftRoomNotifier, RoomNotifier};
 use crate::executor::{AgentExecutor, DiscussionContext};
 use crate::executors::{build_synapse_executor, ClaudeCodeExecutor};
 use crate::kleos::KleosClient;
 use crate::loop_prevention::LoopGuard;
-use crate::rift_client::RiftRestClient;
+use crate::rift_client::{RiftRestClient, RiftWsEvent};
 use crate::roster::AgentRoster;
+use crate::stimulus::Stimulus;
 use crate::turn_manager::TurnManager;
 use crate::types::{AgentId, AgentState, RoomMessage};
 use serde_json::json;
@@ -70,16 +76,9 @@ pub struct Room {
     approval_registry: ApprovalRegistry,
     /// Routes proposals through capability checking and approval registration.
     coordinator: Arc<ProposalCoordinator>,
-    /// Supervises approved execution sessions.
-    supervisor: Arc<ExecutionSupervisor>,
-    /// Creates per-task git worktrees.
-    sandbox_manager: Arc<SandboxManager>,
-    /// Declared workspaces for execution.
-    workspaces: Arc<Vec<WorkspaceConfig>>,
-    /// Bounds simultaneous execution sessions.
-    exec_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Executors keyed by agent username (for execution dispatch).
-    executors_by_username: HashMap<String, Arc<dyn AgentExecutor>>,
+    /// Dispatches approved proposals into supervised sessions. Shared with
+    /// the control-server drain task; dispatch never blocks on room state.
+    dispatcher: ApprovalDispatcher,
     /// Thread-stable persona assignment per agent (empty when personas disabled).
     personas: HashMap<AgentId, PersonaAssignment>,
     /// Per-agent growth file store (None when personas disabled).
@@ -93,6 +92,36 @@ pub struct Room {
     /// question it answers suppresses legitimate confirming answers
     /// (adversarial review finding, 2026-07-17).
     recent_posts: VecDeque<(AgentId, String)>,
+    /// Two-tier echo detector (embedding when configured, token overlap
+    /// otherwise) applied to candidates before posting.
+    echo_detector: EchoDetector,
+    /// Optional embedder shared with topic-reignition checks.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Embedding-tier thresholds and reignition knobs (None when no
+    /// embedding endpoint is configured).
+    embedding_cfg: Option<EmbeddingConfig>,
+    /// Embeddings of recently exhausted topics (ceiling or consensus), with
+    /// their exhaustion times. Fresh triggers matching one get damped
+    /// engagement (parent design: topic exhaustion memory).
+    exhausted_topics: Vec<(Vec<f32>, std::time::Instant)>,
+    /// Engagement multiplier for the cascade currently running: 1.0
+    /// normally, `reignition_damp` while the topic reignites an exhausted
+    /// one. Directly addressed agents are immune.
+    reignition_damp_active: f64,
+}
+
+/// Maximum exhausted-topic embeddings retained for reignition matching.
+const EXHAUSTED_TOPICS_CAP: usize = 8;
+
+/// How a slot wait ended: the slot arrived, a fresh human message
+/// interrupted, or the operator paused the bridge.
+enum SlotOutcome {
+    /// The compose slot arrived; proceed with this agent.
+    Proceed,
+    /// A fresh non-agent message arrived: it becomes the new topic seed.
+    Interrupted(RoomMessage),
+    /// The bridge was paused; abort the cascade.
+    Paused,
 }
 
 /// Capacity of the recent-post ring buffer used for echo comparison.
@@ -116,6 +145,8 @@ impl Room {
         sandbox_manager: Arc<SandboxManager>,
         max_concurrent: usize,
         personas_config: Option<PersonaSettings>,
+        embedder: Option<Arc<dyn Embedder>>,
+        embedding_cfg: Option<EmbeddingConfig>,
     ) -> Result<Self, BridgeError> {
         let roster = AgentRoster::provision(agent_configs, &rift).await?;
 
@@ -202,6 +233,19 @@ impl Room {
         let supervisor = Arc::new(ExecutionSupervisor::new(notifier.clone()));
         let exec_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
 
+        // All execution machinery lives on the dispatcher so approvals never
+        // wait on the room's mutable state (or a running cascade).
+        let dispatcher = ApprovalDispatcher::new(
+            executors_by_username.clone(),
+            Arc::new(workspaces),
+            sandbox_manager,
+            supervisor,
+            exec_semaphore,
+            kleos.clone(),
+            project_name.clone(),
+            approval_registry.clone(),
+        );
+
         // Allocate thread-stable personas across the roster, if configured. The
         // channel id seeds the (stable) thread identity. Allocation failure
         // degrades to no personas rather than failing room startup.
@@ -228,6 +272,17 @@ impl Room {
             None => (HashMap::new(), None),
         };
 
+        // The echo detector's semantic tier activates only when an embedder
+        // is configured; its token tier always carries the daemon threshold.
+        let echo_detector = EchoDetector::new(
+            embedder.clone(),
+            embedding_cfg
+                .as_ref()
+                .map(|c| c.semantic_threshold)
+                .unwrap_or(0.85),
+            daemon_config.echo_similarity_threshold,
+        );
+
         Ok(Self {
             roster,
             executors,
@@ -248,15 +303,16 @@ impl Room {
             channel_name: "general".to_string(),
             approval_registry,
             coordinator,
-            supervisor,
-            sandbox_manager,
-            workspaces: Arc::new(workspaces),
-            exec_semaphore,
-            executors_by_username,
+            dispatcher,
             personas,
             growth,
             room_turn: 0,
             recent_posts: VecDeque::new(),
+            echo_detector,
+            embedder,
+            embedding_cfg,
+            exhausted_topics: Vec::new(),
+            reignition_damp_active: 1.0,
         })
     }
 
@@ -265,9 +321,16 @@ impl Room {
         &self.roster
     }
 
-    /// Handle an incoming message from the room.
-    /// Evaluates engagement for each idle agent, then generates and posts responses.
-    pub async fn handle_message(&mut self, msg: RoomMessage) -> Result<(), BridgeError> {
+    /// Handle an incoming message from the room, driving the conversation
+    /// cascade while staying responsive: slot waits select on fresh WS
+    /// events (control commands dispatch immediately, fresh human messages
+    /// re-seed the topic) and on the operator pause state.
+    pub async fn handle_message(
+        &mut self,
+        msg: RoomMessage,
+        events: &mut mpsc::Receiver<RiftWsEvent>,
+        pause: &mut watch::Receiver<bool>,
+    ) -> Result<(), BridgeError> {
         // Ignore messages from our own agents (prevent self-response loops).
         if self.roster.by_rift_user_id(msg.author_id).is_some() {
             return Ok(());
@@ -275,28 +338,52 @@ impl Room {
 
         // Handle approval control commands from humans.
         if let Some(cmd) = parse_control_command(&msg.content) {
-            match cmd {
-                ControlCommand::Approve(id) => {
-                    if let Some(proposal) = self.approval_registry.approve(id) {
-                        tracing::info!("approval {} accepted by human", id);
-                        self.execute_approved(proposal).await;
-                    } else {
-                        tracing::info!("approval {} not found", id);
-                    }
-                }
-                ControlCommand::Reject(id) => {
-                    if self.approval_registry.reject(id) {
-                        tracing::info!("approval {} rejected by human", id);
-                    }
-                }
-            }
+            self.apply_control_command(cmd);
             return Ok(());
         }
 
-        // Human (or external stimulus) posted: reset interleaving and restore
-        // topic energy. Without this reset the loop guard's counters
-        // accumulated for the process lifetime and the room died permanently
-        // at the thread ceiling (finding N2).
+        self.seed_topic(&msg.content, &msg.author_username).await;
+        self.run_cascade(msg.content, events, pause).await
+    }
+
+    /// Handle an injected stimulus: announce it in the room (humans must see
+    /// what agents react to), then drive the same cascade a human message
+    /// would. The WS echo of the announcement is authored by a roster agent
+    /// and gets dropped by handle_message's own-agent filter, so delivery
+    /// semantics cannot double-trigger the cascade.
+    pub async fn handle_stimulus(
+        &mut self,
+        stimulus: Stimulus,
+        events: &mut mpsc::Receiver<RiftWsEvent>,
+        pause: &mut watch::Receiver<bool>,
+    ) -> Result<(), BridgeError> {
+        let announcement = format!("[STIMULUS] {}", stimulus.text);
+        let first = self
+            .roster
+            .all()
+            .next()
+            .ok_or_else(|| BridgeError::Executor("no agents to announce stimulus".into()))?;
+        // An unannounced stimulus must not seed a cascade: agents build
+        // context from channel history, so reacting to an invisible trigger
+        // would read as agents talking to nobody.
+        self.rift
+            .send_message(
+                first.rift_user_id,
+                &first.username,
+                self.channel_id,
+                &announcement,
+            )
+            .await?;
+
+        self.seed_topic(&stimulus.text, stimulus.kind.as_str()).await;
+        self.run_cascade(stimulus.text, events, pause).await
+    }
+
+    /// Start a new topic from a non-agent trigger: reset interleaving and
+    /// topic energy (finding N2), count the room turn, evaluate reignition
+    /// damping, and report the wake to Kleos. Shared by human messages,
+    /// stimuli, and mid-cascade human interruptions.
+    async fn seed_topic(&mut self, content: &str, author_label: &str) {
         self.turn_manager.record_human_post();
         self.loop_guard.reset();
 
@@ -305,48 +392,52 @@ impl Room {
         // cross-agent repetition (spec P3/F4).
         self.room_turn += 1;
 
+        // Topic reignition (parent design: topic exhaustion memory): a
+        // trigger semantically matching a recently exhausted topic damps the
+        // whole cascade instead of re-litigating at full energy.
+        self.reignition_damp_active = self.reignition_factor(content).await;
+
         if let Err(e) = self
             .kleos
             .report_activity(
                 &self.project_name,
                 "rift-bridge",
                 "task.progress",
-                "Human message triggered room evaluation",
+                "Room evaluation triggered",
                 json!({
                     "channel": self.channel_name,
-                    "author": msg.author_username.clone(),
+                    "author": author_label,
                 }),
             )
             .await
         {
-            tracing::warn!("kleos human activity report failed: {e}");
+            tracing::warn!("kleos wake activity report failed: {e}");
         }
+    }
 
-        // Drive the bounded conversation cascade. The inbound message seeds
-        // round 0; each subsequent round is triggered by the last agent post
-        // of the previous round, so agents can answer each other (finding N3:
-        // previously roster posts never triggered peer evaluation and
-        // agent-to-agent conversation was structurally impossible). Bounds:
-        // per-agent turn budgets, the thread ceiling, the round cap,
-        // engagement decay, per-agent cooldown, and consensus.
-        let mut trigger_content = msg.content.clone();
+    /// Drive the bounded conversation cascade. The trigger seeds round 0;
+    /// each subsequent round is triggered by the last agent post of the
+    /// previous round, so agents can answer each other (finding N3). Bounds:
+    /// per-agent turn budgets, the thread ceiling, the round cap, engagement
+    /// decay, per-agent cooldown, and consensus. Slot waits are
+    /// event-responsive: approvals dispatch at slot boundaries, a fresh
+    /// human message re-seeds the topic, and a pause aborts.
+    async fn run_cascade(
+        &mut self,
+        mut trigger_content: String,
+        events: &mut mpsc::Receiver<RiftWsEvent>,
+        pause: &mut watch::Receiver<bool>,
+    ) -> Result<(), BridgeError> {
+        // The seed of the CURRENT topic, kept for exhaustion recording. A
+        // mid-cascade interruption replaces it along with the trigger.
+        let mut topic_seed = trigger_content.clone();
         let mut trigger_author: Option<AgentId> = None;
         let mut rounds = 0u32;
 
-        while rounds < self.config.max_cascade_rounds {
-            // Honor a bridge pause at round boundaries: handle_message blocks
-            // the main event loop's pause polling, so a multi-round cascade
-            // must check for itself (adversarial review finding). Approvals
-            // queue in their channel and dispatch after the cascade returns.
-            if rounds > 0 {
-                let paused = self.rift.is_paused().await.unwrap_or_else(|e| {
-                    tracing::warn!("pause check failed mid-cascade: {e}");
-                    false
-                });
-                if paused {
-                    tracing::info!("bridge paused, aborting cascade");
-                    break;
-                }
+        'cascade: while rounds < self.config.max_cascade_rounds {
+            if *pause.borrow() {
+                tracing::info!("bridge paused, aborting cascade");
+                return Ok(());
             }
 
             let plan = self.plan_round(&trigger_content, trigger_author);
@@ -363,7 +454,26 @@ impl Room {
                 // window is derived from the agent's stable slot index, with
                 // jitter inside the window, never shared across agents.
                 let target = round_start + self.turn_manager.slot_delay(slot_index);
-                tokio::time::sleep_until(target).await;
+                match self.wait_for_slot(target, events, pause).await {
+                    SlotOutcome::Proceed => {}
+                    SlotOutcome::Interrupted(new_msg) => {
+                        // Human priority (parent design): the fresh message
+                        // becomes the topic. Reset energy and restart the
+                        // cascade against it -- iteratively, never recursively.
+                        tracing::info!("cascade interrupted by fresh message, re-seeding topic");
+                        self.seed_topic(&new_msg.content, &new_msg.author_username)
+                            .await;
+                        trigger_content = new_msg.content;
+                        topic_seed = trigger_content.clone();
+                        trigger_author = None;
+                        rounds = 0;
+                        continue 'cascade;
+                    }
+                    SlotOutcome::Paused => {
+                        tracing::info!("bridge paused during slot wait, aborting cascade");
+                        return Ok(());
+                    }
+                }
 
                 // Peers may have answered while this agent waited for its
                 // slot: re-evaluate at the damped probability (spec P2, the
@@ -391,7 +501,10 @@ impl Room {
                 }
 
                 // Consensus ends the topic: no further replies or rounds.
+                // The concluded topic is recorded so a semantically similar
+                // trigger does not immediately re-litigate it.
                 if self.loop_guard.has_consensus() {
+                    self.record_exhausted_topic(&topic_seed).await;
                     return Ok(());
                 }
             }
@@ -408,7 +521,162 @@ impl Room {
             }
         }
 
+        // Hitting the hard ceiling exhausts the topic (parent design):
+        // remember it so a reignition gets damped instead of burning another
+        // full thread on the same ground.
+        if self.loop_guard.total_turns() >= self.config.thread_ceiling {
+            self.record_exhausted_topic(&topic_seed).await;
+        }
+
         Ok(())
+    }
+
+    /// Wait until `target`, staying responsive: control commands are applied
+    /// immediately, own-agent WS echoes are dropped, a fresh non-agent
+    /// message interrupts, and a pause aborts. A closed event channel or
+    /// pause sender degrades to a plain sleep rather than wedging the wait.
+    ///
+    /// Pause is checked by LEVEL (`borrow`), not only by edge: the
+    /// `pause.changed()` arm can lose the select race to an already-queued
+    /// event, and processing that event -- especially an `!approve` --
+    /// while the operator has paused the bridge would bypass the pause the
+    /// approvals drain task honors (adversarial review finding). While
+    /// paused, inbound room messages are dropped, matching the main event
+    /// loop's paused behavior.
+    async fn wait_for_slot(
+        &mut self,
+        target: tokio::time::Instant,
+        events: &mut mpsc::Receiver<RiftWsEvent>,
+        pause: &mut watch::Receiver<bool>,
+    ) -> SlotOutcome {
+        loop {
+            if *pause.borrow() {
+                return SlotOutcome::Paused;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(target) => return SlotOutcome::Proceed,
+                changed = pause.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            if *pause.borrow() {
+                                return SlotOutcome::Paused;
+                            }
+                        }
+                        Err(_) => {
+                            // Pause sender gone (shutdown): finish the wait
+                            // plainly instead of spinning on the dead arm.
+                            tokio::time::sleep_until(target).await;
+                            return SlotOutcome::Proceed;
+                        }
+                    }
+                }
+                event = events.recv() => {
+                    match event {
+                        Some(RiftWsEvent::MessageCreate(m)) => {
+                            // Level-check pause at the moment the event is
+                            // handled: the paused main loop would have
+                            // dropped this message, so the mid-cascade path
+                            // must too.
+                            if *pause.borrow() {
+                                return SlotOutcome::Paused;
+                            }
+                            // Own-agent echoes never interrupt.
+                            if self.roster.by_rift_user_id(m.author_id).is_some() {
+                                continue;
+                            }
+                            if let Some(cmd) = parse_control_command(&m.content) {
+                                self.apply_control_command(cmd);
+                                continue;
+                            }
+                            return SlotOutcome::Interrupted(m);
+                        }
+                        Some(RiftWsEvent::Ready) | Some(RiftWsEvent::Disconnected) => continue,
+                        None => {
+                            // Event channel gone (shutdown): finish the wait.
+                            tokio::time::sleep_until(target).await;
+                            return SlotOutcome::Proceed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply an in-room approval control command. Approved proposals go to
+    /// the dispatcher, which spawns the execution pipeline: nothing here
+    /// blocks a cascade or the event loop.
+    fn apply_control_command(&self, cmd: ControlCommand) {
+        match cmd {
+            ControlCommand::Approve(id) => {
+                if let Some(proposal) = self.approval_registry.approve(id) {
+                    tracing::info!("approval {} accepted by human", id);
+                    self.dispatcher.execute_approved(proposal);
+                } else {
+                    tracing::info!("approval {} not found", id);
+                }
+            }
+            ControlCommand::Reject(id) => {
+                if self.approval_registry.reject(id) {
+                    tracing::info!("approval {} rejected by human", id);
+                }
+            }
+        }
+    }
+
+    /// Engagement multiplier for a fresh trigger: `reignition_damp` when the
+    /// trigger semantically matches a recently exhausted topic, 1.0
+    /// otherwise. Expired records are pruned here. Embedding failures score
+    /// as no match: a broken endpoint must never mute the room.
+    async fn reignition_factor(&mut self, trigger: &str) -> f64 {
+        let (Some(embedder), Some(cfg)) = (self.embedder.clone(), self.embedding_cfg.clone())
+        else {
+            return 1.0;
+        };
+        let ttl = std::time::Duration::from_secs(cfg.reignition_ttl_secs);
+        self.exhausted_topics
+            .retain(|(_, at)| at.elapsed() < ttl);
+        if self.exhausted_topics.is_empty() {
+            return 1.0;
+        }
+        let trigger_vec = match embedder.embed(trigger).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("reignition embed failed, treating trigger as fresh: {e}");
+                return 1.0;
+            }
+        };
+        let reignited = self
+            .exhausted_topics
+            .iter()
+            .any(|(vec, _)| cosine(&trigger_vec, vec) >= cfg.reignition_threshold);
+        if reignited {
+            tracing::info!(
+                "trigger reignites an exhausted topic, damping engagement x{}",
+                cfg.reignition_damp
+            );
+            cfg.reignition_damp
+        } else {
+            1.0
+        }
+    }
+
+    /// Record an exhausted topic's embedding for reignition matching. No-op
+    /// without an embedder. Failures are logged and dropped: exhaustion
+    /// memory is an optimization, never a gate.
+    async fn record_exhausted_topic(&mut self, topic_seed: &str) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        match embedder.embed(topic_seed).await {
+            Ok(vec) => {
+                self.exhausted_topics
+                    .push((vec, std::time::Instant::now()));
+                while self.exhausted_topics.len() > EXHAUSTED_TOPICS_CAP {
+                    self.exhausted_topics.remove(0);
+                }
+            }
+            Err(e) => tracing::warn!("exhausted-topic embed failed, not recorded: {e}"),
+        }
     }
 
     /// Plan one cascade round: evaluate every idle agent except the trigger's
@@ -487,13 +755,23 @@ impl Room {
             .last_posted_turn
             .map(|turn| u32::try_from(self.room_turn.saturating_sub(turn)).unwrap_or(u32::MAX));
 
-        self.engagement.compute_probability(EngagementInputs {
+        let probability = self.engagement.compute_probability(EngagementInputs {
             base_chance: agent.base_chance,
             directly_addressed,
             turns_since_last_post,
             peer_responses,
             relevance,
-        })
+        });
+
+        // Reignited-topic damping (parent design: topic exhaustion memory).
+        // Directly addressed agents stay immune, matching the peer-damp
+        // immunity: a human naming an agent deserves an answer even on
+        // exhausted ground.
+        if directly_addressed {
+            probability
+        } else {
+            probability * self.reignition_damp_active
+        }
     }
 
     /// Re-evaluate an already-planned agent after peers posted in the same
@@ -604,19 +882,18 @@ impl Room {
         // answers is never suppressed. Consensus votes are exempt because
         // [AGREE] messages are legitimately similar to each other. This check
         // deliberately applies even to directly addressed agents: a verbatim
-        // repeat of a peer is an echo no matter who was named.
+        // repeat of a peer is an echo no matter who was named. Detection is
+        // two-tier (spec P4 closing): embedding cosine when configured,
+        // token overlap otherwise or on embed failure.
         if !is_agreement {
-            let peer_texts: Vec<&str> = self
+            let peer_texts: Vec<String> = self
                 .recent_posts
                 .iter()
                 .filter(|(author, _)| *author != agent_id)
-                .map(|(_, text)| text.as_str())
+                .map(|(_, text)| text.clone())
                 .collect();
-            if echo::is_echo(
-                &agent_resp.text,
-                &peer_texts,
-                self.config.echo_similarity_threshold,
-            ) {
+            let peer_refs: Vec<&str> = peer_texts.iter().map(String::as_str).collect();
+            if self.echo_detector.is_echo(&agent_resp.text, &peer_refs).await {
                 tracing::info!("{display_name} response suppressed as cross-agent echo");
                 self.set_agent_idle(agent_id);
                 return Ok(None);
@@ -817,159 +1094,10 @@ impl Room {
         ))
     }
 
-    /// Sweep expired approvals and notify the room for each.
-    pub async fn sweep_expired_approvals(&self) {
-        for expired in self.approval_registry.sweep_expired() {
-            tracing::info!("approval {} expired", expired.id);
-            let _ = self
-                .kleos
-                .update_task_status(&expired.task_id, "blocked", "approval expired")
-                .await;
-        }
-    }
-
-    /// Dispatch an approved proposal: create the sandbox, then spawn a
-    /// supervised execution session bounded by the concurrency semaphore.
-    pub async fn execute_approved(&self, proposal: PendingProposal) {
-        let executor = match self.executors_by_username.get(&proposal.agent) {
-            Some(e) => e.clone(),
-            None => {
-                tracing::error!("no executor for proposing agent {}", proposal.agent);
-                return;
-            }
-        };
-
-        // Health preflight before creating any worktree: the executor's runtime
-        // must be ready, or the task is blocked rather than spawned into a dead
-        // runtime (AgentExecutor contract: health_check is called before spawn).
-        let health = match executor.health_check().await {
-            Ok(status) => status,
-            Err(e) => {
-                let _ = self
-                    .kleos
-                    .update_task_status(
-                        &proposal.task_id,
-                        "blocked",
-                        &format!("health check failed: {e}"),
-                    )
-                    .await;
-                return;
-            }
-        };
-        match health_preflight(health) {
-            Preflight::Proceed => {}
-            Preflight::ProceedDegraded(reason) => {
-                tracing::warn!(
-                    "executor for {} is degraded but proceeding: {reason}",
-                    proposal.agent
-                );
-            }
-            Preflight::Block(reason) => {
-                tracing::error!(
-                    "executor for {} unavailable, blocking task {}: {reason}",
-                    proposal.agent,
-                    proposal.task_id
-                );
-                let _ = self
-                    .kleos
-                    .update_task_status(
-                        &proposal.task_id,
-                        "blocked",
-                        &format!("executor unavailable: {reason}"),
-                    )
-                    .await;
-                return;
-            }
-        }
-
-        let workspace = match resolve_workspace(&self.workspaces, &proposal.workspace) {
-            Some(w) => w,
-            None => {
-                tracing::error!(
-                    "workspace {} not found for approved task",
-                    proposal.workspace
-                );
-                return;
-            }
-        };
-
-        // Create the branch-isolated sandbox before spawning.
-        let sandbox = match self
-            .sandbox_manager
-            .create(workspace, &proposal.agent, &proposal.task_id)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("sandbox creation failed: {e}");
-                let _ = self
-                    .kleos
-                    .update_task_status(
-                        &proposal.task_id,
-                        "blocked",
-                        &format!("sandbox failed: {e}"),
-                    )
-                    .await;
-                return;
-            }
-        };
-
-        // Clamp the worktree's wall-clock limit to the executor's declared
-        // runtime policy: the bridge owns branch/path, the executor owns its
-        // ceiling (never above the operator-configured limit).
-        let sandbox = apply_runtime_policy(sandbox, &executor.sandbox());
-
-        let supervisor = self.supervisor.clone();
-        let semaphore = self.exec_semaphore.clone();
-        let kleos = self.kleos.clone();
-        let project = self.project_name.clone();
-        let task = SupervisedTask {
-            executor,
-            task_id: proposal.task_id.clone(),
-            description: proposal.scope_summary.clone(),
-            sandbox,
-            granted_capabilities: proposal.granted_capabilities.clone(),
-            // First attempt against a fresh worktree: no prior work to resume. The
-            // crash-recovery path will source a partial-work summary here.
-            prior_context: None,
-        };
-
-        // Spawn so the event loop is not blocked by a long execution.
-        tokio::spawn(async move {
-            let _permit = match semaphore.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let result = supervisor.run(task).await;
-            let (status, note) = match &result {
-                crate::executor::ExecutionResult::Success { summary, .. } => {
-                    ("completed", summary.clone())
-                }
-                crate::executor::ExecutionResult::Failed { reason, .. } => {
-                    ("blocked", reason.clone())
-                }
-            };
-
-            // Durable execution-result memory (best-effort).
-            let tags = vec![
-                format!("project:{project}"),
-                "kind:execution-result".to_string(),
-            ];
-            let memory = format!(
-                "Execution result for task {} ({}): {}",
-                proposal.task_id, status, note
-            );
-            if let Err(e) = kleos.store_consensus_memory(&project, &memory, &tags).await {
-                tracing::warn!("kleos execution-result memory store failed: {e}");
-            }
-
-            if let Err(e) = kleos
-                .update_task_status(&proposal.task_id, status, &note)
-                .await
-            {
-                tracing::warn!("kleos task status update failed: {e}");
-            }
-        });
+    /// Clone the approval dispatcher for tasks outside the room (the control
+    /// server drain task and the expiry sweep task).
+    pub fn dispatcher(&self) -> ApprovalDispatcher {
+        self.dispatcher.clone()
     }
 }
 
@@ -1140,6 +1268,16 @@ mod tests {
             std::path::PathBuf::from("/tmp/rift-bridge-test-worktrees"),
             60,
         ));
+        let dispatcher = ApprovalDispatcher::new(
+            HashMap::new(),
+            Arc::new(Vec::new()),
+            sandbox_manager,
+            supervisor,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            kleos.clone(),
+            "test".to_string(),
+            approval_registry.clone(),
+        );
 
         let room = Room {
             roster,
@@ -1155,15 +1293,16 @@ mod tests {
             channel_name: "general".to_string(),
             approval_registry,
             coordinator,
-            supervisor,
-            sandbox_manager,
-            workspaces: Arc::new(Vec::new()),
-            exec_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            executors_by_username: HashMap::new(),
+            dispatcher,
             personas: HashMap::new(),
             growth: None,
             room_turn: 0,
             recent_posts: VecDeque::new(),
+            echo_detector: EchoDetector::new(None, 0.85, 0.5),
+            embedder: None,
+            embedding_cfg: None,
+            exhausted_topics: Vec::new(),
+            reignition_damp_active: 1.0,
         };
         (room, agent_id)
     }
@@ -1205,6 +1344,245 @@ mod tests {
         assert!(!cooldown_active(None, 30));
         assert!(cooldown_active(Some(std::time::Instant::now()), 30));
         assert!(!cooldown_active(Some(std::time::Instant::now()), 0));
+    }
+
+    use crate::execution::{PendingProposal, ProposalId};
+
+    /// Build a human-authored room message for event-loop tests.
+    fn human_msg(content: &str) -> RoomMessage {
+        RoomMessage {
+            id: Uuid::new_v4(),
+            channel_id: Uuid::new_v4(),
+            author_id: Uuid::new_v4(),
+            author_username: "zan".to_string(),
+            content: content.to_string(),
+            message_type: "user".to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Verifies an in-room `!approve` arriving mid-slot-wait is applied
+    /// immediately (the approval leaves the registry) and the wait then
+    /// completes normally -- the approval-latency fix in miniature.
+    #[tokio::test]
+    async fn test_wait_for_slot_applies_control_command_mid_wait() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(7),
+            agent: "nobody".to_string(),
+            task_id: "t-7".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        tx.send(RiftWsEvent::MessageCreate(human_msg("!approve 7")))
+            .await
+            .unwrap();
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("wait must complete");
+
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+        assert!(
+            room.approval_registry.list().is_empty(),
+            "approval must be consumed during the slot wait, not after the cascade"
+        );
+    }
+
+    /// Verifies a fresh human message interrupts the slot wait and comes
+    /// back as the new topic seed (human priority, parent design).
+    #[tokio::test]
+    async fn test_wait_for_slot_interrupts_on_fresh_human_message() {
+        let (mut room, _agent) = offline_room();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        tx.send(RiftWsEvent::MessageCreate(human_msg("new topic, drop everything")))
+            .await
+            .unwrap();
+
+        // A wait long enough that only the interruption can end it quickly.
+        let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("interruption must end the wait well before the slot");
+
+        match outcome {
+            SlotOutcome::Interrupted(m) => {
+                assert_eq!(m.content, "new topic, drop everything");
+            }
+            _ => panic!("expected Interrupted"),
+        }
+    }
+
+    /// Verifies an own-agent WS echo neither interrupts nor ends the wait:
+    /// the wait proceeds to its slot as if nothing arrived.
+    #[tokio::test]
+    async fn test_wait_for_slot_ignores_own_agent_echo() {
+        let (mut room, _agent) = offline_room();
+        let own_user = room
+            .roster
+            .all()
+            .next()
+            .expect("roster has the test agent")
+            .rift_user_id;
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        let mut echo = human_msg("what an agent just said");
+        echo.author_id = own_user;
+        tx.send(RiftWsEvent::MessageCreate(echo)).await.unwrap();
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("wait must complete");
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+    }
+
+    /// Verifies an in-room `!approve` queued while the bridge is paused is
+    /// NOT applied mid-cascade: the wait aborts on the pause level check and
+    /// the proposal stays in the registry (adversarial review finding: the
+    /// mid-cascade path must not bypass the pause the drain task honors).
+    #[tokio::test]
+    async fn test_wait_for_slot_does_not_apply_control_command_while_paused() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(9),
+            agent: "nobody".to_string(),
+            task_id: "t-9".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pause_tx, mut pause_rx) = watch::channel(false);
+        tx.send(RiftWsEvent::MessageCreate(human_msg("!approve 9")))
+            .await
+            .unwrap();
+        pause_tx.send(true).expect("receiver alive");
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("pause must end the wait");
+        assert!(matches!(outcome, SlotOutcome::Paused));
+        assert_eq!(
+            room.approval_registry.list().len(),
+            1,
+            "a paused bridge must not consume an in-room approval"
+        );
+    }
+
+    /// Verifies a pause flipping true during the wait aborts it.
+    #[tokio::test]
+    async fn test_wait_for_slot_aborts_on_pause() {
+        let (mut room, _agent) = offline_room();
+        let (_tx, mut rx) = mpsc::channel::<RiftWsEvent>(8);
+        let (pause_tx, mut pause_rx) = watch::channel(false);
+        pause_tx.send(true).expect("receiver alive");
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("pause must end the wait well before the slot");
+        assert!(matches!(outcome, SlotOutcome::Paused));
+    }
+
+    /// Embedder stub for reignition tests: "deploy" texts share a direction,
+    /// everything else is orthogonal.
+    struct TopicStubEmbedder;
+
+    /// Canned embeddings keyed on content.
+    #[async_trait]
+    impl crate::embedding::Embedder for TopicStubEmbedder {
+        /// Deterministic two-dimensional vectors.
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, BridgeError> {
+            if text.contains("deploy") {
+                Ok(vec![1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+    }
+
+    /// Attach the stub embedder and reignition knobs to an offline room.
+    fn with_stub_embedding(room: &mut Room) {
+        room.embedder = Some(Arc::new(TopicStubEmbedder));
+        room.embedding_cfg = Some(crate::config::EmbeddingConfig {
+            url: "http://test.invalid/v1/embeddings".to_string(),
+            model: "stub".to_string(),
+            api_key_env: None,
+            semantic_threshold: 0.85,
+            reignition_threshold: 0.85,
+            reignition_damp: 0.3,
+            reignition_ttl_secs: 3600,
+        });
+    }
+
+    /// Verifies a trigger matching a recorded exhausted topic returns the
+    /// configured damp and an unrelated trigger returns 1.0 (parent design:
+    /// topic exhaustion memory).
+    #[tokio::test]
+    async fn test_reignition_factor_matches_exhausted_topic() {
+        let (mut room, _agent) = offline_room();
+        with_stub_embedding(&mut room);
+        room.record_exhausted_topic("the deploy pipeline discussion").await;
+        assert_eq!(room.exhausted_topics.len(), 1);
+
+        let damped = room.reignition_factor("deploy pipeline rollback plan").await;
+        assert!((damped - 0.3).abs() < 1e-9);
+        let fresh = room.reignition_factor("what should we name the cat").await;
+        assert!((fresh - 1.0).abs() < 1e-9);
+    }
+
+    /// Verifies reignition damping multiplies engagement for unaddressed
+    /// agents and leaves directly addressed agents immune.
+    #[tokio::test]
+    async fn test_reignition_damp_applies_to_probability_with_address_immunity() {
+        let (mut room, agent_id) = offline_room();
+
+        room.reignition_damp_active = 1.0;
+        let full = room.probability_for(agent_id, "general remark", 0);
+        room.reignition_damp_active = 0.3;
+        let damped = room.probability_for(agent_id, "general remark", 0);
+        assert!(full > 0.0, "baseline probability must be positive");
+        assert!((damped - full * 0.3).abs() < 1e-9);
+
+        // Directly addressed (display name "Tester"): immune to the damp.
+        room.reignition_damp_active = 1.0;
+        let addr_full = room.probability_for(agent_id, "Tester, your call", 0);
+        room.reignition_damp_active = 0.3;
+        let addr_damped = room.probability_for(agent_id, "Tester, your call", 0);
+        assert!((addr_full - addr_damped).abs() < 1e-9);
+    }
+
+    /// Verifies reignition never fires without an embedder configured.
+    #[tokio::test]
+    async fn test_reignition_disabled_without_embedder() {
+        let (mut room, _agent) = offline_room();
+        room.record_exhausted_topic("anything").await;
+        assert!(room.exhausted_topics.is_empty());
+        assert!((room.reignition_factor("anything").await - 1.0).abs() < 1e-9);
     }
 
     /// Verifies concrete implementation language creates a draft task.

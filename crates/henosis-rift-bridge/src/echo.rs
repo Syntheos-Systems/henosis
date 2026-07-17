@@ -5,12 +5,20 @@
 //! For working agents the failure mode is two agents independently producing
 //! the same proposal and both believing they contributed.
 //!
-//! This module is the cheap first pass the spec calls for: normalized token
-//! overlap (Jaccard) between a candidate response and recent peer messages.
-//! Embedding-based similarity (memory 27272) remains future work and is
-//! recorded as such in the design doc addendum (spec P4).
+//! Two detection tiers live here:
+//!
+//! - The token-overlap (Jaccard) pass the spec called the cheap first cut.
+//! - [`EchoDetector`]: the embedding-based tier (memory 27272, spec P4)
+//!   filling the `echo::similarity` seam the design doc addendum named.
+//!   When an embedder is configured, candidates are compared to recent peer
+//!   posts by cosine similarity, which catches paraphrased echoes token
+//!   overlap cannot. Without one -- or when an embed call fails -- detection
+//!   degrades to the Jaccard pass, never to a false suppression.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::embedding::{cosine, Embedder};
 
 /// Minimum candidate token count before suppression may trigger. Short
 /// acknowledgments ("yes exactly", "good point") legitimately share most of
@@ -52,6 +60,116 @@ pub fn is_echo(candidate: &str, recent_peer_texts: &[&str], threshold: f64) -> b
     recent_peer_texts
         .iter()
         .any(|peer| similarity(candidate, peer) >= threshold)
+}
+
+/// Stateful echo detector combining the semantic (embedding) tier with the
+/// token-overlap fallback. Owned by the room; one instance per channel.
+///
+/// The embedding cache is keyed by exact message text and pruned to the
+/// current peer window after every check, so it never outgrows the recent-post
+/// ring buffer that feeds it.
+pub struct EchoDetector {
+    /// Optional semantic tier. `None` means token-overlap only.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Cosine similarity at or above which a candidate is an echo
+    /// (parent design: 0.85).
+    semantic_threshold: f64,
+    /// Jaccard similarity threshold for the fallback tier.
+    token_threshold: f64,
+    /// Embeddings of recently seen texts, keyed by exact text.
+    cache: HashMap<String, Vec<f32>>,
+}
+
+/// Detection entry point and the semantic-tier internals.
+impl EchoDetector {
+    /// Build a detector. `embedder` = `None` preserves the pure
+    /// token-overlap behavior byte-for-byte.
+    pub fn new(
+        embedder: Option<Arc<dyn Embedder>>,
+        semantic_threshold: f64,
+        token_threshold: f64,
+    ) -> Self {
+        Self {
+            embedder,
+            semantic_threshold,
+            token_threshold,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// True when the candidate substantially reproduces any recent peer
+    /// message. Semantic tier when configured; token overlap otherwise. An
+    /// embed failure degrades to token overlap for this check and logs a
+    /// warning -- an unreachable embeddings endpoint must never suppress a
+    /// post by itself, and must never let a verbatim echo through either.
+    pub async fn is_echo(&mut self, candidate: &str, recent_peer_texts: &[&str]) -> bool {
+        if tokens(candidate).len() < MIN_SUPPRESSIBLE_TOKENS {
+            return false;
+        }
+        if recent_peer_texts.is_empty() {
+            return false;
+        }
+        if self.embedder.is_some() {
+            match self.max_semantic(candidate, recent_peer_texts).await {
+                Ok(max) => return max >= self.semantic_threshold,
+                Err(e) => {
+                    tracing::warn!("semantic echo check failed, falling back to token overlap: {e}");
+                }
+            }
+        }
+        is_echo(candidate, recent_peer_texts, self.token_threshold)
+    }
+
+    /// Maximum non-negative cosine similarity between the candidate and the
+    /// peer window (floored at 0.0 deliberately: negative similarity means
+    /// "opposite", which must never edge toward suppression). Fills the
+    /// cache for peers on demand. The candidate itself is not cached:
+    /// suppressed candidates never become peers, and posted ones re-enter
+    /// via the peer side on the next check.
+    async fn max_semantic(
+        &mut self,
+        candidate: &str,
+        recent_peer_texts: &[&str],
+    ) -> Result<f64, crate::error::BridgeError> {
+        let embedder = self
+            .embedder
+            .as_ref()
+            .expect("max_semantic called without embedder")
+            .clone();
+
+        // Prune BEFORE embedding, not after: pruning on the exit path is
+        // skipped whenever an embed call errors out mid-loop, letting stale
+        // entries outlive the ring-buffer bound (adversarial review
+        // finding). Entry-side pruning holds the invariant on every path.
+        let live: HashSet<&str> = recent_peer_texts.iter().copied().collect();
+        self.cache.retain(|text, _| live.contains(text.as_str()));
+
+        let candidate_vec = match self.cache.get(candidate) {
+            Some(v) => v.clone(),
+            None => embedder.embed(candidate).await?,
+        };
+
+        let mut max = 0.0f64;
+        for peer in recent_peer_texts {
+            if !self.cache.contains_key(*peer) {
+                let vec = embedder.embed(peer).await?;
+                self.cache.insert((*peer).to_string(), vec);
+            }
+            let peer_vec = &self.cache[*peer];
+            if peer_vec.len() != candidate_vec.len() {
+                tracing::warn!(
+                    "embedding dimension mismatch ({} vs {}), scoring 0",
+                    peer_vec.len(),
+                    candidate_vec.len()
+                );
+            }
+            let score = cosine(&candidate_vec, peer_vec);
+            if score > max {
+                max = score;
+            }
+        }
+        Ok(max)
+    }
 }
 
 /// Unit tests using the production echo strings from the 2026-07-16 botcore
@@ -108,5 +226,94 @@ mod tests {
     fn test_normalization_is_case_and_punctuation_insensitive() {
         let shouty = "SELECTION PRESSURE weeded-out the WEAK bots, and kept the BEST!!";
         assert!(similarity(GIR_LINE, shouty) >= 0.7);
+    }
+
+    use super::EchoDetector;
+    use crate::embedding::Embedder;
+    use crate::error::BridgeError;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    /// Embedder stub mapping known texts to fixed vectors, so semantic
+    /// scores are deterministic without a network.
+    struct StubEmbedder;
+
+    /// Maps paraphrase-pair texts to nearby vectors and everything else far away.
+    #[async_trait]
+    impl Embedder for StubEmbedder {
+        /// Returns canned vectors: the two paraphrase texts point the same
+        /// way, unrelated text is orthogonal.
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, BridgeError> {
+            if text.contains("weeded") || text.contains("filtered out the weak") {
+                Ok(vec![1.0, 0.05])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+    }
+
+    /// Embedder stub that always fails, for fallback-path testing.
+    struct FailingEmbedder;
+
+    /// Fails every call with an embedding error.
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        /// Always errors.
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, BridgeError> {
+            Err(BridgeError::Embedding("endpoint down".into()))
+        }
+    }
+
+    /// Verifies the semantic tier catches a paraphrased echo that token
+    /// overlap misses -- the exact gap embeddings were specified to close.
+    #[tokio::test]
+    async fn test_semantic_tier_catches_paraphrase_jaccard_misses() {
+        let paraphrase = "Natural selection filtered out the weak machines while retaining top performers";
+        // Token overlap alone does NOT flag this pair at the default threshold.
+        assert!(!is_echo(paraphrase, &[GIR_LINE], 0.5));
+
+        let mut det = EchoDetector::new(Some(Arc::new(StubEmbedder)), 0.85, 0.5);
+        assert!(det.is_echo(paraphrase, &[GIR_LINE]).await);
+    }
+
+    /// Verifies unrelated content passes the semantic tier.
+    #[tokio::test]
+    async fn test_semantic_tier_passes_unrelated_content() {
+        let mut det = EchoDetector::new(Some(Arc::new(StubEmbedder)), 0.85, 0.5);
+        assert!(
+            !det.is_echo("The deploy pipeline needs a rollback path before Friday", &[GIR_LINE])
+                .await
+        );
+    }
+
+    /// Verifies an embed failure degrades to the token-overlap tier instead
+    /// of suppressing or panicking: the verbatim production echo is still
+    /// caught, unrelated content still passes.
+    #[tokio::test]
+    async fn test_embed_failure_falls_back_to_token_overlap() {
+        let mut det = EchoDetector::new(Some(Arc::new(FailingEmbedder)), 0.85, 0.5);
+        assert!(det.is_echo(ZIM_LINE, &[GIR_LINE]).await);
+        assert!(
+            !det.is_echo("The deploy pipeline needs a rollback path before Friday", &[GIR_LINE])
+                .await
+        );
+    }
+
+    /// Verifies no embedder preserves the pure token-overlap behavior.
+    #[tokio::test]
+    async fn test_no_embedder_is_token_overlap_only() {
+        let mut det = EchoDetector::new(None, 0.85, 0.5);
+        assert!(det.is_echo(ZIM_LINE, &[GIR_LINE]).await);
+        let paraphrase = "Natural selection filtered out the weak machines while retaining top performers";
+        assert!(!det.is_echo(paraphrase, &[GIR_LINE]).await);
+    }
+
+    /// Verifies the short-message guard applies before the semantic tier.
+    #[tokio::test]
+    async fn test_short_candidate_skips_semantic_tier() {
+        let mut det = EchoDetector::new(Some(Arc::new(FailingEmbedder)), 0.85, 0.5);
+        // Five tokens or fewer: never suppressed, embedder never consulted
+        // (FailingEmbedder would otherwise log a fallback).
+        assert!(!det.is_echo("the best ones", &[GIR_LINE]).await);
     }
 }

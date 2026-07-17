@@ -33,6 +33,10 @@ pub enum BridgeError {
     #[error("Authentication error: {0}")]
     Auth(String),
 
+    /// Embeddings endpoint failed or returned an unusable payload.
+    #[error("Embedding error: {0}")]
+    Embedding(String),
+
     /// Underlying HTTP transport error.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

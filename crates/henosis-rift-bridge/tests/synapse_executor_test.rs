@@ -51,6 +51,43 @@ fn test_claude_max_needs_no_credentials() {
     );
 }
 
+/// Verifies the generic OpenAI-compatible proxy arm builds with a base URL
+/// and explicit key (the DeepSeek cheap-agent path).
+#[test]
+fn test_proxy_provider_builds_with_host_and_key() {
+    let result = build_synapse_executor(
+        "proxy",
+        Some("deepseek-v4-flash".into()),
+        Some("https://api.example.com".into()),
+        None,
+        Some("test-key".into()),
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "proxy provider should build: {:?}",
+        result.err().map(|e| e.to_string())
+    );
+}
+
+/// Verifies the proxy arm rejects a missing base URL.
+#[test]
+fn test_proxy_provider_rejects_missing_host() {
+    let result = build_synapse_executor(
+        "proxy",
+        None,
+        None, // no host
+        None,
+        Some("test-key".into()),
+        None,
+        None,
+        None,
+    );
+    assert!(result.is_err(), "proxy provider requires host");
+}
+
 /// Verifies unknown provider identifiers are rejected.
 #[test]
 fn test_rejects_unknown_provider() {
