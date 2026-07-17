@@ -45,10 +45,19 @@ pub struct RoomMessage {
     pub author_username: String,
     /// Message text content.
     pub content: String,
-    /// Type discriminator (user, agent, stimulus, system).
+    /// Type discriminator (user, agent, stimulus, system). Defaulted when
+    /// absent: rift-server gateway events predating the field must still
+    /// parse, because a strict parse here is silently dropped by ws_listen
+    /// and the room goes deaf (2026-07-17 live smoke test finding).
+    #[serde(default = "default_message_type")]
     pub message_type: String,
     /// When the message was created.
     pub created_at: DateTime<Utc>,
+}
+
+/// Default message type for gateway payloads that omit the discriminator.
+fn default_message_type() -> String {
+    "user".to_string()
 }
 
 /// An agent's response to post back to the room.

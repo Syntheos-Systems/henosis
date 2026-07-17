@@ -52,11 +52,10 @@ pub async fn update_me(
         if !email.contains('@') {
             return Err(AppError::BadRequest("Invalid email".into()));
         }
-        if let Some(existing) = db::get_user_by_email(&pool, email).await? {
-            if existing.id != auth.user_id {
+        if let Some(existing) = db::get_user_by_email(&pool, email).await?
+            && existing.id != auth.user_id {
                 return Err(AppError::Conflict("Email already registered".into()));
             }
-        }
         db::update_user_email(&pool, auth.user_id, email).await?;
     }
 
@@ -91,11 +90,10 @@ pub async fn upload_avatar(
     let content_type = field.content_type().map(|s| s.to_string());
 
     // Validate it's an image
-    if let Some(ref ct) = content_type {
-        if !ct.starts_with("image/") {
+    if let Some(ref ct) = content_type
+        && !ct.starts_with("image/") {
             return Err(AppError::BadRequest("File must be an image".into()));
         }
-    }
 
     let data = field
         .bytes()

@@ -117,12 +117,11 @@ pub async fn send_message(
             )
             .await?;
 
-            if let Some((_, stored_upload)) = pending.remove(&upload_id) {
-                if stored_upload.uploader_id != auth.user_id {
+            if let Some((_, stored_upload)) = pending.remove(&upload_id)
+                && stored_upload.uploader_id != auth.user_id {
                     delete_pending_upload_file(&config, &stored_upload).await;
                     continue;
                 }
-            }
 
             attachments.push(attachment);
         }
@@ -140,6 +139,7 @@ pub async fn send_message(
             author_avatar_url: msg.author_avatar_url.clone(),
             content: msg.content.clone(),
             attachments: attachments.clone(),
+            message_type: msg.message_type.clone(),
             created_at: msg.created_at.to_rfc3339(),
         },
     );

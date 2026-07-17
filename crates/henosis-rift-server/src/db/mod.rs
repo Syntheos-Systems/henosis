@@ -808,11 +808,10 @@ pub async fn get_member_permissions(
 ) -> Result<i64, sqlx::Error> {
     // Owner has all permissions
     let server = get_server_by_id(pool, server_id).await?;
-    if let Some(s) = &server {
-        if s.owner_id == user_id {
+    if let Some(s) = &server
+        && s.owner_id == user_id {
             return Ok(i64::MAX); // all bits set
         }
-    }
 
     // Union of: default role permissions + all assigned role permissions
     let row: Option<(i64,)> = sqlx::query_as(

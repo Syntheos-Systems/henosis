@@ -126,11 +126,10 @@ pub async fn upload_files(
 
 pub async fn delete_pending_upload_file(config: &Config, pending_upload: &PendingUpload) {
     let file_path = std::path::Path::new(&config.upload_dir).join(&pending_upload.stored_filename);
-    if let Err(err) = tokio::fs::remove_file(file_path).await {
-        if err.kind() != std::io::ErrorKind::NotFound {
+    if let Err(err) = tokio::fs::remove_file(file_path).await
+        && err.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!("Failed to delete stale upload {}: {err}", pending_upload.stored_filename);
         }
-    }
 }
 
 async fn cleanup_stale_uploads(config: &Config, pending: &PendingUploads) {

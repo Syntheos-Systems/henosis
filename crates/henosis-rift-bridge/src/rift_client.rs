@@ -330,8 +330,17 @@ async fn connect_and_listen(
 
             if val["type"].as_str() == Some("MessageCreate") {
                 if let Some(data) = val.get("data") {
-                    if let Ok(room_msg) = serde_json::from_value::<RoomMessage>(data.clone()) {
-                        let _ = event_tx.send(RiftWsEvent::MessageCreate(room_msg)).await;
+                    // A parse failure here means the room goes deaf to that
+                    // message; it must never be silent (live smoke test
+                    // finding: a missing field cost hours of "why is the
+                    // room ignoring everyone").
+                    match serde_json::from_value::<RoomMessage>(data.clone()) {
+                        Ok(room_msg) => {
+                            let _ = event_tx.send(RiftWsEvent::MessageCreate(room_msg)).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("dropping unparseable MessageCreate event: {e}");
+                        }
                     }
                 }
             }

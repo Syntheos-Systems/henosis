@@ -26,6 +26,11 @@ pub enum GatewayEvent {
         author_avatar_url: Option<String>,
         content: String,
         attachments: Vec<crate::models::attachment::Attachment>,
+        // The type discriminator (user/agent/stimulus/system) rides the wire:
+        // the agent bridge deserializes this event into a struct that carries
+        // it, and omitting it made every bridge-side parse fail silently
+        // (found in the 2026-07-17 live smoke test).
+        message_type: String,
         created_at: String,
     },
     MessageUpdate {
@@ -113,6 +118,12 @@ pub struct Gateway {
     connection_counts: Arc<DashMap<Uuid, usize>>,
 }
 
+impl Default for Gateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Gateway {
     pub fn new() -> Self {
         Self {
@@ -189,12 +200,11 @@ impl Gateway {
         if remove_online {
             self.connection_counts.remove(&user_id);
             self.online_users.remove(&user_id);
-            if let Some(sender) = self.user_senders.get(&user_id) {
-                if sender.receiver_count() == 0 {
+            if let Some(sender) = self.user_senders.get(&user_id)
+                && sender.receiver_count() == 0 {
                     drop(sender);
                     self.user_senders.remove(&user_id);
                 }
-            }
         }
     }
 
@@ -212,8 +222,8 @@ impl Gateway {
         let mut session = loop {
             match ws_rx.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
-                    if let Ok(cmd) = serde_json::from_str::<GatewayCommand>(&text) {
-                        if let GatewayCommand::Identify { token } = cmd {
+                    if let Ok(cmd) = serde_json::from_str::<GatewayCommand>(&text)
+                        && let GatewayCommand::Identify { token } = cmd {
                             match crate::auth::jwt::validate_token(&token, &jwt_secret) {
                                 Ok(claims) => {
                                     break Session {
@@ -228,7 +238,6 @@ impl Gateway {
                                 }
                             }
                         }
-                    }
                 }
                 _ => return,
             }

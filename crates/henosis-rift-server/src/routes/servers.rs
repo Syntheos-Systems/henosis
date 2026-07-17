@@ -201,18 +201,16 @@ pub async fn join_via_invite(
         .ok_or(AppError::NotFound("Invite not found".into()))?;
 
     // Check expiry
-    if let Some(expires) = invite.expires_at {
-        if expires < chrono::Utc::now() {
+    if let Some(expires) = invite.expires_at
+        && expires < chrono::Utc::now() {
             return Err(AppError::BadRequest("Invite expired".into()));
         }
-    }
 
     // Check max uses
-    if let Some(max) = invite.max_uses {
-        if invite.uses >= max {
+    if let Some(max) = invite.max_uses
+        && invite.uses >= max {
             return Err(AppError::BadRequest("Invite has reached max uses".into()));
         }
-    }
 
     // Check if already a member
     if db::is_member(&pool, invite.server_id, auth.user_id).await? {

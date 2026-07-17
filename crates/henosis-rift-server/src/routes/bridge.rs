@@ -65,6 +65,7 @@ pub async fn notify_message(
             author_avatar_url: msg.author_avatar_url.clone(),
             content: msg.content.clone(),
             attachments,
+            message_type: msg.message_type.clone(),
             created_at: msg.created_at.to_rfc3339(),
         },
     );
