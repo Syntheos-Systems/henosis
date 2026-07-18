@@ -32,6 +32,13 @@ pub struct UserResponse {
     pub is_agent: bool,
 }
 
+/// Response from the bridge provisioning endpoint.
+#[derive(Debug, Deserialize)]
+struct ProvisionResponse {
+    /// Provisioned agents, in the order they were requested.
+    agents: Vec<UserResponse>,
+}
+
 /// Response from sending a message.
 #[derive(Debug, Deserialize)]
 pub struct MessageResponse {
@@ -85,85 +92,48 @@ impl RiftRestClient {
         }
     }
 
-    /// Register an agent user. Returns existing user if username already taken.
-    pub async fn register_agent(
+    /// Provision the whole agent roster and join every agent to the server.
+    ///
+    /// Replaces per-agent `/api/auth/register` calls, which created the users
+    /// but left them out of the server's member list. The gateway refuses a
+    /// non-member's channel subscription, so agents provisioned that way could
+    /// post but never hear anything -- a silent, total failure of the room.
+    /// Idempotent, so it runs on every boot.
+    pub async fn provision_agents(
         &self,
-        username: &str,
-        display_name: &str,
-        password: &str,
-    ) -> Result<UserResponse, BridgeError> {
-        let url = format!("{}/api/auth/register", self.base_url);
+        server_id: Uuid,
+        agents: &[(String, String)],
+    ) -> Result<Vec<UserResponse>, BridgeError> {
+        let url = format!("{}/api/bridge/provision", self.base_url);
+        let payload: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|(username, display_name)| {
+                serde_json::json!({
+                    "username": username,
+                    "display_name": display_name,
+                })
+            })
+            .collect();
+
         let resp = self
             .client
             .post(&url)
+            .bearer_auth(self.auth.bridge_secret())
             .json(&serde_json::json!({
-                "username": username,
-                "email": format!("{}@agent.local", username),
-                "password": password,
-                "display_name": display_name,
+                "server_id": server_id,
+                "agents": payload,
             }))
             .send()
             .await?;
 
         if resp.status().is_success() {
-            let body: serde_json::Value = resp.json().await?;
-            let user_id = body["user"]["id"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| {
-                    BridgeError::RiftApi("missing user id in register response".into())
-                })?;
-
-            Ok(UserResponse {
-                id: user_id,
-                username: username.to_string(),
-                is_agent: true,
-            })
-        } else if resp.status() == reqwest::StatusCode::CONFLICT {
-            self.login_agent(username, password).await
+            let body: ProvisionResponse = resp.json().await?;
+            Ok(body.agents)
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             Err(BridgeError::RiftApi(format!(
-                "register failed ({status}): {body}"
-            )))
-        }
-    }
-
-    /// Login an existing agent user to get their ID.
-    async fn login_agent(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<UserResponse, BridgeError> {
-        let url = format!("{}/api/auth/login", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({
-                "username": username,
-                "password": password,
-            }))
-            .send()
-            .await?;
-
-        if resp.status().is_success() {
-            let body: serde_json::Value = resp.json().await?;
-            let user_id = body["user"]["id"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| BridgeError::RiftApi("missing user id in login response".into()))?;
-
-            Ok(UserResponse {
-                id: user_id,
-                username: username.to_string(),
-                is_agent: true,
-            })
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(BridgeError::RiftApi(format!(
-                "login failed ({status}): {body}"
+                "provision failed ({status}): {body}"
             )))
         }
     }

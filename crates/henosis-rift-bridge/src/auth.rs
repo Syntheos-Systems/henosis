@@ -31,6 +31,7 @@ pub struct AgentAuthManager {
     ttl_secs: i64,
 }
 
+/// Implements bridge-side credential issuance for agent identities.
 impl AgentAuthManager {
     /// Create a new auth manager with the shared JWT secret.
     pub fn new(jwt_secret: String) -> Self {
@@ -38,6 +39,16 @@ impl AgentAuthManager {
             jwt_secret,
             ttl_secs: 300,
         }
+    }
+
+    /// The shared bridge secret, presented verbatim as the Bearer token on
+    /// bridge-only server routes (`/api/bridge/*`).
+    ///
+    /// Those routes compare against the raw secret rather than validating a
+    /// JWT, which is precisely what keeps them closed to human accounts: a
+    /// login token is a JWT and can never equal the secret.
+    pub fn bridge_secret(&self) -> &str {
+        &self.jwt_secret
     }
 
     /// Issue a short-lived JWT for an agent.

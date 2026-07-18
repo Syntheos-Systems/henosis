@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rift.clone(),
         kleos.clone(),
         "rift".to_string(),
+        config.rift.server_id,
         config.rift.channel_id,
         oracle,
         approval_registry.clone(),

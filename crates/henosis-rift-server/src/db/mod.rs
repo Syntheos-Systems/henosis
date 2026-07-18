@@ -248,6 +248,13 @@ pub async fn get_user_servers(pool: &PgPool, user_id: Uuid) -> Result<Vec<Server
 
 // ───── Members ─────
 
+/// Join a user to a server, returning the membership row.
+///
+/// Idempotent: re-adding an existing member returns the existing row rather
+/// than erroring. The no-op `DO UPDATE` is deliberate -- `DO NOTHING` suppresses
+/// the `RETURNING` clause, so `fetch_one` used to fail with `RowNotFound` for an
+/// already-joined user. That made every bridge restart against a populated
+/// database look like a provisioning failure.
 pub async fn add_member(
     pool: &PgPool,
     server_id: Uuid,
@@ -256,10 +263,51 @@ pub async fn add_member(
     sqlx::query_as::<_, Member>(
         r#"INSERT INTO members (server_id, user_id)
            VALUES ($1, $2)
-           ON CONFLICT DO NOTHING
+           ON CONFLICT (server_id, user_id)
+           DO UPDATE SET server_id = EXCLUDED.server_id
            RETURNING *"#,
     )
     .bind(server_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Create a user that is flagged as an agent from birth.
+///
+/// Distinct from `create_user`, which always produces a human account
+/// (`is_agent` defaults to FALSE). Agents never authenticate themselves -- the
+/// bridge mints their tokens -- so callers pass a hash of an unguessable random
+/// password purely to keep the login path fail-closed.
+pub async fn create_agent_user(
+    pool: &PgPool,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    display_name: Option<&str>,
+) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        r#"INSERT INTO users (username, email, password_hash, display_name, is_agent)
+           VALUES ($1, $2, $3, $4, TRUE)
+           RETURNING *"#,
+    )
+    .bind(username)
+    .bind(email)
+    .bind(password_hash)
+    .bind(display_name)
+    .fetch_one(pool)
+    .await
+}
+
+/// Flag an existing user as an agent.
+///
+/// Converges agent accounts provisioned before `is_agent` was set correctly:
+/// the bridge used to register agents through the public `/api/auth/register`
+/// route, which always leaves the flag FALSE.
+pub async fn mark_user_as_agent(pool: &PgPool, user_id: Uuid) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "UPDATE users SET is_agent = TRUE, updated_at = NOW() WHERE id = $1 RETURNING *",
+    )
     .bind(user_id)
     .fetch_one(pool)
     .await

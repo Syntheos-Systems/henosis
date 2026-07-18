@@ -138,6 +138,7 @@ impl Room {
         rift: Arc<RiftRestClient>,
         kleos: Arc<dyn KleosClient>,
         project_name: String,
+        server_id: Uuid,
         channel_id: Uuid,
         oracle: Arc<dyn CapabilityOracle>,
         approval_registry: ApprovalRegistry,
@@ -148,11 +149,13 @@ impl Room {
         embedder: Option<Arc<dyn Embedder>>,
         embedding_cfg: Option<EmbeddingConfig>,
     ) -> Result<Self, BridgeError> {
-        let roster = AgentRoster::provision(agent_configs, &rift).await?;
+        let roster = AgentRoster::provision(agent_configs, &rift, server_id).await?;
 
-        // Build executor map from agent configs.
+        // Build executor map from agent configs. Pair by config slot, never by
+        // HashMap iteration order -- zipping arbitrary order against the config
+        // list handed agents each other's executors.
         let mut executors: HashMap<AgentId, Arc<dyn AgentExecutor>> = HashMap::new();
-        for (agent, config) in roster.all().zip(agent_configs.iter()) {
+        for (agent, config) in roster.all_by_slot().into_iter().zip(agent_configs.iter()) {
             let executor: Arc<dyn AgentExecutor> = match &config.executor {
                 ExecutorConfig::ClaudeCode {
                     binary,
@@ -203,9 +206,11 @@ impl Room {
         }
 
         // Build the room notifier from the first provisioned agent identity.
-        let first = roster
-            .all()
-            .next()
+        // Taken by slot so the notifier identity is stable across boots rather
+        // than whichever agent HashMap iteration happened to yield first.
+        let first = *roster
+            .all_by_slot()
+            .first()
             .ok_or_else(|| BridgeError::Config("no agents configured".into()))?;
         let notifier: Arc<dyn RoomNotifier> = Arc::new(RiftRoomNotifier::new(
             rift.clone(),

@@ -309,10 +309,30 @@ impl Gateway {
                                             if session.subscribed_servers.contains(&server_id) {
                                                 continue;
                                             }
+                                            // A refused subscription must never be silent. When
+                                            // this dropped through quietly, a non-member bridge
+                                            // agent looked completely healthy while the room was
+                                            // deaf to every message.
                                             match crate::db::is_member(&pool, server_id, session.user_id).await {
                                                 Ok(true) => {}
-                                                Ok(false) => continue,
-                                                Err(_) => continue,
+                                                Ok(false) => {
+                                                    tracing::warn!(
+                                                        server_id = %server_id,
+                                                        user_id = %session.user_id,
+                                                        username = %session.username,
+                                                        "refusing server subscription: user is not a member"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        server_id = %server_id,
+                                                        user_id = %session.user_id,
+                                                        error = %e,
+                                                        "refusing server subscription: membership check failed"
+                                                    );
+                                                    continue;
+                                                }
                                             }
 
                                             let mut rx = gateway.subscribe_server(server_id);

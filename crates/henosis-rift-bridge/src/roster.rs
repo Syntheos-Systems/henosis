@@ -46,27 +46,45 @@ pub struct AgentRoster {
 
 /// Implements provisioning and lookup helpers for the bridge agent roster.
 impl AgentRoster {
-    /// Provision agent users in Rift from config entries.
-    /// Registers each agent as a Rift user (or logs in if already registered).
+    /// Provision agent users in Rift and join them to the room's server.
+    ///
+    /// One call converges the whole roster: each agent is created (or reused)
+    /// as an agent user AND added to `server_id`'s member list. The join is the
+    /// load-bearing part -- the gateway silently refuses a non-member's channel
+    /// subscription, so agents that are merely registered can post but never
+    /// receive, leaving the room deaf with no error anywhere.
     pub async fn provision(
         configs: &[AgentConfig],
         rift: &RiftRestClient,
+        server_id: Uuid,
     ) -> Result<Self, BridgeError> {
+        let requested: Vec<(String, String)> = configs
+            .iter()
+            .map(|c| (c.username.clone(), c.name.clone()))
+            .collect();
+
+        let provisioned = rift.provision_agents(server_id, &requested).await?;
+
         let mut agents = HashMap::new();
 
         for (slot_index, config) in configs.iter().enumerate() {
-            // Deterministic password derived from username.
-            // Agents never authenticate themselves -- the bridge issues tokens.
-            let password = format!("agent-internal-{}", config.username);
-
-            let user = rift
-                .register_agent(&config.username, &config.name, &password)
-                .await?;
+            // Match by username rather than position: the roster must not
+            // depend on the server echoing agents back in request order.
+            let user = provisioned
+                .iter()
+                .find(|u| u.username == config.username)
+                .ok_or_else(|| {
+                    BridgeError::RiftApi(format!(
+                        "provision response omitted agent '{}'",
+                        config.username
+                    ))
+                })?;
 
             tracing::info!(
-                "provisioned agent: {} (rift_user_id: {})",
+                "provisioned agent: {} (rift_user_id: {}, server: {})",
                 config.name,
-                user.id
+                user.id,
+                server_id
             );
 
             let agent_id = AgentId(Uuid::new_v4());
@@ -88,6 +106,17 @@ impl AgentRoster {
         }
 
         Ok(Self { agents })
+    }
+
+    /// Agents ordered by their config slot, so callers that pair the roster
+    /// with the config list cannot mismatch them.
+    ///
+    /// `all()` iterates a HashMap in arbitrary order; zipping that against the
+    /// config list bound each agent to another agent's executor.
+    pub fn all_by_slot(&self) -> Vec<&RegisteredAgent> {
+        let mut ordered: Vec<&RegisteredAgent> = self.agents.values().collect();
+        ordered.sort_by_key(|a| a.slot_index);
+        ordered
     }
 
     /// Test-only constructor building a roster from pre-made agents without
@@ -171,5 +200,43 @@ mod tests {
 
         assert!(!roster.is_empty());
         assert_eq!(roster.len(), 1);
+    }
+
+    /// Regression: `all_by_slot` must return agents in config-slot order.
+    ///
+    /// `all()` iterates a HashMap, so pairing it with the config list bound
+    /// each agent to whichever executor happened to land at the same iteration
+    /// position -- agents silently ran each other's model and provider. The
+    /// bug hid in the live smoke test because all three agents there shared one
+    /// executor config, making a mismatch unobservable.
+    #[test]
+    fn test_all_by_slot_follows_config_order() {
+        let build = |slot: usize, username: &str| RegisteredAgent {
+            id: AgentId(Uuid::new_v4()),
+            rift_user_id: Uuid::new_v4(),
+            username: username.to_string(),
+            display_name: username.to_string(),
+            base_chance: 0.3,
+            system_prompt: String::new(),
+            state: AgentState::Idle,
+            slot_index: slot,
+            last_posted_turn: None,
+            last_post_at: None,
+        };
+
+        // Insert in an order deliberately unrelated to slot order.
+        let roster = AgentRoster::from_agents(vec![
+            build(2, "rook"),
+            build(0, "vera"),
+            build(1, "pip"),
+        ]);
+
+        let ordered: Vec<&str> = roster
+            .all_by_slot()
+            .iter()
+            .map(|a| a.username.as_str())
+            .collect();
+
+        assert_eq!(ordered, vec!["vera", "pip", "rook"]);
     }
 }

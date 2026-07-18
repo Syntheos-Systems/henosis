@@ -137,7 +137,11 @@ pub async fn logout(
 
 // ── Helpers ──
 
-fn hash_password(password: &str) -> Result<String, AppError> {
+/// Hash a password with Argon2 using a fresh random salt.
+///
+/// Shared with bridge agent provisioning, which hashes a throwaway random
+/// password so agent accounts have no usable login.
+pub(crate) fn hash_password(password: &str) -> Result<String, AppError> {
     use argon2::{
         password_hash::{rand_core::OsRng, SaltString},
         Argon2, PasswordHasher,

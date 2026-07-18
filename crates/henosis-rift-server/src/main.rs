@@ -13,13 +13,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-mod auth;
-mod config;
-mod db;
-mod error;
-mod models;
-mod routes;
-mod ws;
+// Use the library target rather than re-declaring the module tree. Declaring
+// `mod auth; mod db; ...` here compiled every module a second time into the
+// binary, and that private copy is what produced the dead-code warnings: items
+// reachable only from the library's public API looked unused in the bin's copy.
+use henosis_rift_server::{config, routes, ws};
 
 use config::Config;
 use routes::upload::PendingUploads;
@@ -199,6 +197,10 @@ async fn main() {
         .route("/api/upload", post(routes::upload::upload_files))
         // Bridge internal
         .route("/api/bridge/notify", post(routes::bridge::notify_message))
+        .route(
+            "/api/bridge/provision",
+            post(routes::bridge::provision_agents),
+        )
         .route("/api/bridge/pause", post(routes::bridge_control::pause_bridge))
         .route("/api/bridge/resume", post(routes::bridge_control::resume_bridge))
         .route("/api/bridge/status", get(routes::bridge_control::bridge_status))
