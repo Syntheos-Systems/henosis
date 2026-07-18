@@ -12,7 +12,9 @@ use henosis_rift_bridge::auth::AgentAuthManager;
 use henosis_rift_bridge::capability::{PistisOracle, StaticAllowlistOracle};
 use henosis_rift_bridge::config::{BridgeConfig, EmbeddingConfig};
 use henosis_rift_bridge::embedding::{Embedder, OpenAiEmbedder};
-use henosis_rift_bridge::execution::approval::ApprovalRegistry;
+use henosis_rift_bridge::execution::approval::{
+    decide_drain_action, ApprovalRegistry, DrainAction,
+};
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
 use henosis_rift_bridge::stimulus::{
     ChiasmTaskSource, GitHeadSource, ReflectionSource, Stimulus, StimulusInjector, StimulusSource,
@@ -169,27 +171,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatcher = room.dispatcher();
 
     // Approvals drain task: dispatches control-server approvals the moment
-    // they arrive, cascade or no cascade. While paused, approvals are HELD
-    // and dispatched on unpause -- the old loop silently dropped them.
-    // KNOWN LIMITATION: a held proposal left the registry when it was
-    // approved, so it is invisible to /control/approvals and cannot be
-    // rejected until it dispatches; holding beats the old silent drop, and
-    // making holds observable needs a registry re-insert API (future work).
+    // they arrive, cascade or no cascade. While paused, approvals are HELD --
+    // and the hold lives in the ApprovalRegistry, not in a private queue here.
+    // A held proposal therefore stays visible to /control/approvals (tagged
+    // approved_held) and stays rejectable, instead of vanishing until someone
+    // unpaused. Registry state is still in-memory, so a bridge restart loses
+    // pending AND held approvals alike; durability is a separate concern.
     {
         let dispatcher = dispatcher.clone();
+        let registry = approval_registry.clone();
         let mut pause_rx = pause_rx.clone();
         let mut approved_rx = approved_rx;
         tokio::spawn(async move {
-            let mut held: Vec<henosis_rift_bridge::execution::PendingProposal> = Vec::new();
             loop {
                 tokio::select! {
                     maybe = approved_rx.recv() => match maybe {
                         Some(proposal) => {
-                            if *pause_rx.borrow() {
-                                tracing::info!("bridge paused, holding approval {}", proposal.id);
-                                held.push(proposal);
-                            } else {
-                                dispatcher.execute_approved(proposal);
+                            let id = proposal.id;
+                            let paused = *pause_rx.borrow();
+                            match decide_drain_action(paused, &registry, id) {
+                                // Leave it in the registry as Approved; the
+                                // unpause branch below claims it.
+                                DrainAction::Hold => {
+                                    tracing::info!("bridge paused, holding approval {id}");
+                                }
+                                DrainAction::Dispatch => dispatcher.execute_approved(proposal),
+                                // Already claimed by the unpause flush, or
+                                // rejected while held. Dispatching here would
+                                // run the task a second time.
+                                DrainAction::Skip => {
+                                    tracing::debug!("approval {id} already handled, skipping dispatch");
+                                }
                             }
                         }
                         None => return,
@@ -199,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         if !*pause_rx.borrow() {
-                            for proposal in held.drain(..) {
+                            for proposal in registry.take_approved() {
                                 tracing::info!("dispatching held approval {}", proposal.id);
                                 dispatcher.execute_approved(proposal);
                             }

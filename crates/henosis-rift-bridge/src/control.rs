@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::ControlConfig;
-use crate::execution::approval::ApprovalRegistry;
+use crate::execution::approval::{ApprovalRegistry, ProposalState};
 use crate::execution::{PendingProposal, ProposalId};
 
 /// JSON body for an approval action.
@@ -62,11 +62,26 @@ async fn list_approvals(
         )
             .into_response();
     }
+    // Report state so an operator can tell a proposal still awaiting a
+    // decision from one already approved and waiting on unpause. Held
+    // approvals used to be absent from this list entirely.
     let pending: Vec<_> = state
         .registry
-        .list()
+        .list_with_state()
         .into_iter()
-        .map(|p| json!({ "id": p.id.0, "agent": p.agent, "task_id": p.task_id, "scope": p.scope_summary }))
+        .map(|(p, s)| {
+            let state = match s {
+                ProposalState::Pending => "pending",
+                ProposalState::Approved => "approved_held",
+            };
+            json!({
+                "id": p.id.0,
+                "agent": p.agent,
+                "task_id": p.task_id,
+                "scope": p.scope_summary,
+                "state": state,
+            })
+        })
         .collect();
     (StatusCode::OK, Json(json!({ "pending": pending }))).into_response()
 }
@@ -152,6 +167,7 @@ pub async fn serve(
     Ok(())
 }
 
+/// Covers control-server request authorization and body parsing.
 #[cfg(test)]
 mod tests {
     use super::{authorize, ControlAction};

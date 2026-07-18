@@ -613,7 +613,11 @@ impl Room {
     fn apply_control_command(&self, cmd: ControlCommand) {
         match cmd {
             ControlCommand::Approve(id) => {
-                if let Some(proposal) = self.approval_registry.approve(id) {
+                // Immediate dispatch: this path only runs while unpaused (the
+                // event loop and the cascade both level-check pause first), so
+                // the proposal is taken outright rather than left in the held
+                // state the control-server path uses.
+                if let Some(proposal) = self.approval_registry.approve_and_take(id) {
                     tracing::info!("approval {} accepted by human", id);
                     self.dispatcher.execute_approved(proposal);
                 } else {
