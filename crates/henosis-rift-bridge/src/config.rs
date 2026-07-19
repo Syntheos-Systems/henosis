@@ -107,6 +107,12 @@ pub struct StimulusSettings {
     /// Minimum seconds between two git commit stimuli.
     #[serde(default = "default_git_cooldown_secs")]
     pub git_cooldown_secs: u64,
+    /// Minimum seconds between two Axon activity-event stimuli.
+    #[serde(default = "default_axon_cooldown_secs")]
+    pub axon_cooldown_secs: u64,
+    /// Minimum seconds between two Loom workflow-run stimuli.
+    #[serde(default = "default_loom_cooldown_secs")]
+    pub loom_cooldown_secs: u64,
     /// Global cap on stimuli per rolling hour, across all kinds.
     #[serde(default = "default_stimulus_max_per_hour")]
     pub max_per_hour: u32,
@@ -130,6 +136,16 @@ fn default_chiasm_cooldown_secs() -> u64 {
 /// Default git stimulus cooldown (5 minutes).
 fn default_git_cooldown_secs() -> u64 {
     300
+}
+
+/// Default Axon activity-event stimulus cooldown (10 minutes).
+fn default_axon_cooldown_secs() -> u64 {
+    600
+}
+
+/// Default Loom workflow-run stimulus cooldown (10 minutes).
+fn default_loom_cooldown_secs() -> u64 {
+    600
 }
 
 /// Default global stimulus rate cap per hour.
@@ -552,6 +568,8 @@ mod tests {
         assert_eq!(stim.reflection_after_secs, 14400);
         assert_eq!(stim.chiasm_cooldown_secs, 900);
         assert_eq!(stim.git_cooldown_secs, 300);
+        assert_eq!(stim.axon_cooldown_secs, 600);
+        assert_eq!(stim.loom_cooldown_secs, 600);
         assert_eq!(stim.max_per_hour, 6);
     }
 }

@@ -17,8 +17,12 @@ use henosis_rift_bridge::execution::approval::{
 };
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
 use henosis_rift_bridge::stimulus::{
-    ChiasmTaskSource, GitHeadSource, ReflectionSource, Stimulus, StimulusInjector, StimulusSource,
+    AxonEventSource, ChiasmTaskSource, GitHeadSource, LoomRunSource, ReflectionSource, Stimulus,
+    StimulusInjector, StimulusSource,
 };
+
+/// Project scope for all bridge Kleos operations (tasks, activity, stimuli).
+const KLEOS_PROJECT: &str = "rift";
 
 use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use henosis_rift_bridge::room::Room;
@@ -97,6 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|w| (w.name.clone(), w.path.clone()))
         .collect();
+    // Reporters whose Axon activity must never wake the room: the bridge's
+    // own reporting identity (room.rs reports as "rift-bridge") plus every
+    // roster agent -- otherwise the room's own wake reports and its agents'
+    // execution-task updates would feed back into fresh stimuli.
+    let stimulus_exclude_agents: Vec<String> = std::iter::once("rift-bridge".to_string())
+        .chain(config.agents.iter().map(|a| a.username.clone()))
+        .collect();
 
     // Create room (provisions agent users in Rift).
     let mut room = Room::new(
@@ -104,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.bridge,
         rift.clone(),
         kleos.clone(),
-        "rift".to_string(),
+        KLEOS_PROJECT.to_string(),
         config.rift.server_id,
         config.rift.channel_id,
         oracle,
@@ -245,7 +256,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ReflectionSource::new(std::time::Duration::from_secs(
                 settings.reflection_after_secs,
             ))),
-            Box::new(ChiasmTaskSource::new(kleos.clone(), "rift".to_string())),
+            Box::new(ChiasmTaskSource::new(
+                kleos.clone(),
+                KLEOS_PROJECT.to_string(),
+            )),
+            Box::new(AxonEventSource::new(
+                kleos.clone(),
+                KLEOS_PROJECT.to_string(),
+                stimulus_exclude_agents,
+            )),
+            Box::new(LoomRunSource::new(kleos.clone())),
         ];
         if !workspace_paths.is_empty() {
             sources.push(Box::new(GitHeadSource::new(workspace_paths)));

@@ -57,6 +57,116 @@ struct KleosTasksResponse {
     tasks: Vec<KleosTaskSummary>,
 }
 
+/// One Axon event as returned by `GET /axon/events`. The activity fan-out
+/// packs project and summary into the payload object rather than top-level
+/// columns, so the payload is kept raw here and flattened by the Brief
+/// conversion.
+#[derive(Debug, Deserialize)]
+struct KleosAxonEvent {
+    /// Monotonic event id; the since_id cursor compares against it.
+    id: i64,
+    /// Routing channel derived from the action (alerts, tasks, quality, system).
+    channel: String,
+    /// Activity action string (e.g. task.completed, error.raised).
+    action: String,
+    /// Reporting agent name, when the publisher supplied one.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Publisher payload; activity fan-out stores {agent, action, summary, project?}.
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+/// Response envelope returned by Axon event listing.
+#[derive(Debug, Deserialize)]
+struct KleosAxonEventsResponse {
+    /// Matching events, oldest first within the queried window.
+    #[serde(default)]
+    events: Vec<KleosAxonEvent>,
+}
+
+/// One Loom workflow run as returned by `GET /loom/runs`.
+#[derive(Debug, Deserialize)]
+struct KleosLoomRun {
+    /// Run id.
+    id: i64,
+    /// Owning workflow id.
+    workflow_id: i64,
+    /// Current run status string (vocabulary is open; treated opaquely).
+    status: String,
+    /// Failure detail when the run errored.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Response envelope returned by Loom run listing.
+#[derive(Debug, Deserialize)]
+struct KleosLoomRunsResponse {
+    /// Matching run rows, most recent first.
+    #[serde(default)]
+    runs: Vec<KleosLoomRun>,
+}
+
+/// Compact Axon event view handed to stimulus sources.
+#[derive(Debug, Clone)]
+pub struct AxonEventBrief {
+    /// Monotonic event id (cursor value).
+    pub id: i64,
+    /// Routing channel (alerts, tasks, quality, system).
+    pub channel: String,
+    /// Activity action string.
+    pub action: String,
+    /// Reporting agent name, when known.
+    pub agent: Option<String>,
+    /// Project the activity belongs to, when the payload carried one.
+    pub project: Option<String>,
+    /// Human-readable activity summary, when the payload carried one.
+    pub summary: Option<String>,
+}
+
+/// Flatten a wire event into the Brief the stimulus source consumes.
+impl From<KleosAxonEvent> for AxonEventBrief {
+    /// Pull project and summary out of the activity payload object.
+    fn from(event: KleosAxonEvent) -> Self {
+        let project = event.payload["project"].as_str().map(str::to_string);
+        let summary = event.payload["summary"].as_str().map(str::to_string);
+        Self {
+            id: event.id,
+            channel: event.channel,
+            action: event.action,
+            agent: event.agent,
+            project,
+            summary,
+        }
+    }
+}
+
+/// Compact Loom run view handed to stimulus sources.
+#[derive(Debug, Clone)]
+pub struct LoomRunBrief {
+    /// Run id.
+    pub id: i64,
+    /// Owning workflow id.
+    pub workflow_id: i64,
+    /// Current status string, treated opaquely.
+    pub status: String,
+    /// Failure detail when the run errored.
+    pub error: Option<String>,
+}
+
+/// Narrow a wire run row into the Brief the stimulus source consumes.
+impl From<KleosLoomRun> for LoomRunBrief {
+    /// Carry the fields transition detection needs.
+    fn from(run: KleosLoomRun) -> Self {
+        Self {
+            id: run.id,
+            workflow_id: run.workflow_id,
+            status: run.status,
+            error: run.error,
+        }
+    }
+}
+
 /// Transport-agnostic Kleos operations needed by the bridge discussion loop.
 #[async_trait]
 pub trait KleosClient: Send + Sync {
@@ -121,6 +231,25 @@ pub trait KleosClient: Send + Sync {
         status: &str,
         note: &str,
     ) -> Result<(), BridgeError>;
+
+    /// List Axon events newer than the given cursor id, oldest cursor-eligible
+    /// first. Defaults to empty: the in-process AxonBus is pure pub/sub with
+    /// no query surface, so only backends with a queryable event store (the
+    /// HTTP path) override this; everyone else simply contributes no
+    /// activity-event stimuli.
+    async fn list_axon_events_since(
+        &self,
+        _since_id: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<AxonEventBrief>, BridgeError> {
+        Ok(Vec::new())
+    }
+
+    /// List recent Loom workflow runs. Defaults to empty: there is no
+    /// in-process Loom store, so only the HTTP backend overrides this.
+    async fn list_workflow_runs(&self, _limit: usize) -> Result<Vec<LoomRunBrief>, BridgeError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Real Kleos client backed by the local Kleos HTTP API.
@@ -378,6 +507,40 @@ impl KleosClient for HttpKleosClient {
         let _: serde_json::Value = self.parse_json("/chiasm/tasks/:id", response).await?;
         Ok(())
     }
+
+    /// List Axon events past the cursor via `GET /axon/events`.
+    async fn list_axon_events_since(
+        &self,
+        since_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AxonEventBrief>, BridgeError> {
+        let limit_text = limit.to_string();
+        let mut query: Vec<(&str, String)> = vec![("limit", limit_text)];
+        if let Some(id) = since_id {
+            query.push(("since_id", id.to_string()));
+        }
+        let response = self
+            .authed(self.client.get(self.endpoint("/axon/events")).query(&query))
+            .send()
+            .await?;
+        let events: KleosAxonEventsResponse = self.parse_json("/axon/events", response).await?;
+        Ok(events.events.into_iter().map(AxonEventBrief::from).collect())
+    }
+
+    /// List recent Loom workflow runs via `GET /loom/runs`.
+    async fn list_workflow_runs(&self, limit: usize) -> Result<Vec<LoomRunBrief>, BridgeError> {
+        let limit_text = limit.to_string();
+        let response = self
+            .authed(
+                self.client
+                    .get(self.endpoint("/loom/runs"))
+                    .query(&[("limit", limit_text.as_str())]),
+            )
+            .send()
+            .await?;
+        let runs: KleosLoomRunsResponse = self.parse_json("/loom/runs", response).await?;
+        Ok(runs.runs.into_iter().map(LoomRunBrief::from).collect())
+    }
 }
 
 /// One memory hit, transport-agnostic: the fields the bridge renders into its
@@ -423,6 +586,7 @@ impl HttpMemoryBackend {
     }
 }
 
+/// Memory operations against upstream Kleos over HTTP.
 #[async_trait]
 impl BridgeMemory for HttpMemoryBackend {
     /// Search via the upstream Kleos `/search` endpoint.
@@ -508,6 +672,7 @@ impl CognitionMemoryBackend {
     }
 }
 
+/// Memory operations against the in-process cognition store.
 #[cfg(feature = "cognition")]
 #[async_trait]
 impl BridgeMemory for CognitionMemoryBackend {
@@ -1015,5 +1180,66 @@ mod in_process_tests {
             )
             .await
             .expect("report activity");
+    }
+
+    /// An Axon wire event flattens project and summary out of the activity
+    /// payload; absent payload fields become None instead of erroring.
+    #[test]
+    fn axon_event_brief_flattens_payload() {
+        let full: super::KleosAxonEvent = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "channel": "alerts",
+            "action": "error.raised",
+            "agent": "claude-code",
+            "payload": {
+                "agent": "claude-code",
+                "action": "error.raised",
+                "summary": "build broke",
+                "project": "henosis"
+            }
+        }))
+        .expect("wire event parses");
+        let brief = super::AxonEventBrief::from(full);
+        assert_eq!(brief.id, 42);
+        assert_eq!(brief.channel, "alerts");
+        assert_eq!(brief.project.as_deref(), Some("henosis"));
+        assert_eq!(brief.summary.as_deref(), Some("build broke"));
+
+        let bare: super::KleosAxonEvent = serde_json::from_value(serde_json::json!({
+            "id": 43,
+            "channel": "system",
+            "action": "custom.thing"
+        }))
+        .expect("payload-less event parses");
+        let brief = super::AxonEventBrief::from(bare);
+        assert!(brief.project.is_none());
+        assert!(brief.summary.is_none());
+        assert!(brief.agent.is_none());
+    }
+
+    /// A Loom wire run narrows to the transition-relevant fields, and the
+    /// response envelope tolerates an absent runs array.
+    #[test]
+    fn loom_run_brief_narrows_wire_row() {
+        let run: super::KleosLoomRun = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "workflow_id": 3,
+            "status": "failed",
+            "error": "step 2 exploded",
+            "input": {},
+            "output": {},
+            "user_id": 1,
+            "created_at": "2026-07-19"
+        }))
+        .expect("wire run parses with extra fields");
+        let brief = super::LoomRunBrief::from(run);
+        assert_eq!(brief.id, 7);
+        assert_eq!(brief.workflow_id, 3);
+        assert_eq!(brief.status, "failed");
+        assert_eq!(brief.error.as_deref(), Some("step 2 exploded"));
+
+        let empty: super::KleosLoomRunsResponse =
+            serde_json::from_value(serde_json::json!({})).expect("empty envelope parses");
+        assert!(empty.runs.is_empty());
     }
 }

@@ -3,12 +3,14 @@
 //! The parent Rift Team Room design (memory 27272) lists the stimulus
 //! injector as a core bridge component: rooms otherwise only wake when a
 //! human posts, so an idle team never reflects, never notices a new commit,
-//! and never revisits stale tasks. This module implements the injector with
-//! the sources reachable from the bridge today -- scheduled reflection,
-//! Chiasm task-state changes (via the existing KleosClient), and git HEAD
-//! movement in declared workspaces. Axon/Loom/test-result sources from the
-//! parent spec need client surfaces the bridge does not have yet and remain
-//! future work (recorded in the design doc addendum).
+//! and never revisits stale tasks. Sources implemented here: scheduled
+//! reflection, Chiasm task-state changes, git HEAD movement in declared
+//! workspaces, Axon activity events (alerts/tasks channels, self-reports
+//! excluded), and Loom workflow-run transitions -- the latter two via the
+//! KleosClient HTTP surface only (the in-process AxonBus is pure pub/sub
+//! with nothing to query, and there is no in-process Loom store). The
+//! parent spec's test-result source still needs a CI surface the bridge
+//! does not have and remains future work.
 //!
 //! Parent-spec safety requirements implemented here: per-source cooldowns, a
 //! global hourly rate cap, and content sanitization of everything read from
@@ -44,6 +46,10 @@ pub enum StimulusKind {
     ChiasmTasks,
     /// A declared workspace's git HEAD moved.
     GitCommit,
+    /// Fresh Axon activity events for the project (alerts/tasks channels).
+    AxonEvents,
+    /// A Loom workflow run started or changed status.
+    LoomRuns,
 }
 
 /// Cooldown-map keys and display labels for stimulus kinds.
@@ -54,6 +60,8 @@ impl StimulusKind {
             Self::Reflection => "reflection",
             Self::ChiasmTasks => "chiasm-tasks",
             Self::GitCommit => "git-commit",
+            Self::AxonEvents => "axon-events",
+            Self::LoomRuns => "loom-runs",
         }
     }
 }
@@ -325,6 +333,190 @@ impl StimulusSource for GitHeadSource {
     }
 }
 
+/// How many Axon events one poll fetches past the cursor.
+const AXON_FETCH_LIMIT: usize = 50;
+
+/// How many Loom runs one poll examines for status transitions.
+const LOOM_FETCH_LIMIT: usize = 50;
+
+/// Fires when fresh Axon activity events land for this project.
+///
+/// Watches the `alerts` and `tasks` channels (the activity fan-out routes
+/// task.blocked/error.raised to alerts and other task.* actions to tasks).
+/// Events reported by the bridge itself or by its own roster agents are
+/// excluded: the room waking itself through its own activity reports would
+/// be a feedback loop, capped only by cooldowns.
+pub struct AxonEventSource {
+    /// Kleos client the events are fetched through.
+    kleos: Arc<dyn KleosClient>,
+    /// Project whose activity wakes the room (matched against payload.project).
+    project: String,
+    /// Reporter names whose events never fire (the bridge and its agents).
+    exclude_agents: Vec<String>,
+    /// Highest event id seen so far; the next fetch starts past it.
+    cursor: Option<i64>,
+    /// Whether the first poll has primed the cursor. The first observation
+    /// never fires: booting the bridge is not fresh project activity.
+    primed: bool,
+}
+
+/// Construction for the Axon activity source.
+impl AxonEventSource {
+    /// Build for a project with the reporters to ignore.
+    pub fn new(kleos: Arc<dyn KleosClient>, project: String, exclude_agents: Vec<String>) -> Self {
+        Self {
+            kleos,
+            project,
+            exclude_agents,
+            cursor: None,
+            primed: false,
+        }
+    }
+}
+
+/// Emits one batched stimulus covering fresh, non-self project activity.
+#[async_trait]
+impl StimulusSource for AxonEventSource {
+    /// Axon activity stimuli.
+    fn kind(&self) -> StimulusKind {
+        StimulusKind::AxonEvents
+    }
+
+    /// Fetch events past the cursor and batch the qualifying ones. The
+    /// cursor advances past EVERY fetched event -- excluded ones included --
+    /// so self-activity can never be re-examined; a fetch error advances
+    /// nothing, so no event is lost to a transient failure.
+    async fn poll(&mut self, _ctx: &StimulusContext) -> Vec<Stimulus> {
+        let events = match self
+            .kleos
+            .list_axon_events_since(self.cursor, AXON_FETCH_LIMIT)
+            .await
+        {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!("axon stimulus poll failed: {e}");
+                return Vec::new();
+            }
+        };
+        if let Some(max_id) = events.iter().map(|e| e.id).max() {
+            self.cursor = Some(self.cursor.map_or(max_id, |c| c.max(max_id)));
+        }
+        if !self.primed {
+            self.primed = true;
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        for event in events {
+            if event.channel != "alerts" && event.channel != "tasks" {
+                continue;
+            }
+            if event.project.as_deref() != Some(self.project.as_str()) {
+                continue;
+            }
+            if event
+                .agent
+                .as_deref()
+                .is_some_and(|a| self.exclude_agents.iter().any(|x| x == a))
+            {
+                continue;
+            }
+            let agent = event.agent.as_deref().unwrap_or("unknown");
+            let summary = event.summary.as_deref().unwrap_or("(no summary)");
+            lines.push(format!("{} by {agent}: {summary}", event.action));
+        }
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        vec![Stimulus {
+            kind: StimulusKind::AxonEvents,
+            text: format!("Project activity:\n{}", lines.join("\n")),
+        }]
+    }
+}
+
+/// Fires when a Loom workflow run appears or changes status between polls.
+pub struct LoomRunSource {
+    /// Kleos client the runs are fetched through.
+    kleos: Arc<dyn KleosClient>,
+    /// Status last seen per run id, bounded to the latest fetch window.
+    last_status: HashMap<i64, String>,
+    /// Whether the first poll has primed the baseline. The first observation
+    /// never fires: booting the bridge is not a workflow event.
+    primed: bool,
+}
+
+/// Construction for the Loom workflow-run source.
+impl LoomRunSource {
+    /// Build over the bridge's Kleos client.
+    pub fn new(kleos: Arc<dyn KleosClient>) -> Self {
+        Self {
+            kleos,
+            last_status: HashMap::new(),
+            primed: false,
+        }
+    }
+}
+
+/// Emits one batched stimulus listing run starts and status transitions.
+#[async_trait]
+impl StimulusSource for LoomRunSource {
+    /// Loom workflow-run stimuli.
+    fn kind(&self) -> StimulusKind {
+        StimulusKind::LoomRuns
+    }
+
+    /// Diff run statuses against the previous poll. The baseline map is
+    /// replaced with exactly the ids in the latest fetch, so runs rotating
+    /// out of the window are pruned rather than reported; a fetch error
+    /// leaves the baseline untouched. Status vocabulary is open, so
+    /// transitions are reported generically as `old -> new`.
+    async fn poll(&mut self, _ctx: &StimulusContext) -> Vec<Stimulus> {
+        let runs = match self.kleos.list_workflow_runs(LOOM_FETCH_LIMIT).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!("loom stimulus poll failed: {e}");
+                return Vec::new();
+            }
+        };
+
+        let mut lines = Vec::new();
+        let mut next = HashMap::with_capacity(runs.len());
+        for run in &runs {
+            match self.last_status.get(&run.id) {
+                None if self.primed => {
+                    lines.push(format!(
+                        "workflow {} run #{} is {}",
+                        run.workflow_id, run.id, run.status
+                    ));
+                }
+                Some(prev) if prev != &run.status => {
+                    let mut line = format!(
+                        "workflow {} run #{}: {prev} -> {}",
+                        run.workflow_id, run.id, run.status
+                    );
+                    if let Some(error) = &run.error {
+                        line.push_str(&format!(" ({error})"));
+                    }
+                    lines.push(line);
+                }
+                _ => {}
+            }
+            next.insert(run.id, run.status.clone());
+        }
+        self.last_status = next;
+        self.primed = true;
+
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        vec![Stimulus {
+            kind: StimulusKind::LoomRuns,
+            text: format!("Workflow runs changed:\n{}", lines.join("\n")),
+        }]
+    }
+}
+
 /// Strip control characters (newline survives), collapse leading/trailing
 /// whitespace, and truncate to `max_chars` on a char boundary. Everything a
 /// source read from external state (commit subjects, task titles) is
@@ -385,6 +577,14 @@ impl StimulusInjector {
         cooldowns.insert(
             StimulusKind::GitCommit,
             Duration::from_secs(settings.git_cooldown_secs),
+        );
+        cooldowns.insert(
+            StimulusKind::AxonEvents,
+            Duration::from_secs(settings.axon_cooldown_secs),
+        );
+        cooldowns.insert(
+            StimulusKind::LoomRuns,
+            Duration::from_secs(settings.loom_cooldown_secs),
         );
         Self {
             sources,
@@ -485,6 +685,8 @@ mod tests {
             reflection_after_secs: 14400,
             chiasm_cooldown_secs: chiasm_cd,
             git_cooldown_secs: 300,
+            axon_cooldown_secs: 600,
+            loom_cooldown_secs: 600,
             max_per_hour,
         };
         let (tx, _rx) = mpsc::channel(8);
@@ -590,5 +792,271 @@ mod tests {
         };
         assert!(src.poll(&ctx).await.is_empty());
         assert!(src.primed);
+    }
+
+    use crate::error::BridgeError;
+    use crate::kleos::{AxonEventBrief, LoomRunBrief};
+
+    /// Scripted Kleos stub: each Axon/Loom poll pops the next canned batch
+    /// (empty once exhausted) and records the cursor it was asked for.
+    struct ScriptedKleos {
+        /// Remaining Axon batches, popped front per poll.
+        axon_batches: std::sync::Mutex<VecDeque<Vec<AxonEventBrief>>>,
+        /// Remaining Loom batches, popped front per poll.
+        loom_batches: std::sync::Mutex<VecDeque<Vec<LoomRunBrief>>>,
+        /// The since_id argument of every Axon fetch, in call order.
+        axon_cursors: std::sync::Mutex<Vec<Option<i64>>>,
+    }
+
+    /// Construction from canned batches.
+    impl ScriptedKleos {
+        /// Build with the given Axon and Loom poll scripts.
+        fn new(axon: Vec<Vec<AxonEventBrief>>, loom: Vec<Vec<LoomRunBrief>>) -> Self {
+            Self {
+                axon_batches: std::sync::Mutex::new(axon.into_iter().collect()),
+                loom_batches: std::sync::Mutex::new(loom.into_iter().collect()),
+                axon_cursors: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    /// Implements the client trait over the canned scripts; every operation
+    /// the sources do not exercise is a successful no-op.
+    #[async_trait]
+    impl KleosClient for ScriptedKleos {
+        /// Returns no memories.
+        async fn search_memories(
+            &self,
+            _project: &str,
+            _channel: &str,
+            _recent: &[(String, String)],
+            _limit: usize,
+        ) -> Result<Vec<String>, BridgeError> {
+            Ok(Vec::new())
+        }
+
+        /// Returns no task summary.
+        async fn active_tasks_summary(
+            &self,
+            _project: &str,
+            _limit: usize,
+        ) -> Result<Option<String>, BridgeError> {
+            Ok(None)
+        }
+
+        /// Accepts any activity report.
+        async fn report_activity(
+            &self,
+            _project: &str,
+            _agent: &str,
+            _action: &str,
+            _summary: &str,
+            _metadata: serde_json::Value,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        /// Accepts any consensus memory.
+        async fn store_consensus_memory(
+            &self,
+            _project: &str,
+            _content: &str,
+            _tags: &[String],
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        /// Accepts any draft task.
+        async fn create_draft_task(
+            &self,
+            _project: &str,
+            _agent: &str,
+            _title: &str,
+            _summary: &str,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        /// Returns a fixed execution task id.
+        async fn create_execution_task(
+            &self,
+            _project: &str,
+            _agent: &str,
+            _title: &str,
+            _description: &str,
+        ) -> Result<String, BridgeError> {
+            Ok("task-test".to_string())
+        }
+
+        /// Accepts any status update.
+        async fn update_task_status(
+            &self,
+            _task_id: &str,
+            _status: &str,
+            _note: &str,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        /// Pops the next canned Axon batch and records the cursor asked for.
+        async fn list_axon_events_since(
+            &self,
+            since_id: Option<i64>,
+            _limit: usize,
+        ) -> Result<Vec<AxonEventBrief>, BridgeError> {
+            self.axon_cursors.lock().unwrap().push(since_id);
+            Ok(self
+                .axon_batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        /// Pops the next canned Loom batch.
+        async fn list_workflow_runs(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<LoomRunBrief>, BridgeError> {
+            Ok(self
+                .loom_batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+    }
+
+    /// Build a compact Axon event brief for source tests.
+    fn ev(id: i64, channel: &str, action: &str, agent: &str, project: &str) -> AxonEventBrief {
+        AxonEventBrief {
+            id,
+            channel: channel.to_string(),
+            action: action.to_string(),
+            agent: Some(agent.to_string()),
+            project: Some(project.to_string()),
+            summary: Some(format!("summary-{id}")),
+        }
+    }
+
+    /// Build a compact Loom run brief for source tests.
+    fn run(id: i64, workflow_id: i64, status: &str) -> LoomRunBrief {
+        LoomRunBrief {
+            id,
+            workflow_id,
+            status: status.to_string(),
+            error: None,
+        }
+    }
+
+    /// A poll context whose timestamps the Kleos-backed sources ignore.
+    fn stub_ctx() -> StimulusContext {
+        StimulusContext {
+            now: Instant::now(),
+            last_room_activity: Instant::now(),
+        }
+    }
+
+    /// Verifies the Axon source primes silently, then fires ONE batched
+    /// stimulus containing only qualifying events -- self/roster reporters,
+    /// foreign projects, and non-alerts/tasks channels are filtered out --
+    /// and that the cursor advances past excluded events too.
+    #[tokio::test]
+    async fn test_axon_source_primes_filters_and_advances_cursor() {
+        let kleos = Arc::new(ScriptedKleos::new(
+            vec![
+                vec![ev(1, "tasks", "task.started", "alice", "rift")],
+                vec![
+                    ev(2, "tasks", "task.completed", "alice", "rift"),
+                    ev(3, "alerts", "error.raised", "bob", "rift"),
+                    ev(4, "tasks", "task.started", "rift-bridge", "rift"),
+                    ev(5, "tasks", "task.started", "alice", "other-project"),
+                    ev(6, "system", "custom.thing", "alice", "rift"),
+                ],
+            ],
+            Vec::new(),
+        ));
+        let mut src = AxonEventSource::new(
+            kleos.clone(),
+            "rift".to_string(),
+            vec!["rift-bridge".to_string()],
+        );
+        let ctx = stub_ctx();
+
+        // First poll primes without firing, even though events exist.
+        assert!(src.poll(&ctx).await.is_empty());
+
+        // Second poll fires once, containing exactly the qualifying lines.
+        let fired = src.poll(&ctx).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, StimulusKind::AxonEvents);
+        assert!(fired[0].text.contains("task.completed by alice"));
+        assert!(fired[0].text.contains("error.raised by bob"));
+        assert!(!fired[0].text.contains("rift-bridge"));
+        assert!(!fired[0].text.contains("other-project"));
+        assert!(!fired[0].text.contains("custom.thing"));
+
+        // Third poll proves cursor bookkeeping: primed from nothing, then
+        // past id 1, then past id 6 even though 4-6 were all excluded.
+        assert!(src.poll(&ctx).await.is_empty());
+        assert_eq!(
+            *kleos.axon_cursors.lock().unwrap(),
+            vec![None, Some(1), Some(6)]
+        );
+    }
+
+    /// Verifies the Loom source primes silently, reports new runs and
+    /// status transitions batched, stays silent when nothing changed, and
+    /// prunes runs that rotate out of the fetch window.
+    #[tokio::test]
+    async fn test_loom_source_reports_transitions_and_prunes() {
+        let kleos = Arc::new(ScriptedKleos::new(
+            Vec::new(),
+            vec![
+                vec![run(1, 3, "running")],
+                vec![run(1, 3, "completed"), run(2, 3, "running")],
+                vec![run(2, 3, "running")],
+                vec![run(1, 3, "completed"), run(2, 3, "running")],
+            ],
+        ));
+        let mut src = LoomRunSource::new(kleos);
+        let ctx = stub_ctx();
+
+        // Prime: silent.
+        assert!(src.poll(&ctx).await.is_empty());
+
+        // Transition + new run, one batched stimulus.
+        let fired = src.poll(&ctx).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].kind, StimulusKind::LoomRuns);
+        assert!(fired[0].text.contains("run #1: running -> completed"));
+        assert!(fired[0].text.contains("run #2 is running"));
+
+        // No change: silent, and run 1 (absent from the fetch) is pruned.
+        assert!(src.poll(&ctx).await.is_empty());
+
+        // A pruned run reappearing reads as new -- retention is bounded to
+        // the fetch window by design.
+        let fired = src.poll(&ctx).await;
+        assert_eq!(fired.len(), 1);
+        assert!(fired[0].text.contains("run #1 is completed"));
+    }
+
+    /// Verifies a failed run's error text rides along in the transition line.
+    #[tokio::test]
+    async fn test_loom_failure_carries_error_text() {
+        let mut failed = run(5, 2, "failed");
+        failed.error = Some("step 2 exploded".to_string());
+        let kleos = Arc::new(ScriptedKleos::new(
+            Vec::new(),
+            vec![vec![run(5, 2, "running")], vec![failed]],
+        ));
+        let mut src = LoomRunSource::new(kleos);
+        let ctx = stub_ctx();
+
+        assert!(src.poll(&ctx).await.is_empty());
+        let fired = src.poll(&ctx).await;
+        assert_eq!(fired.len(), 1);
+        assert!(fired[0].text.contains("running -> failed (step 2 exploded)"));
     }
 }

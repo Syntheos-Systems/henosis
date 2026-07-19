@@ -144,4 +144,6 @@ auth_token = "set-me"   # require: Authorization: Bearer set-me
 # reflection_after_secs = 14400 # room inactivity before a reflection prompt (4h)
 # chiasm_cooldown_secs = 900    # min spacing between task-change stimuli
 # git_cooldown_secs = 300       # min spacing between commit stimuli
+# axon_cooldown_secs = 600    # min spacing between Axon activity stimuli
+# loom_cooldown_secs = 600    # min spacing between workflow-run stimuli
 # max_per_hour = 6              # global cap across all stimulus kinds
