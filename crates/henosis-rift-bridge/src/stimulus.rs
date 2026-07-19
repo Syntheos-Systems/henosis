@@ -13,9 +13,10 @@
 //! Parent-spec safety requirements implemented here: per-source cooldowns, a
 //! global hourly rate cap, and content sanitization of everything read from
 //! external state (commit subjects, task summaries). Structural distinction
-//! is bridge-level: stimuli enter the cascade in-process and are announced
-//! with a `[STIMULUS]` prefix; the Rift server does not yet accept a
-//! caller-set message type on post.
+//! is end-to-end: stimuli enter the cascade in-process and their room
+//! announcement is posted with message_type 'stimulus' (the Rift server
+//! stamps and broadcasts it), with the `[STIMULUS]` text prefix kept for
+//! human readability and for older servers that ignore the type field.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};

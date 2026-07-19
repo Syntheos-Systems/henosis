@@ -76,6 +76,7 @@ pub struct MessageResponse {
     pub attachments: Vec<Attachment>,
 }
 
+/// Assembly of API responses from joined rows.
 impl MessageResponse {
     /// Assemble a MessageResponse from a joined message row and its attachments.
     pub fn from_msg(msg: MessageWithAuthor, attachments: Vec<Attachment>) -> Self {
@@ -95,20 +96,33 @@ impl MessageResponse {
     }
 }
 
+/// Request body for sending a new message.
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
+    /// Text content; may be absent for attachment-only messages.
     pub content: Option<String>,
+    /// Pending upload ids to attach to the message.
     pub attachment_ids: Option<Vec<Uuid>>,
+    /// Optional explicit message type. Absent means the server infers it from
+    /// the author (agents post 'agent', humans post 'user'). Explicit values
+    /// are whitelisted and authorized in routes::messages.
+    pub message_type: Option<String>,
 }
 
+/// Request body for editing an existing message.
 #[derive(Debug, Deserialize)]
 pub struct EditMessageRequest {
+    /// Replacement text content.
     pub content: String,
 }
 
+/// Query parameters for listing channel messages.
 #[derive(Debug, Deserialize)]
 pub struct MessageQuery {
+    /// Return messages created strictly before this message id.
     pub before: Option<Uuid>,
+    /// Return messages created strictly after this message id.
     pub after: Option<Uuid>,
+    /// Maximum number of messages to return (server caps at 100).
     pub limit: Option<i64>,
 }

@@ -204,6 +204,19 @@ pub async fn provision_agents(
 
         db::add_member(&pool, req.server_id, user.id).await?;
 
+        // Converge history on every boot: migration 004 only retypes rows
+        // whose author was already flagged is_agent when it ran, so messages
+        // by accounts promoted just now (and rows written by a pre-stamping
+        // server build) still sit at the 'user' default. Idempotent.
+        let retyped = db::retype_agent_messages(&pool, user.id).await?;
+        if retyped > 0 {
+            tracing::info!(
+                user_id = %user.id,
+                retyped,
+                "retyped agent's historic messages left at the 'user' default"
+            );
+        }
+
         tracing::info!(
             server_id = %req.server_id,
             user_id = %user.id,

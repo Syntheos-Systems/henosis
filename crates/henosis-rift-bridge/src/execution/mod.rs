@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::error::BridgeError;
 use crate::executor::Capability;
 use crate::rift_client::RiftRestClient;
+use crate::types::MessageType;
 
 /// Opaque identifier for a pending execution proposal, shown to humans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +24,7 @@ pub struct ProposalId(pub u64);
 
 /// Renders the id as a short token for room display (e.g., "7").
 impl std::fmt::Display for ProposalId {
+    /// Write the bare numeric id.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -86,15 +88,23 @@ impl RiftRoomNotifier {
 /// Posts notices through the Rift REST API.
 #[async_trait]
 impl RoomNotifier for RiftRoomNotifier {
-    /// Send the content as a normal channel message.
+    /// Send the content as a system-typed channel message: execution notices
+    /// are bridge machinery, not agent conversation.
     async fn notify(&self, content: &str) -> Result<(), BridgeError> {
         self.rift
-            .send_message(self.user_id, &self.username, self.channel_id, content)
+            .send_message(
+                self.user_id,
+                &self.username,
+                self.channel_id,
+                content,
+                Some(MessageType::System.as_str()),
+            )
             .await?;
         Ok(())
     }
 }
 
+/// Covers proposal id display and proposal field plumbing.
 #[cfg(test)]
 mod tests {
     use super::{PendingProposal, ProposalId};

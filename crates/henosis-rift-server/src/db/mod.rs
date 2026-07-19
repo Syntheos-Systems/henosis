@@ -1,3 +1,7 @@
+//! Postgres data access for the rift server: users, refresh tokens,
+//! servers, members, channels, messages, attachments, roles, invites,
+//! DMs, and bridge state.
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -11,6 +15,7 @@ use crate::models::user::User;
 
 // ───── Users ─────
 
+/// Insert a human user account and return the created row.
 pub async fn create_user(
     pool: &PgPool,
     username: &str,
@@ -31,6 +36,7 @@ pub async fn create_user(
     .await
 }
 
+/// Fetch a user by primary key.
 pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(id)
@@ -38,6 +44,7 @@ pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, sql
         .await
 }
 
+/// Fetch a user by exact username.
 pub async fn get_user_by_username(
     pool: &PgPool,
     username: &str,
@@ -48,6 +55,7 @@ pub async fn get_user_by_username(
         .await
 }
 
+/// Fetch a user by exact email.
 pub async fn get_user_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
         .bind(email)
@@ -55,6 +63,7 @@ pub async fn get_user_by_email(pool: &PgPool, email: &str) -> Result<Option<User
         .await
 }
 
+/// Patch display name, about, and avatar; absent fields keep their values.
 pub async fn update_user_profile(
     pool: &PgPool,
     user_id: Uuid,
@@ -79,6 +88,7 @@ pub async fn update_user_profile(
     .await
 }
 
+/// Replace a user's email address.
 pub async fn update_user_email(
     pool: &PgPool,
     user_id: Uuid,
@@ -92,6 +102,7 @@ pub async fn update_user_email(
     Ok(())
 }
 
+/// Replace a user's password hash.
 pub async fn update_user_password(
     pool: &PgPool,
     user_id: Uuid,
@@ -105,6 +116,7 @@ pub async fn update_user_password(
     Ok(())
 }
 
+/// Set a user's presence status string.
 pub async fn update_user_status(
     pool: &PgPool,
     user_id: Uuid,
@@ -120,6 +132,7 @@ pub async fn update_user_status(
 
 // ───── Refresh Tokens ─────
 
+/// Persist a refresh token hash with its expiry.
 pub async fn store_refresh_token(
     pool: &PgPool,
     user_id: Uuid,
@@ -137,6 +150,7 @@ pub async fn store_refresh_token(
     Ok(())
 }
 
+/// Return the owning user id if the token hash exists and is unexpired.
 pub async fn validate_refresh_token(
     pool: &PgPool,
     token_hash: &str,
@@ -150,6 +164,7 @@ pub async fn validate_refresh_token(
     Ok(row.map(|r| r.0))
 }
 
+/// Atomically delete an unexpired token hash, returning its owner (single-use rotation).
 pub async fn consume_refresh_token(
     pool: &PgPool,
     token_hash: &str,
@@ -163,6 +178,7 @@ pub async fn consume_refresh_token(
     Ok(row.map(|r| r.0))
 }
 
+/// Delete one refresh token by hash.
 pub async fn delete_refresh_token(pool: &PgPool, token_hash: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM refresh_tokens WHERE token_hash = $1")
         .bind(token_hash)
@@ -171,6 +187,7 @@ pub async fn delete_refresh_token(pool: &PgPool, token_hash: &str) -> Result<(),
     Ok(())
 }
 
+/// Delete every refresh token a user holds (global logout).
 pub async fn delete_user_refresh_tokens(pool: &PgPool, user_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
         .bind(user_id)
@@ -181,6 +198,7 @@ pub async fn delete_user_refresh_tokens(pool: &PgPool, user_id: Uuid) -> Result<
 
 // ───── Servers ─────
 
+/// Insert a server owned by the given user.
 pub async fn create_server(
     pool: &PgPool,
     name: &str,
@@ -199,6 +217,7 @@ pub async fn create_server(
     .await
 }
 
+/// Fetch a server by primary key.
 pub async fn get_server_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Server>, sqlx::Error> {
     sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE id = $1")
         .bind(id)
@@ -206,6 +225,7 @@ pub async fn get_server_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Server>,
         .await
 }
 
+/// Patch server name and description; absent fields keep their values.
 pub async fn update_server(
     pool: &PgPool,
     server_id: Uuid,
@@ -226,6 +246,7 @@ pub async fn update_server(
     .await
 }
 
+/// Delete a server (children cascade via foreign keys).
 pub async fn delete_server(pool: &PgPool, server_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM servers WHERE id = $1")
         .bind(server_id)
@@ -234,6 +255,7 @@ pub async fn delete_server(pool: &PgPool, server_id: Uuid) -> Result<(), sqlx::E
     Ok(())
 }
 
+/// List the servers a user is a member of, ordered by name.
 pub async fn get_user_servers(pool: &PgPool, user_id: Uuid) -> Result<Vec<Server>, sqlx::Error> {
     sqlx::query_as::<_, Server>(
         r#"SELECT s.* FROM servers s
@@ -313,6 +335,33 @@ pub async fn mark_user_as_agent(pool: &PgPool, user_id: Uuid) -> Result<User, sq
     .await
 }
 
+/// Retype an agent's historic messages still carrying the 'user' column
+/// default, returning how many rows changed.
+///
+/// Mirrors migration 004's classification exactly. The migration runs once
+/// at boot, strictly before provisioning can promote a legacy account
+/// (is_agent = FALSE) or a pre-stamping server build stops writing 'user'
+/// rows -- so provisioning must converge each agent's history itself or
+/// those rows stay mislabeled forever (adversarial review finding).
+pub async fn retype_agent_messages(pool: &PgPool, user_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"UPDATE messages
+           SET message_type = CASE
+               WHEN content LIKE '[STIMULUS] %' THEN 'stimulus'
+               WHEN content LIKE '[SYSTEM] %' THEN 'system'
+               WHEN content LIKE '[EXEC] %' THEN 'system'
+               ELSE 'agent'
+           END
+           WHERE author_id = $1
+             AND message_type = 'user'"#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Remove a user's membership from a server.
 pub async fn remove_member(
     pool: &PgPool,
     server_id: Uuid,
@@ -326,6 +375,7 @@ pub async fn remove_member(
     Ok(())
 }
 
+/// Fetch one membership row.
 pub async fn get_member(
     pool: &PgPool,
     server_id: Uuid,
@@ -340,6 +390,7 @@ pub async fn get_member(
     .await
 }
 
+/// List a server's members joined with their user rows (emails scrubbed).
 pub async fn get_server_members(
     pool: &PgPool,
     server_id: Uuid,
@@ -388,6 +439,7 @@ pub async fn get_server_members(
         .collect())
 }
 
+/// Flat row shape for the members-with-users join.
 #[derive(Debug, sqlx::FromRow)]
 struct MemberWithUser {
     server_id: Uuid,
@@ -406,6 +458,7 @@ struct MemberWithUser {
     agent_roster_id: Option<String>,
 }
 
+/// True when the user has a membership row in the server.
 pub async fn is_member(
     pool: &PgPool,
     server_id: Uuid,
@@ -423,6 +476,7 @@ pub async fn is_member(
 
 // ───── Channels ─────
 
+/// Insert a channel at the next position within the server.
 pub async fn create_channel(
     pool: &PgPool,
     server_id: Uuid,
@@ -453,6 +507,7 @@ pub async fn create_channel(
     .await
 }
 
+/// Fetch a channel by primary key.
 pub async fn get_channel_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Channel>, sqlx::Error> {
     sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE id = $1")
         .bind(id)
@@ -460,6 +515,7 @@ pub async fn get_channel_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Channel
         .await
 }
 
+/// List a server's channels in position order.
 pub async fn get_server_channels(
     pool: &PgPool,
     server_id: Uuid,
@@ -472,6 +528,7 @@ pub async fn get_server_channels(
     .await
 }
 
+/// Patch channel name, topic, and position; absent fields keep their values.
 pub async fn update_channel(
     pool: &PgPool,
     channel_id: Uuid,
@@ -495,6 +552,7 @@ pub async fn update_channel(
     .await
 }
 
+/// Delete a channel (messages cascade via foreign keys).
 pub async fn delete_channel(pool: &PgPool, channel_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM channels WHERE id = $1")
         .bind(channel_id)
@@ -505,16 +563,20 @@ pub async fn delete_channel(pool: &PgPool, channel_id: Uuid) -> Result<(), sqlx:
 
 // ───── Messages ─────
 
+/// Insert a message with an explicit type and return it joined with author
+/// info. The type is resolved and authorized at the route layer; the column
+/// default ('user') only covers legacy writers that predate explicit stamping.
 pub async fn create_message(
     pool: &PgPool,
     channel_id: Uuid,
     author_id: Uuid,
     content: &str,
+    message_type: &str,
 ) -> Result<MessageWithAuthor, sqlx::Error> {
     sqlx::query_as::<_, MessageWithAuthor>(
         r#"WITH new_msg AS (
-               INSERT INTO messages (channel_id, author_id, content)
-               VALUES ($1, $2, $3)
+               INSERT INTO messages (channel_id, author_id, content, message_type)
+               VALUES ($1, $2, $3, $4)
                RETURNING *
            )
            SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
@@ -528,10 +590,12 @@ pub async fn create_message(
     .bind(channel_id)
     .bind(author_id)
     .bind(content)
+    .bind(message_type)
     .fetch_one(pool)
     .await
 }
 
+/// Page a channel's messages joined with author info: before/after cursor or latest-first.
 pub async fn get_messages(
     pool: &PgPool,
     channel_id: Uuid,
@@ -598,6 +662,7 @@ pub async fn get_messages(
     }
 }
 
+/// Fetch one message joined with author info.
 pub async fn get_message_by_id(
     pool: &PgPool,
     message_id: Uuid,
@@ -617,6 +682,7 @@ pub async fn get_message_by_id(
     .await
 }
 
+/// Replace a message's content and stamp edited_at.
 pub async fn update_message(
     pool: &PgPool,
     message_id: Uuid,
@@ -642,6 +708,7 @@ pub async fn update_message(
     .await
 }
 
+/// Delete a message (attachments cascade via foreign keys).
 pub async fn delete_message(pool: &PgPool, message_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM messages WHERE id = $1")
         .bind(message_id)
@@ -654,6 +721,7 @@ pub async fn delete_message(pool: &PgPool, message_id: Uuid) -> Result<(), sqlx:
 
 // ───── Attachments ─────
 
+/// Insert an attachment row for a message.
 pub async fn create_attachment(
     pool: &PgPool,
     message_id: Uuid,
@@ -676,6 +744,7 @@ pub async fn create_attachment(
     .await
 }
 
+/// List a message's attachments oldest-first.
 pub async fn get_attachments_for_message(
     pool: &PgPool,
     message_id: Uuid,
@@ -688,6 +757,7 @@ pub async fn get_attachments_for_message(
     .await
 }
 
+/// Batch-load attachments for many messages in one query.
 pub async fn get_attachments_for_messages(
     pool: &PgPool,
     message_ids: &[Uuid],
@@ -705,6 +775,7 @@ pub async fn get_attachments_for_messages(
 
 // ───── Roles (continued) ─────
 
+/// Insert a role at the next position within the server.
 pub async fn create_role(
     pool: &PgPool,
     server_id: Uuid,
@@ -733,6 +804,7 @@ pub async fn create_role(
     .await
 }
 
+/// Insert the @everyone default role with baseline permissions.
 pub async fn create_default_role(
     pool: &PgPool,
     server_id: Uuid,
@@ -749,6 +821,7 @@ pub async fn create_default_role(
     .await
 }
 
+/// Fetch a role by primary key.
 pub async fn get_role_by_id(pool: &PgPool, role_id: Uuid) -> Result<Option<Role>, sqlx::Error> {
     sqlx::query_as::<_, Role>("SELECT * FROM roles WHERE id = $1")
         .bind(role_id)
@@ -756,6 +829,7 @@ pub async fn get_role_by_id(pool: &PgPool, role_id: Uuid) -> Result<Option<Role>
         .await
 }
 
+/// List a server's roles in position order.
 pub async fn get_server_roles(pool: &PgPool, server_id: Uuid) -> Result<Vec<Role>, sqlx::Error> {
     sqlx::query_as::<_, Role>(
         "SELECT * FROM roles WHERE server_id = $1 ORDER BY position",
@@ -765,6 +839,7 @@ pub async fn get_server_roles(pool: &PgPool, server_id: Uuid) -> Result<Vec<Role
     .await
 }
 
+/// Patch role name, color, permissions, and position; absent fields keep their values.
 pub async fn update_role(
     pool: &PgPool,
     role_id: Uuid,
@@ -791,6 +866,7 @@ pub async fn update_role(
     .await
 }
 
+/// Delete a role.
 pub async fn delete_role(pool: &PgPool, role_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM roles WHERE id = $1")
         .bind(role_id)
@@ -799,6 +875,7 @@ pub async fn delete_role(pool: &PgPool, role_id: Uuid) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// Grant a role to a member; already-granted is a no-op.
 pub async fn assign_role(
     pool: &PgPool,
     server_id: Uuid,
@@ -816,6 +893,7 @@ pub async fn assign_role(
     Ok(())
 }
 
+/// List the role ids granted to a member.
 pub async fn get_member_role_ids(
     pool: &PgPool,
     server_id: Uuid,
@@ -831,6 +909,7 @@ pub async fn get_member_role_ids(
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
+/// Revoke one role from a member.
 pub async fn remove_role_from_member(
     pool: &PgPool,
     server_id: Uuid,
@@ -881,6 +960,7 @@ pub async fn get_member_permissions(
 
 // ───── Invites ─────
 
+/// Insert an invite code with optional use cap and expiry.
 pub async fn create_invite(
     pool: &PgPool,
     server_id: Uuid,
@@ -903,6 +983,7 @@ pub async fn create_invite(
     .await
 }
 
+/// Fetch an invite by code.
 pub async fn get_invite(pool: &PgPool, code: &str) -> Result<Option<Invite>, sqlx::Error> {
     sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1")
         .bind(code)
@@ -910,6 +991,7 @@ pub async fn get_invite(pool: &PgPool, code: &str) -> Result<Option<Invite>, sql
         .await
 }
 
+/// Increment an invite's use counter.
 pub async fn use_invite(pool: &PgPool, code: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE invites SET uses = uses + 1 WHERE code = $1")
         .bind(code)
@@ -918,6 +1000,7 @@ pub async fn use_invite(pool: &PgPool, code: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// List a server's invites oldest-first.
 pub async fn get_server_invites(
     pool: &PgPool,
     server_id: Uuid,
@@ -928,6 +1011,7 @@ pub async fn get_server_invites(
         .await
 }
 
+/// Delete an invite by code.
 pub async fn delete_invite(pool: &PgPool, code: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM invites WHERE code = $1")
         .bind(code)
@@ -938,12 +1022,14 @@ pub async fn delete_invite(pool: &PgPool, code: &str) -> Result<(), sqlx::Error>
 
 // ───── DM Channels ─────
 
+/// Minimal DM channel row (id plus creation time).
 #[derive(Debug, sqlx::FromRow)]
 pub struct DmChannelRow {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
 }
 
+/// Return the DM channel between two users, creating it on first contact.
 pub async fn get_or_create_dm_channel(
     pool: &PgPool,
     user_a: Uuid,
@@ -981,6 +1067,7 @@ pub async fn get_or_create_dm_channel(
     Ok(row.0)
 }
 
+/// List a user's DM channels with the counterpart's profile fields.
 pub async fn get_user_dm_channels(
     pool: &PgPool,
     user_id: Uuid,
@@ -999,6 +1086,7 @@ pub async fn get_user_dm_channels(
     .await
 }
 
+/// DM message row joined with author profile fields.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct DmMessageWithAuthor {
     pub id: Uuid,
@@ -1012,6 +1100,7 @@ pub struct DmMessageWithAuthor {
     pub author_avatar_url: Option<String>,
 }
 
+/// Insert a DM message and return it joined with author info.
 pub async fn create_dm_message(
     pool: &PgPool,
     dm_channel_id: Uuid,
@@ -1038,6 +1127,7 @@ pub async fn create_dm_message(
     .await
 }
 
+/// Page a DM channel's messages latest-first with an optional before cursor.
 pub async fn get_dm_messages(
     pool: &PgPool,
     dm_channel_id: Uuid,
@@ -1082,6 +1172,7 @@ pub async fn get_dm_messages(
     }
 }
 
+/// True when the user participates in the DM channel.
 pub async fn is_dm_participant(
     pool: &PgPool,
     dm_channel_id: Uuid,

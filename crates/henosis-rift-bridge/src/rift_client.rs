@@ -139,12 +139,18 @@ impl RiftRestClient {
     }
 
     /// Send a message to a channel as an agent.
+    ///
+    /// `message_type` of `Some("stimulus")` or `Some("system")` asks the
+    /// server to stamp that structural type; `None` lets the server infer
+    /// from the author (agents land as 'agent'). Older servers without the
+    /// field simply ignore it.
     pub async fn send_message(
         &self,
         agent_user_id: Uuid,
         agent_username: &str,
         channel_id: Uuid,
         content: &str,
+        message_type: Option<&str>,
     ) -> Result<MessageResponse, BridgeError> {
         let token = self.auth.issue_token(agent_user_id, agent_username)?;
         let url = format!("{}/api/channels/{}/messages", self.base_url, channel_id);
@@ -153,7 +159,7 @@ impl RiftRestClient {
             .client
             .post(&url)
             .bearer_auth(&token)
-            .json(&serde_json::json!({ "content": content }))
+            .json(&message_payload(content, message_type))
             .send()
             .await?;
 
@@ -206,6 +212,18 @@ impl RiftRestClient {
         } else {
             Ok(false)
         }
+    }
+}
+
+/// Build the JSON body for a message post.
+///
+/// The structural type is included only when explicitly requested: an absent
+/// field keeps the wire format identical to pre-message_type bridges, so a
+/// server of either vintage sees exactly what it expects.
+fn message_payload(content: &str, message_type: Option<&str>) -> serde_json::Value {
+    match message_type {
+        Some(t) => serde_json::json!({ "content": content, "message_type": t }),
+        None => serde_json::json!({ "content": content }),
     }
 }
 
@@ -318,4 +336,27 @@ async fn connect_and_listen(
     }
 
     Ok(())
+}
+
+/// Covers the message post payload shape.
+#[cfg(test)]
+mod tests {
+    use super::message_payload;
+
+    /// A typed post carries the discriminator for the server to stamp.
+    #[test]
+    fn test_payload_includes_requested_type() {
+        let body = message_payload("hello", Some("stimulus"));
+        assert_eq!(body["content"], "hello");
+        assert_eq!(body["message_type"], "stimulus");
+    }
+
+    /// An untyped post omits the field entirely -- the server infers the
+    /// type, and older servers see the pre-message_type wire format.
+    #[test]
+    fn test_payload_omits_absent_type() {
+        let body = message_payload("hello", None);
+        assert_eq!(body["content"], "hello");
+        assert!(body.get("message_type").is_none());
+    }
 }

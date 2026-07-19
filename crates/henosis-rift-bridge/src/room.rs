@@ -45,7 +45,7 @@ use crate::rift_client::{RiftRestClient, RiftWsEvent};
 use crate::roster::AgentRoster;
 use crate::stimulus::Stimulus;
 use crate::turn_manager::TurnManager;
-use crate::types::{AgentId, AgentState, RoomMessage};
+use crate::types::{AgentId, AgentState, MessageType, RoomMessage};
 use serde_json::json;
 
 /// The room state machine. Coordinates engagement, turns, and loop prevention.
@@ -336,8 +336,8 @@ impl Room {
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
     ) -> Result<(), BridgeError> {
-        // Ignore messages from our own agents (prevent self-response loops).
-        if self.roster.by_rift_user_id(msg.author_id).is_some() {
+        let own_agent = self.roster.by_rift_user_id(msg.author_id).is_some();
+        if inbound_action(own_agent, &msg.message_type) == InboundAction::Ignore {
             return Ok(());
         }
 
@@ -362,21 +362,26 @@ impl Room {
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
     ) -> Result<(), BridgeError> {
-        let announcement = format!("[STIMULUS] {}", stimulus.text);
-        let first = self
-            .roster
-            .all()
-            .next()
-            .ok_or_else(|| BridgeError::Executor("no agents to announce stimulus".into()))?;
+        let (announcement, announcement_type) = stimulus_announcement(&stimulus.text);
+        // Deterministic announcer: slot 0. HashMap-order .all().next() used
+        // to pick a different agent per boot.
+        let (announcer_id, announcer_name) = {
+            let ordered = self.roster.all_by_slot();
+            let first = ordered
+                .first()
+                .ok_or_else(|| BridgeError::Executor("no agents to announce stimulus".into()))?;
+            (first.rift_user_id, first.username.clone())
+        };
         // An unannounced stimulus must not seed a cascade: agents build
         // context from channel history, so reacting to an invisible trigger
         // would read as agents talking to nobody.
         self.rift
             .send_message(
-                first.rift_user_id,
-                &first.username,
+                announcer_id,
+                &announcer_name,
                 self.channel_id,
                 &announcement,
+                Some(announcement_type),
             )
             .await?;
 
@@ -585,8 +590,15 @@ impl Room {
                             if *pause.borrow() {
                                 return SlotOutcome::Paused;
                             }
-                            // Own-agent echoes never interrupt.
-                            if self.roster.by_rift_user_id(m.author_id).is_some() {
+                            // Same gate as handle_message: own-agent echoes
+                            // and foreign 'system' notices never interrupt.
+                            // Gating only the idle path would let another
+                            // bridge's status line re-seed a running cascade
+                            // (adversarial review finding), and would apply a
+                            // foreign control command mid-cascade that the
+                            // idle path ignores.
+                            let own = self.roster.by_rift_user_id(m.author_id).is_some();
+                            if inbound_action(own, &m.message_type) == InboundAction::Ignore {
                                 continue;
                             }
                             if let Some(cmd) = parse_control_command(&m.content) {
@@ -912,7 +924,7 @@ impl Room {
         // Post to room.
         if let Err(e) = self
             .rift
-            .send_message(rift_user_id, &username, self.channel_id, &agent_resp.text)
+            .send_message(rift_user_id, &username, self.channel_id, &agent_resp.text, None)
             .await
         {
             self.set_agent_idle(agent_id);
@@ -1009,12 +1021,14 @@ impl Room {
             }
 
             tracing::info!("consensus reached -- notifying room");
-            if let Some(a) = self.roster.all().next() {
+            // Slot 0 announces, same as stimuli: deterministic, not HashMap order.
+            if let Some(a) = self.roster.all_by_slot().first() {
                 let _ = self.rift.send_message(
                     a.rift_user_id,
                     &a.username,
                     self.channel_id,
                     "[SYSTEM] All agents have reached consensus on this topic. Human review recommended.",
+                    Some(MessageType::System.as_str()),
                 ).await;
             }
         }
@@ -1138,6 +1152,39 @@ fn draft_task_title(channel_name: &str, consensus_text: &str) -> String {
     let trimmed = consensus_text.trim().trim_start_matches("[AGREE]").trim();
     let compact = trimmed.chars().take(72).collect::<String>();
     format!("[{}] {}", channel_name, compact)
+}
+
+/// The room announcement for an injected stimulus: the human-readable
+/// prefixed text paired with the structural type the post must carry.
+/// Extracted so the pairing is pinned by a unit test -- silently reverting
+/// the type at the call site cannot survive the suite.
+fn stimulus_announcement(text: &str) -> (String, &'static str) {
+    (format!("[STIMULUS] {text}"), MessageType::Stimulus.as_str())
+}
+
+/// What the room should do with an inbound WS message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundAction {
+    /// Drop without any processing.
+    Ignore,
+    /// Treat as a conversation trigger (control parsing, topic seed, cascade).
+    Process,
+}
+
+/// Gate an inbound message before any processing.
+///
+/// Own-agent echoes are dropped to prevent self-response loops. Foreign
+/// 'system' notices are dropped too: they are another bridge's machinery
+/// announcements, and cascading on one reads as agents debating a status
+/// line. Foreign 'stimulus' messages DO process -- a server-side injector is
+/// exactly the caller that type exists for -- and foreign 'agent' messages
+/// process so bridges sharing a channel can converse.
+fn inbound_action(is_own_agent: bool, message_type: &str) -> InboundAction {
+    if is_own_agent || message_type == MessageType::System.as_str() {
+        InboundAction::Ignore
+    } else {
+        InboundAction::Process
+    }
 }
 
 #[cfg(test)]
@@ -1616,5 +1663,127 @@ mod tests {
         let title = draft_task_title("general", "Implement Kleos-backed context assembly next.");
         assert!(title.starts_with("[general] "));
         assert!(title.contains("Implement Kleos-backed context assembly"));
+    }
+
+    /// Verifies own-agent echoes are dropped regardless of their type: a
+    /// stimulus or system announcement posted by our own roster must not
+    /// re-trigger the cascade that produced it.
+    #[test]
+    fn test_inbound_own_agent_ignored_for_every_type() {
+        for t in ["user", "agent", "stimulus", "system"] {
+            assert_eq!(inbound_action(true, t), InboundAction::Ignore);
+        }
+    }
+
+    /// Verifies a foreign system notice is dropped: another bridge's
+    /// machinery announcement is not a conversation trigger.
+    #[test]
+    fn test_inbound_foreign_system_ignored() {
+        assert_eq!(inbound_action(false, "system"), InboundAction::Ignore);
+    }
+
+    /// Verifies foreign user, agent, and stimulus messages all process --
+    /// humans and other bridges' agents converse, and a server-side stimulus
+    /// injector wakes the room.
+    #[test]
+    fn test_inbound_foreign_conversation_processes() {
+        for t in ["user", "agent", "stimulus"] {
+            assert_eq!(inbound_action(false, t), InboundAction::Process);
+        }
+    }
+
+    /// Verifies the stimulus announcement pairs the human-readable prefix
+    /// with the structural 'stimulus' type -- the call site takes both from
+    /// this helper, so reverting the type cannot silently survive.
+    #[test]
+    fn test_stimulus_announcement_carries_prefix_and_type() {
+        let (text, mtype) = stimulus_announcement("new commits landed");
+        assert_eq!(text, "[STIMULUS] new commits landed");
+        assert_eq!(mtype, "stimulus");
+    }
+
+    /// Verifies a foreign 'system' notice mid-wait neither interrupts nor
+    /// re-seeds the cascade: another bridge's machinery announcement must
+    /// not steer this room (adversarial review finding: the inbound gate
+    /// must cover BOTH paths, not just the idle one).
+    #[tokio::test]
+    async fn test_wait_for_slot_ignores_foreign_system_notice() {
+        let (mut room, _agent) = offline_room();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        let mut notice = human_msg("[SYSTEM] All agents have reached consensus on this topic.");
+        notice.message_type = "system".to_string();
+        tx.send(RiftWsEvent::MessageCreate(notice)).await.unwrap();
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("wait must complete");
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+    }
+
+    /// Verifies a foreign 'system' message that happens to spell a control
+    /// command is NOT applied mid-wait: before the gate covered this path,
+    /// approval acceptance depended on cascade timing (applied mid-cascade,
+    /// ignored idle).
+    #[tokio::test]
+    async fn test_wait_for_slot_ignores_foreign_system_control_command() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(9),
+            agent: "nobody".to_string(),
+            task_id: "t-9".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        let mut msg = human_msg("!approve 9");
+        msg.message_type = "system".to_string();
+        tx.send(RiftWsEvent::MessageCreate(msg)).await.unwrap();
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.wait_for_slot(target, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("wait must complete");
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+        assert!(
+            !room.approval_registry.list().is_empty(),
+            "a foreign system-typed '!approve' must not consume the proposal"
+        );
+    }
+
+    /// Verifies the idle inbound path drops a foreign 'system' notice
+    /// before any topic work: the wiring, not just the pure gate function.
+    /// Reverting handle_message to the bare own-agent check would advance
+    /// room_turn here and fail.
+    #[tokio::test]
+    async fn test_handle_message_ignores_foreign_system_notice() {
+        let (mut room, _agent) = offline_room();
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        let before = room.room_turn;
+        let mut notice = human_msg("[SYSTEM] status line from another bridge");
+        notice.message_type = "system".to_string();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            room.handle_message(notice, &mut rx, &mut pause_rx),
+        )
+        .await
+        .expect("a gated message must return immediately");
+        assert!(result.is_ok());
+        assert_eq!(
+            room.room_turn, before,
+            "a dropped notice must not count as a room turn"
+        );
     }
 }

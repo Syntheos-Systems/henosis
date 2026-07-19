@@ -90,9 +90,17 @@ pub async fn send_message(
         require_permission(&pool, channel.server_id, auth.user_id, perms::ATTACH_FILES).await?;
     }
 
+    // The author row is server truth for is_agent; the JWT only carries the
+    // user id, so typing a message requires this lookup.
+    let author = db::get_user_by_id(&pool, auth.user_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let message_type = resolve_message_type(req.message_type.as_deref(), author.is_agent)?;
+
     // Use empty string for content-less messages (attachment-only)
     let msg_content = if content.is_empty() { "" } else { content };
-    let msg = db::create_message(&pool, channel_id, auth.user_id, msg_content).await?;
+    let msg =
+        db::create_message(&pool, channel_id, auth.user_id, msg_content, message_type).await?;
 
     // Link pending uploads to this message
     let mut attachments = Vec::new();
@@ -219,6 +227,37 @@ pub async fn delete_message(
 
 // ─── Helpers ───
 
+/// Resolve and authorize the stored message_type for a new message.
+///
+/// Absent means "infer from the author": agents post 'agent', humans post
+/// 'user'. Explicit values are whitelisted and checked against the author's
+/// is_agent flag, so a human cannot forge bridge machinery ('stimulus',
+/// 'system') and an agent cannot pass itself off as a human ('user').
+/// Whitelisting also guarantees the value fits the VARCHAR(16) column.
+fn resolve_message_type(
+    requested: Option<&str>,
+    author_is_agent: bool,
+) -> Result<&str, AppError> {
+    let Some(requested) = requested else {
+        return Ok(if author_is_agent { "agent" } else { "user" });
+    };
+    let allowed = match requested {
+        "user" => !author_is_agent,
+        "agent" | "stimulus" | "system" => author_is_agent,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unknown message_type '{other}'"
+            )))
+        }
+    };
+    if allowed {
+        Ok(requested)
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+/// Reject callers that are not members of the server owning the channel.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
     if !db::is_member(pool, server_id, user_id).await? {
         return Err(AppError::Forbidden);
@@ -226,6 +265,7 @@ async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result
     Ok(())
 }
 
+/// Reject members that lack the given permission bit in the server.
 async fn require_permission(
     pool: &PgPool,
     server_id: Uuid,
@@ -238,4 +278,63 @@ async fn require_permission(
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+/// Covers the message_type resolution and authorization rules.
+#[cfg(test)]
+mod tests {
+    use super::resolve_message_type;
+    use crate::error::AppError;
+
+    /// An absent type infers from the author: agents post 'agent', humans 'user'.
+    #[test]
+    fn test_absent_type_infers_from_author() {
+        assert_eq!(resolve_message_type(None, true).unwrap(), "agent");
+        assert_eq!(resolve_message_type(None, false).unwrap(), "user");
+    }
+
+    /// Agents may stamp the structural types the bridge machinery uses.
+    #[test]
+    fn test_agent_may_set_structural_types() {
+        for t in ["agent", "stimulus", "system"] {
+            assert_eq!(resolve_message_type(Some(t), true).unwrap(), t);
+        }
+    }
+
+    /// A human explicitly asking for 'user' is redundant but valid.
+    #[test]
+    fn test_human_may_set_user() {
+        assert_eq!(resolve_message_type(Some("user"), false).unwrap(), "user");
+    }
+
+    /// Humans cannot forge agent, stimulus, or system messages.
+    #[test]
+    fn test_human_cannot_forge_structural_types() {
+        for t in ["agent", "stimulus", "system"] {
+            assert!(matches!(
+                resolve_message_type(Some(t), false),
+                Err(AppError::Forbidden)
+            ));
+        }
+    }
+
+    /// An agent cannot pass itself off as a human author.
+    #[test]
+    fn test_agent_cannot_post_as_user() {
+        assert!(matches!(
+            resolve_message_type(Some("user"), true),
+            Err(AppError::Forbidden)
+        ));
+    }
+
+    /// Unknown discriminators are a client error, not a silent default.
+    #[test]
+    fn test_unknown_type_is_bad_request() {
+        for requested in ["shout", "", "USER", "Agent"] {
+            assert!(matches!(
+                resolve_message_type(Some(requested), true),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+    }
 }
