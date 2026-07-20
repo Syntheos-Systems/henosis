@@ -122,14 +122,15 @@ auth_token = "set-me"   # require: Authorization: Bearer set-me
 
 # Optional OpenAI-compatible embeddings endpoint. When present, echo
 # suppression uses cosine similarity (catches paraphrased echoes token
-# overlap misses) and exhausted topics damp semantically similar re-triggers.
+# overlap misses) and exhausted topics share consumed turn budgets with
+# semantically similar re-triggers while damping their engagement.
 # Absent = token-overlap detection only. Works with OpenAI, TEI, and Ollama.
 # [embedding]
 # url = "http://127.0.0.1:11434/v1/embeddings"
 # model = "bge-m3"
 # api_key_env = "EMBEDDING_API_KEY"   # env var holding the bearer token; omit for local endpoints
 # semantic_threshold = 0.85           # cosine at/above which a candidate is an echo
-# reignition_threshold = 0.85         # cosine at/above which a trigger reignites an exhausted topic
+# reignition_threshold = 0.85         # cosine at/above which a trigger shares an exhausted topic's budget
 # reignition_damp = 0.3               # engagement multiplier on reignited topics (1.0 disables)
 # reignition_ttl_secs = 21600         # how long an exhausted topic stays live (6h)
 
