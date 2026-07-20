@@ -9,8 +9,9 @@
 //! becomes the trigger for the next evaluation round, so agents answer each
 //! other (2026-07-17 design spec; parent Rift Team Room success criterion 1).
 //! The cascade is bounded by per-agent turn budgets, the thread ceiling, a
-//! round cap, per-agent cooldown, engagement decay, and consensus. Topic
-//! energy (budgets, agreements) resets on each inbound human message.
+//! round cap, per-agent cooldown, engagement decay, and consensus. Fresh
+//! topics reset their energy; semantic re-ignitions restore the exhausted
+//! cluster's consumed turn budget while clearing agreement votes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -27,9 +28,6 @@ use crate::context::build_discussion_context;
 use crate::echo::EchoDetector;
 use crate::embedding::{cosine, Embedder};
 use crate::engagement::{EngagementEngine, EngagementInputs};
-use crate::growth::GrowthStore;
-use crate::persona_alloc::{PersonaAllocator, PersonaAssignment};
-use crate::relevance;
 use crate::error::BridgeError;
 use crate::execution::approval::ApprovalRegistry;
 use crate::execution::command::{parse_control_command, ControlCommand};
@@ -39,8 +37,11 @@ use crate::execution::supervisor::ExecutionSupervisor;
 use crate::execution::{RiftRoomNotifier, RoomNotifier};
 use crate::executor::{AgentExecutor, DiscussionContext};
 use crate::executors::{build_synapse_executor, ClaudeCodeExecutor};
+use crate::growth::GrowthStore;
 use crate::kleos::KleosClient;
-use crate::loop_prevention::LoopGuard;
+use crate::loop_prevention::{LoopBudget, LoopGuard};
+use crate::persona_alloc::{PersonaAllocator, PersonaAssignment};
+use crate::relevance;
 use crate::rift_client::{RiftRestClient, RiftWsEvent};
 use crate::roster::AgentRoster;
 use crate::stimulus::Stimulus;
@@ -100,10 +101,12 @@ pub struct Room {
     /// Embedding-tier thresholds and reignition knobs (None when no
     /// embedding endpoint is configured).
     embedding_cfg: Option<EmbeddingConfig>,
-    /// Embeddings of recently exhausted topics (ceiling or consensus), with
-    /// their exhaustion times. Fresh triggers matching one get damped
-    /// engagement (parent design: topic exhaustion memory).
-    exhausted_topics: Vec<(Vec<f32>, std::time::Instant)>,
+    /// Recently exhausted semantic topic clusters. Fresh triggers matching
+    /// one inherit its consumed turn budget and get damped engagement.
+    exhausted_topics: Vec<ExhaustedTopic>,
+    /// Cache index of the exhausted cluster currently being re-ignited. Its
+    /// budget snapshot is refreshed after every successful agent post.
+    active_topic_cluster: Option<usize>,
     /// Engagement multiplier for the cascade currently running: 1.0
     /// normally, `reignition_damp` while the topic reignites an exhausted
     /// one. Directly addressed agents are immune.
@@ -112,6 +115,16 @@ pub struct Room {
 
 /// Maximum exhausted-topic embeddings retained for reignition matching.
 const EXHAUSTED_TOPICS_CAP: usize = 8;
+
+/// One exhausted semantic topic and the loop budget already consumed on it.
+struct ExhaustedTopic {
+    /// Embedding used to match later trigger text into this topic cluster.
+    embedding: Vec<f32>,
+    /// Last time this cluster exhausted, used for TTL expiry and tie-breaking.
+    exhausted_at: std::time::Instant,
+    /// Per-agent and thread-wide turn debt accumulated by this cluster.
+    budget: LoopBudget,
+}
 
 /// How a slot wait ended: the slot arrived, a fresh human message
 /// interrupted, or the operator paused the bridge.
@@ -268,7 +281,9 @@ impl Room {
                         .map(|a| (a.agent_id, a))
                         .collect::<HashMap<_, _>>(),
                     Err(e) => {
-                        tracing::warn!("persona allocation failed, continuing without personas: {e}");
+                        tracing::warn!(
+                            "persona allocation failed, continuing without personas: {e}"
+                        );
                         HashMap::new()
                     }
                 };
@@ -317,6 +332,7 @@ impl Room {
             embedder,
             embedding_cfg,
             exhausted_topics: Vec::new(),
+            active_topic_cluster: None,
             reignition_damp_active: 1.0,
         })
     }
@@ -385,13 +401,14 @@ impl Room {
             )
             .await?;
 
-        self.seed_topic(&stimulus.text, stimulus.kind.as_str()).await;
+        self.seed_topic(&stimulus.text, stimulus.kind.as_str())
+            .await;
         self.run_cascade(stimulus.text, events, pause).await
     }
 
-    /// Start a new topic from a non-agent trigger: reset interleaving and
-    /// topic energy (finding N2), count the room turn, evaluate reignition
-    /// damping, and report the wake to Kleos. Shared by human messages,
+    /// Start a topic from a non-agent trigger: reset interleaving and topic
+    /// energy, restore a matching exhausted cluster's consumed budget, count
+    /// the room turn, and report the wake to Kleos. Shared by human messages,
     /// stimuli, and mid-cascade human interruptions.
     async fn seed_topic(&mut self, content: &str, author_label: &str) {
         self.turn_manager.record_human_post();
@@ -403,8 +420,9 @@ impl Room {
         self.room_turn += 1;
 
         // Topic reignition (parent design: topic exhaustion memory): a
-        // trigger semantically matching a recently exhausted topic damps the
-        // whole cascade instead of re-litigating at full energy.
+        // trigger semantically matching a recently exhausted topic restores
+        // its consumed budget and damps the cascade. An unmatched or failed
+        // embedding leaves the reset budget fresh.
         self.reignition_damp_active = self.reignition_factor(content).await;
 
         if let Err(e) = self
@@ -644,18 +662,19 @@ impl Room {
         }
     }
 
-    /// Engagement multiplier for a fresh trigger: `reignition_damp` when the
-    /// trigger semantically matches a recently exhausted topic, 1.0
-    /// otherwise. Expired records are pruned here. Embedding failures score
-    /// as no match: a broken endpoint must never mute the room.
+    /// Restore a matching exhausted cluster's consumed budget and return its
+    /// engagement damp. Expired records are pruned here. Embedding failures
+    /// score as no match: a broken endpoint must never mute the room or carry
+    /// stale budget into a fresh topic.
     async fn reignition_factor(&mut self, trigger: &str) -> f64 {
+        self.active_topic_cluster = None;
         let (Some(embedder), Some(cfg)) = (self.embedder.clone(), self.embedding_cfg.clone())
         else {
             return 1.0;
         };
         let ttl = std::time::Duration::from_secs(cfg.reignition_ttl_secs);
         self.exhausted_topics
-            .retain(|(_, at)| at.elapsed() < ttl);
+            .retain(|topic| topic.exhausted_at.elapsed() < ttl);
         if self.exhausted_topics.is_empty() {
             return 1.0;
         }
@@ -666,14 +685,15 @@ impl Room {
                 return 1.0;
             }
         };
-        let reignited = self
-            .exhausted_topics
-            .iter()
-            .any(|(vec, _)| cosine(&trigger_vec, vec) >= cfg.reignition_threshold);
-        if reignited {
+        let best_match = self.best_topic_match(&trigger_vec, cfg.reignition_threshold);
+        if let Some(index) = best_match {
+            let budget = self.exhausted_topics[index].budget.clone();
+            self.loop_guard.restore_budget(&budget);
+            self.active_topic_cluster = Some(index);
             tracing::info!(
-                "trigger reignites an exhausted topic, damping engagement x{}",
-                cfg.reignition_damp
+                total_turns = self.loop_guard.total_turns(),
+                damp = cfg.reignition_damp,
+                "trigger reignites an exhausted topic, restoring clustered turn budget"
             );
             cfg.reignition_damp
         } else {
@@ -681,19 +701,62 @@ impl Room {
         }
     }
 
-    /// Record an exhausted topic's embedding for reignition matching. No-op
-    /// without an embedder. Failures are logged and dropped: exhaustion
-    /// memory is an optimization, never a gate.
+    /// Return the closest live topic cluster meeting `threshold`. Similarity
+    /// wins first; an exact tie selects the most recently exhausted record.
+    fn best_topic_match(&self, embedding: &[f32], threshold: f64) -> Option<usize> {
+        self.exhausted_topics
+            .iter()
+            .enumerate()
+            .filter_map(|(index, topic)| {
+                let score = cosine(embedding, &topic.embedding);
+                (score.is_finite() && score >= threshold).then_some((
+                    index,
+                    score,
+                    topic.exhausted_at,
+                ))
+            })
+            .max_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(index, _, _)| index)
+    }
+
+    /// Record an exhausted topic's embedding and consumed budget. A semantic
+    /// match updates the existing cluster instead of appending a duplicate.
+    /// No-op without embedding configuration; failures are logged and dropped.
     async fn record_exhausted_topic(&mut self, topic_seed: &str) {
-        let Some(embedder) = self.embedder.clone() else {
+        let (Some(embedder), Some(cfg)) = (self.embedder.clone(), self.embedding_cfg.clone())
+        else {
             return;
         };
+        let ttl = std::time::Duration::from_secs(cfg.reignition_ttl_secs);
+        self.exhausted_topics
+            .retain(|topic| topic.exhausted_at.elapsed() < ttl);
+        let budget = self.loop_guard.budget_snapshot();
         match embedder.embed(topic_seed).await {
-            Ok(vec) => {
-                self.exhausted_topics
-                    .push((vec, std::time::Instant::now()));
+            Ok(embedding) => {
+                let now = std::time::Instant::now();
+                let matching_cluster = self.best_topic_match(&embedding, cfg.reignition_threshold);
+                let topic = ExhaustedTopic {
+                    embedding,
+                    exhausted_at: now,
+                    budget,
+                };
+                if let Some(index) = matching_cluster {
+                    self.exhausted_topics.remove(index);
+                }
+                // Append updates too: index order remains least-recently
+                // exhausted first, so cap eviction cannot discard a cluster
+                // that was just refreshed in place.
+                self.exhausted_topics.push(topic);
+                self.active_topic_cluster = Some(self.exhausted_topics.len() - 1);
                 while self.exhausted_topics.len() > EXHAUSTED_TOPICS_CAP {
                     self.exhausted_topics.remove(0);
+                    self.active_topic_cluster = self
+                        .active_topic_cluster
+                        .and_then(|index| index.checked_sub(1));
                 }
             }
             Err(e) => tracing::warn!("exhausted-topic embed failed, not recorded: {e}"),
@@ -824,6 +887,22 @@ impl Room {
         }
     }
 
+    /// Record one successful post and immediately refresh the active semantic
+    /// cluster's budget. This preserves debt even when a re-ignited cascade
+    /// ends quietly or is paused before reaching consensus or the ceiling.
+    fn record_topic_contribution(&mut self, agent_id: AgentId) {
+        self.loop_guard.record_contribution(agent_id);
+        let Some(index) = self.active_topic_cluster else {
+            return;
+        };
+        let budget = self.loop_guard.budget_snapshot();
+        if let Some(topic) = self.exhausted_topics.get_mut(index) {
+            topic.budget = budget;
+        } else {
+            self.active_topic_cluster = None;
+        }
+    }
+
     /// Generate a response from an agent and post it to the room. Holds the
     /// compose floor for the whole sequence (context build, generation,
     /// post) so no other agent composes against the same room state (spec P1
@@ -914,7 +993,11 @@ impl Room {
                 .map(|(_, text)| text.clone())
                 .collect();
             let peer_refs: Vec<&str> = peer_texts.iter().map(String::as_str).collect();
-            if self.echo_detector.is_echo(&agent_resp.text, &peer_refs).await {
+            if self
+                .echo_detector
+                .is_echo(&agent_resp.text, &peer_refs)
+                .await
+            {
                 tracing::info!("{display_name} response suppressed as cross-agent echo");
                 self.set_agent_idle(agent_id);
                 return Ok(None);
@@ -924,7 +1007,13 @@ impl Room {
         // Post to room.
         if let Err(e) = self
             .rift
-            .send_message(rift_user_id, &username, self.channel_id, &agent_resp.text, None)
+            .send_message(
+                rift_user_id,
+                &username,
+                self.channel_id,
+                &agent_resp.text,
+                None,
+            )
             .await
         {
             self.set_agent_idle(agent_id);
@@ -941,7 +1030,7 @@ impl Room {
         // Update tracking state: the post is a room turn and this agent's
         // new recency anchor (the old code instead incremented a posts-made
         // counter that fed the recency decay inverted -- finding N1).
-        self.loop_guard.record_contribution(agent_id);
+        self.record_topic_contribution(agent_id);
         self.turn_manager.record_post(agent_id);
         self.room_turn += 1;
         let room_turn = self.room_turn;
@@ -995,11 +1084,7 @@ impl Room {
 
             if let Err(e) = self
                 .kleos
-                .store_consensus_memory(
-                    &self.project_name,
-                    &consensus_text,
-                    &consensus_tags,
-                )
+                .store_consensus_memory(&self.project_name, &consensus_text, &consensus_tags)
                 .await
             {
                 tracing::warn!("kleos consensus memory store failed: {e}");
@@ -1094,10 +1179,7 @@ impl Room {
         let team_members: Vec<&str> = self.roster.all().map(|a| a.display_name.as_str()).collect();
 
         // Persona name and growth notes for this agent, when personas are enabled.
-        let persona_name = self
-            .personas
-            .get(&agent_id)
-            .map(|p| p.persona_name.clone());
+        let persona_name = self.personas.get(&agent_id).map(|p| p.persona_name.clone());
         let growth_notes = self
             .growth
             .as_ref()
@@ -1358,6 +1440,7 @@ mod tests {
             embedder: None,
             embedding_cfg: None,
             exhausted_topics: Vec::new(),
+            active_topic_cluster: None,
             reignition_damp_active: 1.0,
         };
         (room, agent_id)
@@ -1389,7 +1472,10 @@ mod tests {
             room.turn_manager.acquire_floor(),
         )
         .await;
-        assert!(floor.is_ok(), "compose floor must be released after failure");
+        assert!(
+            floor.is_ok(),
+            "compose floor must be released after failure"
+        );
     }
 
     /// Verifies per-agent cooldown floor semantics (review finding:
@@ -1460,9 +1546,11 @@ mod tests {
         let (mut room, _agent) = offline_room();
         let (tx, mut rx) = mpsc::channel(8);
         let (_pause_tx, mut pause_rx) = watch::channel(false);
-        tx.send(RiftWsEvent::MessageCreate(human_msg("new topic, drop everything")))
-            .await
-            .unwrap();
+        tx.send(RiftWsEvent::MessageCreate(human_msg(
+            "new topic, drop everything",
+        )))
+        .await
+        .unwrap();
 
         // A wait long enough that only the interruption can end it quickly.
         let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1564,19 +1652,26 @@ mod tests {
         assert!(matches!(outcome, SlotOutcome::Paused));
     }
 
-    /// Embedder stub for reignition tests: "deploy" texts share a direction,
-    /// everything else is orthogonal.
+    /// Embedder stub for reignition tests. Generic deploy text is the cluster
+    /// query direction; alpha and beta are distinct clusters that both match
+    /// it, while everything else is orthogonal.
     struct TopicStubEmbedder;
 
     /// Canned embeddings keyed on content.
     #[async_trait]
     impl crate::embedding::Embedder for TopicStubEmbedder {
-        /// Deterministic two-dimensional vectors.
+        /// Deterministic three-dimensional vectors or a requested failure.
         async fn embed(&self, text: &str) -> Result<Vec<f32>, BridgeError> {
-            if text.contains("deploy") {
-                Ok(vec![1.0, 0.0])
+            if text.contains("embed-error") {
+                Err(BridgeError::Embedding("stub failure".to_string()))
+            } else if text.contains("deploy-alpha") {
+                Ok(vec![0.87, 0.493, 0.0])
+            } else if text.contains("deploy-beta") {
+                Ok(vec![0.95, 0.0, 0.312])
+            } else if text.contains("deploy") {
+                Ok(vec![1.0, 0.0, 0.0])
             } else {
-                Ok(vec![0.0, 1.0])
+                Ok(vec![0.0, 1.0, 0.0])
             }
         }
     }
@@ -1602,13 +1697,178 @@ mod tests {
     async fn test_reignition_factor_matches_exhausted_topic() {
         let (mut room, _agent) = offline_room();
         with_stub_embedding(&mut room);
-        room.record_exhausted_topic("the deploy pipeline discussion").await;
+        room.record_exhausted_topic("the deploy pipeline discussion")
+            .await;
         assert_eq!(room.exhausted_topics.len(), 1);
 
-        let damped = room.reignition_factor("deploy pipeline rollback plan").await;
+        let damped = room
+            .reignition_factor("deploy pipeline rollback plan")
+            .await;
         assert!((damped - 0.3).abs() < 1e-9);
         let fresh = room.reignition_factor("what should we name the cat").await;
         assert!((fresh - 1.0).abs() < 1e-9);
+    }
+
+    /// Verifies a matching topic restores its consumed per-agent budget but
+    /// not its prior consensus vote.
+    #[tokio::test]
+    async fn test_reignition_restores_budget_without_consensus() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        for _ in 0..room.config.turn_budget {
+            room.loop_guard.record_contribution(agent_id);
+        }
+        room.loop_guard.record_agreement(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+
+        room.seed_topic("deploy rollback", "tester").await;
+
+        assert!((room.reignition_damp_active - 0.3).abs() < 1e-9);
+        assert!(!room.loop_guard.can_contribute(agent_id));
+        assert!(!room.loop_guard.has_consensus());
+    }
+
+    /// Verifies an unrelated trigger starts with zero topic debt even while
+    /// an exhausted semantic cluster remains live in the cache.
+    #[tokio::test]
+    async fn test_dissimilar_topic_keeps_fresh_budget() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+
+        room.seed_topic("what should we name the cat", "tester")
+            .await;
+
+        assert!((room.reignition_damp_active - 1.0).abs() < 1e-9);
+        assert_eq!(room.loop_guard.total_turns(), 0);
+        assert!(room.loop_guard.can_contribute(agent_id));
+    }
+
+    /// Verifies an embedding outage fails open with a fresh budget rather
+    /// than restoring a cached cluster based on stale or partial state.
+    #[tokio::test]
+    async fn test_reignition_embedding_error_keeps_fresh_budget() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+
+        room.seed_topic("embed-error", "tester").await;
+
+        assert!((room.reignition_damp_active - 1.0).abs() < 1e-9);
+        assert_eq!(room.loop_guard.total_turns(), 0);
+        assert!(room.loop_guard.can_contribute(agent_id));
+    }
+
+    /// Verifies repeated exhaustion of one semantic cluster replaces its
+    /// record and carries the cumulative budget into the next re-ignition.
+    #[tokio::test]
+    async fn test_reexhausted_cluster_updates_cumulative_budget() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+
+        room.loop_guard.reset();
+        room.reignition_factor("deploy rollback").await;
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy rollback").await;
+        assert_eq!(room.exhausted_topics.len(), 1);
+
+        room.loop_guard.reset();
+        room.reignition_factor("deploy follow-up").await;
+        assert_eq!(room.loop_guard.total_turns(), 2);
+    }
+
+    /// Verifies a re-ignited cluster retains newly consumed debt even when it
+    /// has not reached consensus or exhausted the hard ceiling again.
+    #[tokio::test]
+    async fn test_active_cluster_tracks_each_successful_contribution() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+
+        room.seed_topic("deploy follow-up", "tester").await;
+        room.record_topic_contribution(agent_id);
+        assert_eq!(room.loop_guard.total_turns(), 2);
+
+        room.loop_guard.reset();
+        room.reignition_factor("deploy again").await;
+        assert_eq!(room.loop_guard.total_turns(), 2);
+    }
+
+    /// Verifies refreshing the oldest cluster moves it to the newest cache
+    /// position so the next cap eviction removes a genuinely older record.
+    #[tokio::test]
+    async fn test_refreshed_cluster_survives_cache_eviction() {
+        let (mut room, _agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        let budget = room.loop_guard.budget_snapshot();
+        room.exhausted_topics.push(ExhaustedTopic {
+            embedding: vec![1.0, 0.0, 0.0],
+            exhausted_at: std::time::Instant::now(),
+            budget: budget.clone(),
+        });
+        for dimensions in 4..=10 {
+            room.exhausted_topics.push(ExhaustedTopic {
+                embedding: vec![1.0; dimensions],
+                exhausted_at: std::time::Instant::now(),
+                budget: budget.clone(),
+            });
+        }
+        assert_eq!(room.exhausted_topics.len(), EXHAUSTED_TOPICS_CAP);
+
+        room.record_exhausted_topic("deploy pipeline").await;
+        room.record_exhausted_topic("unrelated cat topic").await;
+
+        assert_eq!(room.exhausted_topics.len(), EXHAUSTED_TOPICS_CAP);
+        assert!(room
+            .exhausted_topics
+            .iter()
+            .any(|topic| cosine(&topic.embedding, &[1.0, 0.0, 0.0]) > 0.99));
+    }
+
+    /// Verifies the nearest live cluster wins when one trigger matches more
+    /// than one cluster above the configured threshold.
+    #[tokio::test]
+    async fn test_reignition_chooses_highest_cosine_cluster() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy-alpha").await;
+
+        room.loop_guard.reset();
+        for _ in 0..3 {
+            room.loop_guard.record_contribution(agent_id);
+        }
+        room.record_exhausted_topic("deploy-beta").await;
+        assert_eq!(room.exhausted_topics.len(), 2);
+
+        room.loop_guard.reset();
+        room.reignition_factor("deploy query").await;
+        assert_eq!(room.loop_guard.total_turns(), 3);
+    }
+
+    /// Verifies an expired semantic cluster is removed and cannot restore
+    /// turn debt into a later trigger.
+    #[tokio::test]
+    async fn test_expired_cluster_does_not_restore_budget() {
+        let (mut room, agent_id) = offline_room();
+        with_stub_embedding(&mut room);
+        room.embedding_cfg.as_mut().unwrap().reignition_ttl_secs = 1;
+        room.loop_guard.record_contribution(agent_id);
+        room.record_exhausted_topic("deploy pipeline").await;
+        room.exhausted_topics[0].exhausted_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+
+        room.loop_guard.reset();
+        let factor = room.reignition_factor("deploy follow-up").await;
+
+        assert!((factor - 1.0).abs() < 1e-9);
+        assert_eq!(room.loop_guard.total_turns(), 0);
+        assert!(room.exhausted_topics.is_empty());
     }
 
     /// Verifies reignition damping multiplies engagement for unaddressed

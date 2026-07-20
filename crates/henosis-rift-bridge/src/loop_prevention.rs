@@ -3,12 +3,10 @@
 //! Prevents conversation loops by tracking per-agent turn budgets,
 //! thread-wide ceilings, and consensus signals.
 //!
-//! HONESTY NOTE (2026-07-17 design spec, P4): the original design (memory
-//! 27272) specified embedding-based loop detection. What is implemented here
-//! is counters plus consensus markers; semantic "circling" detection is a
-//! cheap token-overlap pass in [`crate::echo`], and embedding-based
-//! detection remains future work. This gap is recorded deliberately instead
-//! of silently drifting.
+//! The synchronous guard owns only budget accounting. Semantic topic
+//! clustering stays in [`crate::room`], which snapshots and restores the
+//! consumed budget through [`LoopBudget`] when an exhausted topic reignites.
+//! Echo detection stays in [`crate::echo`].
 //!
 //! Consensus markers are LINE-ANCHORED (spec P5): a signal counts only when
 //! a line starts with it, so an agent *discussing* the protocol ("should I
@@ -23,6 +21,16 @@ use crate::types::AgentId;
 const PASS_MARKER: &str = "[PASS]";
 /// Marker an agent emits to signal agreement with the current consensus.
 const AGREE_MARKER: &str = "[AGREE]";
+
+/// Opaque copy of consumed topic energy. Consensus votes are deliberately
+/// excluded: a semantic re-ignition shares turn debt, not a completed vote.
+#[derive(Clone)]
+pub(crate) struct LoopBudget {
+    /// Per-agent contributions already consumed in the topic cluster.
+    agent_turns: HashMap<AgentId, u32>,
+    /// Thread-wide contributions already consumed in the topic cluster.
+    total_turns: u32,
+}
 
 /// Tracks turn budgets, thread ceilings, and agreement signals.
 pub struct LoopGuard {
@@ -114,6 +122,23 @@ impl LoopGuard {
         self.agreed_agents.clear();
     }
 
+    /// Snapshot consumed per-agent and thread budget for an exhausted topic.
+    /// Agreement state is intentionally not part of the snapshot.
+    pub(crate) fn budget_snapshot(&self) -> LoopBudget {
+        LoopBudget {
+            agent_turns: self.agent_turns.clone(),
+            total_turns: self.total_turns,
+        }
+    }
+
+    /// Replace current topic energy with a prior cluster's consumed budget.
+    /// Registered agents remain stable and agreement starts fresh.
+    pub(crate) fn restore_budget(&mut self, budget: &LoopBudget) {
+        self.agent_turns.clone_from(&budget.agent_turns);
+        self.total_turns = budget.total_turns;
+        self.agreed_agents.clear();
+    }
+
     /// Get current total turn count.
     pub fn total_turns(&self) -> u32 {
         self.total_turns
@@ -173,6 +198,53 @@ mod tests {
         assert!(guard.can_contribute(a));
         assert!(!guard.has_consensus());
         assert_eq!(guard.total_turns(), 0);
+    }
+
+    /// Verifies a restored topic keeps per-agent and thread debt while
+    /// clearing the previous topic's completed agreement vote.
+    #[test]
+    fn test_budget_snapshot_restores_debt_without_consensus() {
+        let a = agent();
+        let b = agent();
+        let mut guard = LoopGuard::new(2, 3);
+        guard.register_agent(a);
+        guard.register_agent(b);
+        guard.record_contribution(a);
+        guard.record_contribution(a);
+        guard.record_contribution(b);
+        guard.record_agreement(a);
+        guard.record_agreement(b);
+        let budget = guard.budget_snapshot();
+
+        guard.reset();
+        guard.restore_budget(&budget);
+
+        assert!(!guard.can_contribute(a), "agent debt must survive restore");
+        assert!(
+            !guard.can_contribute(b),
+            "thread ceiling must survive restore"
+        );
+        assert_eq!(guard.total_turns(), 3);
+        assert!(!guard.has_consensus(), "agreement votes must start fresh");
+    }
+
+    /// Verifies an agent absent from an older cluster snapshot starts with no
+    /// individual debt when the thread still has room.
+    #[test]
+    fn test_budget_restore_leaves_new_agent_at_zero_turns() {
+        let old = agent();
+        let new = agent();
+        let mut guard = LoopGuard::new(2, 10);
+        guard.record_contribution(old);
+        guard.record_contribution(old);
+        let budget = guard.budget_snapshot();
+
+        guard.reset();
+        guard.register_agent(new);
+        guard.restore_budget(&budget);
+
+        assert!(!guard.can_contribute(old));
+        assert!(guard.can_contribute(new));
     }
 
     /// Verifies consensus requires every registered agent to agree.
