@@ -35,6 +35,7 @@ pub enum TaskStatus {
     Queued,
 }
 
+/// Wire conversion and lifecycle helpers for task statuses.
 impl TaskStatus {
     /// The canonical storage/wire token for this status.
     pub fn as_str(&self) -> &'static str {
@@ -163,6 +164,7 @@ pub struct TaskPatch {
     pub assignee: Option<PrincipalId>,
 }
 
+/// Inspection helpers for partial task updates.
 impl TaskPatch {
     /// Whether the patch carries no changes.
     pub fn is_empty(&self) -> bool {
@@ -201,6 +203,25 @@ pub struct TaskUpdate {
     pub created_at: Timestamp,
 }
 
+/// One append-only dispatcher lifecycle event correlated with a Chiasm task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskActivity {
+    /// Append-only log id.
+    pub id: i64,
+    /// The task this activity belongs to.
+    pub task_id: TaskId,
+    /// Tenant that dispatched the action.
+    pub tenant: TenantId,
+    /// Principal that dispatched the action and owns the task.
+    pub principal_id: PrincipalId,
+    /// Axon lifecycle kind such as `action.invoked` or `action.completed`.
+    pub kind: String,
+    /// Structured lifecycle payload with arguments and results deliberately omitted.
+    pub payload: serde_json::Value,
+    /// When the projection was recorded.
+    pub created_at: Timestamp,
+}
+
 /// Aggregate task counts for one principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChiasmStats {
@@ -235,6 +256,7 @@ pub struct PathClaim {
     pub released: bool,
 }
 
+/// Lease-state helpers for path claims.
 impl PathClaim {
     /// Whether this claim is active at `now`: not released and not yet expired. Expiry is
     /// compared here in Rust because the stored nanosecond RFC3339 strings do not order

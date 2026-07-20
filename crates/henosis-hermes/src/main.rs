@@ -4,32 +4,15 @@
 //! All business logic (tool registry, adapters, circuit breakers, rate limiting,
 //! audit, webhooks, MCP bridge) lives in the library crate (`lib.rs`).
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
 use axum::{routing::get, routing::post, Json, Router};
 use serde_json::json;
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use henosis_hermes::{
-    AppState,
-    axon::AxonPublisher,
-    audit::AuditTrail,
-    circuit::CircuitRegistry,
-    config::Config,
-    credd_client::CreddClient,
-    metrics::MetricsRegistry,
-    mcp_bridge,
-    oauth_refresh::{OAuthRefreshDaemon, RefreshRegistry},
-    rate_limit::{RateLimitConfig, RateLimiter},
-    registry::build_registry,
-    routes,
-    tenant_config::TenantConfigStore,
-    webhooks,
-};
+use henosis_hermes::{config::Config, mcp_bridge, routes, webhooks, AppState};
 
 /// Service name embedded in health and version responses.
 const SERVICE: &str = "hermes";
@@ -48,46 +31,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config::from_env();
     let port = cfg.port;
-    let registry = Arc::new(build_registry());
-    let refresh_registry = RefreshRegistry::default();
-    let credd = Arc::new(
-        CreddClient::new(cfg.credd_url.clone(), cfg.credd_token.clone())
-            .with_refresh_registry(refresh_registry.clone()),
-    );
+    let credd_url = cfg.credd_url.clone();
+    let credd_token_missing = cfg.credd_token.is_none();
+    let state = AppState::from_config(cfg);
 
     info!(
         "{SERVICE} {VERSION} -- {} tools registered, credd at {}",
-        registry.list().len(),
-        cfg.credd_url,
+        state.registry.list().len(),
+        credd_url,
     );
-    if cfg.credd_token.is_none() {
-        info!("HERMES_CREDD_TOKEN not set -- adapters needing OAuth will return credd_auth_missing");
+    if credd_token_missing {
+        info!(
+            "HERMES_CREDD_TOKEN not set -- adapters needing OAuth will return credd_auth_missing"
+        );
     }
-
-    OAuthRefreshDaemon::new(refresh_registry, credd.clone()).spawn();
-
-    let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
-    let circuits = Arc::new(CircuitRegistry::new());
-    let metrics = Arc::new(MetricsRegistry::new());
-    let axon_publisher = AxonPublisher::from_env();
-    let audit = Arc::new(AuditTrail::new(axon_publisher.clone()));
-    audit.clone().spawn_publisher();
-
-    let state = AppState {
-        registry,
-        credd,
-        rate_limiter,
-        circuits,
-        metrics,
-        audit,
-        axon: axon_publisher,
-        tenant_config: Arc::new(TenantConfigStore::with_path(
-            std::env::var("HERMES_TENANT_CONFIG_PATH")
-                .unwrap_or_else(|_| "data/tenant_config.json".to_string())
-                .into(),
-        )),
-        public_url: cfg.public_url.clone(),
-    };
 
     let mut app = Router::new()
         .route("/health", get(health))

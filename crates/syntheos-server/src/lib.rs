@@ -15,7 +15,8 @@
 //! 6.x / row 1), EidolonGate (prompt-injection, scope-violation, and persona-drift policy read
 //! from Thymus via the [`ThymusDriftSignal`] adapter, Story 2.6), HumanGate (human-in-the-loop
 //! approvals over Rift, Story 4.6), and PhylaxGate (credential resolution, Story 3.6, when
-//! `SYNTHEOS_PHYLAX_KEY` is set). All five gate slots are real -- no deny-stubs remain. The
+//! `SYNTHEOS_PHYLAX_KEY` is set; boot fails when it is absent). All five gate slots are real -- no
+//! deny-stubs remain. The
 //! `EidolonOutputFilter` is wired into the dispatcher's output slot, scrubbing credential-bearing
 //! fields from executor results.
 //!
@@ -37,6 +38,12 @@
 
 pub mod app;
 
+/// Projects dispatcher lifecycle events into Broca and task-scoped Chiasm activity.
+pub mod action_reactor;
+
+/// Production dispatcher executor for Hermes tools and Phylax operations.
+pub mod henosis_executor;
+
 /// The Stripe billing webhook: `POST /billing/stripe/webhook` (Story 6.4a).
 ///
 /// Additive -- the default kernel server is unchanged when [`billing::BillingState`] is not
@@ -49,6 +56,7 @@ pub mod billing;
 /// is not constructed. Routes mount conditionally (Task 7).
 pub mod operator;
 
+pub use action_reactor::spawn_action_reactor;
 pub use app::{
     eidolon_gate, live_gate_chain, router, AppState, BrocaFeedQuery, BrocaLogRequest,
     BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery, ChiasmOwnerQuery, EnrollRequest,
@@ -58,3 +66,4 @@ pub use app::{
     ThymusDriftSignal, ThymusEvaluate, ThymusEvaluationsQuery, ThymusMetricSummaryQuery,
     ThymusOwnerQuery, ThymusRecordDrift, ThymusRecordMetric,
 };
+pub use henosis_executor::HenosisExecutor;

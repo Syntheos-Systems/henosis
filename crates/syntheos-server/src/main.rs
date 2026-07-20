@@ -11,7 +11,9 @@ use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
 use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
 use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
-use henosis_loom::{CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor};
+use henosis_loom::{
+    CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor,
+};
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
 use henosis_plutus::{PlutusStore, PolicyBackend, QuotaTier};
@@ -20,12 +22,11 @@ use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalKind, TenantId};
-use syntheos_dispatch::deny::DenyExecutor;
 use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
 use syntheos_server::billing::BillingState;
 use syntheos_server::operator::OperatorState;
-use syntheos_server::{live_gate_chain, SomaQualitySink};
+use syntheos_server::{live_gate_chain, spawn_action_reactor, HenosisExecutor, SomaQualitySink};
 use syntheos_server::{router, AppState};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -57,6 +58,7 @@ struct HephaestusRuntimeDispatch {
 }
 
 #[async_trait]
+/// Execute Loom Hephaestus steps against the absorbed in-process runtime.
 impl HephaestusDispatch for HephaestusRuntimeDispatch {
     /// Forward the step payload to the in-process Hephaestus executor and await the result.
     ///
@@ -118,6 +120,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IN_FLIGHT: usize = 1024;
 
 #[tokio::main]
+/// Initialize every kernel authority and serve the unified Syntheos API.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -205,18 +208,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "plutus policy authority open (real gate in plutus slot)"
     );
 
-    // The dispatcher gate chain: all five slots now run REAL gates (pistis, plutus, eidolon,
-    // human, phylax-when-keyed). The plutus slot is the real PlutusGate (Story 6.x / row 1).
-    // The phylax credential authority is opt-in and fail-closed: it activates only when a master
-    // key is configured (SYNTHEOS_PHYLAX_KEY). Absent a key, the phylax slot stays a deny-stub so
-    // no credential operation is silently permitted.
+    // The dispatcher gate chain: all five slots run real authorities. Phylax is required rather
+    // than replaced by a deny-shaped placeholder when its key is missing.
     let phylax = phylax_from_env(bus.clone())?;
-    match &phylax {
-        Some(_) => {
-            tracing::info!("phylax credential authority enabled (real gate in the phylax slot)")
-        }
-        None => tracing::info!("phylax disabled (SYNTHEOS_PHYLAX_KEY unset); phylax slot denies"),
-    }
+    tracing::info!("phylax credential authority enabled (real gate and executor path)");
+
+    // Subscribe before the dispatcher is made reachable so no action can race past the two
+    // downstream projections required by the kernel definition of done.
+    let _action_reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
 
     // The pistis capability authority is a REAL gate in the pistis slot. Until live Matrix room
     // materialization lands, its room-state source is empty: a capability-bearing invocation fails
@@ -242,12 +241,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &policy,
                 thymus.clone(),
                 pistis_source,
-                phylax,
+                phylax.clone(),
                 bus.clone(),
                 human_approver,
                 plutus,
             )?,
-            Box::new(DenyExecutor),
+            Box::new(HenosisExecutor::from_env(phylax)),
             bus.clone(),
         )?
         .with_output_filter(Box::new(EidolonOutputFilter::new(&policy)?)),
@@ -344,7 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "syntheos-server listening (all five gate slots real: pistis, plutus, eidolon, human, phylax-when-keyed)");
+    tracing::info!(%addr, "syntheos-server listening (five real gates, in-process Hermes/Phylax executor, action projections live)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -352,27 +351,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build the supervisor from the environment, when enabled.
+/// Open the required Phylax credential store from its configured master key.
 ///
-/// `SYNTHEOS_SUPERVISOR_WATCH_DIR` unset = disabled (`Ok(None)`). When set, the identity the
-/// violation events carry is REQUIRED (`SYNTHEOS_SUPERVISOR_TENANT` /
-/// `SYNTHEOS_SUPERVISOR_PRINCIPAL`, canonical UUID strings) and a configured-but-unreadable
-/// rules file (`SYNTHEOS_SUPERVISOR_RULES`) is a boot error rather than a silent fall-back to
-/// defaults. `SYNTHEOS_SUPERVISOR_ALLOWED_PATHS` (colon-separated) enables the file-scope check.
-/// Open the Phylax credential store if a master key is configured, else `None`.
-///
-/// Opt-in and fail-closed: the store activates only when `SYNTHEOS_PHYLAX_KEY` holds a 64-hex
-/// (32-byte) master key. The DB path defaults to `data/phylax.sqlite` (override with
-/// `SYNTHEOS_PHYLAX_DB`). A set-but-malformed key is a hard boot error -- never a silent
-/// fallback to no authority -- so a misconfiguration cannot quietly leave the slot denying when
-/// the operator intended it enabled.
-fn phylax_from_env(
-    bus: Arc<AxonBus>,
-) -> Result<Option<Arc<PhylaxStore>>, Box<dyn std::error::Error>> {
-    let key_hex = match std::env::var("SYNTHEOS_PHYLAX_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return Ok(None),
-    };
+/// `SYNTHEOS_PHYLAX_KEY` must hold a 64-hex (32-byte) master key. The DB path defaults to
+/// `data/phylax.sqlite` (override with `SYNTHEOS_PHYLAX_DB`). Missing or malformed authority
+/// configuration is a boot error because a five-gate production dispatcher may not substitute a
+/// stub for Phylax.
+fn phylax_from_env(bus: Arc<AxonBus>) -> Result<Arc<PhylaxStore>, Box<dyn std::error::Error>> {
+    let key_hex = std::env::var("SYNTHEOS_PHYLAX_KEY")
+        .map_err(|_| "SYNTHEOS_PHYLAX_KEY is required (64 hex characters)")?;
+    if key_hex.is_empty() {
+        return Err("SYNTHEOS_PHYLAX_KEY is required (64 hex characters)".into());
+    }
     let key_bytes =
         hex::decode(key_hex.trim()).map_err(|e| format!("SYNTHEOS_PHYLAX_KEY must be hex: {e}"))?;
     let key: [u8; 32] = key_bytes
@@ -381,9 +371,16 @@ fn phylax_from_env(
     let db = db_path("SYNTHEOS_PHYLAX_DB", "data/phylax.sqlite")?;
     let store = PhylaxStore::open(&db, bus, key)?;
     tracing::info!(path = %db, "phylax credential store open");
-    Ok(Some(Arc::new(store)))
+    Ok(Arc::new(store))
 }
 
+/// Build the supervisor from the environment, when enabled.
+///
+/// `SYNTHEOS_SUPERVISOR_WATCH_DIR` unset = disabled (`Ok(None)`). When set, the identity the
+/// violation events carry is required (`SYNTHEOS_SUPERVISOR_TENANT` /
+/// `SYNTHEOS_SUPERVISOR_PRINCIPAL`, canonical UUID strings) and a configured-but-unreadable
+/// rules file (`SYNTHEOS_SUPERVISOR_RULES`) is a boot error rather than a silent fallback to
+/// defaults. `SYNTHEOS_SUPERVISOR_ALLOWED_PATHS` enables the colon-separated file-scope check.
 fn supervisor_from_env(
     bus: Arc<AxonBus>,
 ) -> Result<Option<Supervisor>, Box<dyn std::error::Error>> {

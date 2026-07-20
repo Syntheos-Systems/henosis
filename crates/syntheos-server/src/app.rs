@@ -33,7 +33,6 @@ use serde::Deserialize;
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{Gate, RunId, Timestamp, WorkflowId};
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
-use syntheos_dispatch::deny::DenyGate;
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 use syntheos_identity::PrincipalDirectory;
 
@@ -133,23 +132,18 @@ pub fn eidolon_gate(
 ///   tests: a [`henosis_plutus::MockPolicyBackend`]).
 /// - `eidolon`: [`EidolonGate`] -- prompt-injection, scope-violation, persona-drift policy.
 /// - `human`:   [`HumanGate`] -- human-in-the-loop approvals over Rift.
-/// - `phylax`:  [`PhylaxGate`] when a credential store is configured; [`DenyGate`] otherwise
-///   (fail-closed: no authority means deny).
+/// - `phylax`:  [`PhylaxGate`] over the required credential store.
 ///
 /// `Dispatcher::new` re-validates the canonical order at boot, so a mis-wiring is a boot error.
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
     pistis_source: Arc<dyn RoomStateSource>,
-    phylax: Option<Arc<PhylaxStore>>,
+    phylax: Arc<PhylaxStore>,
     bus: Arc<AxonBus>,
     human_approver: Arc<dyn Approver>,
     plutus: Arc<dyn PolicyBackend>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
-    let phylax_gate: Box<dyn Gate> = match phylax {
-        Some(store) => Box::new(PhylaxGate::new(store)),
-        None => Box::new(DenyGate::new("phylax")),
-    };
     Ok(vec![
         Box::new(PistisGate::new(pistis_source)),
         // The REAL PlutusGate (Story 6.x / row 1): org status, RBAC, hard-quota, and
@@ -160,7 +154,7 @@ pub fn live_gate_chain(
         // escalated to a human (Axon notification) and blocks on the approver
         // until they decide or it times out (fail-closed).
         Box::new(HumanGate::new(human_approver, bus)),
-        phylax_gate,
+        Box::new(PhylaxGate::new(phylax)),
     ])
 }
 
@@ -1561,6 +1555,14 @@ mod tests {
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
+    /// Build the real Phylax authority over an isolated in-memory store.
+    fn test_phylax(bus: Arc<AxonBus>) -> Arc<PhylaxStore> {
+        Arc::new(
+            PhylaxStore::open_in_memory(bus, *henosis_phylax::crypto::generate_key())
+                .expect("phylax store"),
+        )
+    }
+
     /// Build an in-memory [`henosis_cognition::Cognition`] for the feature build's
     /// test helpers. `Cognition::open_in_memory` is async; these helpers are sync
     /// and run inside a `#[tokio::test]` runtime, so the open is driven on a
@@ -1848,7 +1850,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            None,
+            test_phylax(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -1876,7 +1878,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus2,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            None,
+            test_phylax(bus2.clone()),
             bus2.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -1926,7 +1928,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            None,
+            test_phylax(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -1962,8 +1964,7 @@ mod tests {
 
     /// With a configured phylax store the chain is still canonical, and the phylax slot is the
     /// REAL gate: a credential invocation the principal's policy permits is allowed by it (the
-    /// dispatcher still denies overall at the pistis deny-stub, but the phylax gate itself does
-    /// not deny -- proven by checking the gate directly).
+    /// other gates are not part of this gate-level assertion).
     #[tokio::test]
     async fn live_gate_chain_uses_real_phylax_when_configured() {
         use henosis_phylax::{ResolveMode, SecretData};
@@ -2003,7 +2004,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Some(phylax),
+            phylax,
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -2069,7 +2070,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            None,
+            test_phylax(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -2091,7 +2092,7 @@ mod tests {
             workflow: None,
         };
 
-        // No declared capability -> pistis allows -> plutus (deny-stub) denies. The denial landing
+        // No declared capability -> pistis allows -> the configured Plutus backend denies. The denial landing
         // at plutus, not pistis, proves the request traversed the real pistis gate.
         let no_cap = dispatcher
             .dispatch(GateRequest {

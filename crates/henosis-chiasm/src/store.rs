@@ -24,8 +24,8 @@ use crate::events::{
     TaskStale, TaskUnblocked, TaskUpdated,
 };
 use crate::model::{
-    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskFilter,
-    TaskPatch, TaskStatus, TaskUpdate,
+    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskActivity,
+    TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
@@ -36,6 +36,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         4,
         include_str!("../migrations/V4__chiasm_legacy_map_source.sql"),
+    ),
+    (
+        5,
+        include_str!("../migrations/V5__chiasm_task_activity.sql"),
     ),
 ];
 
@@ -522,6 +526,113 @@ impl ChiasmStore {
                 })?,
                 status: TaskStatus::parse(&status)?,
                 summary,
+                created_at: ts_from_db(&created_at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Append one dispatcher lifecycle event to an owned task without changing task state.
+    ///
+    /// The insert is tenant- and principal-scoped in the same SQL statement. A missing task or
+    /// identity mismatch returns [`ChiasmError::NotFound`] and records nothing.
+    pub async fn record_activity(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+        id: TaskId,
+        kind: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<TaskActivity, ChiasmError> {
+        if !payload.is_object() {
+            return Err(ChiasmError::Backend(
+                "task activity payload must be a JSON object".to_string(),
+            ));
+        }
+        let kind = kind.into();
+        let created_at = Timestamp::now();
+        let conn = self.lock();
+        let inserted = conn
+            .execute(
+                "INSERT INTO chiasm_task_activity \
+                 (task_id, tenant, principal_id, kind, payload, created_at) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+                 WHERE EXISTS (SELECT 1 FROM chiasm_tasks \
+                 WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3)",
+                rusqlite::params![
+                    id.to_string(),
+                    tenant.to_string(),
+                    principal.to_string(),
+                    &kind,
+                    payload.to_string(),
+                    ts_to_db(&created_at)?,
+                ],
+            )
+            .map_err(berr)?;
+        if inserted == 0 {
+            return Err(ChiasmError::NotFound(id));
+        }
+        Ok(TaskActivity {
+            id: conn.last_insert_rowid(),
+            task_id: id,
+            tenant,
+            principal_id: principal,
+            kind,
+            payload,
+            created_at,
+        })
+    }
+
+    /// Return an owned task's dispatcher activity, newest first, capped at `limit`.
+    pub async fn activity(
+        &self,
+        principal: PrincipalId,
+        id: TaskId,
+        limit: usize,
+    ) -> Result<Vec<TaskActivity>, ChiasmError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.task_id, a.tenant, a.principal_id, a.kind, a.payload, a.created_at \
+                 FROM chiasm_task_activity a JOIN chiasm_tasks t ON t.id = a.task_id \
+                 WHERE a.task_id = ?1 AND t.principal_id = ?2 ORDER BY a.id DESC LIMIT ?3",
+            )
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![id.to_string(), principal.to_string(), limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(berr)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (activity_id, task_id, tenant, principal_id, kind, payload, created_at) =
+                row.map_err(berr)?;
+            out.push(TaskActivity {
+                id: activity_id,
+                task_id: task_id.parse::<TaskId>().map_err(|error| {
+                    ChiasmError::Backend(format!("corrupt task_id {task_id:?}: {error}"))
+                })?,
+                tenant: tenant.parse::<TenantId>().map_err(|error| {
+                    ChiasmError::Backend(format!("corrupt tenant {tenant:?}: {error}"))
+                })?,
+                principal_id: principal_id.parse::<PrincipalId>().map_err(|error| {
+                    ChiasmError::Backend(format!("corrupt principal_id {principal_id:?}: {error}"))
+                })?,
+                kind,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    ChiasmError::Backend(format!("corrupt activity payload: {error}"))
+                })?,
                 created_at: ts_from_db(&created_at)?,
             });
         }
@@ -1338,6 +1449,66 @@ mod tests {
         // The owner sees it; a different principal does not.
         assert!(store.get(owner, task.id).await.expect("get").is_some());
         assert!(store.get(other, task.id).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    /// Task activity is append-only, owner-scoped, and leaves task state unchanged.
+    async fn task_activity_is_scoped_and_non_mutating() {
+        let (store, _bus) = store();
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let task = store
+            .create(new_task(tenant, principal, "activity"))
+            .await
+            .expect("create");
+
+        store
+            .record_activity(
+                tenant,
+                principal,
+                task.id,
+                "action.invoked",
+                serde_json::json!({"tool": "test", "action": "echo"}),
+            )
+            .await
+            .expect("record activity");
+        store
+            .record_activity(
+                tenant,
+                principal,
+                task.id,
+                "action.completed",
+                serde_json::json!({"tool": "test", "action": "echo"}),
+            )
+            .await
+            .expect("record activity");
+
+        let activity = store
+            .activity(principal, task.id, 10)
+            .await
+            .expect("activity");
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].kind, "action.completed");
+        assert_eq!(activity[1].kind, "action.invoked");
+        let unchanged = store
+            .get(principal, task.id)
+            .await
+            .expect("get")
+            .expect("task");
+        assert_eq!(unchanged.status, TaskStatus::Active);
+        assert_eq!(unchanged.summary, None);
+
+        let error = store
+            .record_activity(
+                tenant,
+                PrincipalId::new(),
+                task.id,
+                "action.failed",
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("foreign principal must fail closed");
+        assert!(matches!(error, ChiasmError::NotFound(id) if id == task.id));
     }
 
     #[tokio::test]

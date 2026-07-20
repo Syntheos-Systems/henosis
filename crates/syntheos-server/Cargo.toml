@@ -28,6 +28,8 @@ henosis-pistis = { path = "../henosis-pistis" }
 henosis-phylax = { path = "../henosis-phylax" }
 # The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
 henosis-rift = { path = "../henosis-rift" }
+# The external tool gateway, invoked in-process after the canonical gate chain allows an action.
+henosis-hermes = { path = "../henosis-hermes" }
 # The Plutus policy authority: the real gate in the plutus slot (Story 6.x / row 1).
 henosis-plutus = { path = "../henosis-plutus" }
 # The cognitive core facade over vendored kleos-lib (Wave 2). OPTIONAL: only the
@@ -40,6 +42,8 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 thiserror.workspace = true
 # Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
 hex.workspace = true
+# Phylax signatures, derived bytes, and scrubbed exec output use base64 on the wire.
+base64.workspace = true
 # `now` for the Stripe webhook signature tolerance window (Story 6.4a). Pinned directly,
 # matching henosis-plutus, which owns the verifier this clock is handed to.
 chrono = "0.4"

@@ -54,4 +54,6 @@ pub use output::{FilterDecision, OutputFilter};
 
 pub mod lifecycle;
 
-pub use lifecycle::{ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired};
+pub use lifecycle::{
+    ActionCompleted, ActionDenied, ActionFailed, ActionInvoked, ApprovalRequired, ACTION_CHANNEL,
+};

@@ -17,8 +17,20 @@ use serde_json::json;
 use crate::circuit::invoke_with_circuit;
 use crate::metrics::Outcome;
 use crate::rate_limit::CheckOutcome;
-use crate::tool::{err, InvokeContext, InvokeRequest, InvokeResponse};
+use crate::tool::{err, error_response, InvokeContext, InvokeRequest, InvokeResponse};
 use crate::AppState;
+
+/// A controlled Hermes invocation plus the HTTP transport metadata needed by
+/// the gateway wrapper.
+#[derive(Debug, Clone)]
+pub struct InvocationOutcome {
+    /// The adapter response envelope returned to every caller surface.
+    pub response: InvokeResponse,
+    /// HTTP-equivalent status for callers that expose an HTTP transport.
+    pub status: StatusCode,
+    /// Retry delay emitted only when the rate limiter throttles the call.
+    pub retry_after_secs: Option<u64>,
+}
 
 /// `GET /tools`: list all registered tools, sorted by tool ID.
 pub async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
@@ -31,22 +43,50 @@ pub async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn invoke_tool(
     State(state): State<AppState>,
     Path(tool_id): Path<String>,
-    Json(mut req): Json<InvokeRequest>,
+    Json(req): Json<InvokeRequest>,
 ) -> impl IntoResponse {
-    let tool = match state.registry.get(&tool_id) {
+    let outcome = invoke_controlled(&state, &tool_id, req).await;
+    if let Some(retry_after_secs) = outcome.retry_after_secs {
+        return (
+            outcome.status,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            Json(outcome.response),
+        )
+            .into_response();
+    }
+    (outcome.status, Json(outcome.response)).into_response()
+}
+
+/// Invoke one Hermes tool through the complete shared control path.
+///
+/// Both the HTTP gateway and absorbed in-process callers use this function so
+/// tenant policy, rate limits, circuits, metrics, audit, and Axon events cannot
+/// diverge between transports.
+pub async fn invoke_controlled(
+    state: &AppState,
+    tool_id: &str,
+    mut req: InvokeRequest,
+) -> InvocationOutcome {
+    let tool = match state.registry.get(tool_id) {
         Some(t) => t,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("tool '{}' not found", tool_id)
-                })),
-            )
-                .into_response();
+            return InvocationOutcome {
+                response: error_response(
+                    tool_id,
+                    "tool_not_found",
+                    format!("tool '{tool_id}' not found"),
+                    None,
+                ),
+                status: StatusCode::NOT_FOUND,
+                retry_after_secs: None,
+            };
         }
     };
 
-    let provider = state.registry.provider_of(&tool_id).unwrap_or("unknown");
+    let provider = state.registry.provider_of(tool_id).unwrap_or("unknown");
     let tenant_owned = req.tenant_id.clone();
     let tenant_key = req.tenant_id.as_deref().unwrap_or("_anon");
 
@@ -57,7 +97,7 @@ pub async fn invoke_tool(
     if !cfg.enabled {
         state.audit.record(
             tenant_owned,
-            &tool_id,
+            tool_id,
             provider,
             0,
             Outcome::Error,
@@ -65,8 +105,8 @@ pub async fn invoke_tool(
             0,
             crate::audit::args_hash(&req.args),
         );
-        let resp = InvokeResponse {
-            tool_id: tool_id.clone(),
+        let response = InvokeResponse {
+            tool_id: tool_id.to_string(),
             success: false,
             result: None,
             error: Some(err(
@@ -76,7 +116,11 @@ pub async fn invoke_tool(
             )),
             duration_ms: 0,
         };
-        return (StatusCode::FORBIDDEN, Json(resp)).into_response();
+        return InvocationOutcome {
+            response,
+            status: StatusCode::FORBIDDEN,
+            retry_after_secs: None,
+        };
     }
 
     // Merge tenant default args (as defaults, request wins) before dispatch so
@@ -92,7 +136,7 @@ pub async fn invoke_tool(
     let tenant_for_limit = req.tenant_id.as_deref().unwrap_or("_anon");
     if let CheckOutcome::Throttled { retry_after_secs } = state
         .rate_limiter
-        .check_with_capacity(tenant_for_limit, &tool_id, cfg.rate_limit_override)
+        .check_with_capacity(tenant_for_limit, tool_id, cfg.rate_limit_override)
         .await
     {
         // A throttled call never reaches the adapter, but it is still an
@@ -100,7 +144,7 @@ pub async fn invoke_tool(
         state.metrics.record(provider, Outcome::RateLimited, 0, 0);
         state.audit.record(
             tenant_owned,
-            &tool_id,
+            tool_id,
             provider,
             0,
             Outcome::RateLimited,
@@ -108,8 +152,8 @@ pub async fn invoke_tool(
             0,
             args_digest,
         );
-        let resp = InvokeResponse {
-            tool_id: tool_id.clone(),
+        let response = InvokeResponse {
+            tool_id: tool_id.to_string(),
             success: false,
             result: None,
             error: Some(err(
@@ -122,15 +166,11 @@ pub async fn invoke_tool(
             )),
             duration_ms: 0,
         };
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                axum::http::header::RETRY_AFTER,
-                retry_after_secs.to_string(),
-            )],
-            Json(resp),
-        )
-            .into_response();
+        return InvocationOutcome {
+            response,
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after_secs: Some(retry_after_secs),
+        };
     }
 
     let ctx = InvokeContext {
@@ -140,17 +180,18 @@ pub async fn invoke_tool(
     };
 
     let start = Instant::now();
-    let (mut resp, retries) =
-        invoke_with_circuit(&state.circuits, &tool, &tool_id, &ctx, req).await;
+    let (mut resp, retries) = invoke_with_circuit(&state.circuits, &tool, tool_id, &ctx, req).await;
     resp.duration_ms = start.elapsed().as_millis() as u64;
 
     // Fold the outcome (and the upstream retry count) into metrics + audit.
     let outcome = Outcome::classify(&resp);
     let error_code = error_code_of(&resp);
-    state.metrics.record(provider, outcome, resp.duration_ms, retries);
+    state
+        .metrics
+        .record(provider, outcome, resp.duration_ms, retries);
     state.audit.record(
         tenant_owned.clone(),
-        &tool_id,
+        tool_id,
         provider,
         resp.duration_ms,
         outcome,
@@ -159,7 +200,7 @@ pub async fn invoke_tool(
         args_digest,
     );
     state.axon.tool_invoked(
-        &tool_id,
+        tool_id,
         tenant_owned.as_deref(),
         outcome.label(),
         resp.duration_ms,
@@ -167,17 +208,21 @@ pub async fn invoke_tool(
     if outcome == Outcome::Error {
         state
             .axon
-            .tool_failed(&tool_id, error_code.as_deref(), retries);
+            .tool_failed(tool_id, error_code.as_deref(), retries);
     }
 
     // A tripped circuit fails fast with HTTP 503 so callers can distinguish
     // "upstream temporarily unavailable" from an ordinary adapter error.
-    let code = if is_circuit_open(&resp) {
+    let status = if is_circuit_open(&resp) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
     };
-    (code, Json(resp)).into_response()
+    InvocationOutcome {
+        response: resp,
+        status,
+        retry_after_secs: None,
+    }
 }
 
 /// Return `true` when the response error code is `circuit_open`.
@@ -329,4 +374,170 @@ pub async fn adapters_health(State(state): State<AppState>) -> impl IntoResponse
         "providers": providers,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+/// Tests for the transport-independent controlled invocation path.
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use crate::audit::{AuditQuery, AuditTrail};
+    use crate::axon::AxonPublisher;
+    use crate::circuit::CircuitRegistry;
+    use crate::credd_client::CreddClient;
+    use crate::metrics::MetricsRegistry;
+    use crate::rate_limit::{RateLimitConfig, RateLimiter};
+    use crate::tenant_config::{TenantAdapterConfig, TenantConfigStore};
+    use crate::tool::{Tool, ToolSchema};
+    use crate::ToolRegistry;
+
+    /// A deterministic adapter that records how often Hermes reaches it.
+    struct EchoTool {
+        /// Shared invocation counter used to prove rejected calls never dispatch.
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    /// Tool implementation for the controlled-path tests.
+    impl Tool for EchoTool {
+        /// Describe the test adapter.
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool_id: "test.echo".to_string(),
+                name: "Echo".to_string(),
+                description: "Return the supplied arguments".to_string(),
+                input_schema: json!({"type": "object"}),
+                output_schema: json!({"type": "object"}),
+                category: "test".to_string(),
+                requires_auth: false,
+            }
+        }
+
+        /// Count and return one invocation.
+        async fn invoke(&self, _context: &InvokeContext, request: InvokeRequest) -> InvokeResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            InvokeResponse {
+                tool_id: "test.echo".to_string(),
+                success: true,
+                result: Some(request.args),
+                error: None,
+                duration_ms: 0,
+            }
+        }
+
+        /// Isolate the adapter under a stable provider key.
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    /// Construct complete in-memory Hermes state with a configurable rate limit.
+    fn state(capacity: u32) -> (AppState, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool {
+            calls: calls.clone(),
+        });
+        let axon = AxonPublisher::from_env();
+        let state = AppState {
+            registry: Arc::new(registry),
+            credd: Arc::new(CreddClient::new("http://127.0.0.1:1".to_string(), None)),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                capacity,
+                refill_per_sec: 0.0001,
+            })),
+            circuits: Arc::new(CircuitRegistry::new()),
+            metrics: Arc::new(MetricsRegistry::new()),
+            audit: Arc::new(AuditTrail::new(axon.clone())),
+            axon,
+            tenant_config: Arc::new(TenantConfigStore::new()),
+            public_url: None,
+        };
+        (state, calls)
+    }
+
+    /// A successful in-process call records metrics and a hashed audit entry.
+    #[tokio::test]
+    async fn controlled_success_records_observability() {
+        let (state, calls) = state(10);
+        let outcome = invoke_controlled(
+            &state,
+            "test.echo",
+            InvokeRequest {
+                tenant_id: Some("tenant-a".to_string()),
+                args: json!({"value": 7}),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.status, StatusCode::OK);
+        assert!(outcome.response.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let metrics = state.metrics.snapshot(state.circuits.open_count());
+        assert_eq!(metrics["global"]["total_invocations"], 1);
+        let records = state.audit.query(&AuditQuery::default());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool_id, "test.echo");
+        assert_eq!(records[0].tenant_id.as_deref(), Some("tenant-a"));
+    }
+
+    /// Tenant disablement fails closed before the adapter is reached.
+    #[tokio::test]
+    async fn controlled_invocation_enforces_tenant_disablement() {
+        let (state, calls) = state(10);
+        state.tenant_config.set(
+            "tenant-a",
+            "test",
+            TenantAdapterConfig {
+                enabled: false,
+                rate_limit_override: None,
+                default_args: None,
+            },
+        );
+
+        let outcome = invoke_controlled(
+            &state,
+            "test.echo",
+            InvokeRequest {
+                tenant_id: Some("tenant-a".to_string()),
+                args: json!({}),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.status, StatusCode::FORBIDDEN);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            outcome
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error["code"].as_str()),
+            Some("adapter_disabled")
+        );
+    }
+
+    /// A depleted tenant/tool bucket returns retry metadata without dispatching twice.
+    #[tokio::test]
+    async fn controlled_invocation_enforces_rate_limit() {
+        let (state, calls) = state(1);
+        let request = InvokeRequest {
+            tenant_id: Some("tenant-a".to_string()),
+            args: json!({}),
+        };
+        let first = invoke_controlled(&state, "test.echo", request.clone()).await;
+        let second = invoke_controlled(&state, "test.echo", request).await;
+
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(second.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.retry_after_secs.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let metrics = state.metrics.snapshot(state.circuits.open_count());
+        assert_eq!(metrics["providers"]["test"]["rate_limited_count"], 1);
+    }
 }

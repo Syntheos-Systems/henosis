@@ -61,6 +61,16 @@ As of 2026-06-29 every ledger row is closed -- the table below is empty. Row num
 were kept stable while rows were open because code comments referenced them. Severities
 were from the adversarial verification pass.
 
+The 2026-07-20 completion audit found and closed two additional live-composition gaps that the
+empty ledger and stub scan had missed. `syntheos-server` now installs `HenosisExecutor` instead of
+`DenyExecutor`; it executes ordinary tools through Hermes's shared controlled path, preserving
+tenant configuration, rate limiting, circuits, metrics, audit, and Axon, while Phylax
+use-without-holding actions use the same `PhylaxStore` as the required real gate.
+The server also subscribes once to dispatcher action events and projects every event into Broca,
+plus task-correlated events into an append-only Chiasm task-activity projection. The production
+gate chain no longer substitutes a deny gate when the Phylax key is absent; missing authority
+configuration is an explicit boot error.
+
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
 

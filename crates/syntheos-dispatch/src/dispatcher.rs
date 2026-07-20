@@ -49,6 +49,7 @@ pub struct Dispatcher {
     bus: Arc<AxonBus>,
 }
 
+/// Construction, validation, dispatch, and lifecycle emission for the canonical chain.
 impl Dispatcher {
     /// Assemble a dispatcher from an ordered gate chain, an executor, and the shared bus,
     /// validating the chain before anything can dispatch through it.
@@ -120,11 +121,13 @@ impl Dispatcher {
         let principal = request.context.principal;
         let tool = request.invocation.tool.clone();
         let action = request.invocation.action.clone();
+        let task_id = request.context.task.as_ref().map(|task| task.id);
 
         self.emit(
             &ActionInvoked {
                 tool: tool.clone(),
                 action: action.clone(),
+                task_id,
             },
             tenant,
             principal,
@@ -141,6 +144,7 @@ impl Dispatcher {
                             action: action.clone(),
                             gate: gate.clone(),
                             reason: reason.clone(),
+                            task_id,
                         },
                         tenant,
                         principal,
@@ -155,6 +159,7 @@ impl Dispatcher {
                             action: action.clone(),
                             gate: gate.clone(),
                             prompt: prompt.clone(),
+                            task_id,
                         },
                         tenant,
                         principal,
@@ -171,6 +176,7 @@ impl Dispatcher {
                             action: action.clone(),
                             gate: gate.clone(),
                             reason: reason.clone(),
+                            task_id,
                         },
                         tenant,
                         principal,
@@ -188,6 +194,7 @@ impl Dispatcher {
                             action: action.clone(),
                             gate: gate.clone(),
                             reason: reason.clone(),
+                            task_id,
                         },
                         tenant,
                         principal,
@@ -223,7 +230,15 @@ impl Dispatcher {
                         }
                     }
                 }
-                self.emit(&ActionCompleted { tool, action }, tenant, principal);
+                self.emit(
+                    &ActionCompleted {
+                        tool,
+                        action,
+                        task_id,
+                    },
+                    tenant,
+                    principal,
+                );
                 Ok(DispatchOutcome::Executed { result })
             }
             Err(err) => {
@@ -232,6 +247,7 @@ impl Dispatcher {
                         tool,
                         action,
                         error: err.to_string(),
+                        task_id,
                     },
                     tenant,
                     principal,
@@ -251,6 +267,7 @@ impl Dispatcher {
 }
 
 #[cfg(test)]
+/// Tests for canonical ordering, fail-closed behavior, output filtering, and events.
 mod tests {
     use super::*;
     use crate::deny::deny_gate_chain;
@@ -287,10 +304,13 @@ mod tests {
         reason: &'static str,
     }
     #[async_trait]
+    /// Gate implementation that returns a fixed denial.
     impl Gate for DenyGate {
+        /// Return this test gate's canonical authority name.
         fn name(&self) -> &str {
             self.name
         }
+        /// Deny every request with the configured reason.
         async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             Ok(GateDecision::Deny {
                 reason: self.reason.to_string(),
@@ -303,10 +323,13 @@ mod tests {
         name: &'static str,
     }
     #[async_trait]
+    /// Gate implementation that always requires human approval.
     impl Gate for ApprovalGate {
+        /// Return this test gate's canonical authority name.
         fn name(&self) -> &str {
             self.name
         }
+        /// Escalate every request with a fixed prompt.
         async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             Ok(GateDecision::RequireApproval {
                 prompt: "approve?".to_string(),
@@ -322,10 +345,13 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait]
+    /// Gate implementation that records execution before returning its decision.
     impl Gate for RecordingGate {
+        /// Return this test gate's canonical authority name.
         fn name(&self) -> &str {
             self.name
         }
+        /// Record the gate visit and return the configured decision.
         async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             self.log.lock().unwrap().push(self.name.to_string());
             Ok(self.decision.clone())
@@ -337,7 +363,9 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
     #[async_trait]
+    /// Executor implementation that counts authorized executions.
     impl Executor for CountingExecutor {
+        /// Count the execution and return a deterministic result.
         async fn execute(
             &self,
             _ctx: &RequestContext,
@@ -351,7 +379,9 @@ mod tests {
     /// An executor that always fails.
     struct FailingExecutor;
     #[async_trait]
+    /// Executor implementation that returns a fixed failure.
     impl Executor for FailingExecutor {
+        /// Fail every attempted execution.
         async fn execute(
             &self,
             _ctx: &RequestContext,
@@ -371,6 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A fully allowing canonical chain reaches the executor and emits completion.
     async fn allow_chain_executes() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe("action");
@@ -392,6 +423,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A denial short-circuits later gates and the executor.
     async fn deny_short_circuits() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe("action");
@@ -436,6 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// An approval requirement short-circuits execution and emits escalation.
     async fn approval_short_circuits() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe("action");
@@ -476,6 +509,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Executor failures propagate and emit the failed lifecycle event.
     async fn execution_failure_propagates() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe("action");
@@ -494,6 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Gates run in canonical order and stop at the first denial.
     async fn gate_order_and_short_circuit() {
         let bus = Arc::new(AxonBus::new());
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -538,6 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Typed action subscribers receive dispatcher lifecycle events.
     async fn typed_event_emission() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe_typed::<ActionInvoked>();
@@ -554,11 +590,13 @@ mod tests {
             ActionInvoked {
                 tool: "kleos".into(),
                 action: "memory_store".into(),
+                task_id: None,
             }
         );
     }
 
     #[test]
+    /// Gate-name introspection preserves the canonical authority order.
     fn gate_names_reports_canonical_order() {
         let bus = Arc::new(AxonBus::new());
         let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus)
@@ -574,10 +612,13 @@ mod tests {
         reason: &'static str,
     }
     #[async_trait]
+    /// Output filter implementation that always withholds the result.
     impl OutputFilter for RedactFilter {
+        /// Return the filter's stable name.
         fn name(&self) -> &str {
             "redact"
         }
+        /// Replace the output with a redaction decision.
         async fn filter(
             &self,
             _result: &mut serde_json::Value,
@@ -594,10 +635,13 @@ mod tests {
         value: serde_json::Value,
     }
     #[async_trait]
+    /// Output filter implementation that replaces the whole result.
     impl OutputFilter for ReplaceFilter {
+        /// Return the filter's stable name.
         fn name(&self) -> &str {
             "replace"
         }
+        /// Return the configured replacement value.
         async fn filter(
             &self,
             _result: &mut serde_json::Value,
@@ -612,10 +656,13 @@ mod tests {
         field: &'static str,
     }
     #[async_trait]
+    /// Output filter implementation that removes one field in place.
     impl OutputFilter for ScrubFilter {
+        /// Return the filter's stable name.
         fn name(&self) -> &str {
             "scrub"
         }
+        /// Remove the configured field and pass the remaining output.
         async fn filter(
             &self,
             result: &mut serde_json::Value,
@@ -629,6 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Redaction filters withhold the original executor result.
     async fn output_filter_redacts_result() {
         let bus = Arc::new(AxonBus::new());
         let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus.clone())
@@ -651,6 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Replacement filters substitute their configured output.
     async fn output_filter_replaces_result() {
         let bus = Arc::new(AxonBus::new());
         let replacement = serde_json::json!({ "minimised": true });
@@ -671,6 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// In-place scrub filters preserve the non-sensitive fields.
     async fn output_filter_passes_after_scrubbing_in_place() {
         let bus = Arc::new(AxonBus::new());
         // EchoExecutor returns { tool, action, echoed }; scrub the `echoed` field, pass the rest.
@@ -692,6 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A dispatcher without an output filter returns the executor result.
     async fn no_output_filter_passes_result_through() {
         let bus = Arc::new(AxonBus::new());
         // Default dispatcher (no filter) returns the executor result verbatim.
@@ -711,6 +762,7 @@ mod tests {
     }
 
     #[test]
+    /// An empty authority chain is rejected at construction.
     fn empty_chain_rejected() {
         let bus = Arc::new(AxonBus::new());
         let err = Dispatcher::new(Vec::new(), Box::new(EchoExecutor), bus)
@@ -723,6 +775,7 @@ mod tests {
     }
 
     #[test]
+    /// A chain missing one canonical authority is rejected.
     fn incomplete_chain_rejected() {
         let bus = Arc::new(AxonBus::new());
         // Canonical chain minus the human authority: incomplete, must be rejected.
@@ -743,6 +796,7 @@ mod tests {
     }
 
     #[test]
+    /// A chain with canonical authorities in the wrong order is rejected.
     fn misordered_chain_rejected() {
         let bus = Arc::new(AxonBus::new());
         // All five authorities present, but phylax before human: order violation, rejected.
@@ -760,6 +814,7 @@ mod tests {
     }
 
     #[test]
+    /// A chain containing a duplicate authority is rejected.
     fn duplicate_authority_rejected() {
         let bus = Arc::new(AxonBus::new());
         // A duplicated canonical authority is rejected even with all five present in order.
@@ -778,6 +833,7 @@ mod tests {
     }
 
     #[test]
+    /// A chain containing an extra non-authority gate is rejected.
     fn extra_non_canonical_gate_rejected() {
         let bus = Arc::new(AxonBus::new());
         // An extra gate interleaved into the canonical five is rejected: the authority chain must
@@ -821,16 +877,20 @@ mod tests {
         name: &'static str,
     }
     #[async_trait]
+    /// Gate implementation that simulates an unreachable authority.
     impl Gate for ErroringGate {
+        /// Return this test gate's canonical authority name.
         fn name(&self) -> &str {
             self.name
         }
+        /// Fail every policy check.
         async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             Err(GateError::new("authority unreachable"))
         }
     }
 
     #[tokio::test]
+    /// Gate errors become fail-closed denials and never execute.
     async fn gate_error_denies_fail_closed() {
         let bus = Arc::new(AxonBus::new());
         let mut rx = bus.subscribe("action");
@@ -874,6 +934,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// The explicit deny chain rejects before reaching its executor.
     async fn deny_chain_denies_and_never_executes() {
         let bus = Arc::new(AxonBus::new());
         let calls = Arc::new(AtomicUsize::new(0));

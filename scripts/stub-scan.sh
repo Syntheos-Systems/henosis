@@ -58,6 +58,14 @@ echo
 
 # HARD findings after allowlist filtering.
 hard="$(rg_scan "$HARD_PAT" | filt)"
+
+# Production composition must never quietly fall back to deny test doubles.
+# Keep this target narrow so legitimate fail-closed fixtures remain usable in
+# unit tests while a regressed live binary fails the completion gate.
+production_deny="$(rg -n '\b(DenyExecutor|DenyGate)\b' +  crates/syntheos-server/src/main.rs 2>/dev/null || true)"
+if [ -n "$production_deny" ]; then
+  hard="$(printf '%s\n%s\n' "$hard" "$production_deny" | sed '/^$/d')"
+fi
 hard_n="$(printf '%s' "$hard" | grep -c . || true)"
 
 # SOFT findings (informational).

@@ -1,0 +1,339 @@
+//! In-process projection of dispatcher action events into Broca and Chiasm.
+
+use std::sync::Arc;
+
+use henosis_broca::{BrocaStore, LogAction};
+use henosis_chiasm::ChiasmStore;
+use syntheos_axon::AxonBus;
+use syntheos_contracts::{TaskId, ACTION_CHANNEL};
+use tokio::sync::broadcast::error::RecvError;
+
+/// Subscribe to the action channel and project each lifecycle envelope into downstream stores.
+///
+/// Subscription happens synchronously before the task is spawned, so an action dispatched
+/// immediately after this function returns cannot race past the reactor. Every action becomes a
+/// Broca entry. Task-correlated actions additionally become append-only Chiasm activity.
+pub fn spawn_action_reactor(
+    bus: Arc<AxonBus>,
+    chiasm: Arc<ChiasmStore>,
+    broca: Arc<BrocaStore>,
+) -> tokio::task::JoinHandle<()> {
+    let mut receiver = bus.subscribe(ACTION_CHANNEL);
+    tokio::spawn(async move {
+        loop {
+            let envelope = match receiver.recv().await {
+                Ok(envelope) => envelope,
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "action reactor lagged behind Axon");
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+
+            if let Err(error) = broca
+                .log(LogAction {
+                    tenant: envelope.tenant,
+                    principal_id: envelope.principal,
+                    service: Some("dispatcher".to_string()),
+                    action: envelope.kind.clone(),
+                    payload: Some(envelope.payload.clone()),
+                    narrative: None,
+                })
+                .await
+            {
+                tracing::warn!(error = %error, kind = %envelope.kind, "action reactor failed to project into Broca");
+            }
+
+            let Some(task_id) = envelope
+                .payload
+                .get("task_id")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let task_id = match task_id.parse::<TaskId>() {
+                Ok(task_id) => task_id,
+                Err(error) => {
+                    tracing::warn!(error = %error, task_id, kind = %envelope.kind, "action reactor rejected invalid task id");
+                    continue;
+                }
+            };
+            if let Err(error) = chiasm
+                .record_activity(
+                    envelope.tenant,
+                    envelope.principal,
+                    task_id,
+                    envelope.kind.clone(),
+                    envelope.payload,
+                )
+                .await
+            {
+                tracing::warn!(error = %error, %task_id, kind = %envelope.kind, "action reactor failed to project into Chiasm");
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+/// Tests for the action projection loop.
+mod tests {
+    use super::*;
+    use crate::{live_gate_chain, HenosisExecutor};
+    use henosis_broca::ActionFilter;
+    use henosis_chiasm::{NewTask, TaskStatus};
+    use henosis_eidolon::EidolonPolicy;
+    use henosis_hermes::{
+        audit::AuditTrail,
+        axon::AxonPublisher,
+        circuit::CircuitRegistry,
+        credd_client::CreddClient,
+        metrics::MetricsRegistry,
+        rate_limit::{RateLimitConfig, RateLimiter},
+        tenant_config::TenantConfigStore,
+        AppState as HermesState, ToolRegistry,
+    };
+    use henosis_phylax::{PhylaxStore, ResolveMode, SecretData};
+    use henosis_pistis::InMemoryRoomStateSource;
+    use henosis_plutus::{MockPolicyBackend, PolicyBackend, Role};
+    use henosis_rift::RegistryApprover;
+    use henosis_thymus::ThymusStore;
+    use syntheos_contracts::{
+        ActionCompleted, ActionInvoked, GateRequest, PrincipalId, RequestContext, TaskRef,
+        TenantId, ToolInvocation,
+    };
+    use syntheos_dispatch::{DispatchOutcome, Dispatcher};
+
+    /// One Axon action stream reaches both downstream projections.
+    #[tokio::test]
+    async fn action_stream_reaches_broca_and_chiasm() {
+        let bus = Arc::new(AxonBus::new());
+        let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm"));
+        let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca"));
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let task = chiasm
+            .create(NewTask {
+                tenant,
+                principal_id: principal,
+                project: "henosis".to_string(),
+                title: "project action stream".to_string(),
+                status: Some(TaskStatus::Active),
+                summary: None,
+                expected_output: None,
+                output_format: None,
+                assignee: None,
+                heartbeat_interval_secs: None,
+            })
+            .await
+            .expect("task");
+        let reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
+
+        bus.publish_event(
+            &ActionInvoked {
+                tool: "test".to_string(),
+                action: "echo".to_string(),
+                task_id: Some(task.id),
+            },
+            tenant,
+            principal,
+        )
+        .expect("publish invoked");
+        bus.publish_event(
+            &ActionCompleted {
+                tool: "test".to_string(),
+                action: "echo".to_string(),
+                task_id: Some(task.id),
+            },
+            tenant,
+            principal,
+        )
+        .expect("publish completed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let task_rows = chiasm
+                    .activity(principal, task.id, 10)
+                    .await
+                    .expect("task activity");
+                let broca_rows = broca
+                    .query(
+                        tenant,
+                        ActionFilter {
+                            service: Some("dispatcher".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("broca feed");
+                if task_rows.len() == 2 && broca_rows.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both projections become visible");
+
+        let task_rows = chiasm
+            .activity(principal, task.id, 10)
+            .await
+            .expect("task activity");
+        assert_eq!(task_rows[0].kind, "action.completed");
+        assert_eq!(task_rows[1].kind, "action.invoked");
+        let broca_rows = broca
+            .query(
+                tenant,
+                ActionFilter {
+                    service: Some("dispatcher".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("broca feed");
+        assert_eq!(broca_rows[0].action, "action.completed");
+        assert_eq!(broca_rows[1].action, "action.invoked");
+        reactor.abort();
+    }
+
+    /// The five real gates execute a Phylax action and expose it to both downstream subscribers.
+    #[tokio::test]
+    async fn canonical_dispatch_executes_and_reaches_two_subscribers() {
+        let bus = Arc::new(AxonBus::new());
+        let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm"));
+        let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca"));
+        let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus"));
+        let phylax = Arc::new(
+            PhylaxStore::open_in_memory(bus.clone(), *henosis_phylax::crypto::generate_key())
+                .expect("phylax"),
+        );
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        phylax
+            .store_secret(
+                &tenant,
+                &principal,
+                "test",
+                "signing",
+                &SecretData::Note {
+                    content: "subscriber-proof-secret".to_string(),
+                },
+            )
+            .expect("secret");
+        phylax
+            .create_policy(
+                &tenant,
+                Some(&principal),
+                Some("test"),
+                Some("signing"),
+                &[ResolveMode::Sign],
+                None,
+            )
+            .expect("policy");
+        let task = chiasm
+            .create(NewTask {
+                tenant,
+                principal_id: principal,
+                project: "henosis".to_string(),
+                title: "canonical dispatch".to_string(),
+                status: Some(TaskStatus::Active),
+                summary: None,
+                expected_output: None,
+                output_format: None,
+                assignee: None,
+                heartbeat_interval_secs: None,
+            })
+            .await
+            .expect("task");
+        let reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
+        let plutus: Arc<dyn PolicyBackend> =
+            Arc::new(MockPolicyBackend::with_role(Role::Admin));
+        let gates = live_gate_chain(
+            &EidolonPolicy::default(),
+            thymus,
+            Arc::new(InMemoryRoomStateSource::new()),
+            phylax.clone(),
+            bus.clone(),
+            Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
+            plutus,
+        )
+        .expect("five real gates");
+        let axon = AxonPublisher::from_env();
+        let executor = HenosisExecutor::new(
+            HermesState {
+                registry: Arc::new(ToolRegistry::new()),
+                credd: Arc::new(CreddClient::new("http://127.0.0.1:1".to_string(), None)),
+                rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                    capacity: 60,
+                    refill_per_sec: 1.0,
+                })),
+                circuits: Arc::new(CircuitRegistry::new()),
+                metrics: Arc::new(MetricsRegistry::new()),
+                audit: Arc::new(AuditTrail::new(axon.clone())),
+                axon,
+                tenant_config: Arc::new(TenantConfigStore::new()),
+                public_url: None,
+            },
+            phylax,
+        );
+        let dispatcher = Dispatcher::new(gates, Box::new(executor), bus).expect("dispatcher");
+
+        let outcome = dispatcher
+            .dispatch(GateRequest {
+                context: RequestContext {
+                    tenant,
+                    principal,
+                    persona: None,
+                    session: None,
+                    room: None,
+                    task: Some(TaskRef {
+                        id: task.id,
+                        tenant,
+                        title: Some(task.title.clone()),
+                    }),
+                    workflow: None,
+                },
+                invocation: ToolInvocation {
+                    tool: "phylax".to_string(),
+                    action: "sign".to_string(),
+                    args: serde_json::json!({
+                        "category": "test",
+                        "name": "signing",
+                        "payload": "prove the chain"
+                    }),
+                },
+            })
+            .await
+            .expect("dispatch");
+        let DispatchOutcome::Executed { result } = outcome else {
+            panic!("canonical request did not execute: {outcome:?}");
+        };
+        assert!(result["signature"].as_str().is_some());
+        assert!(!result.to_string().contains("subscriber-proof-secret"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let task_rows = chiasm
+                    .activity(principal, task.id, 10)
+                    .await
+                    .expect("task activity");
+                let broca_rows = broca
+                    .query(
+                        tenant,
+                        ActionFilter {
+                            service: Some("dispatcher".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("broca feed");
+                if task_rows.len() == 2 && broca_rows.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both subscribers observe invoked and completed");
+        reactor.abort();
+    }
+}

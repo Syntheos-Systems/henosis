@@ -39,7 +39,7 @@ pub use events::{
     TaskStale, TaskUnblocked, TaskUpdated, TASK_CHANNEL,
 };
 pub use model::{
-    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskFilter,
-    TaskPatch, TaskStatus, TaskUpdate,
+    ChiasmStats, Dependency, EnqueueTask, NewTask, PathClaim, PathConflict, Task, TaskActivity,
+    TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
 };
 pub use store::ChiasmStore;

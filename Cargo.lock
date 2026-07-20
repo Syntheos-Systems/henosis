@@ -7946,6 +7946,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "henosis-broca",
@@ -7953,6 +7954,7 @@ dependencies = [
  "henosis-cognition",
  "henosis-eidolon",
  "henosis-hephaestus",
+ "henosis-hermes",
  "henosis-loom",
  "henosis-phylax",
  "henosis-pistis",

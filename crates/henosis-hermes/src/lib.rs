@@ -91,6 +91,9 @@ pub use registry::{build_registry, ToolRegistry};
 /// walking into the tool module.
 pub use tool::{InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema};
 
+/// Re-export the full controlled invocation path used by HTTP and in-process callers.
+pub use routes::{invoke_controlled, InvocationOutcome};
+
 // -- AppState ------------------------------------------------------------------
 
 /// Shared application state threaded through all axum handlers and the
@@ -119,4 +122,48 @@ pub struct AppState {
     /// Hermes's external base URL (`HERMES_PUBLIC_URL`), threaded into
     /// `InvokeContext` for webhook-registration adapters.
     pub public_url: Option<String>,
+}
+
+/// Production construction helpers for the complete Hermes runtime state.
+impl AppState {
+    /// Build the full Hermes state from explicit runtime configuration.
+    ///
+    /// This starts the OAuth refresh and audit-publishing background tasks, so
+    /// it must be called from within a Tokio runtime.
+    pub fn from_config(config: config::Config) -> Self {
+        let registry = Arc::new(build_registry());
+        let refresh_registry = oauth_refresh::RefreshRegistry::default();
+        let credd = Arc::new(
+            credd_client::CreddClient::new(config.credd_url, config.credd_token)
+                .with_refresh_registry(refresh_registry.clone()),
+        );
+        oauth_refresh::OAuthRefreshDaemon::new(refresh_registry, credd.clone()).spawn();
+
+        let axon = axon::AxonPublisher::from_env();
+        let audit = Arc::new(audit::AuditTrail::new(axon.clone()));
+        audit.clone().spawn_publisher();
+
+        Self {
+            registry,
+            credd,
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new(
+                rate_limit::RateLimitConfig::default(),
+            )),
+            circuits: Arc::new(circuit::CircuitRegistry::new()),
+            metrics: Arc::new(metrics::MetricsRegistry::new()),
+            audit,
+            axon,
+            tenant_config: Arc::new(tenant_config::TenantConfigStore::with_path(
+                std::env::var("HERMES_TENANT_CONFIG_PATH")
+                    .unwrap_or_else(|_| "data/tenant_config.json".to_string())
+                    .into(),
+            )),
+            public_url: config.public_url,
+        }
+    }
+
+    /// Build the full Hermes state from process environment variables.
+    pub fn from_env() -> Self {
+        Self::from_config(config::Config::from_env())
+    }
 }

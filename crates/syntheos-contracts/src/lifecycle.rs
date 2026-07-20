@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::TypedEvent;
+use crate::TaskId;
 
 /// The coarse channel every action-lifecycle event travels on.
 pub const ACTION_CHANNEL: &str = "action";
@@ -24,6 +25,9 @@ pub struct ActionInvoked {
     pub tool: String,
     /// The specific action on that tool (e.g. `memory_store`).
     pub action: String,
+    /// Chiasm task correlated with this action, when the request is task-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// Emit `ActionInvoked` on the action lifecycle channel.
@@ -40,6 +44,9 @@ pub struct ActionCompleted {
     pub tool: String,
     /// The action that ran.
     pub action: String,
+    /// Chiasm task correlated with this action, when the request is task-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// Emit `ActionCompleted` on the action lifecycle channel.
@@ -58,6 +65,9 @@ pub struct ActionFailed {
     pub action: String,
     /// Human-readable execution error.
     pub error: String,
+    /// Chiasm task correlated with this action, when the request is task-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// Emit `ActionFailed` on the action lifecycle channel.
@@ -78,6 +88,9 @@ pub struct ActionDenied {
     pub gate: String,
     /// Why the gate denied it.
     pub reason: String,
+    /// Chiasm task correlated with this action, when the request is task-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// Emit `ActionDenied` on the action lifecycle channel.
@@ -98,6 +111,9 @@ pub struct ApprovalRequired {
     pub gate: String,
     /// The prompt to show the approver.
     pub prompt: String,
+    /// Chiasm task correlated with this action, when the request is task-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// Emit `ApprovalRequired` on the action lifecycle channel.
@@ -111,7 +127,7 @@ impl TypedEvent for ApprovalRequired {
 mod tests {
     use super::{ActionDenied, ActionInvoked};
     use crate::event::TypedEvent;
-    use crate::ids::{PrincipalId, TenantId};
+    use crate::ids::{PrincipalId, TaskId, TenantId};
 
     /// Invoked events envelope onto the shared action channel.
     #[test]
@@ -119,6 +135,7 @@ mod tests {
         let ev = ActionInvoked {
             tool: "kleos".into(),
             action: "memory_store".into(),
+            task_id: None,
         };
         let env = ev
             .to_envelope(TenantId::new(), PrincipalId::new())
@@ -139,6 +156,7 @@ mod tests {
             action: "memory_store".into(),
             gate: "phylax".into(),
             reason: "no capability".into(),
+            task_id: None,
         };
         let env = ev
             .to_envelope(TenantId::new(), PrincipalId::new())
@@ -146,6 +164,21 @@ mod tests {
         assert_eq!(env.kind, "action.denied");
         let back: ActionDenied = serde_json::from_value(env.payload).expect("roundtrip");
         assert_eq!(back, ev);
+    }
+
+    /// Task-scoped lifecycle events carry the correlation id on the wire.
+    #[test]
+    fn task_scoped_event_serializes_correlation() {
+        let task_id = TaskId::new();
+        let ev = ActionInvoked {
+            tool: "phylax".into(),
+            action: "sign".into(),
+            task_id: Some(task_id),
+        };
+        let env = ev
+            .to_envelope(TenantId::new(), PrincipalId::new())
+            .expect("event serializes");
+        assert_eq!(env.payload["task_id"], task_id.to_string());
     }
 
     /// Lifecycle events reject misspelled fields.

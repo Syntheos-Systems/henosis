@@ -11,26 +11,23 @@
 //! [`syntheos_axon`] bus, where reactors (narration, evaluation, the future durable audit path)
 //! observe the action stream.
 //!
-//! ## Phase 0 posture: fail-closed
+//! ## Fail-closed posture
 //!
 //! The gate trait and the canonical chain order already exist; the real authorities do not.
 //! The dispatcher is fail-closed BY CONSTRUCTION: [`Dispatcher::new`] rejects an empty chain and
 //! any chain that is not *exactly* the canonical authority set (`pistis -> plutus -> eidolon ->
 //! human -> phylax`, [`dispatcher::CANONICAL_GATE_ORDER`]) -- a missing, duplicated, or misordered
 //! authority, or any extra non-canonical gate, is refused. A gate that cannot reach a decision
-//! returns `Err`, which the dispatcher also denies (fail-closed). Until real authorities land,
-//! the live binary wires [`deny::deny_gate_chain`] and [`deny::DenyExecutor`], denying every
-//! action. Allow-all placeholders (`stubs::stub_gate_chain`,
+//! returns `Err`, which the dispatcher also denies (fail-closed). The fail-closed deny fixtures
+//! remain available for isolated tests. Allow-all placeholders (`stubs::stub_gate_chain`,
 //! `stubs::EchoExecutor`) exist for tests only, behind the non-default `stubs` cargo feature --
-//! they never compile into a release build. Real gates and executors swap in by trait object as
-//! each authority lands (EidolonGate Phase 2; Pistis/Phylax Phase 3; Plutus Phase 6; Human via
-//! Rift/Athena).
+//! they never compile into a release build. The production server supplies all five real gates
+//! and its in-process executor through these trait-object seams.
 //!
 //! ## What this is not
 //!
-//! No real gate or executor logic, no output filtering/redaction (a separate `OutputFilter` seam),
-//! no approval *resolution* (the dispatcher only surfaces [`DispatchOutcome::RequiresApproval`] and
-//! stops), and no persistence/audit.
+//! Authority, tool, output-filter, approval-resolution, and persistence implementations live in
+//! their owning crates. This crate only enforces their ordering and execution lifecycle.
 
 pub mod deny;
 pub mod dispatcher;
