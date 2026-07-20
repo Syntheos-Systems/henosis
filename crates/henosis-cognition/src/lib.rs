@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use kleos_lib::config::Config;
 use kleos_lib::db::Database;
+use kleos_lib::embeddings::onnx::OnnxProvider;
 use kleos_lib::handoffs::HandoffsDb;
 use tokio::sync::Semaphore;
 
@@ -64,6 +65,7 @@ pub use kleos_lib::intelligence::types::{
     CausalAncestor, CausalChain, CausalLink, Contradiction, Digest, MemoryHealthReport, Reflection,
 };
 pub use kleos_lib::forge::approaches::ApproachItem;
+pub use kleos_lib::Result as KleosResult;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -81,6 +83,16 @@ pub enum CognitionError {
 
 /// The facade's result type.
 pub type Result<T> = std::result::Result<T, CognitionError>;
+
+/// Build the vendored Kleos bge-m3 provider from the process's standard
+/// Kleos/Engram environment configuration. Callers can clone the returned
+/// `Arc` into every in-process consumer so cognition and agent subsystems use
+/// one ONNX session and one vector space.
+pub async fn load_embedding_provider_from_env() -> Result<Arc<dyn EmbeddingProvider>> {
+    let config = Config::from_env();
+    let provider = OnnxProvider::new(&config).await?;
+    Ok(Arc::new(provider))
+}
 
 /// In-process handle over the `kleos-lib` cognitive core.
 ///
@@ -105,6 +117,7 @@ pub struct Cognition {
     handoff_gc_sem: Arc<Semaphore>,
 }
 
+/// Constructs and operates the in-process Kleos cognitive facade.
 impl Cognition {
     /// Open the cognitive core over a configured [`Config`], with NO embedder.
     ///
@@ -867,6 +880,7 @@ impl Cognition {
     }
 }
 
+/// Tests for cognition storage, retrieval, and facade pass-through behavior.
 #[cfg(test)]
 mod tests {
     use super::*;

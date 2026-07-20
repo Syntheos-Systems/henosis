@@ -34,22 +34,28 @@ pub struct BridgeConfig {
     /// standalone HTTP client; present with in_process=true backs the bridge's
     /// coordination with the in-process henosis kernel stores.
     pub kleos: Option<KleosBackendConfig>,
-    /// Optional embedding endpoint for semantic echo/loop detection.
-    /// Absent = token-overlap detection only (the pre-embedding behavior).
+    /// Optional embedding tuning or HTTP override for semantic echo/loop
+    /// detection. In cognition-enabled in-process deployments, absence selects
+    /// the shared local provider; other deployments remain token-overlap only.
     pub embedding: Option<EmbeddingConfig>,
     /// Optional stimulus injector settings. Absent (or enabled=false)
     /// disables injection entirely.
     pub stimulus: Option<StimulusSettings>,
 }
 
-/// OpenAI-compatible embeddings endpoint powering the semantic tier of echo
-/// suppression and topic-reignition damping (design spec P4 closing; parent
-/// design memory 27272).
+/// Embedding provider settings powering the semantic tier of echo suppression
+/// and topic-reignition damping. An explicit URL selects the HTTP provider;
+/// without a URL, a cognition-enabled in-process deployment uses its shared
+/// Kleos provider.
 #[derive(Debug, Deserialize, Clone)]
 pub struct EmbeddingConfig {
     /// Full endpoint URL (e.g. `http://127.0.0.1:11434/v1/embeddings`).
-    pub url: String,
-    /// Model identifier passed to the endpoint.
+    /// Omit to use Henosis's in-process Kleos provider when available.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Model identifier passed to an explicit HTTP endpoint. The in-process
+    /// provider uses the model selected by standard Kleos environment config.
+    #[serde(default = "default_embedding_model")]
     pub model: String,
     /// Name of the environment variable holding the bearer token, if the
     /// endpoint needs one. Local TEI/Ollama endpoints typically do not.
@@ -70,6 +76,29 @@ pub struct EmbeddingConfig {
     /// Seconds an exhausted topic stays live for reignition matching.
     #[serde(default = "default_reignition_ttl_secs")]
     pub reignition_ttl_secs: u64,
+}
+
+/// Supplies semantic thresholds for the in-process Kleos provider when no
+/// explicit embedding block is present.
+impl Default for EmbeddingConfig {
+    /// Build local-provider-ready settings with the established semantic
+    /// thresholds and no external URL override.
+    fn default() -> Self {
+        Self {
+            url: None,
+            model: default_embedding_model(),
+            api_key_env: None,
+            semantic_threshold: default_semantic_threshold(),
+            reignition_threshold: default_semantic_threshold(),
+            reignition_damp: default_reignition_damp(),
+            reignition_ttl_secs: default_reignition_ttl_secs(),
+        }
+    }
+}
+
+/// Default embedding model identifier used by both local and HTTP providers.
+fn default_embedding_model() -> String {
+    "bge-m3".to_string()
 }
 
 /// Default cosine threshold for both echo and reignition matching.
@@ -556,6 +585,10 @@ mod tests {
 
         let config: BridgeConfig = toml::from_str(toml).expect("config should parse");
         let emb = config.embedding.expect("embedding block");
+        assert_eq!(
+            emb.url.as_deref(),
+            Some("http://127.0.0.1:11434/v1/embeddings")
+        );
         assert_eq!(emb.model, "bge-m3");
         assert!(emb.api_key_env.is_none());
         assert!((emb.semantic_threshold - 0.85).abs() < 1e-9);
@@ -571,5 +604,40 @@ mod tests {
         assert_eq!(stim.axon_cooldown_secs, 600);
         assert_eq!(stim.loom_cooldown_secs, 600);
         assert_eq!(stim.max_per_hour, 6);
+    }
+
+    /// Verifies an embedding block without a URL selects the in-process-ready
+    /// defaults instead of requiring a fake endpoint value.
+    #[test]
+    fn test_embedding_block_without_url_uses_local_defaults() {
+        let toml = r#"
+            [rift]
+            api_url = "http://localhost:3200"
+            ws_url = "ws://localhost:3200/ws"
+            jwt_secret = "secret"
+            server_id = "00000000-0000-0000-0000-000000000001"
+            channel_id = "00000000-0000-0000-0000-000000000002"
+
+            [bridge]
+            cooldown_secs = 30
+            turn_budget = 5
+            thread_ceiling = 30
+            context_window = 50
+
+            [embedding]
+
+            [[agents]]
+            name = "Architect"
+            username = "architect"
+            base_chance = 0.5
+            system_prompt = "You are an architect."
+            executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+        "#;
+
+        let config: BridgeConfig = toml::from_str(toml).expect("config should parse");
+        let emb = config.embedding.expect("embedding block");
+        assert!(emb.url.is_none());
+        assert_eq!(emb.model, "bge-m3");
+        assert!((emb.semantic_threshold - 0.85).abs() < 1e-9);
     }
 }

@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, watch};
 use henosis_rift_bridge::auth::AgentAuthManager;
 use henosis_rift_bridge::capability::{PistisOracle, StaticAllowlistOracle};
 use henosis_rift_bridge::config::{BridgeConfig, EmbeddingConfig};
+#[cfg(feature = "cognition")]
+use henosis_rift_bridge::embedding::CognitionEmbedder;
 use henosis_rift_bridge::embedding::{Embedder, OpenAiEmbedder};
 use henosis_rift_bridge::execution::approval::{
     decide_drain_action, ApprovalRegistry, DrainAction,
@@ -23,6 +25,30 @@ use henosis_rift_bridge::stimulus::{
 
 /// Project scope for all bridge Kleos operations (tasks, activity, stimuli).
 const KLEOS_PROJECT: &str = "rift";
+
+/// Embedding backend selected from explicit HTTP configuration and the
+/// compile-time/runtime in-process cognition switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingBackendChoice {
+    /// Existing OpenAI-compatible HTTP provider.
+    Http,
+    /// Vendored Kleos ONNX provider shared inside the Henosis process.
+    #[cfg(feature = "cognition")]
+    Cognition,
+    /// Token-overlap-only behavior with no semantic provider.
+    Disabled,
+}
+
+/// Fully constructed embedding dependencies shared by cognition and the room.
+struct EmbeddingRuntime {
+    /// Rift-facing semantic embedder.
+    room: Option<Arc<dyn Embedder>>,
+    /// Threshold and reignition settings paired with the room embedder.
+    config: Option<EmbeddingConfig>,
+    /// Vendored provider cloned into the cognition memory facade.
+    #[cfg(feature = "cognition")]
+    cognition: Option<Arc<dyn henosis_cognition::EmbeddingProvider>>,
+}
 
 use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use henosis_rift_bridge::room::Room;
@@ -46,10 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = BridgeConfig::load(&config_path)?;
     tracing::info!("loaded config with {} agents", config.agents.len());
 
+    // Build embeddings before either consumer so cognition and Rift receive
+    // clones of the same provider Arc in the in-process configuration.
+    let embedding_runtime = build_embedding_runtime(&config).await?;
+
     // Create auth manager and REST client.
     let auth = AgentAuthManager::new(config.rift.jwt_secret.clone());
     let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
-    let kleos = build_kleos_client(&config).await?;
+    let kleos = build_kleos_client(&config, &embedding_runtime).await?;
 
     // Wire execution-mode dependencies from config.
     let oracle: Arc<dyn henosis_rift_bridge::capability::CapabilityOracle> = match &config.pistis {
@@ -90,10 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keep the original sender alive so `approved_rx` never sees all senders dropped.
     let _approved_tx = approved_tx;
 
-    // Optional embedding endpoint: powers semantic echo suppression and
-    // topic-reignition damping. Absent = token-overlap detection only.
-    let (embedder, embedding_cfg) = build_embedder(&config.embedding);
-
     // Stimulus wiring needs pieces that move into the room below.
     let stimulus_settings = config.stimulus.clone();
     let workspace_paths: Vec<(String, PathBuf)> = config
@@ -124,8 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sandbox_manager,
         max_concurrent,
         config.personas,
-        embedder,
-        embedding_cfg,
+        embedding_runtime.room,
+        embedding_runtime.config,
     )
     .await?;
 
@@ -340,13 +366,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Build the optional embedder from config: resolve the API key env var if
-/// named, and log which detection tier the bridge runs with.
-fn build_embedder(
-    config: &Option<EmbeddingConfig>,
-) -> (Option<Arc<dyn Embedder>>, Option<EmbeddingConfig>) {
-    match config {
-        Some(cfg) => {
+/// Choose the provider without constructing model state, keeping precedence
+/// deterministic and independently testable.
+fn select_embedding_backend(has_http_url: bool, in_process: bool) -> EmbeddingBackendChoice {
+    if has_http_url {
+        return EmbeddingBackendChoice::Http;
+    }
+    #[cfg(feature = "cognition")]
+    if in_process {
+        return EmbeddingBackendChoice::Cognition;
+    }
+    #[cfg(not(feature = "cognition"))]
+    let _ = in_process;
+    EmbeddingBackendChoice::Disabled
+}
+
+/// Construct the selected provider and retain the exact shared `Arc` needed by
+/// both the cognition facade and Rift's semantic adapter.
+async fn build_embedding_runtime(
+    config: &BridgeConfig,
+) -> Result<EmbeddingRuntime, Box<dyn std::error::Error>> {
+    let embedding_config = config.embedding.clone();
+    let has_http_url = embedding_config
+        .as_ref()
+        .and_then(|settings| settings.url.as_deref())
+        .is_some();
+    let in_process = config
+        .kleos
+        .as_ref()
+        .map(|settings| settings.in_process)
+        .unwrap_or(false);
+
+    match select_embedding_backend(has_http_url, in_process) {
+        EmbeddingBackendChoice::Http => {
+            let cfg = embedding_config.expect("HTTP choice requires embedding config");
+            let url = cfg.url.clone().expect("HTTP choice requires embedding URL");
             let api_key = match &cfg.api_key_env {
                 Some(var) => match std::env::var(var) {
                     Ok(v) => Some(v),
@@ -361,21 +415,49 @@ fn build_embedder(
             };
             tracing::info!(
                 "semantic echo/loop detection enabled via {} ({})",
-                cfg.url,
+                url,
                 cfg.model
             );
-            (
-                Some(Arc::new(OpenAiEmbedder::new(
-                    cfg.url.clone(),
+            Ok(EmbeddingRuntime {
+                room: Some(Arc::new(OpenAiEmbedder::new(
+                    url,
                     cfg.model.clone(),
                     api_key,
                 ))),
-                Some(cfg.clone()),
-            )
+                config: Some(cfg),
+                #[cfg(feature = "cognition")]
+                cognition: None,
+            })
         }
-        None => {
-            tracing::info!("no embedding endpoint configured; echo detection is token-overlap only");
-            (None, None)
+        #[cfg(feature = "cognition")]
+        EmbeddingBackendChoice::Cognition => {
+            let provider = henosis_cognition::load_embedding_provider_from_env().await?;
+            let room: Arc<dyn Embedder> = Arc::new(CognitionEmbedder::new(Arc::clone(&provider)));
+            tracing::info!(
+                "semantic echo/loop detection and cognition share the in-process bge-m3 provider"
+            );
+            Ok(EmbeddingRuntime {
+                room: Some(room),
+                config: Some(embedding_config.unwrap_or_default()),
+                cognition: Some(provider),
+            })
+        }
+        EmbeddingBackendChoice::Disabled => {
+            if embedding_config.is_some() {
+                tracing::warn!(
+                    "embedding config has no URL and in-process cognition is unavailable; using token-overlap only"
+                );
+            } else {
+                tracing::info!(
+                    "no embedding provider configured; echo detection is token-overlap only"
+                );
+            }
+            Ok(EmbeddingRuntime {
+                room: None,
+                config: None,
+                #[cfg(feature = "cognition")]
+                cognition: None,
+            })
         }
     }
 }
@@ -384,14 +466,11 @@ fn build_embedder(
 /// the in-process henosis kernel stores.
 async fn build_kleos_client(
     config: &BridgeConfig,
+    embedding_runtime: &EmbeddingRuntime,
 ) -> Result<Arc<dyn henosis_rift_bridge::kleos::KleosClient>, Box<dyn std::error::Error>> {
     use henosis_rift_bridge::kleos::{HttpKleosClient, InProcessKleosClient};
 
-    let in_process = config
-        .kleos
-        .as_ref()
-        .map(|k| k.in_process)
-        .unwrap_or(false);
+    let in_process = config.kleos.as_ref().map(|k| k.in_process).unwrap_or(false);
 
     if !in_process {
         return Ok(Arc::new(HttpKleosClient::from_env()?));
@@ -420,7 +499,7 @@ async fn build_kleos_client(
         ),
     };
 
-    let memory = build_memory_backend(config).await?;
+    let memory = build_memory_backend(config, embedding_runtime).await?;
 
     let tenant = henosis_rift_bridge::identity::bridge_tenant();
     let principal = henosis_rift_bridge::identity::principal_for_agent("rift-bridge");
@@ -444,10 +523,8 @@ async fn build_kleos_client(
 #[cfg(feature = "cognition")]
 async fn build_memory_backend(
     config: &BridgeConfig,
-) -> Result<
-    Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>,
-    Box<dyn std::error::Error>,
-> {
+    embedding_runtime: &EmbeddingRuntime,
+) -> Result<Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>, Box<dyn std::error::Error>> {
     use henosis_rift_bridge::kleos::CognitionMemoryBackend;
 
     let cognition = match config.kleos.as_ref().and_then(|k| k.db_dir.clone()) {
@@ -458,14 +535,23 @@ async fn build_memory_backend(
                 .to_str()
                 .ok_or("cognition db path is not valid UTF-8")?;
             let cog = henosis_cognition::Cognition::open_path(path).await?;
-            tracing::info!(db = path, "kleos memory backend: in-process cognition store (persistent)");
+            tracing::info!(
+                db = path,
+                "kleos memory backend: in-process cognition store (persistent)"
+            );
             cog
         }
         None => {
             let cog = henosis_cognition::Cognition::open_in_memory().await?;
-            tracing::info!("kleos memory backend: in-process cognition store (in-memory, volatile)");
+            tracing::info!(
+                "kleos memory backend: in-process cognition store (in-memory, volatile)"
+            );
             cog
         }
+    };
+    let cognition = match &embedding_runtime.cognition {
+        Some(provider) => cognition.with_embedder(Arc::clone(provider)),
+        None => cognition,
     };
     Ok(Arc::new(CognitionMemoryBackend::new(Arc::new(cognition))))
 }
@@ -476,10 +562,8 @@ async fn build_memory_backend(
 #[cfg(not(feature = "cognition"))]
 async fn build_memory_backend(
     _config: &BridgeConfig,
-) -> Result<
-    Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>,
-    Box<dyn std::error::Error>,
-> {
+    _embedding_runtime: &EmbeddingRuntime,
+) -> Result<Arc<dyn henosis_rift_bridge::kleos::BridgeMemory>, Box<dyn std::error::Error>> {
     use henosis_memory_client::Client as MemoryClient;
     use henosis_rift_bridge::kleos::HttpMemoryBackend;
 
@@ -510,4 +594,41 @@ fn load_cred_secret(reference: &str) -> Result<String, Box<dyn std::error::Error
         .into());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// Unit tests for provider selection precedence without constructing a real
+/// ONNX session or contacting an HTTP endpoint.
+#[cfg(test)]
+mod tests {
+    use super::{select_embedding_backend, EmbeddingBackendChoice};
+
+    /// Verifies an explicit URL always preserves the HTTP override.
+    #[test]
+    fn test_explicit_url_selects_http() {
+        assert_eq!(
+            select_embedding_backend(true, true),
+            EmbeddingBackendChoice::Http
+        );
+    }
+
+    /// Verifies an in-process cognition build selects its local provider when
+    /// no external URL overrides it.
+    #[cfg(feature = "cognition")]
+    #[test]
+    fn test_in_process_cognition_selects_shared_provider() {
+        assert_eq!(
+            select_embedding_backend(false, true),
+            EmbeddingBackendChoice::Cognition
+        );
+    }
+
+    /// Verifies configurations without either provider preserve token-only
+    /// behavior.
+    #[test]
+    fn test_missing_provider_disables_semantic_embedding() {
+        assert_eq!(
+            select_embedding_backend(false, false),
+            EmbeddingBackendChoice::Disabled
+        );
+    }
 }

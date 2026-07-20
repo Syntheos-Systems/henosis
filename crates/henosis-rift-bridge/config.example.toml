@@ -120,13 +120,13 @@ auth_token = "set-me"   # require: Authorization: Bearer set-me
 # max_same_persona = 2
 # challenger_slot = true
 
-# Optional OpenAI-compatible embeddings endpoint. When present, echo
-# suppression uses cosine similarity (catches paraphrased echoes token
-# overlap misses) and exhausted topics share consumed turn budgets with
-# semantically similar re-triggers while damping their engagement.
-# Absent = token-overlap detection only. Works with OpenAI, TEI, and Ollama.
+# Optional embedding tuning. With the `cognition` feature and
+# `[kleos].in_process = true`, Henosis automatically shares one local bge-m3
+# provider between cognition and Rift; omit `url` in that mode. Otherwise an
+# explicit OpenAI-compatible URL selects OpenAI, TEI, Ollama, or another HTTP
+# provider. Without either backend, detection remains token-overlap only.
 # [embedding]
-# url = "http://127.0.0.1:11434/v1/embeddings"
+# url = "http://127.0.0.1:11434/v1/embeddings" # optional external override
 # model = "bge-m3"
 # api_key_env = "EMBEDDING_API_KEY"   # env var holding the bearer token; omit for local endpoints
 # semantic_threshold = 0.85           # cosine at/above which a candidate is an echo

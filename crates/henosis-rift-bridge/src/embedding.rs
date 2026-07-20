@@ -2,18 +2,20 @@
 //!
 //! The 2026-07-17 design spec (P4) recorded embedding-based echo/loop
 //! detection as future work behind the `echo::similarity` seam; this module
-//! is that capability landing. It deliberately implements a thin
-//! OpenAI-compatible `/v1/embeddings` client instead of pulling the vendored
-//! kleos-lib ML stack into the default bridge build: the same wire protocol
-//! serves OpenAI, TEI, Ollama, and any locally hosted bge-class model, and
-//! the [`Embedder`] trait keeps an in-process kleos-lib adapter possible
-//! later without touching call sites.
+//! is that capability landing. The default build implements a thin
+//! OpenAI-compatible `/v1/embeddings` client instead of pulling in the vendored
+//! kleos-lib ML stack. The optional `cognition` feature adds an adapter around
+//! Henosis's in-process provider, letting memory and room semantics share one
+//! ONNX session without changing call sites.
 //!
-//! Everything here is optional at runtime: no `[embedding]` config block
-//! means no embedder, and every caller falls back to the token-overlap path.
+//! Everything remains optional at runtime: explicit HTTP configuration selects
+//! the wire client, cognition plus in-process Kleos selects the shared local
+//! provider, and every caller falls back to token overlap when neither exists.
 
 use async_trait::async_trait;
 use serde::Deserialize;
+#[cfg(feature = "cognition")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::BridgeError;
@@ -116,6 +118,38 @@ impl Embedder for OpenAiEmbedder {
     }
 }
 
+/// Adapter that lets Rift semantic checks use Henosis's in-process vendored
+/// Kleos embedding provider without creating another model session.
+#[cfg(feature = "cognition")]
+pub struct CognitionEmbedder {
+    /// Provider shared with the `Cognition` memory facade.
+    provider: Arc<dyn henosis_cognition::EmbeddingProvider>,
+}
+
+/// Constructs the Rift-facing adapter around a shared cognition provider.
+#[cfg(feature = "cognition")]
+impl CognitionEmbedder {
+    /// Wrap an existing provider. Cloning the input `Arc` preserves one model
+    /// instance across cognition and room semantics.
+    pub fn new(provider: Arc<dyn henosis_cognition::EmbeddingProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+/// Delegates Rift embedding requests into the shared Kleos provider.
+#[cfg(feature = "cognition")]
+#[async_trait]
+impl Embedder for CognitionEmbedder {
+    /// Embed one text through the in-process provider, translating the vendored
+    /// Kleos error into the bridge's operational embedding error.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, BridgeError> {
+        self.provider
+            .embed(text)
+            .await
+            .map_err(|error| BridgeError::Embedding(error.to_string()))
+    }
+}
+
 /// Cosine similarity of two vectors. Dimension mismatches and zero-norm
 /// vectors score 0.0 instead of panicking or producing NaN: a broken
 /// embedding must never suppress a message on its own.
@@ -141,6 +175,41 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{cosine, EmbeddingsResponse};
+    #[cfg(feature = "cognition")]
+    use super::{CognitionEmbedder, Embedder};
+    #[cfg(feature = "cognition")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "cognition")]
+    use std::sync::Arc;
+
+    /// Stub vendored provider used to prove the Rift adapter delegates through
+    /// the exact shared `Arc` instead of constructing independent state.
+    #[cfg(feature = "cognition")]
+    struct StubCognitionProvider {
+        /// Number of embed calls observed through every clone of the provider.
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// Returns a fixed vector while recording calls through shared state.
+    #[cfg(feature = "cognition")]
+    impl henosis_cognition::EmbeddingProvider for StubCognitionProvider {
+        /// Record one call and return the deterministic test vector.
+        fn embed<'a>(
+            &'a self,
+            _text: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = henosis_cognition::KleosResult<Vec<f32>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0.25, 0.75])
+            })
+        }
+    }
 
     /// Verifies identical vectors score 1.0 and orthogonal vectors 0.0.
     #[test]
@@ -172,5 +241,22 @@ mod tests {
         let json = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"m"}"#;
         let parsed: EmbeddingsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.data[0].embedding.len(), 2);
+    }
+
+    /// Verifies the cognition adapter reaches the shared provider instance and
+    /// returns its vector unchanged.
+    #[cfg(feature = "cognition")]
+    #[tokio::test]
+    async fn test_cognition_adapter_delegates_to_shared_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn henosis_cognition::EmbeddingProvider> =
+            Arc::new(StubCognitionProvider {
+                calls: Arc::clone(&calls),
+            });
+        let adapter = CognitionEmbedder::new(Arc::clone(&provider));
+
+        assert_eq!(adapter.embed("shared").await.unwrap(), vec![0.25, 0.75]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&provider), 2);
     }
 }

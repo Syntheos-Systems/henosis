@@ -1680,7 +1680,7 @@ mod tests {
     fn with_stub_embedding(room: &mut Room) {
         room.embedder = Some(Arc::new(TopicStubEmbedder));
         room.embedding_cfg = Some(crate::config::EmbeddingConfig {
-            url: "http://test.invalid/v1/embeddings".to_string(),
+            url: Some("http://test.invalid/v1/embeddings".to_string()),
             model: "stub".to_string(),
             api_key_env: None,
             semantic_threshold: 0.85,
