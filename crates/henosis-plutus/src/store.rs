@@ -8,7 +8,9 @@
 //! D1 rule 5 (rate-limit transaction with SELECT FOR UPDATE) are all implemented here.
 
 use std::str::FromStr;
+use std::time::Duration;
 
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use syntheos_contracts::{PrincipalId, TenantId};
 use uuid::Uuid;
@@ -43,13 +45,29 @@ pub struct PlutusStore {
     pool: PgPool,
 }
 
+/// Opens and operates the Postgres-backed Plutus policy store.
 impl PlutusStore {
     /// Open (or connect to) the Postgres database at `url` and apply pending migrations.
     ///
     /// `url` is a standard Postgres connection string (e.g. `postgres://user:pw@host/db`).
     /// The migrations in `migrations/` are embedded at compile time via `sqlx::migrate!()`.
     pub async fn open(url: &str) -> Result<Self> {
-        let pool = PgPool::connect(url)
+        Self::open_with_options(url, PgPoolOptions::new()).await
+    }
+
+    /// Open Postgres with an explicit pool acquisition timeout, then apply pending migrations.
+    ///
+    /// The timeout covers connection establishment, TLS/authentication, and later acquisitions
+    /// from this pool. Migrations begin only after the initial connection succeeds and are not
+    /// cancelled by the acquisition deadline.
+    pub async fn open_with_acquire_timeout(url: &str, timeout: Duration) -> Result<Self> {
+        Self::open_with_options(url, PgPoolOptions::new().acquire_timeout(timeout)).await
+    }
+
+    /// Open Postgres with the supplied pool options and apply embedded migrations.
+    async fn open_with_options(url: &str, options: PgPoolOptions) -> Result<Self> {
+        let pool = options
+            .connect(url)
             .await
             .map_err(|e| PlutusError::Store(format!("connect: {e}")))?;
         sqlx::migrate!("./migrations")

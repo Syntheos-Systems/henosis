@@ -119,6 +119,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// shared semaphore instead of piling onto the runtime.
 const MAX_IN_FLIGHT: usize = 1024;
 
+/// Default maximum seconds for acquiring a Plutus Postgres connection.
+const DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// Largest accepted Plutus acquisition timeout, preventing an accidental unbounded boot stall.
+const MAX_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 300;
+
 #[tokio::main]
 /// Initialize every kernel authority and serve the unified Syntheos API.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,11 +197,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plutus_url = std::env::var("SYNTHEOS_PLUTUS_DB").map_err(|_| {
         "SYNTHEOS_PLUTUS_DB is required: set to a Postgres connection URL (e.g. postgres://user:pw@host/plutus)"
     })?;
+    let plutus_acquire_timeout = plutus_acquire_timeout_from_env()?;
     // Wrap PlutusStore in Arc before the trait-object coercion so the concrete handle
     // remains available for the operator bootstrap (create_org, add_member).
-    let plutus_store = Arc::new(PlutusStore::open(&plutus_url).await.map_err(|e| {
-        format!("plutus store open failed: {e}")
-    })?);
+    let plutus_store = Arc::new(
+        PlutusStore::open_with_acquire_timeout(&plutus_url, plutus_acquire_timeout)
+            .await
+            .map_err(|e| format!("plutus store open failed: {e}"))?,
+    );
     plutus_store.bootstrap_operator_org_if_absent().await.map_err(|e| {
         format!("plutus operator bootstrap: {e}")
     })?;
@@ -627,6 +636,33 @@ fn db_path(var: &str, default: &str) -> Result<String, std::io::Error> {
     Ok(path)
 }
 
+/// Read and validate the Plutus pool acquisition deadline from the process environment.
+fn plutus_acquire_timeout_from_env() -> Result<Duration, String> {
+    let raw = match std::env::var("SYNTHEOS_PLUTUS_ACQUIRE_TIMEOUT_SECS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("SYNTHEOS_PLUTUS_ACQUIRE_TIMEOUT_SECS: {error}")),
+    };
+    validated_plutus_acquire_timeout(raw.as_deref())
+}
+
+/// Validate an optional Plutus acquisition timeout and return the production default when absent.
+fn validated_plutus_acquire_timeout(raw: Option<&str>) -> Result<Duration, String> {
+    let seconds = match raw {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            "SYNTHEOS_PLUTUS_ACQUIRE_TIMEOUT_SECS must be an integer from 1 through 300".to_string()
+        })?,
+        None => DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS,
+    };
+    if !(1..=MAX_PLUTUS_ACQUIRE_TIMEOUT_SECS).contains(&seconds) {
+        return Err(
+            "SYNTHEOS_PLUTUS_ACQUIRE_TIMEOUT_SECS must be an integer from 1 through 300"
+                .to_string(),
+        );
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 /// The fallback logged in place of a connection string this function cannot confidently parse.
 /// Never the raw input -- an unrecognized shape might still carry a password we failed to find.
 const REDACTED_URL_PLACEHOLDER: &str = "<redacted: unparseable connection string>";
@@ -740,6 +776,48 @@ mod redact_tests {
         let redacted = redact_postgres_password("not a connection string at all");
         assert_eq!(redacted, REDACTED_URL_PLACEHOLDER);
         assert!(!redacted.contains("not a connection string"));
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the Plutus pool acquisition deadline policy.
+mod plutus_timeout_tests {
+    use super::*;
+
+    /// An absent override uses the bounded production default.
+    #[test]
+    fn absent_timeout_uses_default() {
+        assert_eq!(
+            validated_plutus_acquire_timeout(None).expect("default must be valid"),
+            Duration::from_secs(DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS)
+        );
+    }
+
+    /// The smallest supported timeout is accepted for fast-failing probes and deployments.
+    #[test]
+    fn one_second_timeout_is_accepted() {
+        assert_eq!(
+            validated_plutus_acquire_timeout(Some("1")).expect("one second must be valid"),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// Zero cannot silently disable the deadline or force every acquisition to fail immediately.
+    #[test]
+    fn zero_timeout_is_rejected() {
+        assert!(validated_plutus_acquire_timeout(Some("0")).is_err());
+    }
+
+    /// Malformed values are configuration errors rather than implicit defaults.
+    #[test]
+    fn malformed_timeout_is_rejected() {
+        assert!(validated_plutus_acquire_timeout(Some("soon")).is_err());
+    }
+
+    /// Values above the operational ceiling cannot recreate an effectively unbounded boot stall.
+    #[test]
+    fn excessive_timeout_is_rejected() {
+        assert!(validated_plutus_acquire_timeout(Some("301")).is_err());
     }
 }
 
