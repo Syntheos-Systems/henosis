@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(delta.len(), 1);
         match &delta[0].content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "second"),
-            other => panic!("expected Text, got {:?}", other),
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 

@@ -1167,7 +1167,7 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
-        (format!("http://{}", addr), receiver)
+        (format!("http://{addr}"), receiver)
     }
 
     /// Verifies that the browser authorization URL includes PKCE and CSRF state parameters.

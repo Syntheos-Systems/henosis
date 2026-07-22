@@ -298,7 +298,7 @@ mod tests {
                 assert_eq!(s.session_id.unwrap(), "sess-abc");
                 assert_eq!(s.model.unwrap(), "claude-sonnet-4-6");
             }
-            other => panic!("expected System, got {:?}", other),
+            other => panic!("expected System, got {other:?}"),
         }
     }
 
@@ -326,10 +326,10 @@ mod tests {
                 assert_eq!(a.message.content.len(), 1);
                 match &a.message.content[0] {
                     AssistantContentBlock::Text { text } => assert_eq!(text, "Hello world"),
-                    other => panic!("expected Text, got {:?}", other),
+                    other => panic!("expected Text, got {other:?}"),
                 }
             }
-            other => panic!("expected Assistant, got {:?}", other),
+            other => panic!("expected Assistant, got {other:?}"),
         }
     }
 
@@ -354,10 +354,10 @@ mod tests {
                     ControlRequestPayload::CanUseTool { tool_name, .. } => {
                         assert_eq!(tool_name, "bash");
                     }
-                    other => panic!("expected CanUseTool, got {:?}", other),
+                    other => panic!("expected CanUseTool, got {other:?}"),
                 }
             }
-            other => panic!("expected ControlRequest, got {:?}", other),
+            other => panic!("expected ControlRequest, got {other:?}"),
         }
     }
 
@@ -391,10 +391,10 @@ mod tests {
                         assert_eq!(server_name, "synapse-tools");
                         assert_eq!(message["method"], "tools/list");
                     }
-                    other => panic!("expected McpMessage, got {:?}", other),
+                    other => panic!("expected McpMessage, got {other:?}"),
                 }
             }
-            other => panic!("expected ControlRequest, got {:?}", other),
+            other => panic!("expected ControlRequest, got {other:?}"),
         }
     }
 
@@ -417,7 +417,7 @@ mod tests {
                 assert_eq!(r.duration_ms.unwrap(), 1234);
                 assert_eq!(r.usage.as_ref().unwrap().input_tokens, 100);
             }
-            other => panic!("expected Result, got {:?}", other),
+            other => panic!("expected Result, got {other:?}"),
         }
     }
 
@@ -433,6 +433,7 @@ mod tests {
         assert!(matches!(msg, IncomingMessage::Unknown(_)));
     }
 
+    /// Verifies explicit cache token fields deserialize into usage metadata.
     #[test]
     fn message_usage_deserializes_cache_fields() {
         let json = r#"{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":80,"cache_creation_input_tokens":12}"#;
@@ -442,6 +443,7 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 12);
     }
 
+    /// Verifies omitted cache token fields default to zero.
     #[test]
     fn message_usage_defaults_cache_fields_to_zero() {
         let json = r#"{"input_tokens":10,"output_tokens":5}"#;

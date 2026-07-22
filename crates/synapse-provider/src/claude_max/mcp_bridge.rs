@@ -168,7 +168,7 @@ mod tests {
                     is_error: false,
                 }),
                 _ => Ok(ToolExecutionResult {
-                    output: format!("unknown tool: {}", name),
+                    output: format!("unknown tool: {name}"),
                     is_error: true,
                 }),
             }

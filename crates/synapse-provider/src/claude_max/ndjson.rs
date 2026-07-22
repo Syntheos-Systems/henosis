@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn parse_line_handles_trailing_whitespace() {
         let raw = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-4-6","tools":[]}"#;
-        let padded = format!("  {}  \n", raw);
+        let padded = format!("  {raw}  \n");
         let msg = parse_line(&padded).unwrap();
         assert!(matches!(msg, IncomingMessage::System(_)));
     }
