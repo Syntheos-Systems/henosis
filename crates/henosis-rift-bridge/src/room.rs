@@ -1496,7 +1496,7 @@ mod tests {
             id: Uuid::new_v4(),
             channel_id: Uuid::new_v4(),
             author_id: Uuid::new_v4(),
-            author_username: "zan".to_string(),
+            author_username: "operator".to_string(),
             content: content.to_string(),
             message_type: "user".to_string(),
             created_at: chrono::Utc::now(),
