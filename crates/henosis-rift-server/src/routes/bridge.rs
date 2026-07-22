@@ -1,5 +1,5 @@
 //! Internal bridge endpoints for notifying the gateway about externally-created messages.
-//! Secured via the JWT secret passed as a Bearer token (same secret the bridge already has).
+//! Secured via a dedicated bridge secret passed as a Bearer token.
 
 use axum::{
     extract::State,
@@ -31,7 +31,8 @@ fn agent_email(username: &str) -> String {
 ///
 /// Compares in constant time so the secret cannot be recovered a byte at a time
 /// by timing repeated requests. Human credentials are JWTs and can never equal
-/// the raw secret, which is what keeps bridge-only routes closed to them.
+/// the dedicated bridge secret, which keeps bridge-only routes isolated from
+/// the user JWT signing key.
 fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
     let Some(token) = headers
         .get("authorization")
@@ -41,7 +42,7 @@ fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
         return false;
     };
 
-    let (token, secret) = (token.as_bytes(), config.jwt_secret.as_bytes());
+    let (token, secret) = (token.as_bytes(), config.bridge_secret.as_bytes());
     if token.len() != secret.len() {
         return false;
     }
@@ -254,8 +255,10 @@ mod tests {
     fn config_with_secret(secret: &str) -> Config {
         Config {
             database_url: String::new(),
-            jwt_secret: secret.to_string(),
+            jwt_secret: "different-jwt-signing-secret".to_string(),
+            bridge_secret: secret.to_string(),
             listen_addr: String::new(),
+            cors_origins: Vec::new(),
             upload_dir: String::new(),
             max_upload_bytes: 0,
         }

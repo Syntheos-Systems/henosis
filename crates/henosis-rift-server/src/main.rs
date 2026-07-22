@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use sqlx::postgres::PgPoolOptions;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -32,31 +32,39 @@ struct AppState {
     pending_uploads: PendingUploads,
 }
 
-// Implement FromRef for each piece of state so Axum extractors work
+/// Extracts the shared PostgreSQL pool from the Rift application state.
 impl axum::extract::FromRef<AppState> for sqlx::PgPool {
+    /// Clones the pooled database handle for an Axum request extractor.
     fn from_ref(state: &AppState) -> Self {
         state.pool.clone()
     }
 }
 
+/// Extracts runtime configuration from the Rift application state.
 impl axum::extract::FromRef<AppState> for Config {
+    /// Clones the runtime configuration for an Axum request extractor.
     fn from_ref(state: &AppState) -> Self {
         state.config.clone()
     }
 }
 
+/// Extracts the WebSocket gateway from the Rift application state.
 impl axum::extract::FromRef<AppState> for Gateway {
+    /// Clones the gateway handle for an Axum request extractor.
     fn from_ref(state: &AppState) -> Self {
         state.gateway.clone()
     }
 }
 
+/// Extracts pending upload state from the Rift application state.
 impl axum::extract::FromRef<AppState> for PendingUploads {
+    /// Clones the pending upload registry for an Axum request extractor.
     fn from_ref(state: &AppState) -> Self {
         state.pending_uploads.clone()
     }
 }
 
+/// Start the standalone Rift server with its database, routes, and trust boundaries.
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -108,7 +116,7 @@ async fn main() {
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -227,6 +235,7 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
+/// Upgrade an authenticated Rift WebSocket connection into the shared gateway.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,

@@ -2,6 +2,7 @@
 //! environment so that no deployment-specific values are baked into the binary.
 
 use std::env;
+use std::net::SocketAddr;
 
 /// Resolved gateway configuration.
 #[derive(Debug, Clone)]
@@ -57,5 +58,55 @@ fn hostname() -> String {
     match std::fs::read_to_string("/proc/sys/kernel/hostname") {
         Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+/// Parse the gateway bind address and reject remote exposure unless explicitly overridden.
+pub fn validated_bind_addr(
+    bind_addr: &str,
+    allow_insecure_remote: Option<&str>,
+) -> Result<SocketAddr, String> {
+    let address: SocketAddr = bind_addr
+        .parse()
+        .map_err(|error| format!("invalid SYNTHEOS_GATEWAY_ADDR {bind_addr:?}: {error}"))?;
+    if address.ip().is_loopback() || allow_insecure_remote == Some("1") {
+        return Ok(address);
+    }
+    Err(format!(
+        "SYNTHEOS_GATEWAY_ADDR {bind_addr:?} is not loopback; set \
+         SYNTHEOS_GATEWAY_ALLOW_INSECURE_REMOTE=1 only behind a trusted authenticated boundary"
+    ))
+}
+
+#[cfg(test)]
+/// Exercises fail-closed validation of gateway bind addresses.
+mod tests {
+    use super::validated_bind_addr;
+
+    /// IPv4 and IPv6 loopback addresses are safe without an override.
+    #[test]
+    fn loopback_addresses_are_accepted() {
+        assert!(validated_bind_addr("127.0.0.1:4510", None).is_ok());
+        assert!(validated_bind_addr("[::1]:4510", None).is_ok());
+    }
+
+    /// Wildcard and private-network binds fail closed by default.
+    #[test]
+    fn remote_addresses_are_rejected_by_default() {
+        assert!(validated_bind_addr("0.0.0.0:4510", None).is_err());
+        assert!(validated_bind_addr("192.0.2.10:4510", None).is_err());
+    }
+
+    /// Only the exact documented override enables a deliberate remote bind.
+    #[test]
+    fn exact_override_allows_remote_address() {
+        assert!(validated_bind_addr("0.0.0.0:4510", Some("1")).is_ok());
+        assert!(validated_bind_addr("0.0.0.0:4510", Some("true")).is_err());
+    }
+
+    /// Malformed addresses fail before the server attempts to bind.
+    #[test]
+    fn malformed_address_is_rejected() {
+        assert!(validated_bind_addr("localhost:4510", None).is_err());
     }
 }

@@ -77,7 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedding_runtime = build_embedding_runtime(&config).await?;
 
     // Create auth manager and REST client.
-    let auth = AgentAuthManager::new(config.rift.jwt_secret.clone());
+    let auth = AgentAuthManager::new(
+        config.rift.jwt_secret.clone(),
+        config.rift.bridge_secret.clone(),
+    );
     let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
     let kleos = build_kleos_client(&config, &embedding_runtime).await?;
 
@@ -158,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("room initialized, starting WebSocket listener");
 
     // Mint a WS connection token using the first agent's credentials.
-    let ws_auth = AgentAuthManager::new(config.rift.jwt_secret.clone());
+    let ws_auth = AgentAuthManager::new(
+        config.rift.jwt_secret.clone(),
+        config.rift.bridge_secret.clone(),
+    );
     let first_agent = room
         .roster_ref()
         .all()

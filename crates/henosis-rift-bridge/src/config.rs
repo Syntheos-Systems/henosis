@@ -225,6 +225,8 @@ pub struct RiftConfig {
     pub ws_url: String,
     /// JWT secret shared with Rift server for agent token issuance.
     pub jwt_secret: String,
+    /// Dedicated bearer secret for bridge-only Rift routes.
+    pub bridge_secret: String,
     /// Rift server ID to join agents to.
     pub server_id: Uuid,
     /// Channel ID for the team room.
@@ -379,8 +381,26 @@ impl BridgeConfig {
         let content = std::fs::read_to_string(path).map_err(|e| {
             BridgeError::Config(format!("failed to read {}: {}", path.display(), e))
         })?;
-        toml::from_str(&content)
-            .map_err(|e| BridgeError::Config(format!("failed to parse {}: {}", path.display(), e)))
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| BridgeError::Config(format!("failed to parse {}: {}", path.display(), e)))?;
+        config.validate_secrets()?;
+        Ok(config)
+    }
+
+    /// Reject weak or reused Rift secrets before the bridge connects.
+    fn validate_secrets(&self) -> Result<(), BridgeError> {
+        if self.rift.jwt_secret.len() < 32 || self.rift.bridge_secret.len() < 32 {
+            return Err(BridgeError::Config(
+                "rift.jwt_secret and rift.bridge_secret must each contain at least 32 bytes"
+                    .to_string(),
+            ));
+        }
+        if self.rift.jwt_secret == self.rift.bridge_secret {
+            return Err(BridgeError::Config(
+                "rift.jwt_secret and rift.bridge_secret must differ".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -461,6 +481,7 @@ mod tests {
             api_url = "http://localhost:3200"
             ws_url = "ws://localhost:3200/ws"
             jwt_secret = "secret"
+            bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
 
@@ -514,6 +535,7 @@ mod tests {
             api_url = "http://localhost:3200"
             ws_url = "ws://localhost:3200/ws"
             jwt_secret = "secret"
+            bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
 
@@ -558,6 +580,7 @@ mod tests {
             api_url = "http://localhost:3200"
             ws_url = "ws://localhost:3200/ws"
             jwt_secret = "secret"
+            bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
 
@@ -615,6 +638,7 @@ mod tests {
             api_url = "http://localhost:3200"
             ws_url = "ws://localhost:3200/ws"
             jwt_secret = "secret"
+            bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
 

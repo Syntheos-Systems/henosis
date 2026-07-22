@@ -27,16 +27,13 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
-
-    // Warn when binding on a non-loopback address -- this exposes the gateway
-    // to the network without transport-level auth on the Kleos side.
-    if !config.bind_addr.starts_with("127.") && !config.bind_addr.starts_with("localhost") {
-        tracing::warn!(
-            bind_addr = %config.bind_addr,
-            "gateway is binding on a non-loopback address; \
-             ensure this is intentional and the network is trusted"
-        );
-    }
+    let bind_addr = config::validated_bind_addr(
+        &config.bind_addr,
+        std::env::var("SYNTHEOS_GATEWAY_ALLOW_INSECURE_REMOTE")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 
     // Load the signing key (PIV YubiKey attempted first, Ed25519 software key as fallback).
     let signer = match RequestSigner::from_env_or_file(
@@ -72,7 +69,7 @@ async fn main() {
     let client = KleosClient::new(&config, signer);
     let app = routes::router(client);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_addr.as_str())
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {}: {e}", config.bind_addr));
     tracing::info!(

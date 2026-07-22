@@ -58,7 +58,10 @@ async fn serve_recorder(port: u16) -> Recorded {
 async fn notifier_posts_system_typed_messages() {
     let rec = serve_recorder(39221).await;
 
-    let auth = AgentAuthManager::new("test-secret".to_string());
+    let auth = AgentAuthManager::new(
+        "test-secret".to_string(),
+        "test-bridge-secret".to_string(),
+    );
     let rift = Arc::new(RiftRestClient::new(
         "http://127.0.0.1:39221".to_string(),
         auth,

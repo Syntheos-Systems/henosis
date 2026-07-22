@@ -27,16 +27,19 @@ pub struct Claims {
 pub struct AgentAuthManager {
     /// Shared JWT secret (must match Rift server).
     jwt_secret: String,
+    /// Dedicated bearer secret for bridge-only server routes.
+    bridge_secret: String,
     /// Token TTL in seconds (default: 300 = 5 minutes).
     ttl_secs: i64,
 }
 
 /// Implements bridge-side credential issuance for agent identities.
 impl AgentAuthManager {
-    /// Create a new auth manager with the shared JWT secret.
-    pub fn new(jwt_secret: String) -> Self {
+    /// Create an auth manager with independent JWT-signing and bridge-route secrets.
+    pub fn new(jwt_secret: String, bridge_secret: String) -> Self {
         Self {
             jwt_secret,
+            bridge_secret,
             ttl_secs: 300,
         }
     }
@@ -48,7 +51,7 @@ impl AgentAuthManager {
     /// JWT, which is precisely what keeps them closed to human accounts: a
     /// login token is a JWT and can never equal the secret.
     pub fn bridge_secret(&self) -> &str {
-        &self.jwt_secret
+        &self.bridge_secret
     }
 
     /// Issue a short-lived JWT for an agent.
@@ -67,5 +70,19 @@ impl AgentAuthManager {
             &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
         )
         .map_err(|e| BridgeError::Auth(format!("failed to encode JWT: {e}")))
+    }
+}
+
+/// Unit tests for independent bridge and JWT credential handling.
+#[cfg(test)]
+mod tests {
+    use super::AgentAuthManager;
+
+    /// Bridge-only requests use the dedicated secret rather than the JWT signing key.
+    #[test]
+    fn bridge_secret_is_independent() {
+        let auth = AgentAuthManager::new("jwt-secret".to_string(), "bridge-secret".to_string());
+        assert_eq!(auth.bridge_secret(), "bridge-secret");
+        assert_ne!(auth.bridge_secret(), "jwt-secret");
     }
 }

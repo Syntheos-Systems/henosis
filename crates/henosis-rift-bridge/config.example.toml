@@ -5,7 +5,8 @@
 [rift]
 api_url = "http://localhost:3200"
 ws_url = "ws://localhost:3200/ws"
-jwt_secret = "your-jwt-secret-here"
+jwt_secret = "replace-with-at-least-32-random-bytes-jwt"
+bridge_secret = "replace-with-at-least-32-random-bytes-bridge"
 server_id = "00000000-0000-0000-0000-000000000000"
 channel_id = "00000000-0000-0000-0000-000000000000"
 pause_poll_secs = 5
