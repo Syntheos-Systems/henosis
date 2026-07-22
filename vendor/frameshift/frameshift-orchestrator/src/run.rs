@@ -249,6 +249,7 @@ pub fn select_rich_with_embedder(
 }
 
 #[cfg(test)]
+/// Verifies end-to-end orchestration runs against temporary persona sources.
 mod tests {
     use super::*;
     use std::fs;

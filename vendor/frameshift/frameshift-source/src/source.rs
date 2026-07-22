@@ -28,6 +28,7 @@ pub struct LoadOptions {
     pub max_patterns: usize,
 }
 
+/// Provides bounded defaults for local persona-source loading.
 impl Default for LoadOptions {
     /// Returns default load options suitable for local development use.
     fn default() -> Self {
@@ -54,6 +55,7 @@ pub struct PersonaSource {
     pub patterns: PatternSet,
 }
 
+/// Loads, validates, constructs, and writes composite persona sources.
 impl PersonaSource {
     /// Constructs a new `PersonaSource` with the given persona and empty rules, skills, and patterns.
     pub fn new(persona: Persona) -> Self {
@@ -214,6 +216,7 @@ fn write_toml<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<(), Sour
 }
 
 #[cfg(test)]
+/// Verifies persona-source persistence and loading failures.
 mod tests {
     use super::*;
     use crate::patterns::{AntiPattern, PatternSet, StackCategory};
@@ -222,6 +225,7 @@ mod tests {
     use crate::skills::{Skill, SkillSet};
     use std::collections::BTreeMap;
 
+    /// Builds a populated persona source shared by persistence tests.
     fn sample() -> PersonaSource {
         let mut anchor = BTreeMap::new();
         anchor.insert(
@@ -285,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    /// Round-trips a persona source directory through disk.
     fn write_then_load_roundtrip() {
         let tmp = tempfile_dir();
         let original = sample();
@@ -295,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a source directory without its required persona file.
     fn missing_persona_file_errors() {
         let tmp = tempfile_dir();
         let err = PersonaSource::load_from_dir(&tmp).unwrap_err();

@@ -257,6 +257,7 @@ pub struct Persona {
     pub default_questions: Vec<DefaultQuestion>,
 }
 
+/// Constructs persona definitions with safe empty defaults.
 impl Persona {
     /// Minimal valid persona -- used as a default when scaffolding.
     ///
@@ -294,6 +295,7 @@ impl Persona {
 }
 
 #[cfg(test)]
+/// Verifies persona TOML serialization and schema compatibility.
 mod tests {
     use super::*;
 

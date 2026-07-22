@@ -59,6 +59,7 @@ pub struct Orchestrator {
     pub preferences: Preferences,
 }
 
+/// Selects and switches personas using the orchestrator's indexed state.
 impl Orchestrator {
     /// Create a new `Orchestrator` with the given index and default weights/policy/preferences.
     pub fn new(index: PersonaIndex) -> Self {
@@ -87,6 +88,7 @@ impl Orchestrator {
 }
 
 #[cfg(test)]
+/// Verifies the public orchestration facade.
 mod tests {
     use super::*;
     use std::collections::BTreeSet;

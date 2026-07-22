@@ -35,6 +35,7 @@ pub struct AuditLog {
     entries: Vec<Transition>,
 }
 
+/// Loads, appends, and queries persona transition audit records.
 impl AuditLog {
     /// Maximum number of audit entries retained in memory when loading. Entries
     /// older than the most recent `MAX_AUDIT_ENTRIES` are dropped so a log grown
@@ -115,6 +116,7 @@ pub fn now_timestamp() -> String {
 }
 
 #[cfg(test)]
+/// Verifies audit persistence, retention, and timestamp behavior.
 mod tests {
     use super::*;
     use tempfile::TempDir;

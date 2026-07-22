@@ -19,17 +19,21 @@ pub struct Skill {
     pub mandatory: bool,
 }
 
+/// Constructs skill collections for persona sources.
 impl SkillSet {
+    /// Constructs an empty skill collection.
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 #[cfg(test)]
+/// Verifies skill collection TOML serialization.
 mod tests {
     use super::*;
 
     #[test]
+    /// Round-trips a populated skill collection through TOML.
     fn skillset_toml_roundtrip() {
         let original = SkillSet {
             skills: vec![
@@ -54,6 +58,7 @@ mod tests {
     }
 
     #[test]
+    /// Round-trips an empty skill collection through TOML.
     fn empty_skillset_roundtrips() {
         let original = SkillSet::default();
         let serialized = toml::to_string(&original).unwrap();
@@ -62,6 +67,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserves the mandatory-skill flag through TOML serialization.
     fn skill_with_mandatory_roundtrips() {
         let original = SkillSet {
             skills: vec![Skill {

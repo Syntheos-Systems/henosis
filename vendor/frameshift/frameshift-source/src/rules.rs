@@ -46,6 +46,7 @@ pub enum Layer {
     L3,
 }
 
+/// Constructs behavioral rule collections for persona sources.
 impl RuleSet {
     /// Construct an empty `RuleSet`. Equivalent to `RuleSet::default()`.
     pub fn new() -> Self {
@@ -54,10 +55,12 @@ impl RuleSet {
 }
 
 #[cfg(test)]
+/// Verifies rule collection TOML serialization.
 mod tests {
     use super::*;
 
     #[test]
+    /// Round-trips a populated rule collection through TOML.
     fn ruleset_toml_roundtrip() {
         let original = RuleSet {
             rules: vec![
@@ -91,6 +94,7 @@ mod tests {
     }
 
     #[test]
+    /// Round-trips an empty rule collection through TOML.
     fn empty_ruleset_roundtrips() {
         let original = RuleSet::default();
         let serialized = toml::to_string(&original).unwrap();
@@ -99,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserves optional rule reasoning through TOML serialization.
     fn rule_with_reasoning_roundtrips() {
         let original = RuleSet {
             rules: vec![Rule {

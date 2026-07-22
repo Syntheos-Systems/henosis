@@ -91,6 +91,7 @@ const fn default_schema_version() -> u32 {
     1
 }
 
+/// Constructs pattern collections for persona sources.
 impl PatternSet {
     /// Constructs an empty `PatternSet` with default schema version.
     pub fn new() -> Self {
@@ -98,6 +99,7 @@ impl PatternSet {
     }
 }
 
+/// Provides an empty versioned pattern collection.
 impl Default for PatternSet {
     /// Constructs an empty `PatternSet` with `schema_version` set to `1`.
     fn default() -> Self {
@@ -112,10 +114,12 @@ impl Default for PatternSet {
 }
 
 #[cfg(test)]
+/// Verifies pattern collection TOML serialization.
 mod tests {
     use super::*;
 
     #[test]
+    /// Round-trips a populated pattern collection through TOML.
     fn pattern_set_toml_roundtrip() {
         let original = PatternSet {
             schema_version: 1,
@@ -149,6 +153,7 @@ mod tests {
     }
 
     #[test]
+    /// Round-trips an empty pattern collection through TOML.
     fn empty_pattern_set_roundtrips() {
         let original = PatternSet::default();
         let serialized = toml::to_string(&original).unwrap();

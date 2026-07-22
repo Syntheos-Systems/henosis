@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
+/// Reports persona-source loading, parsing, validation, and serialization failures.
 pub enum SourceError {
     #[error("i/o error at {path}: {source}")]
     Io {

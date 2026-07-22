@@ -291,6 +291,7 @@ pub fn relatedness(a: Intent, b: Intent) -> f32 {
 }
 
 #[cfg(test)]
+/// Verifies token classification and intent-relatedness scoring.
 mod tests {
     use super::*;
 

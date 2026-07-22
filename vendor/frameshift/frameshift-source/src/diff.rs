@@ -227,6 +227,7 @@ fn anchor_token_set(anchors: &[CascadeAnchor]) -> HashSet<String> {
 }
 
 #[cfg(test)]
+/// Verifies semantic persona-source diff generation.
 mod tests {
     use super::*;
     use crate::patterns::PatternSet;

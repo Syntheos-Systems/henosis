@@ -250,6 +250,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result<()>
 pub(crate) struct BagOfWordsEmbedder;
 
 #[cfg(test)]
+/// Produces deterministic test embeddings with a bag-of-words model.
 impl Embedder for BagOfWordsEmbedder {
     /// Embed `text` as a 64-dimensional word-occurrence histogram.
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -270,6 +271,7 @@ impl Embedder for BagOfWordsEmbedder {
 }
 
 #[cfg(test)]
+/// Verifies embedding similarity and cache behavior.
 mod tests {
     use super::*;
 
@@ -313,6 +315,7 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    /// Constructs and inspects the embedder used to count cache misses.
     impl CountingEmbedder {
         /// Fresh counter around the bag-of-words mock.
         fn new() -> Self {
@@ -328,6 +331,7 @@ mod tests {
         }
     }
 
+    /// Counts each delegated embedding operation.
     impl Embedder for CountingEmbedder {
         /// Delegate to the mock, counting the call.
         fn embed(&self, text: &str) -> Vec<f32> {

@@ -696,6 +696,7 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+/// Verifies project-context collection and tokenization behavior.
 mod tests {
     use super::*;
     use std::fs;

@@ -71,6 +71,7 @@ pub enum AnchorPosition {
     Recency,
 }
 
+/// Converts anchor positions to their serialized persona-source representation.
 impl AnchorPosition {
     /// Returns the lowercase string key used as the `position` field in
     /// `CascadeAnchor` TOML entries (e.g. `"top"`, `"l2"`, `"recency"`).

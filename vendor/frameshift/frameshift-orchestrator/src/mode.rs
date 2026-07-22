@@ -38,6 +38,7 @@ pub struct ModeState {
     pub sensitivity: f32,
 }
 
+/// Loads and persists the operator's automate-mode state.
 impl ModeState {
     /// Load mode state from a JSON file.
     ///
@@ -66,6 +67,7 @@ impl ModeState {
 }
 
 #[cfg(test)]
+/// Verifies mode-state defaults and persistence.
 mod tests {
     use super::*;
     use tempfile::TempDir;

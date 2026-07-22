@@ -47,6 +47,7 @@ pub struct SwitchPolicy {
     pub min_gap_fraction: f32,
 }
 
+/// Maps operator sensitivity into concrete switching thresholds.
 impl SwitchPolicy {
     /// Construct a SwitchPolicy from a user-facing sensitivity value in [0.0, 1.0].
     ///
@@ -71,6 +72,7 @@ impl SwitchPolicy {
     }
 }
 
+/// Provides balanced switching thresholds as the default policy.
 impl Default for SwitchPolicy {
     /// Returns the default policy from sensitivity 0.5 (balanced).
     fn default() -> Self {
@@ -117,6 +119,7 @@ pub struct SwitchController {
     challenger: Option<String>,
 }
 
+/// Controls automate-mode transitions and persona-switch hysteresis.
 impl SwitchController {
     /// Create a new `SwitchController` in the `Off` state with the given policy.
     pub fn new(policy: SwitchPolicy) -> Self {
@@ -371,6 +374,7 @@ impl SwitchController {
 }
 
 #[cfg(test)]
+/// Verifies controller state transitions, thresholds, and debounce behavior.
 mod tests {
     use super::*;
     use crate::policy::ScoreComponents;

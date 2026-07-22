@@ -1,7 +1,7 @@
 # Vendored FrameShift persona crates
 
 Mode: PRISTINE
-Pin: f2a5315efb2d04f11ebdae71c09dc894e7eb22f0
+Pin: 1a96331867006d37e5decd1280b4cdb3ae28706f
 Upstream: frameshift
 Mirror: frameshift-source=crates/frameshift-source
 Mirror: frameshift-orchestrator=crates/frameshift-orchestrator
