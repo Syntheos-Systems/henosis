@@ -2,6 +2,10 @@
 name = "synapse-tui"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal user interface for Synapse sessions."
 
 [[bin]]
 name = "synapse-tui"

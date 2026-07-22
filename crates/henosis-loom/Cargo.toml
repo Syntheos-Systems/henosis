@@ -2,6 +2,7 @@
 name = "henosis-loom"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Loom: the workflow-orchestration kernel service, extracted onto syntheos-contracts + in-process Axon."

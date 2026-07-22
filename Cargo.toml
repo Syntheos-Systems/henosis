@@ -45,8 +45,9 @@ exclude = ["vendor/kleos", "vendor/frameshift", "vendor/sqlx", "vendor/sqlx-macr
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.88"
 license = "Elastic-2.0"
-repository = "https://github.com/Syntheos-Systems/syntheos-os"
+repository = "https://github.com/Syntheos-Systems/henosis"
 
 [workspace.dependencies]
 axum = "0.8"

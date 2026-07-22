@@ -2,9 +2,10 @@
 name = "henosis-pistis"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pistis: the capability authority for the dispatcher's pistis gate slot -- ed25519 admission, room-materialized trust math, and fail-closed capability authorization. An independent snapshot of the GhostFrame/pistis decision core, reworked onto the principal model."
+description = "Pistis capability authority for ed25519 admission, room-materialized trust, and fail-closed authorization on the Henosis principal model."
 
 [dependencies]
 # Gate/GateDecision/GateRequest contract plus PrincipalId/RequestContext/TypedEvent.

@@ -2,6 +2,7 @@
 name = "henosis-soma"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Soma: the agent presence + quality kernel service, extracted onto syntheos-contracts + in-process Axon."

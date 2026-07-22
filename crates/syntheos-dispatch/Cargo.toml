@@ -2,6 +2,7 @@
 name = "syntheos-dispatch"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Unified action dispatcher: runs the authorization gate chain, executes, and emits lifecycle events."

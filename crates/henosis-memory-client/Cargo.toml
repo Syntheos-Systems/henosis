@@ -2,6 +2,7 @@
 name = "henosis-memory-client"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Transitional HTTP client + Ed25519 request signer for Synapse's memory/coordination access during absorption. Software-key only (no PIV/YubiKey); retired when in-process kernel dispatch lands."

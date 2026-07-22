@@ -1,9 +1,8 @@
 //! Pistis: the capability authority behind the dispatcher's `pistis` gate slot.
 //!
-//! An independent, copy-and-own snapshot of the `GhostFrame/pistis` decision
-//! core, reworked onto the Henosis principal model. Pistis stays a standalone
-//! project; Henosis owns this snapshot of the authorization math the same way it
-//! absorbed Eidolon and Phylax.
+//! Henosis owns this copy of the proprietary Pistis decision core, reworked onto
+//! the principal model. The standalone Pistis service remains separately
+//! maintained, and this workspace does not depend on its repository.
 //!
 //! What lives here is the *decision* core: ed25519 admission identity
 //! ([`crypto`]), the capability + trust-input taxonomy ([`model`]), a focused

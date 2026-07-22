@@ -5,6 +5,10 @@
 name = "henosis-rift"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Human approval gate backed by Rift."
 
 [dependencies]
 syntheos-contracts = { path = "../syntheos-contracts" }

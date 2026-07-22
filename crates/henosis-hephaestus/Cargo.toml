@@ -3,7 +3,7 @@
 name = "henosis-hephaestus"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 description = "Stateful agent executor for henosis"
 license = "Elastic-2.0"
 

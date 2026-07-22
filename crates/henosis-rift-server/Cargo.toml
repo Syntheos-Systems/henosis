@@ -4,6 +4,10 @@
 name = "henosis-rift-server"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rift room, message, membership, WebSocket, and approval server."
 
 [dependencies]
 # Web framework

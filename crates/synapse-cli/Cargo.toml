@@ -2,6 +2,10 @@
 name = "synapse-cli"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line client for persistent provider-backed agent sessions."
 
 [[bin]]
 name = "synapse"

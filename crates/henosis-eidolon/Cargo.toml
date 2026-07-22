@@ -2,6 +2,7 @@
 name = "henosis-eidolon"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Eidolon: the policy authority for the dispatcher's eidolon gate slot -- prompt-injection, persona-drift, and scope-violation checks."

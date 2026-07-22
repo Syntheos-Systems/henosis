@@ -39,7 +39,9 @@ Install the integrated Henosis server from the current source checkout.
 
 Database:
   On a fresh interactive install, the Postgres URL is requested without echo.
-  For automation, pass --postgres-url URL or set SYNTHEOS_PLUTUS_DB.
+  For automation, set SYNTHEOS_PLUTUS_DB.
+  The --postgres-url option exposes the URL in process listings and may save it
+  in shell history.
 
 Options:
   --binary PATH         Install a prebuilt syntheos-server instead of building.

@@ -63,7 +63,7 @@ The default `syntheos-server` build excludes the vendored Kleos machine-learning
 The installer supports Linux and installs `syntheos-server` as a systemd user service. A source
 install needs:
 
-- Git, a Rust toolchain, Cargo, and OpenSSL
+- Git, Rust 1.88 or newer, Cargo, OpenSSL, and ripgrep
 - A reachable PostgreSQL database for the Plutus authority
 - `curl` or `wget` for the startup health check
 - A systemd user manager, unless you pass `--no-service`
@@ -139,7 +139,7 @@ authority chain remains part of the product security model.
 
 | Area | Choices or interface | Status |
 |------|----------------------|--------|
-| Synapse models | Anthropic, OpenAI-compatible endpoints, Ollama, Azure OpenAI, OpenCode Zen, OpenAI Codex, Palantir Foundry, and Claude Max | Selected at runtime |
+| Synapse models | Anthropic, custom OpenAI-compatible proxies, Ollama, Azure OpenAI, OpenCode Zen, OpenAI Codex, Palantir Foundry, and Claude Max | Selected at runtime |
 | Hephaestus models | Anthropic or an OpenAI-compatible endpoint such as OpenAI, Ollama, Azure, or OpenRouter | Selected through environment configuration |
 | Rift embeddings | OpenAI-compatible HTTP, shared in-process Kleos bge-m3, or token overlap | Runtime and feature configuration |
 | Rift memory | External Kleos HTTP or in-process Cognition | External by default; embedded with the `cognition` feature |
@@ -190,7 +190,7 @@ cargo build --locked -p syntheos-server --features cognition
 ```
 
 The Cognition build compiles the vendored Kleos machine-learning and vector-search dependencies.
-Run the repository checks with:
+The stub scan requires ripgrep. Run the repository checks with:
 
 ```sh
 cargo fmt --all --check
