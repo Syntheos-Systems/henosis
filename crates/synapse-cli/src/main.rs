@@ -407,10 +407,7 @@ async fn run_event_loop(
                 turn_usd,
                 session_total_usd,
             } => {
-                print!(
-                    " {GREEN}[turn ${:.4} | session ${:.4}]{RESET}",
-                    turn_usd, session_total_usd
-                );
+                print!(" {GREEN}[turn ${turn_usd:.4} | session ${session_total_usd:.4}]{RESET}");
                 log_usage(
                     session_store.as_deref(),
                     session_id,
@@ -1394,7 +1391,8 @@ async fn main() -> anyhow::Result<()> {
                                 })
                                 .collect();
                             prompt_builder.with_skill_index(&entries);
-                            eprintln!(" {DIM}{} skills{RESET}", skills.len());
+                            let skill_count = skills.len();
+                            eprintln!(" {DIM}{skill_count} skills{RESET}");
                         } else {
                             eprintln!(" {DIM}none{RESET}");
                         }
@@ -2801,7 +2799,7 @@ async fn probe_models(base_url: &str, bearer: Option<&str>, is_ollama: bool) -> 
         .unwrap();
     let mut req = client.get(&url);
     if let Some(key) = bearer {
-        req = req.header("Authorization", format!("Bearer {}", key));
+        req = req.header("Authorization", format!("Bearer {key}"));
     }
     match req.send().await {
         Ok(resp) => {
@@ -2864,7 +2862,7 @@ async fn probe_chat(base_url: &str, key: &str) -> bool {
         .unwrap();
     match client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", key))
+        .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -2915,7 +2913,7 @@ async fn probe_responses(base_url: &str, key: &str, model: &str) -> bool {
         .unwrap();
     match client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", key))
+        .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
