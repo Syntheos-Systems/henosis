@@ -4,5 +4,3 @@
 .env
 .DS_Store
 /data
-.agent-scratch/
-/.claude/
