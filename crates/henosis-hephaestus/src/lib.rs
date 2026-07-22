@@ -23,13 +23,21 @@ pub mod tasks;
 
 use std::sync::Arc;
 
-use axum::{routing::get, routing::post, Json, Router};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::{Json, Router, routing::get, routing::post};
+use hmac::{Hmac, Mac};
 use serde_json::json;
+use sha2::Sha256;
 use tracing::info;
 
 pub use clients::Clients;
 pub use config::Config;
-pub use tasks::{run_task_to_completion, AppState, CreateTaskBody, TaskRecord, TaskStatus, TaskStore};
+pub use tasks::{
+    AppState, CreateTaskBody, TaskRecord, TaskStatus, TaskStore, run_task_to_completion,
+};
 
 /// Canonical service name used in logs, health responses, and version output.
 pub const SERVICE: &str = "hephaestus";
@@ -37,17 +45,65 @@ pub const SERVICE: &str = "hephaestus";
 /// Crate version forwarded from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Build the axum Router for the public API. Exposed for tests so they can
-/// drive the full request path against an in-process server.
-pub fn build_router(state: AppState) -> Router {
-    Router::new()
+/// HMAC type used to compare inbound service tokens without string equality.
+type HmacSha256 = Hmac<Sha256>;
+
+/// Build the axum router with public liveness routes and authenticated task control.
+pub fn build_router(state: AppState, api_token: String) -> Router {
+    let public = Router::new()
         .route("/health", get(health))
-        .route("/version", get(version))
+        .route("/version", get(version));
+    let protected = Router::new()
         .route("/tasks", post(tasks::create_task))
         .route("/tasks/{id}", get(tasks::get_task))
         .route("/tasks/{id}/resume", post(tasks::resume_task))
         .route("/tasks/{id}/stream", get(streaming::stream_task))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(api_token, require_api_token));
+
+    public.merge(protected).with_state(state)
+}
+
+/// Reject task-control requests without the configured service credential.
+async fn require_api_token(
+    State(expected): State<String>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if authorize_api_token(request.headers(), &expected) {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+    )
+        .into_response()
+}
+
+/// Validate one Authorization header against the configured service token.
+fn authorize_api_token(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+
+    api_token_matches(expected, presented)
+}
+
+/// Compare service credentials through fixed-size HMAC tags.
+fn api_token_matches(expected: &str, presented: &str) -> bool {
+    let mut presented_mac =
+        HmacSha256::new_from_slice(presented.as_bytes()).expect("HMAC accepts any key length");
+    presented_mac.update(b"henosis-hephaestus-inbound-api-token");
+    let presented_tag = presented_mac.finalize().into_bytes();
+
+    let mut expected_mac =
+        HmacSha256::new_from_slice(expected.as_bytes()).expect("HMAC accepts any key length");
+    expected_mac.update(b"henosis-hephaestus-inbound-api-token");
+    expected_mac.verify_slice(&presented_tag).is_ok()
 }
 
 /// Construct the AppState used by the binary and tests.
@@ -68,7 +124,9 @@ pub async fn recover_in_flight_tasks(state: &AppState) -> usize {
     let mut resumed = 0usize;
     let mut seen = std::collections::HashSet::<String>::new();
     for mem in recoverable {
-        let Some(rec) = parse_task_record(&mem) else { continue };
+        let Some(rec) = parse_task_record(&mem) else {
+            continue;
+        };
         if !seen.insert(rec.id.clone()) {
             continue;
         }
@@ -104,4 +162,41 @@ async fn health() -> Json<serde_json::Value> {
 /// version string from `Cargo.toml`.
 async fn version() -> Json<serde_json::Value> {
     Json(json!({ "name": SERVICE, "version": VERSION }))
+}
+
+#[cfg(test)]
+/// Tests for standalone request authentication.
+mod authentication_tests {
+    use super::*;
+
+    /// Missing, malformed, and incorrect credentials fail authentication.
+    #[test]
+    fn rejects_invalid_authorization_headers() {
+        let expected = "hephaestus-api-token-that-is-at-least-32-bytes";
+        let mut headers = HeaderMap::new();
+        assert!(!authorize_api_token(&headers, expected));
+
+        headers.insert(header::AUTHORIZATION, "not-bearer".parse().unwrap());
+        assert!(!authorize_api_token(&headers, expected));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer hephaestus-api-token-that-is-at-least-32-byteS"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!authorize_api_token(&headers, expected));
+    }
+
+    /// The exact configured credential authenticates successfully.
+    #[test]
+    fn accepts_exact_authorization_token() {
+        let expected = "hephaestus-api-token-that-is-at-least-32-bytes";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {expected}").parse().unwrap(),
+        );
+        assert!(authorize_api_token(&headers, expected));
+    }
 }

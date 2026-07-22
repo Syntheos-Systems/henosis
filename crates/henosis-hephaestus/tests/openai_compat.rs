@@ -15,6 +15,9 @@ use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Service credential used by the isolated HTTP acceptance server.
+const API_TOKEN: &str = "hephaestus-api-token-that-is-at-least-32-bytes";
+
 /// Bundle of mocked upstream services used by the OpenAI-compat test.
 /// Same coordination services as the Anthropic harness; only the LLM
 /// endpoint shape differs.
@@ -139,13 +142,26 @@ impl Mocks {
 /// URL plus the AppState (so the test can inspect the StreamHub).
 async fn spawn_app(cfg: Config) -> (String, henosis_hephaestus::AppState) {
     let state = build_state(cfg);
-    let router = build_router(state.clone());
+    let router = build_router(state.clone(), API_TOKEN.to_string());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         axum::serve(listener, router).await.ok();
     });
     (format!("http://{addr}"), state)
+}
+
+/// Build an HTTP client that authenticates to the isolated task-control surface.
+fn authenticated_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {API_TOKEN}").parse().unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }
 
 /// Poll GET /tasks/{id} until it reaches the target status or the timeout
@@ -156,7 +172,7 @@ async fn poll_status(
     target: TaskStatus,
     timeout: Duration,
 ) -> Option<Value> {
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let r = client
@@ -216,7 +232,7 @@ async fn openai_compat_happy_path() {
         .await;
 
     let (base, _state) = spawn_app(mocks.config()).await;
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
 
     let r = client
         .post(format!("{base}/tasks"))

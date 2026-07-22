@@ -1,6 +1,7 @@
 //! Runtime configuration loaded from environment variables. Every field has a
 //! documented default so the service can start with minimal configuration.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -116,6 +117,73 @@ pub struct Config {
     pub provider_api_key: Option<String>,
 }
 
+/// Validated network and authentication settings for the standalone server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    /// Socket address that the standalone server may bind.
+    pub listen_addr: SocketAddr,
+    /// Dedicated Bearer token protecting task-control routes.
+    pub api_token: String,
+}
+
+/// Builds and validates the standalone server boundary.
+impl ServerConfig {
+    /// Load standalone settings from the environment and reject unsafe values.
+    pub fn from_env(port: u16, provider_api_key: Option<&str>) -> Result<Self, String> {
+        let raw_addr =
+            std::env::var("HEPHAESTUS_LISTEN_ADDR").unwrap_or_else(|_| format!("127.0.0.1:{port}"));
+        let api_token = std::env::var("HEPHAESTUS_API_TOKEN")
+            .map_err(|_| "HEPHAESTUS_API_TOKEN is required for the standalone server")?;
+        let allow_insecure_remote =
+            std::env::var("HEPHAESTUS_ALLOW_INSECURE_REMOTE").as_deref() == Ok("1");
+        Self::validate(
+            &raw_addr,
+            api_token,
+            allow_insecure_remote,
+            provider_api_key,
+        )
+    }
+
+    /// Validate explicit values so startup and regression tests share one policy.
+    fn validate(
+        raw_addr: &str,
+        api_token: String,
+        allow_insecure_remote: bool,
+        provider_api_key: Option<&str>,
+    ) -> Result<Self, String> {
+        let listen_addr = raw_addr
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid HEPHAESTUS_LISTEN_ADDR '{raw_addr}': {error}"))?;
+        if !listen_addr.ip().is_loopback() && !allow_insecure_remote {
+            return Err(format!(
+                "refusing non-loopback HEPHAESTUS_LISTEN_ADDR {listen_addr}; set HEPHAESTUS_ALLOW_INSECURE_REMOTE=1 only behind a trusted TLS boundary"
+            ));
+        }
+        if !(32..=256).contains(&api_token.len()) {
+            return Err("HEPHAESTUS_API_TOKEN must contain 32 to 256 bytes".to_string());
+        }
+        if !api_token.is_ascii()
+            || api_token.trim() != api_token
+            || api_token.chars().any(char::is_whitespace)
+        {
+            return Err(
+                "HEPHAESTUS_API_TOKEN must contain only non-whitespace ASCII characters"
+                    .to_string(),
+            );
+        }
+        if provider_api_key == Some(api_token.as_str()) {
+            return Err(
+                "HEPHAESTUS_API_TOKEN must be distinct from HEPHAESTUS_PROVIDER_KEY".to_string(),
+            );
+        }
+
+        Ok(Self {
+            listen_addr,
+            api_token,
+        })
+    }
+}
+
 /// Implements the behavior exposed by Config.
 impl Config {
     /// Load all configuration from environment variables. Every field has a
@@ -200,4 +268,51 @@ impl Config {
 /// empty. Used throughout `Config::from_env` for URL and string fields.
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+/// Tests for standalone-server security configuration.
+mod server_config_tests {
+    use super::*;
+
+    /// Produce a valid service token for boundary tests.
+    fn token() -> String {
+        "hephaestus-api-token-that-is-at-least-32-bytes".to_string()
+    }
+
+    /// Loopback listeners are accepted without a remote acknowledgement.
+    #[test]
+    fn accepts_loopback_listener() {
+        let server = ServerConfig::validate("[::1]:4700", token(), false, None).unwrap();
+        assert!(server.listen_addr.ip().is_loopback());
+    }
+
+    /// Wildcard listeners fail closed unless the exact acknowledgement is present.
+    #[test]
+    fn remote_listener_requires_acknowledgement() {
+        assert!(ServerConfig::validate("0.0.0.0:4700", token(), false, None).is_err());
+        assert!(ServerConfig::validate("0.0.0.0:4700", token(), true, None).is_ok());
+    }
+
+    /// Weak, oversized, non-ASCII, whitespace-bearing, and reused tokens are rejected.
+    #[test]
+    fn rejects_unsafe_service_tokens() {
+        assert!(ServerConfig::validate("127.0.0.1:4700", "short".into(), false, None).is_err());
+        assert!(ServerConfig::validate("127.0.0.1:4700", "x".repeat(257), false, None).is_err());
+        assert!(
+            ServerConfig::validate(
+                "127.0.0.1:4700",
+                "token with whitespace that is long enough".into(),
+                false,
+                None,
+            )
+            .is_err()
+        );
+        assert!(ServerConfig::validate("127.0.0.1:4700", "é".repeat(32), false, None).is_err());
+        let reused = token();
+        assert!(
+            ServerConfig::validate("127.0.0.1:4700", reused.clone(), false, Some(&reused),)
+                .is_err()
+        );
+    }
 }

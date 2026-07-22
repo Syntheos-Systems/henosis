@@ -2,14 +2,15 @@
 //! Wires configuration from environment variables, recovers in-flight tasks
 //! from Kleos checkpoints, and serves the axum HTTP API until shutdown.
 
-use std::net::SocketAddr;
-
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use henosis_hephaestus::{build_router, build_state, recover_in_flight_tasks, Config, SERVICE, VERSION};
+use henosis_hephaestus::config::ServerConfig;
+use henosis_hephaestus::{
+    Config, SERVICE, VERSION, build_router, build_state, recover_in_flight_tasks,
+};
 
 /// Main entry point. Initialises tracing, loads config from environment,
 /// recovers in-flight tasks, binds the HTTP listener, and serves until
@@ -23,15 +24,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = Config::from_env();
-    let port = cfg.port;
+    let server = ServerConfig::from_env(cfg.port, cfg.provider_api_key.as_deref())
+        .map_err(std::io::Error::other)?;
     let state = build_state(cfg);
 
     let resumed = recover_in_flight_tasks(&state).await;
     info!("resumed {resumed} task(s) from Kleos checkpoints");
 
-    let app = build_router(state);
+    let app = build_router(state, server.api_token);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = server.listen_addr;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("failed to bind {addr}: {e}"))?;

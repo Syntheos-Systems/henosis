@@ -12,12 +12,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use henosis_hephaestus::{build_router, build_state, recover_in_flight_tasks, tasks::TaskStatus, Config};
-use serde_json::{json, Value};
+use henosis_hephaestus::{
+    Config, CreateTaskBody, build_router, build_state, recover_in_flight_tasks,
+    run_task_to_completion, tasks::TaskStatus,
+};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Service credential used by the isolated HTTP acceptance server.
+const API_TOKEN: &str = "hephaestus-api-token-that-is-at-least-32-bytes";
 
 // -- mock harness ------------------------------------------------------------
 
@@ -93,12 +99,9 @@ impl Mocks {
         // Tempdir + dev credentials file.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cred = tmp.path().join("credentials.json");
-        tokio::fs::write(
-            &cred,
-            br#"{"claudeAiOauth":{"accessToken":"test-token"}}"#,
-        )
-        .await
-        .expect("cred write");
+        tokio::fs::write(&cred, br#"{"claudeAiOauth":{"accessToken":"test-token"}}"#)
+            .await
+            .expect("cred write");
 
         Self {
             anthropic,
@@ -157,13 +160,26 @@ fn path_regex(re: &str) -> wiremock::matchers::PathRegexMatcher {
 /// URL and AppState so tests can drive it via HTTP and inspect state.
 async fn spawn_app(cfg: Config) -> (String, henosis_hephaestus::AppState) {
     let state = build_state(cfg);
-    let router = build_router(state.clone());
+    let router = build_router(state.clone(), API_TOKEN.to_string());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         axum::serve(listener, router).await.ok();
     });
     (format!("http://{addr}"), state)
+}
+
+/// Build an HTTP client that authenticates to the isolated task-control surface.
+fn authenticated_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {API_TOKEN}").parse().unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }
 
 /// Poll `GET /tasks/{task_id}` until the task reaches `target` status or the
@@ -174,7 +190,7 @@ async fn poll_status(
     target: TaskStatus,
     timeout: Duration,
 ) -> Option<Value> {
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let r = client
@@ -233,6 +249,63 @@ fn assistant_end_turn(text: &str) -> Value {
     })
 }
 
+/// Task-control routes reject unauthenticated callers while liveness remains public.
+#[tokio::test]
+async fn task_routes_require_service_authentication() {
+    let mocks = Mocks::new().await;
+    let (base, _state) = spawn_app(mocks.config()).await;
+    let client = reqwest::Client::new();
+
+    let rejected = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({"input": "must not run"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+}
+
+/// The in-process completion entry point performs one provider execution pass.
+#[tokio::test]
+async fn in_process_task_executes_once() {
+    let mocks = Mocks::new().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(assistant_end_turn("once")))
+        .mount(&mocks.anthropic)
+        .await;
+
+    let state = build_state(mocks.config());
+    let record = run_task_to_completion(
+        state,
+        CreateTaskBody {
+            agent: None,
+            project: None,
+            title: Some("exactly-once".to_string()),
+            tenant_id: None,
+            system: None,
+            input: "execute once".to_string(),
+            verify_command: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.status, TaskStatus::Completed);
+
+    let provider_calls = mocks
+        .anthropic
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/messages")
+        .count();
+    assert_eq!(provider_calls, 1);
+}
+
 // -- Test 1: 3-step loop -----------------------------------------------------
 
 /// Full agent loop: first turn calls a Hermes tool, second turn ends.
@@ -265,7 +338,7 @@ async fn happy_path_three_step_loop() {
     // a tool_result and then ends the turn normally.
 
     let (base, _state) = spawn_app(mocks.config()).await;
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
 
     let r = client
         .post(format!("{base}/tasks"))
@@ -280,9 +353,14 @@ async fn happy_path_three_step_loop() {
         .and_then(|s| s.as_str())
         .expect("task_id");
 
-    let final_state = poll_status(&base, task_id, TaskStatus::Completed, Duration::from_secs(5))
-        .await
-        .expect("task did not reach Completed");
+    let final_state = poll_status(
+        &base,
+        task_id,
+        TaskStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("task did not reach Completed");
     assert_eq!(
         final_state.get("output").and_then(|s| s.as_str()),
         Some("thinking...done")
@@ -310,7 +388,10 @@ async fn happy_path_three_step_loop() {
         .into_iter()
         .filter(|r| r.url.path() == "/v1/messages")
         .count();
-    assert!(llm_hits >= 2, "expected >=2 anthropic calls, got {llm_hits}");
+    assert!(
+        llm_hits >= 2,
+        "expected >=2 anthropic calls, got {llm_hits}"
+    );
 }
 
 // -- Test 2: HITL pause + resume --------------------------------------------
@@ -324,10 +405,12 @@ async fn hitl_pause_and_resume() {
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(assistant_with_tool(
-            "ask_human",
-            json!({"question": "ok to proceed?"}),
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(assistant_with_tool(
+                "ask_human",
+                json!({"question": "ok to proceed?"}),
+            )),
+        )
         .up_to_n_times(1)
         .mount(&mocks.anthropic)
         .await;
@@ -338,7 +421,7 @@ async fn hitl_pause_and_resume() {
         .await;
 
     let (base, _state) = spawn_app(mocks.config()).await;
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
 
     let r = client
         .post(format!("{base}/tasks"))
@@ -366,14 +449,21 @@ async fn hitl_pause_and_resume() {
         .expect("post resume");
     assert_eq!(resume.status(), reqwest::StatusCode::OK);
 
-    let final_state = poll_status(&base, task_id, TaskStatus::Completed, Duration::from_secs(5))
-        .await
-        .expect("task did not reach Completed after resume");
-    assert!(final_state
-        .get("output")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .contains("acknowledged"));
+    let final_state = poll_status(
+        &base,
+        task_id,
+        TaskStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("task did not reach Completed after resume");
+    assert!(
+        final_state
+            .get("output")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .contains("acknowledged")
+    );
 
     // Chiasm should have been hit twice: original task create + HITL alert.
     let chiasm_hits = mocks
@@ -567,7 +657,7 @@ async fn sse_stream_emits_progress_events() {
         .await;
 
     let (base, _state) = spawn_app(mocks.config()).await;
-    let client = reqwest::Client::new();
+    let client = authenticated_client();
 
     // Submit the task first so the stream channel exists when we subscribe.
     let r = client
@@ -616,7 +706,10 @@ async fn sse_stream_emits_progress_events() {
             let event = buffer[..idx].to_string();
             buffer.drain(..idx + 2);
             for line in event.lines() {
-                if let Some(json_str) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
+                if let Some(json_str) = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                {
                     let trimmed = json_str.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -650,5 +743,11 @@ async fn sse_stream_emits_progress_events() {
     assert!(got_turn_end, "expected at least one turn_end event");
 
     // And the task itself reaches Completed.
-    let _ = poll_status(&base, &task_id, TaskStatus::Completed, Duration::from_secs(2)).await;
+    let _ = poll_status(
+        &base,
+        &task_id,
+        TaskStatus::Completed,
+        Duration::from_secs(2),
+    )
+    .await;
 }
