@@ -1232,7 +1232,7 @@ fn should_create_draft_task(consensus_text: &str) -> bool {
 fn draft_task_title(channel_name: &str, consensus_text: &str) -> String {
     let trimmed = consensus_text.trim().trim_start_matches("[AGREE]").trim();
     let compact = trimmed.chars().take(72).collect::<String>();
-    format!("[{}] {}", channel_name, compact)
+    format!("[{channel_name}] {compact}")
 }
 
 /// The room announcement for an injected stimulus: the human-readable

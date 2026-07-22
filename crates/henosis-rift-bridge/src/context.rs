@@ -40,11 +40,10 @@ pub fn build_discussion_context(
     };
 
     let system_framing = format!(
-        "{}{}\n\nYou are {} in the #{} channel.\n\
-         Other team members: {}\n\
+        "{system_prompt}{persona_framing}\n\nYou are {agent_name} in the #{channel_name} channel.\n\
+         Other team members: {team_list}\n\
          Respond concisely. If you have nothing to add, say exactly: [PASS]\n\
-         If you agree with the current consensus, include [AGREE] in your message.{}",
-        system_prompt, persona_framing, agent_name, channel_name, team_list, growth_framing
+         If you agree with the current consensus, include [AGREE] in your message.{growth_framing}"
     );
 
     let messages = recent_messages
@@ -96,7 +95,7 @@ pub fn to_cli_prompt(ctx: &DiscussionContext) -> String {
     }
 
     if let Some(tasks) = &ctx.active_tasks_summary {
-        parts.push(format!("\n--- Active tasks ---\n{}\n---", tasks));
+        parts.push(format!("\n--- Active tasks ---\n{tasks}\n---"));
     }
 
     parts.join("\n")

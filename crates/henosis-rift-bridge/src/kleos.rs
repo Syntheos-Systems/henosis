@@ -998,7 +998,7 @@ pub fn build_memory_query(channel: &str, recent_messages: &[(&str, &str)]) -> St
         .map(|(_, text)| *text)
         .collect::<Vec<_>>()
         .join(" ");
-    format!("#{} {}", channel, joined)
+    format!("#{channel} {joined}")
 }
 
 /// Collapse active task rows into one compact executor-facing summary string.

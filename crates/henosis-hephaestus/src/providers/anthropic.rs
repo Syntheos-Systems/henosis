@@ -261,7 +261,7 @@ impl Provider for HephaestusAnthropicProvider {
 
             let mut es = match req_builder.eventsource() {
                 Ok(es) => es,
-                Err(e) => { yield Err(anyhow!("eventsource init: {}", e)); return; }
+                Err(e) => { yield Err(anyhow!("eventsource init: {e}")); return; }
             };
 
             while let Some(event) = es.next().await {
@@ -275,7 +275,7 @@ impl Provider for HephaestusAnthropicProvider {
                     }
                     Err(reqwest_eventsource::Error::StreamEnded) => break,
                     Err(e) => {
-                        yield Err(anyhow!("sse error: {}", e));
+                        yield Err(anyhow!("sse error: {e}"));
                         break;
                     }
                 }
@@ -328,7 +328,7 @@ fn parse_response(text: &str) -> Result<ChatResponse> {
     }
 
     let raw: AnthRespRaw =
-        serde_json::from_str(text).map_err(|e| anyhow!("parse anthropic response: {}", e))?;
+        serde_json::from_str(text).map_err(|e| anyhow!("parse anthropic response: {e}"))?;
 
     let mut content = Vec::new();
     if let Some(blocks) = raw.content {
