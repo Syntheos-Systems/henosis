@@ -373,8 +373,7 @@ mod tests {
         let result = resolve_api_key("no-phylaxd-slot-unique-xyz").await;
         assert!(
             matches!(result, Err(CredError::NoAgentKey)),
-            "expected NoAgentKey, got {:?}",
-            result
+            "expected NoAgentKey, got {result:?}"
         );
     }
 
