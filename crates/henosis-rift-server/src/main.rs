@@ -1,3 +1,5 @@
+//! Standalone Rift HTTP and WebSocket server entry point.
+
 use axum::{
     extract::{
         ws::WebSocketUpgrade,
@@ -24,6 +26,9 @@ use henosis_rift_server::{config, routes, ws};
 use config::Config;
 use routes::upload::PendingUploads;
 use ws::gateway::Gateway;
+
+/// Maximum accepted WebSocket message and frame size.
+const MAX_WEBSOCKET_BYTES: usize = 64 * 1024;
 
 /// Shared application state
 #[derive(Clone)]
@@ -252,7 +257,9 @@ async fn ws_handler(
     let jwt_secret = state.config.jwt_secret.clone();
     let gateway = state.gateway.clone();
     let pool = state.pool.clone();
-    ws.on_upgrade(move |socket| async move {
-        gateway.handle_connection(socket, jwt_secret, pool).await;
-    })
+    ws.max_message_size(MAX_WEBSOCKET_BYTES)
+        .max_frame_size(MAX_WEBSOCKET_BYTES)
+        .on_upgrade(move |socket| async move {
+            gateway.handle_connection(socket, jwt_secret, pool).await;
+        })
 }
