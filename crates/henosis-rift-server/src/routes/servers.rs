@@ -15,6 +15,7 @@ use crate::models::role::Role;
 use crate::models::server::{CreateInviteRequest, CreateServerRequest, Invite, Server, UpdateServerRequest};
 use crate::models::user::PublicUser;
 
+/// Server response enriched with its visible channels and roles.
 #[derive(Serialize)]
 pub struct ServerWithChannels {
     #[serde(flatten)]
@@ -23,6 +24,7 @@ pub struct ServerWithChannels {
     pub roles: Vec<Role>,
 }
 
+/// Public member details returned by a server membership listing.
 #[derive(Serialize)]
 pub struct MemberInfo {
     pub user: PublicUser,
@@ -250,12 +252,18 @@ pub async fn delete_invite(
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_permission(&pool, server_id, auth.user_id, perms::MANAGE_INVITES).await?;
 
+    let invite = db::get_invite(&pool, &code)
+        .await?
+        .ok_or(AppError::NotFound("Invite not found".into()))?;
+    require_invite_server(invite.server_id, server_id)?;
+
     db::delete_invite(&pool, &code).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ─── Helpers ───
 
+/// Reject callers that are not members of the requested server.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
     if !db::is_member(pool, server_id, user_id).await? {
         return Err(AppError::Forbidden);
@@ -263,6 +271,7 @@ async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result
     Ok(())
 }
 
+/// Reject members that lack the requested permission in the server.
 async fn require_permission(
     pool: &PgPool,
     server_id: Uuid,
@@ -277,6 +286,15 @@ async fn require_permission(
     Ok(())
 }
 
+/// Reject an invite code that does not belong to the server in the route path.
+fn require_invite_server(invite_server_id: Uuid, path_server_id: Uuid) -> Result<(), AppError> {
+    if invite_server_id != path_server_id {
+        return Err(AppError::NotFound("Invite not found".into()));
+    }
+    Ok(())
+}
+
+/// Generate a random URL-safe invite code.
 fn generate_invite_code() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -287,4 +305,19 @@ fn generate_invite_code() -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+/// Exercises parent-server binding for nested invite mutation routes.
+mod tests {
+    use super::require_invite_server;
+    use uuid::Uuid;
+
+    /// An invite is accepted only under its authoritative server identifier.
+    #[test]
+    fn invite_parent_must_match_route_server() {
+        let server_id = Uuid::new_v4();
+        assert!(require_invite_server(server_id, server_id).is_ok());
+        assert!(require_invite_server(server_id, Uuid::new_v4()).is_err());
+    }
 }

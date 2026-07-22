@@ -163,9 +163,15 @@ pub async fn edit_message(
     Path((channel_id, message_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<EditMessageRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
+    let channel = db::get_channel_by_id(&pool, channel_id)
+        .await?
+        .ok_or(AppError::NotFound("Channel not found".into()))?;
+    require_member(&pool, channel.server_id, auth.user_id).await?;
+
     let existing = db::get_message_by_id(&pool, message_id)
         .await?
         .ok_or(AppError::NotFound("Message not found".into()))?;
+    require_message_channel(existing.channel_id, channel_id)?;
 
     if existing.author_id != auth.user_id {
         return Err(AppError::Forbidden);
@@ -174,6 +180,11 @@ pub async fn edit_message(
     let content = req.content.trim();
     if content.is_empty() {
         return Err(AppError::BadRequest("Message cannot be empty".into()));
+    }
+    if content.len() > 4000 {
+        return Err(AppError::BadRequest(
+            "Message too long (max 4000 chars)".into(),
+        ));
     }
 
     let msg = db::update_message(&pool, message_id, content).await?;
@@ -199,15 +210,18 @@ pub async fn delete_message(
     auth: AuthUser,
     Path((channel_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let channel = db::get_channel_by_id(&pool, channel_id)
+        .await?
+        .ok_or(AppError::NotFound("Channel not found".into()))?;
+    require_member(&pool, channel.server_id, auth.user_id).await?;
+
     let existing = db::get_message_by_id(&pool, message_id)
         .await?
         .ok_or(AppError::NotFound("Message not found".into()))?;
+    require_message_channel(existing.channel_id, channel_id)?;
 
     // Author can delete own messages, or user with MANAGE_MESSAGES
     if existing.author_id != auth.user_id {
-        let channel = db::get_channel_by_id(&pool, channel_id)
-            .await?
-            .ok_or(AppError::NotFound("Channel not found".into()))?;
         require_permission(&pool, channel.server_id, auth.user_id, perms::MANAGE_MESSAGES).await?;
     }
 
@@ -226,6 +240,14 @@ pub async fn delete_message(
 }
 
 // ─── Helpers ───
+
+/// Reject a message identifier that does not belong to the channel in the route path.
+fn require_message_channel(message_channel_id: Uuid, path_channel_id: Uuid) -> Result<(), AppError> {
+    if message_channel_id != path_channel_id {
+        return Err(AppError::NotFound("Message not found".into()));
+    }
+    Ok(())
+}
 
 /// Resolve and authorize the stored message_type for a new message.
 ///
@@ -280,11 +302,20 @@ async fn require_permission(
     Ok(())
 }
 
-/// Covers the message_type resolution and authorization rules.
+/// Covers message parent binding and message-type authorization rules.
 #[cfg(test)]
 mod tests {
-    use super::resolve_message_type;
+    use super::{require_message_channel, resolve_message_type};
     use crate::error::AppError;
+    use uuid::Uuid;
+
+    /// A message is accepted only under its authoritative channel identifier.
+    #[test]
+    fn message_parent_must_match_route_channel() {
+        let channel_id = Uuid::new_v4();
+        assert!(require_message_channel(channel_id, channel_id).is_ok());
+        assert!(require_message_channel(channel_id, Uuid::new_v4()).is_err());
+    }
 
     /// An absent type infers from the author: agents post 'agent', humans 'user'.
     #[test]
