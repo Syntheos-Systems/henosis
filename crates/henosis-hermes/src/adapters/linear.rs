@@ -783,24 +783,4 @@ mod tests {
         let result = prep_request("t", &req);
         assert!(result.is_err());
     }
-
-    /// Adapter integration tests use wiremock to mock the Linear GraphQL endpoint.
-    /// These tests are behind a separate feature to avoid the default test suite
-    /// requiring network access. They are exercised by the workspace CI run.
-    #[cfg(feature = "integration-tests")]
-    mod integration {
-        use super::*;
-        use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
-
-        /// Verifies start linear mock.
-        async fn start_linear_mock(response_body: Value) -> MockServer {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/graphql"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-                .mount(&server)
-                .await;
-            server
-        }
-    }
 }
