@@ -47,6 +47,8 @@ async-trait = "0.1"
 
 # HTTP control server (approval endpoint)
 axum = "0.8"
+hmac.workspace = true
+sha2.workspace = true
 
 # Synapse agent loop engine (local development path dependency)
 synapse-core = { path = "../synapse-core" }

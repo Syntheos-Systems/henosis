@@ -22,7 +22,8 @@ async fn serve_control(port: u16, registry: ApprovalRegistry) -> (String, mpsc::
     let (tx, rx) = mpsc::channel::<PendingProposal>(8);
     let config = ControlConfig {
         bind_addr: format!("127.0.0.1:{port}"),
-        auth_token: "smoke-token".to_string(),
+        auth_token: "smoke-token-that-is-at-least-32-bytes".to_string(),
+        allow_insecure_remote: false,
     };
     tokio::spawn(async move {
         let _ = control::serve(config, registry, tx).await;
@@ -57,7 +58,7 @@ fn seed(registry: &ApprovalRegistry) -> ProposalId {
 async fn list(client: &reqwest::Client, base: &str) -> serde_json::Value {
     client
         .get(format!("{base}/control/approvals"))
-        .bearer_auth("smoke-token")
+        .bearer_auth("smoke-token-that-is-at-least-32-bytes")
         .send()
         .await
         .expect("list request")
@@ -70,7 +71,7 @@ async fn list(client: &reqwest::Client, base: &str) -> serde_json::Value {
 async fn act(client: &reqwest::Client, base: &str, id: ProposalId, action: &str) -> u16 {
     client
         .post(format!("{base}/control/approvals/{}", id.0))
-        .bearer_auth("smoke-token")
+        .bearer_auth("smoke-token-that-is-at-least-32-bytes")
         .json(&serde_json::json!({ "action": action }))
         .send()
         .await

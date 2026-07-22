@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -381,14 +382,15 @@ impl BridgeConfig {
         let content = std::fs::read_to_string(path).map_err(|e| {
             BridgeError::Config(format!("failed to read {}: {}", path.display(), e))
         })?;
-        let config: Self = toml::from_str(&content)
-            .map_err(|e| BridgeError::Config(format!("failed to parse {}: {}", path.display(), e)))?;
-        config.validate_secrets()?;
+        let config: Self = toml::from_str(&content).map_err(|e| {
+            BridgeError::Config(format!("failed to parse {}: {}", path.display(), e))
+        })?;
+        config.validate_security()?;
         Ok(config)
     }
 
-    /// Reject weak or reused Rift secrets before the bridge connects.
-    fn validate_secrets(&self) -> Result<(), BridgeError> {
+    /// Reject unsafe listener and secret settings before the bridge connects.
+    fn validate_security(&self) -> Result<(), BridgeError> {
         if self.rift.jwt_secret.len() < 32 || self.rift.bridge_secret.len() < 32 {
             return Err(BridgeError::Config(
                 "rift.jwt_secret and rift.bridge_secret must each contain at least 32 bytes"
@@ -399,6 +401,9 @@ impl BridgeConfig {
             return Err(BridgeError::Config(
                 "rift.jwt_secret and rift.bridge_secret must differ".to_string(),
             ));
+        }
+        if let Some(control) = &self.control {
+            control.validate(&[&self.rift.jwt_secret, &self.rift.bridge_secret])?;
         }
         Ok(())
     }
@@ -466,6 +471,46 @@ pub struct ControlConfig {
     pub bind_addr: String,
     /// Bearer token required on control requests.
     pub auth_token: String,
+    /// Whether a non-loopback bind is explicitly acknowledged as externally protected.
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
+}
+
+/// Implements fail-closed validation for the execution-approval boundary.
+impl ControlConfig {
+    /// Validate the listener and token, returning the parsed bind address.
+    pub fn validate(&self, reserved_secrets: &[&str]) -> Result<SocketAddr, BridgeError> {
+        let bind_addr = self.bind_addr.parse::<SocketAddr>().map_err(|error| {
+            BridgeError::Config(format!(
+                "invalid control.bind_addr {:?}: {error}",
+                self.bind_addr
+            ))
+        })?;
+        if !bind_addr.ip().is_loopback() && !self.allow_insecure_remote {
+            return Err(BridgeError::Config(format!(
+                "refusing non-loopback control.bind_addr {bind_addr}; set control.allow_insecure_remote=true only behind a trusted TLS boundary"
+            )));
+        }
+        if !(32..=256).contains(&self.auth_token.len()) {
+            return Err(BridgeError::Config(
+                "control.auth_token must contain 32 to 256 bytes".to_string(),
+            ));
+        }
+        if !self.auth_token.is_ascii()
+            || self.auth_token.trim() != self.auth_token
+            || self.auth_token.chars().any(char::is_whitespace)
+        {
+            return Err(BridgeError::Config(
+                "control.auth_token must contain only non-whitespace ASCII characters".to_string(),
+            ));
+        }
+        if reserved_secrets.contains(&self.auth_token.as_str()) {
+            return Err(BridgeError::Config(
+                "control.auth_token must differ from Rift JWT and bridge secrets".to_string(),
+            ));
+        }
+        Ok(bind_addr)
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +570,44 @@ mod tests {
         );
         assert!(config.pistis.is_none());
         assert_eq!(config.control.as_ref().unwrap().bind_addr, "127.0.0.1:3210");
+    }
+
+    /// Verifies the control boundary accepts a strong token on loopback.
+    #[test]
+    fn control_config_accepts_safe_loopback_settings() {
+        let control = super::ControlConfig {
+            bind_addr: "[::1]:3210".to_string(),
+            auth_token: "control-token-that-is-at-least-32-bytes".to_string(),
+            allow_insecure_remote: false,
+        };
+        assert!(
+            control
+                .validate(&["another-strong-secret-value-here"])
+                .is_ok()
+        );
+    }
+
+    /// Verifies remote listeners and unsafe tokens fail closed.
+    #[test]
+    fn control_config_rejects_unsafe_boundary_settings() {
+        let token = "control-token-that-is-at-least-32-bytes".to_string();
+        let mut control = super::ControlConfig {
+            bind_addr: "0.0.0.0:3210".to_string(),
+            auth_token: token.clone(),
+            allow_insecure_remote: false,
+        };
+        assert!(control.validate(&[]).is_err());
+        control.allow_insecure_remote = true;
+        assert!(control.validate(&[]).is_ok());
+        control.bind_addr = "127.0.0.1:3210".to_string();
+        control.auth_token = "weak".to_string();
+        assert!(control.validate(&[]).is_err());
+        control.auth_token = "token with whitespace that is long enough".to_string();
+        assert!(control.validate(&[]).is_err());
+        control.auth_token = "é".repeat(32);
+        assert!(control.validate(&[]).is_err());
+        control.auth_token = token.clone();
+        assert!(control.validate(&[&token]).is_err());
     }
 
     /// Verifies a legacy config without the new blocks still parses.

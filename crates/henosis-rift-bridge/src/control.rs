@@ -5,13 +5,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Sha256;
 use tokio::sync::mpsc;
 
 use crate::config::ControlConfig;
 use crate::execution::approval::{ApprovalRegistry, ProposalState};
 use crate::execution::{PendingProposal, ProposalId};
+
+/// HMAC type used to compare control credentials through fixed-size tags.
+type HmacSha256 = Hmac<Sha256>;
 
 /// JSON body for an approval action.
 #[derive(Debug, Deserialize)]
@@ -33,13 +38,18 @@ struct ControlState {
 
 /// Check the Authorization header against the configured bearer token.
 pub fn authorize(header: Option<&str>, expected: &str) -> bool {
-    match header {
-        Some(value) => value
-            .strip_prefix("Bearer ")
-            .map(|t| t == expected)
-            .unwrap_or(false),
-        None => false,
-    }
+    let Some(presented) = header.and_then(|value| value.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let mut presented_mac =
+        HmacSha256::new_from_slice(presented.as_bytes()).expect("HMAC accepts any key length");
+    presented_mac.update(b"henosis-rift-bridge-control-token");
+    let presented_tag = presented_mac.finalize().into_bytes();
+
+    let mut expected_mac =
+        HmacSha256::new_from_slice(expected.as_bytes()).expect("HMAC accepts any key length");
+    expected_mac.update(b"henosis-rift-bridge-control-token");
+    expected_mac.verify_slice(&presented_tag).is_ok()
 }
 
 /// Build the control router with the given state.
@@ -152,15 +162,16 @@ pub async fn serve(
     registry: ApprovalRegistry,
     approved_tx: mpsc::Sender<PendingProposal>,
 ) -> Result<(), crate::error::BridgeError> {
+    let bind_addr = config.validate(&[])?;
     let state = ControlState {
         registry,
         approved_tx,
         auth_token: config.auth_token.clone(),
     };
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| crate::error::BridgeError::Execution(format!("control bind failed: {e}")))?;
-    tracing::info!("control server listening on {}", config.bind_addr);
+    tracing::info!("control server listening on {bind_addr}");
     axum::serve(listener, router(state))
         .await
         .map_err(|e| crate::error::BridgeError::Execution(format!("control server error: {e}")))?;
@@ -170,7 +181,7 @@ pub async fn serve(
 /// Covers control-server request authorization and body parsing.
 #[cfg(test)]
 mod tests {
-    use super::{authorize, ControlAction};
+    use super::{ControlAction, authorize};
 
     /// Verifies a matching bearer token authorizes the request.
     #[test]
