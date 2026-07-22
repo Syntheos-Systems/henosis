@@ -259,7 +259,7 @@ impl crate::Provider for ClaudeMaxProvider {
                         match serde_json::to_value(b) {
                             Ok(v) => blocks.push(v),
                             Err(e) => {
-                                log::warn!("failed to serialize content block: {}", e);
+                                log::warn!("failed to serialize content block: {e}");
                             }
                         }
                     }
@@ -268,7 +268,7 @@ impl crate::Provider for ClaudeMaxProvider {
                     match serde_json::to_value(&content_blocks) {
                         Ok(v) => v,
                         Err(e) => {
-                            yield Err(anyhow::anyhow!("failed to serialize content: {}", e));
+                            yield Err(anyhow::anyhow!("failed to serialize content: {e}"));
                             return;
                         }
                     }
@@ -345,7 +345,7 @@ impl crate::Provider for ClaudeMaxProvider {
                     IncomingMessage::ControlRequest(cr) => {
                         let response = match cr.request {
                             ControlRequestPayload::CanUseTool { tool_name, .. } => {
-                                log::debug!("denying built-in tool request: {}", tool_name);
+                                log::debug!("denying built-in tool request: {tool_name}");
                                 OutgoingMessage::ControlResponse {
                                     response: ControlResponsePayload {
                                         subtype: "success".into(),
@@ -361,10 +361,7 @@ impl crate::Provider for ClaudeMaxProvider {
                                 server_name,
                                 message,
                             } => {
-                                log::debug!(
-                                    "handling MCP message for server: {}",
-                                    server_name
-                                );
+                                log::debug!("handling MCP message for server: {server_name}");
                                 let mcp_response = bridge.handle_jsonrpc(message).await;
                                 OutgoingMessage::ControlResponse {
                                     response: ControlResponsePayload {

@@ -40,6 +40,7 @@ struct AnthRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+/// Represents one message in Anthropic's request wire format.
 struct AnthMessage<'a> {
     role: &'static str,
     content: Vec<AnthContentBlock<'a>>,
@@ -47,6 +48,7 @@ struct AnthMessage<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Represents a typed content block in an Anthropic request.
 enum AnthContentBlock<'a> {
     Text {
         text: &'a str,
@@ -63,6 +65,7 @@ enum AnthContentBlock<'a> {
     },
 }
 
+/// Maps a provider-neutral role to Anthropic's wire role.
 fn role_str(role: &Role) -> &'static str {
     match role {
         Role::System => "user", // Anthropic doesn't have system role in messages
@@ -71,6 +74,7 @@ fn role_str(role: &Role) -> &'static str {
     }
 }
 
+/// Converts a provider-neutral request to Anthropic's wire format.
 fn build_anth_request<'a>(req: &'a ChatRequest) -> AnthRequest<'a> {
     let messages = req
         .messages
@@ -123,6 +127,7 @@ struct AnthResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Represents a typed content block in an Anthropic response.
 enum AnthResponseBlock {
     Text {
         text: String,
@@ -135,6 +140,7 @@ enum AnthResponseBlock {
 }
 
 #[derive(Debug, Deserialize)]
+/// Captures Anthropic token usage and prompt-cache accounting.
 struct AnthUsage {
     input_tokens: u32,
     output_tokens: u32,
@@ -146,6 +152,7 @@ struct AnthUsage {
     cache_creation_input_tokens: u32,
 }
 
+/// Converts an Anthropic wire response to the provider-neutral response.
 fn anth_response_to_chat(resp: AnthResponse) -> ChatResponse {
     let stop_reason = match resp.stop_reason.as_deref() {
         Some("tool_use") => StopReason::ToolUse,
@@ -200,6 +207,7 @@ pub enum AnthropicAuth {
     Bearer(String),
 }
 
+/// Provides token classification and expiration checks for Anthropic auth.
 impl AnthropicAuth {
     /// Detect auth mode from a token string.
     /// OAuth access tokens start with `sk-ant-oat01-`.
@@ -215,6 +223,7 @@ impl AnthropicAuth {
         }
     }
 
+    /// Reports whether an OAuth token is expired or near expiration.
     fn is_expired(&self) -> bool {
         match self {
             AnthropicAuth::OAuth { expires_ms, .. } if *expires_ms > 0 => {
@@ -231,6 +240,7 @@ impl AnthropicAuth {
     }
 }
 
+/// Sends chat requests to Anthropic or an Anthropic-compatible proxy.
 pub struct AnthropicProvider {
     client: reqwest::Client,
     auth: tokio::sync::RwLock<AnthropicAuth>,
@@ -240,7 +250,9 @@ pub struct AnthropicProvider {
     strip_eager_streaming: bool,
 }
 
+/// Provides constructors, endpoint selection, and authentication helpers.
 impl AnthropicProvider {
+    /// Creates a provider from an Anthropic API key or detectable OAuth token.
     pub fn new(client: reqwest::Client, api_key: String) -> Self {
         Self {
             client,
@@ -250,6 +262,7 @@ impl AnthropicProvider {
         }
     }
 
+    /// Creates a provider with explicit OAuth credentials and expiration.
     pub fn new_oauth(
         client: reqwest::Client,
         access_token: String,
@@ -304,10 +317,10 @@ impl AnthropicProvider {
         let builder = match &*auth {
             AnthropicAuth::ApiKey(key) => builder.header("x-api-key", key),
             AnthropicAuth::OAuth { access_token, .. } => builder
-                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .header("anthropic-beta", ANTHROPIC_BETA),
             AnthropicAuth::Bearer(token) => {
-                builder.header("Authorization", format!("Bearer {}", token))
+                builder.header("Authorization", format!("Bearer {token}"))
             }
         };
         Ok(builder
@@ -347,7 +360,7 @@ impl AnthropicProvider {
                     };
                 }
                 Err(e) => {
-                    log::warn!("failed to refresh Anthropic OAuth token: {}", e);
+                    log::warn!("failed to refresh Anthropic OAuth token: {e}");
                     // Try to re-read from OpenCode auth.json as fallback
                     if let Some((access, refresh_tok, expires)) = load_opencode_anthropic_token() {
                         *auth = AnthropicAuth::OAuth {
@@ -366,8 +379,10 @@ impl AnthropicProvider {
     }
 }
 
+/// Implements synchronous and streaming chat requests for Anthropic.
 #[async_trait]
 impl Provider for AnthropicProvider {
+    /// Sends a non-streaming chat completion request.
     async fn send(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let mut req = request.clone();
         if self.strip_eager_streaming {
@@ -387,14 +402,15 @@ impl Provider for AnthropicProvider {
             let text = resp
                 .text()
                 .await
-                .unwrap_or_else(|e| format!("(failed to read body: {})", e));
-            bail!("anthropic error {}: {}", status, text);
+                .unwrap_or_else(|e| format!("(failed to read body: {e})"));
+            bail!("anthropic error {status}: {text}");
         }
 
         let anth_resp: AnthResponse = resp.json().await.context("parse anthropic response")?;
         Ok(anth_response_to_chat(anth_resp))
     }
 
+    /// Opens a streaming chat completion request and converts its SSE events.
     fn send_streaming(
         &self,
         request: &ChatRequest,
@@ -408,12 +424,12 @@ impl Provider for AnthropicProvider {
                     AnthropicAuth::ApiKey(key) => ("x-api-key".to_string(), key.clone(), false),
                     AnthropicAuth::OAuth { access_token, .. } => (
                         "Authorization".to_string(),
-                        format!("Bearer {}", access_token),
+                        format!("Bearer {access_token}"),
                         true,
                     ),
                     AnthropicAuth::Bearer(token) => (
                         "Authorization".to_string(),
-                        format!("Bearer {}", token),
+                        format!("Bearer {token}"),
                         false,
                     ),
                 },
@@ -464,7 +480,7 @@ impl Provider for AnthropicProvider {
 
             let mut es = match request_builder.eventsource() {
                 Ok(es) => es,
-                Err(e) => { yield Err(anyhow::anyhow!("{}", e)); return; }
+                Err(e) => { yield Err(anyhow::anyhow!("{e}")); return; }
             };
 
             while let Some(event) = {
@@ -488,7 +504,7 @@ impl Provider for AnthropicProvider {
                         break;
                     }
                     Err(e) => {
-                        yield Err(anyhow::anyhow!("sse error: {}", e));
+                        yield Err(anyhow::anyhow!("sse error: {e}"));
                         break;
                     }
                 }
@@ -496,6 +512,7 @@ impl Provider for AnthropicProvider {
         })
     }
 
+    /// Returns the stable provider identifier.
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -550,6 +567,7 @@ pub fn load_opencode_anthropic_token() -> Option<(String, String, u64)> {
     None
 }
 
+/// Returns supported filesystem paths for OpenCode Anthropic credentials.
 pub fn opencode_auth_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
 
@@ -602,6 +620,7 @@ async fn refresh_anthropic_token(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<(String, u64)> {
+    /// Deserializes the token endpoint fields used after a refresh.
     #[derive(Deserialize)]
     struct RefreshResponse {
         access_token: String,
@@ -624,8 +643,8 @@ async fn refresh_anthropic_token(
         let body = resp
             .text()
             .await
-            .unwrap_or_else(|e| format!("(failed to read body: {})", e));
-        bail!("anthropic token refresh failed {}: {}", status, body);
+            .unwrap_or_else(|e| format!("(failed to read body: {e})"));
+        bail!("anthropic token refresh failed {status}: {body}");
     }
 
     let token_resp: RefreshResponse = resp.json().await?;
@@ -637,7 +656,7 @@ async fn refresh_anthropic_token(
 
     // Update the OpenCode auth.json with the fresh token
     if let Err(e) = save_refreshed_token(&token_resp.access_token, refresh_token, expires_ms) {
-        log::warn!("failed to save refreshed token to auth.json: {}", e);
+        log::warn!("failed to save refreshed token to auth.json: {e}");
     }
 
     Ok((token_resp.access_token, expires_ms))
@@ -663,10 +682,12 @@ fn save_refreshed_token(access: &str, refresh: &str, expires_ms: u64) -> Result<
     Ok(())
 }
 
+/// Tests Anthropic wire-format conversion and accounting.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies cached tokens are included in normalized input usage.
     #[test]
     fn anth_response_normalizes_total_and_captures_cache() {
         let json = r#"{

@@ -16,30 +16,35 @@ struct OaiChunk {
     usage: Option<OaiUsage>,
 }
 
+/// Deserializes one OpenAI streaming choice.
 #[derive(Debug, Deserialize)]
 struct OaiChoice {
     delta: Option<OaiDelta>,
     finish_reason: Option<String>,
 }
 
+/// Deserializes incremental text and tool-call content.
 #[derive(Debug, Deserialize)]
 struct OaiDelta {
     content: Option<String>,
     tool_calls: Option<Vec<OaiToolCallDelta>>,
 }
 
+/// Deserializes one incremental OpenAI tool call.
 #[derive(Debug, Deserialize)]
 struct OaiToolCallDelta {
     id: Option<String>,
     function: Option<OaiFunction>,
 }
 
+/// Deserializes incremental function name and arguments.
 #[derive(Debug, Deserialize)]
 struct OaiFunction {
     name: Option<String>,
     arguments: Option<String>,
 }
 
+/// Deserializes token usage carried by an OpenAI stream.
 #[derive(Debug, Deserialize)]
 struct OaiUsage {
     prompt_tokens: Option<u32>,
@@ -158,6 +163,7 @@ pub fn parse_anthropic_sse(event_type: &str, data: &str) -> Vec<StreamEvent> {
     }
 }
 
+/// Parses an Anthropic content-block start event.
 fn parse_anthropic_content_block_start(data: &str) -> Vec<StreamEvent> {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -172,6 +178,7 @@ fn parse_anthropic_content_block_start(data: &str) -> Vec<StreamEvent> {
     vec![]
 }
 
+/// Parses incremental Anthropic text or tool arguments.
 fn parse_anthropic_content_block_delta(data: &str) -> Vec<StreamEvent> {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -199,6 +206,7 @@ fn parse_anthropic_content_block_delta(data: &str) -> Vec<StreamEvent> {
     }
 }
 
+/// Parses Anthropic usage and stop-reason message deltas.
 fn parse_anthropic_message_delta(data: &str) -> Vec<StreamEvent> {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -286,7 +294,7 @@ pub fn events_to_response(events: Vec<StreamEvent>, id: &str) -> Result<ChatResp
             StreamEvent::MessageStop(r) => stop_reason = r,
             StreamEvent::Usage(u) => usage = u,
             StreamEvent::Error(e) => {
-                return Err(anyhow::anyhow!("stream error: {}", e));
+                return Err(anyhow::anyhow!("stream error: {e}"));
             }
         }
     }
@@ -313,10 +321,12 @@ pub fn events_to_response(events: Vec<StreamEvent>, id: &str) -> Result<ChatResp
     })
 }
 
+/// Tests OpenAI and Anthropic stream parsing and assembly.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies the OpenAI terminator does not emit an event.
     #[test]
     fn openai_done_returns_empty() {
         // [DONE] is a stream terminator, not a stop reason.
@@ -325,6 +335,7 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// Verifies an OpenAI text delta becomes a content event.
     #[test]
     fn openai_content_delta() {
         let data = r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}"#;
@@ -333,6 +344,7 @@ mod tests {
         assert!(matches!(&events[0], StreamEvent::ContentDelta(t) if t == "hello"));
     }
 
+    /// Verifies an OpenAI function delta starts a tool-use event.
     #[test]
     fn openai_tool_call_start() {
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#;
@@ -344,6 +356,7 @@ mod tests {
         );
     }
 
+    /// Verifies the tool-calls finish reason maps to tool use.
     #[test]
     fn openai_finish_reason_tool_calls() {
         let data = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
@@ -354,6 +367,7 @@ mod tests {
         ));
     }
 
+    /// Verifies an Anthropic text delta becomes a content event.
     #[test]
     fn anthropic_text_delta() {
         let data = r#"{"delta":{"type":"text_delta","text":"hi"}}"#;
@@ -362,6 +376,7 @@ mod tests {
         assert!(matches!(&events[0], StreamEvent::ContentDelta(t) if t == "hi"));
     }
 
+    /// Verifies an Anthropic tool block starts a tool-use event.
     #[test]
     fn anthropic_tool_use_start() {
         let data = r#"{"content_block":{"type":"tool_use","id":"t1","name":"read"}}"#;
@@ -369,6 +384,7 @@ mod tests {
         assert!(matches!(&events[0], StreamEvent::ToolUseStart { name, .. } if name == "read"));
     }
 
+    /// Verifies Anthropic stop and usage data become stream events.
     #[test]
     fn anthropic_message_delta_stop_reason() {
         let data = r#"{"delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50}}"#;
@@ -385,6 +401,7 @@ mod tests {
         );
     }
 
+    /// Verifies text stream events assemble into one response.
     #[test]
     fn events_to_response_assembles_text() {
         let events = vec![
@@ -405,6 +422,7 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 10);
     }
 
+    /// Verifies OpenAI cached-token usage survives SSE parsing.
     #[test]
     fn openai_sse_usage_captures_cached_tokens() {
         let data = r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
@@ -422,6 +440,7 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, 0);
     }
 
+    /// Verifies missing OpenAI cache details produce zero cache usage.
     #[test]
     fn openai_sse_usage_without_cache_is_zero() {
         let data = r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20}}"#;
@@ -436,6 +455,7 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 0);
     }
 
+    /// Verifies tool stream events assemble into one tool-use block.
     #[test]
     fn events_to_response_assembles_tool_use() {
         let events = vec![
@@ -451,6 +471,7 @@ mod tests {
         assert!(matches!(&resp.content[0], ContentBlock::ToolUse { name, .. } if name == "bash"));
     }
 
+    /// Verifies Anthropic cache usage contributes to normalized input tokens.
     #[test]
     fn anthropic_message_delta_normalizes_total_and_captures_cache() {
         let data = r#"{"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":80,"cache_creation_input_tokens":12}}"#;

@@ -16,6 +16,7 @@ use crate::types::{
     ChatRequest, ChatResponse, ContentBlock, Provider, Role, StopReason, StreamEvent, Usage,
 };
 
+/// Serializes an OpenAI-compatible chat completion request.
 #[derive(Debug, Serialize)]
 pub(crate) struct OaiRequest {
     pub model: String,
@@ -32,6 +33,7 @@ pub(crate) struct OaiRequest {
     pub tools: Option<Vec<Value>>,
 }
 
+/// Serializes one OpenAI-compatible request message.
 #[derive(Debug, Serialize)]
 pub(crate) struct OaiMessage {
     pub role: &'static str,
@@ -52,12 +54,14 @@ pub(crate) struct OaiToolCallOut {
     pub function: OaiFunctionOut,
 }
 
+/// Serializes the function payload inside an outbound tool call.
 #[derive(Debug, Serialize)]
 pub(crate) struct OaiFunctionOut {
     pub name: String,
     pub arguments: String,
 }
 
+/// Deserializes an OpenAI-compatible chat completion response.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiResponse {
     pub id: String,
@@ -65,30 +69,35 @@ pub(crate) struct OaiResponse {
     pub usage: Option<OaiUsage>,
 }
 
+/// Deserializes one response choice and its finish reason.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiChoice {
     pub message: OaiChoiceMessage,
     pub finish_reason: Option<String>,
 }
 
+/// Deserializes content and tool calls from a response choice.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiChoiceMessage {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<OaiToolCall>>,
 }
 
+/// Deserializes one tool call returned by the provider.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiToolCall {
     pub id: String,
     pub function: OaiFunction,
 }
 
+/// Deserializes a returned function name and JSON arguments.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiFunction {
     pub name: String,
     pub arguments: String,
 }
 
+/// Deserializes token usage from an OpenAI-compatible response.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiUsage {
     pub prompt_tokens: u32,
@@ -105,6 +114,7 @@ pub(crate) struct OaiPromptDetails {
     pub cached_tokens: u32,
 }
 
+/// Maps a provider-neutral role to the OpenAI wire role.
 pub(crate) fn role_str(role: &Role) -> &'static str {
     match role {
         Role::System => "system",
@@ -114,6 +124,7 @@ pub(crate) fn role_str(role: &Role) -> &'static str {
     }
 }
 
+/// Builds a standard OpenAI-compatible request body.
 pub(crate) fn build_request(req: &ChatRequest) -> OaiRequest {
     build_request_with(req, false)
 }
@@ -233,6 +244,7 @@ pub(crate) fn build_request_with(req: &ChatRequest, max_completion_tokens: bool)
     }
 }
 
+/// Converts an OpenAI-compatible response to the provider-neutral response.
 pub(crate) fn to_chat_response(resp: OaiResponse) -> ChatResponse {
     let mut content = Vec::new();
     let mut stop = StopReason::EndTurn;
@@ -286,6 +298,7 @@ pub(crate) fn to_chat_response(resp: OaiResponse) -> ChatResponse {
     }
 }
 
+/// Sends chat requests to a configurable OpenAI-compatible endpoint.
 pub struct ProxyProvider {
     client: reqwest::Client,
     base_url: String,
@@ -297,7 +310,9 @@ pub struct ProxyProvider {
     max_completion_tokens: bool,
 }
 
+/// Provides construction and endpoint helpers for proxy providers.
 impl ProxyProvider {
+    /// Creates a provider targeting an OpenAI-compatible base URL.
     pub fn new(client: reqwest::Client, base_url: String, api_key: String) -> Self {
         Self {
             client,
@@ -324,17 +339,21 @@ impl ProxyProvider {
         self
     }
 
+    /// Returns the configured provider base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    /// Builds the proxy chat completions endpoint.
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 }
 
+/// Implements synchronous and streaming chat requests for compatible proxies.
 #[async_trait]
 impl Provider for ProxyProvider {
+    /// Sends a non-streaming chat completion request.
     async fn send(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let oai = build_request_with(request, self.max_completion_tokens);
         let body = serde_json::to_string(&oai)?;
@@ -353,14 +372,15 @@ impl Provider for ProxyProvider {
             let text = resp
                 .text()
                 .await
-                .unwrap_or_else(|e| format!("(failed to read body: {})", e));
-            bail!("proxy error {}: {}", status, text);
+                .unwrap_or_else(|e| format!("(failed to read body: {e})"));
+            bail!("proxy error {status}: {text}");
         }
 
         let oai_resp: OaiResponse = resp.json().await.context("parse proxy response")?;
         Ok(to_chat_response(oai_resp))
     }
 
+    /// Opens a streaming chat completion request and converts its SSE events.
     fn send_streaming(
         &self,
         request: &ChatRequest,
@@ -377,13 +397,13 @@ impl Provider for ProxyProvider {
                 Err(e) => { yield Err(e.into()); return; }
             };
             let rb = client.post(&endpoint)
-                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Authorization", format!("Bearer {api_key}"))
                 .header("Content-Type", "application/json")
                 .body(body);
 
             let mut es = match rb.eventsource() {
                 Ok(es) => es,
-                Err(e) => { yield Err(anyhow::anyhow!("{}", e)); return; }
+                Err(e) => { yield Err(anyhow::anyhow!("{e}")); return; }
             };
 
             while let Some(event) = {
@@ -401,7 +421,7 @@ impl Provider for ProxyProvider {
                         break; // Normal: stream closed after [DONE]
                     }
                     Err(e) => {
-                        yield Err(anyhow::anyhow!("sse error: {}", e));
+                        yield Err(anyhow::anyhow!("sse error: {e}"));
                         break;
                     }
                 }
@@ -409,17 +429,20 @@ impl Provider for ProxyProvider {
         })
     }
 
+    /// Returns the configured provider identifier.
     fn name(&self) -> &str {
         self.name
     }
 }
 
+/// Tests OpenAI wire conversion and proxy request behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatRequest, ContentBlock, Role};
     use serde_json::json;
 
+    /// Builds a minimal request shared by proxy conversion tests.
     fn make_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
             model: "test-model".into(),
@@ -431,6 +454,7 @@ mod tests {
         }
     }
 
+    /// Verifies plain text messages retain their OpenAI wire fields.
     #[test]
     fn build_request_simple_text() {
         let req = make_request(vec![ChatMessage {
@@ -512,6 +536,7 @@ mod tests {
         assert_eq!(params["type"], "object");
     }
 
+    /// Verifies the system prompt becomes the first wire message.
     #[test]
     fn build_request_system_message() {
         let mut req = make_request(vec![ChatMessage {
@@ -525,6 +550,7 @@ mod tests {
         assert_eq!(oai.messages[0].content.as_deref(), Some("You are helpful."));
     }
 
+    /// Verifies assistant tool use becomes an OpenAI function call.
     #[test]
     fn build_request_assistant_tool_use() {
         let req = make_request(vec![ChatMessage {
@@ -548,6 +574,7 @@ mod tests {
         assert_eq!(tcs[0].function.arguments, r#"{"command":"ls"}"#);
     }
 
+    /// Verifies assistant text and tool use coexist in one message.
     #[test]
     fn build_request_assistant_text_plus_tool_use() {
         let req = make_request(vec![ChatMessage {
@@ -570,6 +597,7 @@ mod tests {
         assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
     }
 
+    /// Verifies tool results become separate tool-role messages.
     #[test]
     fn build_request_tool_results() {
         let req = make_request(vec![ChatMessage {
@@ -600,6 +628,7 @@ mod tests {
         assert_eq!(oai.messages[1].tool_call_id.as_deref(), Some("call_2"));
     }
 
+    /// Verifies a complete multi-turn tool exchange preserves ordering.
     #[test]
     fn build_request_multi_turn_tool_conversation() {
         // Full multi-turn: user -> assistant(tool_use) -> user(tool_result) -> assistant(text)
@@ -649,6 +678,7 @@ mod tests {
         assert_eq!(oai.messages[3].content.as_deref(), Some("Found 2 files."));
     }
 
+    /// Verifies tool calls are serialized as JSON rather than legacy XML.
     #[test]
     fn build_request_no_xml_in_output() {
         // Verify the old XML format is gone
@@ -682,6 +712,7 @@ mod tests {
         );
     }
 
+    /// Verifies cached prompt tokens are retained in response usage.
     #[test]
     fn to_chat_response_captures_cached_tokens() {
         let json = r#"{
@@ -696,6 +727,7 @@ mod tests {
         assert_eq!(chat.usage.cache_write_tokens, 0);
     }
 
+    /// Verifies absent prompt details produce zero cached-token usage.
     #[test]
     fn to_chat_response_no_prompt_details_yields_zero_cache() {
         let json = r#"{
@@ -709,6 +741,7 @@ mod tests {
         assert_eq!(chat.usage.cache_write_tokens, 0);
     }
 
+    /// Verifies serialized tool calls match the OpenAI structure.
     #[test]
     fn build_request_serialization_format() {
         // Verify the serialized JSON has correct OpenAI structure
@@ -729,6 +762,7 @@ mod tests {
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "bash");
     }
 
+    /// Verifies the alternate token-limit field is emitted exclusively.
     #[test]
     fn build_request_with_emits_max_completion_tokens() {
         let req = make_request(vec![ChatMessage {

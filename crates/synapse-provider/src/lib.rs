@@ -164,7 +164,7 @@ pub fn create_provider(config: ProviderConfig) -> Result<Box<dyn Provider>> {
             Ok(Box::new(p))
         }
         ProviderConfig::FoundryOpenAI { host, token } => {
-            let base_url = format!("https://{}/api/v2/llm/proxy/openai/v1", host);
+            let base_url = format!("https://{host}/api/v2/llm/proxy/openai/v1");
             Ok(Box::new(
                 proxy::ProxyProvider::new(client, base_url, token)
                     .with_name("foundry-openai")
@@ -174,7 +174,7 @@ pub fn create_provider(config: ProviderConfig) -> Result<Box<dyn Provider>> {
             ))
         }
         ProviderConfig::FoundryAnthropic { host, token } => {
-            let base_url = format!("https://{}/api/v2/llm/proxy/anthropic/v1", host);
+            let base_url = format!("https://{host}/api/v2/llm/proxy/anthropic/v1");
             Ok(Box::new(anthropic::AnthropicProvider::new_foundry(
                 client, base_url, token,
             )))

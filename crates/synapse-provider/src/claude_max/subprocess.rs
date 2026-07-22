@@ -35,7 +35,7 @@ impl SubprocessState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to spawn claude binary at {}", cli_path))?;
+            .with_context(|| format!("failed to spawn claude binary at {cli_path}"))?;
 
         let stdin = child
             .stdin
@@ -55,7 +55,7 @@ impl SubprocessState {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                log::debug!("[claude stderr] {}", line);
+                log::debug!("[claude stderr] {line}");
             }
         });
 
@@ -104,15 +104,13 @@ impl SubprocessState {
                         .ok_or_else(|| anyhow::anyhow!("system/init missing session_id"))?;
                     let model = sys.model.unwrap_or_default();
                     log::info!(
-                        "claude subprocess initialized: session={}, model={}",
-                        session_id,
-                        model
+                        "claude subprocess initialized: session={session_id}, model={model}"
                     );
                     return Ok((session_id, model));
                 }
                 Ok(_) => continue,
                 Err(e) => {
-                    log::warn!("ignoring unparseable line during init: {}", e);
+                    log::warn!("ignoring unparseable line during init: {e}");
                     continue;
                 }
             }

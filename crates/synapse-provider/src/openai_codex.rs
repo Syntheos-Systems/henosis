@@ -588,7 +588,7 @@ impl Provider for OpenAICodexProvider {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("(failed to read body: {error})"));
-            bail!("openai codex error {}: {}", status, text);
+            bail!("openai codex error {status}: {text}");
         }
 
         let value = response
