@@ -1,6 +1,7 @@
 //! `syntheos-server` binary: the single entry point that boots the Henosis foundation and serves
 //! the Phase 0 HTTP surface.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,8 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the in-process Hephaestus executor from env (Config::from_env). If provider
     // credentials are absent the AppState still constructs and attaches; individual task
     // executions will fail with a meaningful auth error rather than silently succeeding.
-    let heph_state =
-        henosis_hephaestus::build_state(henosis_hephaestus::Config::from_env());
+    let heph_state = henosis_hephaestus::build_state(henosis_hephaestus::Config::from_env());
     let heph_dispatch = HephaestusRuntimeDispatch { state: heph_state };
 
     // CompositeStepExecutor: Transform handles pure-JSON steps inline; Hephaestus dispatches
@@ -205,9 +205,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("plutus store open failed: {e}"))?,
     );
-    plutus_store.bootstrap_operator_org_if_absent().await.map_err(|e| {
-        format!("plutus operator bootstrap: {e}")
-    })?;
+    plutus_store
+        .bootstrap_operator_org_if_absent()
+        .await
+        .map_err(|e| format!("plutus operator bootstrap: {e}"))?;
     let plutus: Arc<dyn PolicyBackend> = plutus_store.clone();
     // Log the redacted form only -- the raw URL carries the Postgres password in its userinfo
     // and must never reach the log stream (info-level logs routinely end up in aggregators/disk
@@ -240,8 +241,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
-    let human_approver: Arc<dyn Approver> =
-        Arc::new(RegistryApprover::new(Duration::from_secs(approval_timeout_secs)));
+    let human_approver: Arc<dyn Approver> = Arc::new(RegistryApprover::new(Duration::from_secs(
+        approval_timeout_secs,
+    )));
 
     let policy = EidolonPolicy::default();
     let dispatcher = Arc::new(
@@ -350,7 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    let addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
+    let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
+    let insecure_remote = std::env::var("SYNTHEOS_ALLOW_INSECURE_REMOTE").ok();
+    let addr = validated_bind_addr(&raw_addr, insecure_remote.as_deref())?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "syntheos-server listening (five real gates, in-process Hermes/Phylax executor, action projections live)");
 
@@ -358,6 +362,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Parse the configured bind address and reject accidental remote exposure of the
+/// caller-asserted kernel APIs.
+fn validated_bind_addr(raw: &str, insecure_remote: Option<&str>) -> Result<SocketAddr, String> {
+    let addr = raw.parse::<SocketAddr>().map_err(|_| {
+        "SYNTHEOS_ADDR must be an IP socket address such as 127.0.0.1:8088".to_string()
+    })?;
+    if !addr.ip().is_loopback() && insecure_remote != Some("1") {
+        return Err(format!(
+            "refusing non-loopback SYNTHEOS_ADDR {addr}: kernel APIs use caller-asserted identity; set SYNTHEOS_ALLOW_INSECURE_REMOTE=1 only behind an authenticated private boundary"
+        ));
+    }
+    Ok(addr)
 }
 
 /// Open the required Phylax credential store from its configured master key.
@@ -516,13 +534,13 @@ async fn operator_state_from_env(
     };
 
     // Attempt hex decoding first; fall back to raw UTF-8 bytes.
-    let secret_bytes: Vec<u8> =
-        if raw.len() % 2 == 0 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            hex::decode(raw.trim())
-                .map_err(|e| format!("SYNTHEOS_OPERATOR_JWT_SECRET hex decode failed: {e}"))?
-        } else {
-            raw.into_bytes()
-        };
+    let secret_bytes: Vec<u8> = if raw.len() % 2 == 0 && raw.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        hex::decode(raw.trim())
+            .map_err(|e| format!("SYNTHEOS_OPERATOR_JWT_SECRET hex decode failed: {e}"))?
+    } else {
+        raw.into_bytes()
+    };
 
     // A set-but-too-short secret is a hard boot error -- never a silent fallback.
     if secret_bytes.len() < 32 {
@@ -751,7 +769,8 @@ mod redact_tests {
     /// database stay visible for diagnostics.
     #[test]
     fn redact_postgres_password_masks_password() {
-        let redacted = redact_postgres_password("postgres://plutus:hunter2@db.internal:5432/plutus");
+        let redacted =
+            redact_postgres_password("postgres://plutus:hunter2@db.internal:5432/plutus");
         assert_eq!(redacted, "postgres://plutus:***@db.internal:5432/plutus");
     }
 
@@ -818,6 +837,49 @@ mod plutus_timeout_tests {
     #[test]
     fn excessive_timeout_is_rejected() {
         assert!(validated_plutus_acquire_timeout(Some("301")).is_err());
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the integrated server's fail-closed bind policy.
+mod bind_policy_tests {
+    use super::*;
+
+    /// IPv4 loopback is accepted without an unsafe override.
+    #[test]
+    fn ipv4_loopback_is_accepted() {
+        let addr = validated_bind_addr("127.0.0.1:8088", None).expect("loopback must be valid");
+        assert!(addr.ip().is_loopback());
+    }
+
+    /// IPv6 loopback is accepted without an unsafe override.
+    #[test]
+    fn ipv6_loopback_is_accepted() {
+        let addr = validated_bind_addr("[::1]:8088", None).expect("loopback must be valid");
+        assert!(addr.ip().is_loopback());
+    }
+
+    /// A wildcard bind is rejected because the kernel APIs do not authenticate callers.
+    #[test]
+    fn wildcard_bind_is_rejected_by_default() {
+        let error = validated_bind_addr("0.0.0.0:8088", None).expect_err("remote bind must fail");
+        assert!(error.contains("caller-asserted identity"));
+    }
+
+    /// Only the exact documented override enables a deliberate non-loopback bind.
+    #[test]
+    fn exact_override_allows_deliberate_remote_bind() {
+        let addr = validated_bind_addr("192.0.2.1:8088", Some("1"))
+            .expect("explicit development override must be accepted");
+        assert_eq!(addr.to_string(), "192.0.2.1:8088");
+        assert!(validated_bind_addr("192.0.2.1:8088", Some("true")).is_err());
+    }
+
+    /// Hostnames and malformed values fail with a stable configuration error.
+    #[test]
+    fn malformed_address_is_rejected() {
+        let error = validated_bind_addr("localhost:8088", None).expect_err("hostname must fail");
+        assert!(error.contains("must be an IP socket address"));
     }
 }
 

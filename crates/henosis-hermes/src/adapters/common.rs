@@ -1,4 +1,4 @@
-//! Shared helpers used across HTTP-backed adapters: credd error mapping,
+//! Shared helpers used across HTTP-backed adapters: phylaxd error mapping,
 //! HTTP client builder, a small `truncate` for log/error bodies, and the
 //! retry/backoff wrapper that all adapters route their upstream calls through.
 
@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::warn;
 
-use crate::credd_client::CreddError;
+use crate::phylaxd_client::PhylaxdError;
 use crate::tool::{err, error_response, InvokeResponse, RetryPolicy};
 
 tokio::task_local! {
@@ -165,11 +165,11 @@ async fn sleep_ms(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
-/// Map a `CreddError` to a structured `InvokeResponse` error appropriate for
+/// Map a `PhylaxdError` to a structured `InvokeResponse` error appropriate for
 /// surfacing to the caller.
-pub fn credd_error_to_response(tool_id: &str, e: &CreddError) -> InvokeResponse {
+pub fn phylaxd_error_to_response(tool_id: &str, e: &PhylaxdError) -> InvokeResponse {
     match e {
-        CreddError::TenantNotAuthorized {
+        PhylaxdError::TenantNotAuthorized {
             provider,
             category,
             name,
@@ -180,39 +180,42 @@ pub fn credd_error_to_response(tool_id: &str, e: &CreddError) -> InvokeResponse 
             error: Some(err(
                 "tenant_not_authorized",
                 format!("tenant has no provisioned {provider} OAuth credential"),
-                Some(&format!("provision credd slot {category}/{name}")),
+                Some(&format!("provision phylaxd slot {category}/{name}")),
             )),
             duration_ms: 0,
         },
-        CreddError::AuthMissing => error_response(
+        PhylaxdError::AuthMissing => error_response(
             tool_id,
-            "credd_auth_missing",
+            "phylaxd_auth_missing",
             e.to_string(),
-            Some("set HERMES_CREDD_TOKEN env var"),
+            Some("set HERMES_PHYLAXD_TOKEN env var"),
         ),
-        CreddError::Unreachable { .. } => {
-            error_response(tool_id, "credd_unreachable", e.to_string(), None)
+        PhylaxdError::Unreachable { .. } => {
+            error_response(tool_id, "phylaxd_unreachable", e.to_string(), None)
         }
-        CreddError::Upstream { .. } => {
-            error_response(tool_id, "credd_upstream_error", e.to_string(), None)
+        PhylaxdError::Upstream { .. } => {
+            error_response(tool_id, "phylaxd_upstream_error", e.to_string(), None)
         }
-        CreddError::MalformedResponse => {
-            error_response(tool_id, "credd_malformed_response", e.to_string(), None)
+        PhylaxdError::MalformedResponse => {
+            error_response(tool_id, "phylaxd_malformed_response", e.to_string(), None)
         }
     }
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
     #[test]
+    /// Verifies truncate short passthrough.
     fn truncate_short_passthrough() {
         assert_eq!(truncate("hi", 10), "hi");
     }
 
     #[test]
+    /// Verifies truncate long marks truncation.
     fn truncate_long_marks_truncation() {
         let out = truncate("abcdef", 3);
         assert!(out.starts_with("abc"));
@@ -220,6 +223,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies retry after parses seconds to ms.
     fn retry_after_parses_seconds_to_ms() {
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("2"));
@@ -227,11 +231,13 @@ mod tests {
     }
 
     #[test]
+    /// Verifies retry after absent is none.
     fn retry_after_absent_is_none() {
         assert_eq!(retry_after_ms(&HeaderMap::new()), None);
     }
 
     #[test]
+    /// Verifies jitter stays in range.
     fn jitter_stays_in_range() {
         for _ in 0..50 {
             assert!(jitter_ms(500) < 500);

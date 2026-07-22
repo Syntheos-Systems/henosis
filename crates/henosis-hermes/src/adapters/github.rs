@@ -9,15 +9,16 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::adapters::common::{
-    build_http, credd_error_to_response, send_with_retry, truncate, HttpOutcome,
+    build_http, phylaxd_error_to_response, send_with_retry, truncate, HttpOutcome,
 };
 use crate::tool::{
-    err, error_response, InvokeContext, InvokeRequest, InvokeResponse, RetryPolicy, Tool, ToolSchema,
+    err, error_response, InvokeContext, InvokeRequest, InvokeResponse, RetryPolicy, Tool,
+    ToolSchema,
 };
 
 /// Tool ID for the create-issue adapter.
 const TOOL_ID: &str = "github.create_issue";
-/// credd provider tag for all GitHub tools.
+/// phylaxd provider tag for all GitHub tools.
 const PROVIDER: &str = "github";
 /// GitHub REST API base URL.
 const GH_API: &str = "https://api.github.com";
@@ -28,7 +29,9 @@ const GH_UA: &str = "hermes-tool-gateway";
 pub struct GitHubCreateIssueTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubCreateIssueTool.
 impl Tool for GitHubCreateIssueTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: TOOL_ID.to_string(),
@@ -67,10 +70,12 @@ impl Tool for GitHubCreateIssueTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
@@ -82,9 +87,9 @@ impl Tool for GitHubCreateIssueTool {
             Err(msg) => return error_response(TOOL_ID, "bad_request", msg, None),
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response(TOOL_ID, &e),
+            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),
         };
 
         let http = match build_http() {
@@ -102,18 +107,12 @@ impl Tool for GitHubCreateIssueTool {
             payload["body"] = Value::String(b.clone());
         }
         if !args.labels.is_empty() {
-            payload["labels"] = Value::Array(
-                args.labels.iter().cloned().map(Value::String).collect(),
-            );
+            payload["labels"] =
+                Value::Array(args.labels.iter().cloned().map(Value::String).collect());
         }
         if !args.assignees.is_empty() {
-            payload["assignees"] = Value::Array(
-                args.assignees
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            );
+            payload["assignees"] =
+                Value::Array(args.assignees.iter().cloned().map(Value::String).collect());
         }
 
         let request = http
@@ -264,16 +263,20 @@ async fn gh_prep(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| error_response(tool_id, "bad_request", "tenant_id is required", None))?;
     let token = ctx
-        .credd
+        .phylaxd
         .fetch_token(tenant, PROVIDER)
         .await
-        .map_err(|e| credd_error_to_response(tool_id, &e))?;
-    let http = build_http().map_err(|e| error_response(tool_id, "internal_error", e.to_string(), None))?;
+        .map_err(|e| phylaxd_error_to_response(tool_id, &e))?;
+    let http =
+        build_http().map_err(|e| error_response(tool_id, "internal_error", e.to_string(), None))?;
     Ok((token, http))
 }
 
 /// Turn a retry outcome into either the parsed JSON body or a ready error.
-fn gh_finish(tool_id: &str, res: Result<HttpOutcome, reqwest::Error>) -> Result<Value, InvokeResponse> {
+fn gh_finish(
+    tool_id: &str,
+    res: Result<HttpOutcome, reqwest::Error>,
+) -> Result<Value, InvokeResponse> {
     match res {
         Err(e) => Err(error_response(
             tool_id,
@@ -283,7 +286,11 @@ fn gh_finish(tool_id: &str, res: Result<HttpOutcome, reqwest::Error>) -> Result<
         )),
         Ok(o) if o.status.is_success() => Ok(serde_json::from_str(&o.body).unwrap_or(Value::Null)),
         Ok(o) => {
-            warn!(status = o.status.as_u16(), tool = tool_id, "github api error");
+            warn!(
+                status = o.status.as_u16(),
+                tool = tool_id,
+                "github api error"
+            );
             Err(InvokeResponse {
                 tool_id: tool_id.to_string(),
                 success: false,
@@ -312,7 +319,11 @@ fn gh_ok(tool_id: &str, result: Value) -> InvokeResponse {
 }
 
 /// Pull a required non-empty string field from an args map.
-fn req_str(obj: &serde_json::Map<String, Value>, key: &str, tool_id: &str) -> Result<String, InvokeResponse> {
+fn req_str(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    tool_id: &str,
+) -> Result<String, InvokeResponse> {
     obj.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
@@ -322,11 +333,18 @@ fn req_str(obj: &serde_json::Map<String, Value>, key: &str, tool_id: &str) -> Re
 
 /// Pull an optional trimmed non-empty string field.
 fn opt_str(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    obj.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Require that `args` is a JSON object; return a structured error otherwise.
-fn as_obj<'a>(args: &'a Value, tool_id: &str) -> Result<&'a serde_json::Map<String, Value>, InvokeResponse> {
+fn as_obj<'a>(
+    args: &'a Value,
+    tool_id: &str,
+) -> Result<&'a serde_json::Map<String, Value>, InvokeResponse> {
     args.as_object()
         .ok_or_else(|| error_response(tool_id, "bad_request", "args must be a JSON object", None))
 }
@@ -339,7 +357,9 @@ fn as_obj<'a>(args: &'a Value, tool_id: &str) -> Result<&'a serde_json::Map<Stri
 pub struct GitHubListIssuesTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubListIssuesTool.
 impl Tool for GitHubListIssuesTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.list_issues".to_string(),
@@ -365,10 +385,12 @@ impl Tool for GitHubListIssuesTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.list_issues";
         let obj = match as_obj(&req.args, tool_id) {
@@ -410,7 +432,10 @@ impl Tool for GitHubListIssuesTool {
 
         let url = format!("{GH_API}/repos/{owner}/{repo}/issues");
         let request = gh_auth(http.get(&url), &token).query(&params);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(tool_id, json!({ "issues": v })),
             Err(r) => r,
         }
@@ -425,7 +450,9 @@ impl Tool for GitHubListIssuesTool {
 pub struct GitHubGetIssueTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubGetIssueTool.
 impl Tool for GitHubGetIssueTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.get_issue".to_string(),
@@ -449,10 +476,12 @@ impl Tool for GitHubGetIssueTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.get_issue";
         let obj = match as_obj(&req.args, tool_id) {
@@ -469,7 +498,9 @@ impl Tool for GitHubGetIssueTool {
         };
         let number = match obj.get("issue_number").and_then(|v| v.as_u64()) {
             Some(n) => n,
-            None => return error_response(tool_id, "bad_request", "'issue_number' is required", None),
+            None => {
+                return error_response(tool_id, "bad_request", "'issue_number' is required", None)
+            }
         };
         let (token, http) = match gh_prep(ctx, req.tenant_id.as_deref(), tool_id).await {
             Ok(v) => v,
@@ -488,7 +519,11 @@ impl Tool for GitHubGetIssueTool {
         let comments_url = format!("{GH_API}/repos/{owner}/{repo}/issues/{number}/comments");
         let comments = match gh_finish(
             tool_id,
-            send_with_retry(gh_auth(http.get(&comments_url), &token), &self.retry_policy()).await,
+            send_with_retry(
+                gh_auth(http.get(&comments_url), &token),
+                &self.retry_policy(),
+            )
+            .await,
         ) {
             Ok(v) => v,
             Err(r) => return r,
@@ -506,7 +541,9 @@ impl Tool for GitHubGetIssueTool {
 pub struct GitHubCreatePrTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubCreatePrTool.
 impl Tool for GitHubCreatePrTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.create_pr".to_string(),
@@ -534,14 +571,17 @@ impl Tool for GitHubCreatePrTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Returns the retry policy for this tool operation.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.create_pr";
         let obj = match as_obj(&req.args, tool_id) {
@@ -583,7 +623,10 @@ impl Tool for GitHubCreatePrTool {
 
         let url = format!("{GH_API}/repos/{owner}/{repo}/pulls");
         let request = gh_auth(http.post(&url), &token).json(&payload);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(
                 tool_id,
                 json!({
@@ -605,7 +648,9 @@ impl Tool for GitHubCreatePrTool {
 pub struct GitHubListPrsTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubListPrsTool.
 impl Tool for GitHubListPrsTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.list_prs".to_string(),
@@ -632,10 +677,12 @@ impl Tool for GitHubListPrsTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.list_prs";
         let obj = match as_obj(&req.args, tool_id) {
@@ -670,7 +717,10 @@ impl Tool for GitHubListPrsTool {
 
         let url = format!("{GH_API}/repos/{owner}/{repo}/pulls");
         let request = gh_auth(http.get(&url), &token).query(&params);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(tool_id, json!({ "pull_requests": v })),
             Err(r) => r,
         }
@@ -685,7 +735,9 @@ impl Tool for GitHubListPrsTool {
 pub struct GitHubMergePrTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubMergePrTool.
 impl Tool for GitHubMergePrTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.merge_pr".to_string(),
@@ -712,14 +764,17 @@ impl Tool for GitHubMergePrTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Returns the retry policy for this tool operation.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.merge_pr";
         let obj = match as_obj(&req.args, tool_id) {
@@ -736,7 +791,9 @@ impl Tool for GitHubMergePrTool {
         };
         let number = match obj.get("pull_number").and_then(|v| v.as_u64()) {
             Some(n) => n,
-            None => return error_response(tool_id, "bad_request", "'pull_number' is required", None),
+            None => {
+                return error_response(tool_id, "bad_request", "'pull_number' is required", None)
+            }
         };
         let (token, http) = match gh_prep(ctx, req.tenant_id.as_deref(), tool_id).await {
             Ok(v) => v,
@@ -756,7 +813,10 @@ impl Tool for GitHubMergePrTool {
 
         let url = format!("{GH_API}/repos/{owner}/{repo}/pulls/{number}/merge");
         let request = gh_auth(http.put(&url), &token).json(&payload);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(
                 tool_id,
                 json!({
@@ -778,7 +838,9 @@ impl Tool for GitHubMergePrTool {
 pub struct GitHubSearchCodeTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubSearchCodeTool.
 impl Tool for GitHubSearchCodeTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.search_code".to_string(),
@@ -802,10 +864,12 @@ impl Tool for GitHubSearchCodeTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.search_code";
         let obj = match as_obj(&req.args, tool_id) {
@@ -837,7 +901,10 @@ impl Tool for GitHubSearchCodeTool {
             .header("Accept", "application/vnd.github.text-match+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .query(&params);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(
                 tool_id,
                 json!({
@@ -858,12 +925,15 @@ impl Tool for GitHubSearchCodeTool {
 pub struct GitHubListReposTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubListReposTool.
 impl Tool for GitHubListReposTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.list_repos".to_string(),
             name: "List Repositories".to_string(),
-            description: "List repositories for an organization or user (exactly one required).".to_string(),
+            description: "List repositories for an organization or user (exactly one required)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -881,10 +951,12 @@ impl Tool for GitHubListReposTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.list_repos";
         let obj = match as_obj(&req.args, tool_id) {
@@ -897,10 +969,20 @@ impl Tool for GitHubListReposTool {
             (Some(o), None) => format!("{GH_API}/orgs/{o}/repos"),
             (None, Some(u)) => format!("{GH_API}/users/{u}/repos"),
             (Some(_), Some(_)) => {
-                return error_response(tool_id, "bad_request", "provide either 'org' or 'user', not both", None)
+                return error_response(
+                    tool_id,
+                    "bad_request",
+                    "provide either 'org' or 'user', not both",
+                    None,
+                )
             }
             (None, None) => {
-                return error_response(tool_id, "bad_request", "one of 'org' or 'user' is required", None)
+                return error_response(
+                    tool_id,
+                    "bad_request",
+                    "one of 'org' or 'user' is required",
+                    None,
+                )
             }
         };
         let (token, http) = match gh_prep(ctx, req.tenant_id.as_deref(), tool_id).await {
@@ -923,7 +1005,10 @@ impl Tool for GitHubListReposTool {
         }
 
         let request = gh_auth(http.get(&base), &token).query(&params);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(tool_id, json!({ "repos": v })),
             Err(r) => r,
         }
@@ -938,7 +1023,9 @@ impl Tool for GitHubListReposTool {
 pub struct GitHubCreateWebhookTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GitHubCreateWebhookTool.
 impl Tool for GitHubCreateWebhookTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "github.create_webhook".to_string(),
@@ -966,14 +1053,17 @@ impl Tool for GitHubCreateWebhookTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Returns the retry policy for this tool operation.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "github.create_webhook";
         let obj = match as_obj(&req.args, tool_id) {
@@ -1015,7 +1105,13 @@ impl Tool for GitHubCreateWebhookTool {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .filter(|v| !v.is_empty())
-            .map(|v| Value::Array(v.into_iter().map(|s| Value::String(s.to_string())).collect()))
+            .map(|v| {
+                Value::Array(
+                    v.into_iter()
+                        .map(|s| Value::String(s.to_string()))
+                        .collect(),
+                )
+            })
             .unwrap_or_else(|| json!(["push"]));
         let content_type = opt_str(obj, "content_type").unwrap_or_else(|| "json".to_string());
         let active = obj.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -1024,11 +1120,15 @@ impl Tool for GitHubCreateWebhookTool {
         if let Some(secret) = opt_str(obj, "secret") {
             config["secret"] = Value::String(secret);
         }
-        let payload = json!({ "name": "web", "active": active, "events": events, "config": config });
+        let payload =
+            json!({ "name": "web", "active": active, "events": events, "config": config });
 
         let url = format!("{GH_API}/repos/{owner}/{repo}/hooks");
         let request = gh_auth(http.post(&url), &token).json(&payload);
-        match gh_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match gh_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => gh_ok(
                 tool_id,
                 json!({
@@ -1043,10 +1143,12 @@ impl Tool for GitHubCreateWebhookTool {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies parse minimal.
     fn parse_minimal() {
         let v = json!({"owner":"a","repo":"b","title":"t"});
         let a = parse_args(&v).unwrap();
@@ -1057,6 +1159,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse with labels.
     fn parse_with_labels() {
         let v = json!({"owner":"a","repo":"b","title":"t","labels":["bug","p1"]});
         let a = parse_args(&v).unwrap();
@@ -1064,18 +1167,21 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse rejects missing title.
     fn parse_rejects_missing_title() {
         let v = json!({"owner":"a","repo":"b"});
         assert!(parse_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies parse rejects empty owner.
     fn parse_rejects_empty_owner() {
         let v = json!({"owner":"","repo":"b","title":"t"});
         assert!(parse_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies req str pulls and rejects.
     fn req_str_pulls_and_rejects() {
         let obj = json!({"owner": "octocat", "blank": "  "});
         let m = obj.as_object().unwrap();
@@ -1085,6 +1191,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies opt str trims and filters.
     fn opt_str_trims_and_filters() {
         let obj = json!({"a": "x", "b": "  ", "c": "  y  "});
         let m = obj.as_object().unwrap();
@@ -1095,6 +1202,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies non idempotent tools disable retry.
     fn non_idempotent_tools_disable_retry() {
         assert_eq!(GitHubCreatePrTool.retry_policy().max_retries, 0);
         assert_eq!(GitHubMergePrTool.retry_policy().max_retries, 0);
@@ -1104,6 +1212,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies all github tools report provider.
     fn all_github_tools_report_provider() {
         assert_eq!(GitHubListIssuesTool.provider(), "github");
         assert_eq!(GitHubGetIssueTool.provider(), "github");
@@ -1111,21 +1220,31 @@ mod tests {
     }
 
     #[test]
+    /// Verifies gh finish maps outcomes.
     fn gh_finish_maps_outcomes() {
         // Success body parses to JSON.
         let ok = gh_finish(
             "t",
-            Ok(HttpOutcome { status: reqwest::StatusCode::OK, body: "{\"a\":1}".into() }),
+            Ok(HttpOutcome {
+                status: reqwest::StatusCode::OK,
+                body: "{\"a\":1}".into(),
+            }),
         );
         assert_eq!(ok.unwrap(), json!({"a": 1}));
 
         // 5xx becomes a structured api error carrying the status.
         let err = gh_finish(
             "t",
-            Ok(HttpOutcome { status: reqwest::StatusCode::INTERNAL_SERVER_ERROR, body: "boom".into() }),
+            Ok(HttpOutcome {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                body: "boom".into(),
+            }),
         );
         let resp = err.unwrap_err();
         assert!(!resp.success);
-        assert_eq!(resp.error.unwrap().get("status").and_then(|v| v.as_u64()), Some(500));
+        assert_eq!(
+            resp.error.unwrap().get("status").and_then(|v| v.as_u64()),
+            Some(500)
+        );
     }
 }

@@ -1,20 +1,20 @@
 //! Google Calendar adapters: list_events, create_event, update_event, delete_event.
 //!
-//! All tools authenticate via Google OAuth tokens resolved from credd under
+//! All tools authenticate via Google OAuth tokens resolved from phylaxd under
 //! the `google` provider tag.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate};
+use crate::adapters::common::{build_http, phylaxd_error_to_response, send_with_retry, truncate};
 use crate::tool::{
     err, error_response, InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema,
 };
 
 /// Tool ID for the list_events adapter.
 const TOOL_ID: &str = "gcal.list_events";
-/// credd provider tag for all Google Calendar tools.
+/// phylaxd provider tag for all Google Calendar tools.
 const PROVIDER: &str = "google";
 /// Google Calendar v3 calendars endpoint base URL.
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars";
@@ -23,14 +23,15 @@ const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars";
 pub struct GCalListEventsTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GCalListEventsTool.
 impl Tool for GCalListEventsTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: TOOL_ID.to_string(),
             name: "List Calendar Events".to_string(),
-            description:
-                "List Google Calendar events in a window for the authenticated tenant."
-                    .to_string(),
+            description: "List Google Calendar events in a window for the authenticated tenant."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -69,10 +70,12 @@ impl Tool for GCalListEventsTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
@@ -84,9 +87,9 @@ impl Tool for GCalListEventsTool {
             Err(msg) => return error_response(TOOL_ID, "bad_request", msg, None),
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response(TOOL_ID, &e),
+            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),
         };
 
         let http = match build_http() {
@@ -228,7 +231,9 @@ fn parse_args(args: &Value) -> Result<GCalArgs, String> {
 pub struct GCalCreateEventTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GCalCreateEventTool.
 impl Tool for GCalCreateEventTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gcal.create_event".to_string(),
@@ -261,32 +266,88 @@ impl Tool for GCalCreateEventTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gcal.create_event", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gcal.create_event",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gcal.create_event", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gcal.create_event",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let summary = match obj.get("summary").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let summary = match obj
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => s,
-            None => return error_response("gcal.create_event", "bad_request", "'summary' is required", None),
+            None => {
+                return error_response(
+                    "gcal.create_event",
+                    "bad_request",
+                    "'summary' is required",
+                    None,
+                )
+            }
         };
-        let start = match obj.get("start").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let start = match obj
+            .get("start")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => s,
-            None => return error_response("gcal.create_event", "bad_request", "'start' is required", None),
+            None => {
+                return error_response(
+                    "gcal.create_event",
+                    "bad_request",
+                    "'start' is required",
+                    None,
+                )
+            }
         };
-        let end = match obj.get("end").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let end = match obj
+            .get("end")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => s,
-            None => return error_response("gcal.create_event", "bad_request", "'end' is required", None),
+            None => {
+                return error_response(
+                    "gcal.create_event",
+                    "bad_request",
+                    "'end' is required",
+                    None,
+                )
+            }
         };
-        let calendar_id = obj.get("calendar_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("primary");
+        let calendar_id = obj
+            .get("calendar_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("primary");
 
         let mut event = json!({
             "summary": summary,
@@ -306,20 +367,29 @@ impl Tool for GCalCreateEventTool {
             event["reminders"] = r.clone();
         }
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gcal.create_event", &e),
+            Err(e) => return phylaxd_error_to_response("gcal.create_event", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gcal.create_event", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gcal.create_event", "internal_error", e.to_string(), None)
+            }
         };
 
         let url = format!("{}/{}/events", CALENDAR_BASE, urlencode_path(calendar_id));
         let request = http.post(&url).bearer_auth(&token).json(&event);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gcal.create_event", "gcal_unreachable", format!("calendar api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gcal.create_event",
+                    "gcal_unreachable",
+                    format!("calendar api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "calendar create error");
@@ -348,12 +418,15 @@ impl Tool for GCalCreateEventTool {
 pub struct GCalUpdateEventTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GCalUpdateEventTool.
 impl Tool for GCalUpdateEventTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gcal.update_event".to_string(),
             name: "Update Calendar Event".to_string(),
-            description: "Patch a Google Calendar event; only supplied fields are changed.".to_string(),
+            description: "Patch a Google Calendar event; only supplied fields are changed."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["event_id"],
@@ -374,44 +447,95 @@ impl Tool for GCalUpdateEventTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gcal.update_event", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gcal.update_event",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gcal.update_event", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gcal.update_event",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let event_id = match obj.get("event_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let event_id = match obj
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(e) => e.to_string(),
-            None => return error_response("gcal.update_event", "bad_request", "'event_id' is required", None),
+            None => {
+                return error_response(
+                    "gcal.update_event",
+                    "bad_request",
+                    "'event_id' is required",
+                    None,
+                )
+            }
         };
-        let calendar_id = obj.get("calendar_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("primary");
+        let calendar_id = obj
+            .get("calendar_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("primary");
 
         let patch = build_event_patch(obj);
         if patch.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-            return error_response("gcal.update_event", "bad_request", "no updatable fields provided", Some("supply at least one of summary/start/end/description/location/attendees"));
+            return error_response(
+                "gcal.update_event",
+                "bad_request",
+                "no updatable fields provided",
+                Some("supply at least one of summary/start/end/description/location/attendees"),
+            );
         }
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gcal.update_event", &e),
+            Err(e) => return phylaxd_error_to_response("gcal.update_event", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gcal.update_event", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gcal.update_event", "internal_error", e.to_string(), None)
+            }
         };
 
-        let url = format!("{}/{}/events/{}", CALENDAR_BASE, urlencode_path(calendar_id), urlencode_path(&event_id));
+        let url = format!(
+            "{}/{}/events/{}",
+            CALENDAR_BASE,
+            urlencode_path(calendar_id),
+            urlencode_path(&event_id)
+        );
         let request = http.patch(&url).bearer_auth(&token).json(&patch);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gcal.update_event", "gcal_unreachable", format!("calendar api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gcal.update_event",
+                    "gcal_unreachable",
+                    format!("calendar api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "calendar update error");
@@ -436,7 +560,9 @@ impl Tool for GCalUpdateEventTool {
 pub struct GCalDeleteEventTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GCalDeleteEventTool.
 impl Tool for GCalDeleteEventTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gcal.delete_event".to_string(),
@@ -460,44 +586,100 @@ impl Tool for GCalDeleteEventTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gcal.delete_event", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gcal.delete_event",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gcal.delete_event", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gcal.delete_event",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let event_id = match obj.get("event_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let event_id = match obj
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(e) => e.to_string(),
-            None => return error_response("gcal.delete_event", "bad_request", "'event_id' is required", None),
+            None => {
+                return error_response(
+                    "gcal.delete_event",
+                    "bad_request",
+                    "'event_id' is required",
+                    None,
+                )
+            }
         };
-        let calendar_id = obj.get("calendar_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("primary");
+        let calendar_id = obj
+            .get("calendar_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("primary");
         let send_updates = match obj.get("send_updates").and_then(|v| v.as_str()) {
             Some(s) if ["all", "externalOnly", "none"].contains(&s) => s,
-            Some(s) => return error_response("gcal.delete_event", "bad_request", format!("invalid send_updates '{s}'"), None),
+            Some(s) => {
+                return error_response(
+                    "gcal.delete_event",
+                    "bad_request",
+                    format!("invalid send_updates '{s}'"),
+                    None,
+                )
+            }
             None => "none",
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gcal.delete_event", &e),
+            Err(e) => return phylaxd_error_to_response("gcal.delete_event", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gcal.delete_event", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gcal.delete_event", "internal_error", e.to_string(), None)
+            }
         };
 
-        let url = format!("{}/{}/events/{}", CALENDAR_BASE, urlencode_path(calendar_id), urlencode_path(&event_id));
-        let request = http.delete(&url).bearer_auth(&token).query(&[("sendUpdates", send_updates)]);
+        let url = format!(
+            "{}/{}/events/{}",
+            CALENDAR_BASE,
+            urlencode_path(calendar_id),
+            urlencode_path(&event_id)
+        );
+        let request = http
+            .delete(&url)
+            .bearer_auth(&token)
+            .query(&[("sendUpdates", send_updates)]);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gcal.delete_event", "gcal_unreachable", format!("calendar api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gcal.delete_event",
+                    "gcal_unreachable",
+                    format!("calendar api request failed: {e}"),
+                    None,
+                )
+            }
         };
         // Google returns 204 No Content (or 200) on success; 410 Gone if already deleted.
         if !outcome.status.is_success() {
@@ -546,10 +728,18 @@ fn build_event_patch(obj: &serde_json::Map<String, Value>) -> Value {
     if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
         patch.insert("summary".into(), Value::String(s.to_string()));
     }
-    if let Some(s) = obj.get("start").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(s) = obj
+        .get("start")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         patch.insert("start".into(), time_field(s));
     }
-    if let Some(s) = obj.get("end").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(s) = obj
+        .get("end")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         patch.insert("end".into(), time_field(s));
     }
     if let Some(s) = obj.get("description").and_then(|v| v.as_str()) {
@@ -597,10 +787,12 @@ fn urlencode_path(s: &str) -> String {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies parse empty.
     fn parse_empty() {
         let a = parse_args(&Value::Null).unwrap();
         assert!(a.calendar_id.is_none());
@@ -608,6 +800,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse full.
     fn parse_full() {
         let v = json!({
             "calendar_id": "user@example.com",
@@ -622,6 +815,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies url encode handles at and colon.
     fn url_encode_handles_at_and_colon() {
         assert_eq!(urlencode_path("user@example.com"), "user%40example.com");
         assert_eq!(urlencode_path("a/b:c"), "a%2Fb%3Ac");
@@ -629,12 +823,17 @@ mod tests {
     }
 
     #[test]
+    /// Verifies time field distinguishes datetime and date.
     fn time_field_distinguishes_datetime_and_date() {
-        assert_eq!(time_field("2026-06-01T10:00:00Z"), json!({"dateTime": "2026-06-01T10:00:00Z"}));
+        assert_eq!(
+            time_field("2026-06-01T10:00:00Z"),
+            json!({"dateTime": "2026-06-01T10:00:00Z"})
+        );
         assert_eq!(time_field("2026-06-01"), json!({"date": "2026-06-01"}));
     }
 
     #[test]
+    /// Verifies attendees field maps emails.
     fn attendees_field_maps_emails() {
         let v = json!(["a@b.com", "", "c@d.com"]);
         let out = attendees_field(Some(&v)).unwrap();
@@ -642,22 +841,28 @@ mod tests {
     }
 
     #[test]
+    /// Verifies attendees field empty is none.
     fn attendees_field_empty_is_none() {
         assert!(attendees_field(Some(&json!([]))).is_none());
         assert!(attendees_field(None).is_none());
     }
 
     #[test]
+    /// Verifies event patch includes only present fields.
     fn event_patch_includes_only_present_fields() {
         let obj = json!({ "event_id": "e1", "summary": "new title", "location": "HQ" });
         let patch = build_event_patch(obj.as_object().unwrap());
-        assert_eq!(patch.get("summary").and_then(|v| v.as_str()), Some("new title"));
+        assert_eq!(
+            patch.get("summary").and_then(|v| v.as_str()),
+            Some("new title")
+        );
         assert_eq!(patch.get("location").and_then(|v| v.as_str()), Some("HQ"));
         assert!(patch.get("start").is_none());
         assert!(patch.get("description").is_none());
     }
 
     #[test]
+    /// Verifies event patch empty when no fields.
     fn event_patch_empty_when_no_fields() {
         let obj = json!({ "event_id": "e1" });
         let patch = build_event_patch(obj.as_object().unwrap());

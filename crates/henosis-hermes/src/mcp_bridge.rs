@@ -213,13 +213,12 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
     // Hash args before dispatch consumes the request (never store the args).
     let args_digest = crate::audit::args_hash(&invoke.args);
     let ctx = InvokeContext {
-        credd: state.credd.clone(),
+        phylaxd: state.phylaxd.clone(),
         bases: crate::tool::ProviderBases::default(),
         hermes_public_url: state.public_url.clone(),
     };
     let start = Instant::now();
-    let (mut resp, retries) =
-        invoke_with_circuit(&state.circuits, &tool, name, &ctx, invoke).await;
+    let (mut resp, retries) = invoke_with_circuit(&state.circuits, &tool, name, &ctx, invoke).await;
     resp.duration_ms = start.elapsed().as_millis() as u64;
 
     let outcome = crate::metrics::Outcome::classify(&resp);
@@ -242,9 +241,12 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
         retries,
         args_digest,
     );
-    state
-        .axon
-        .tool_invoked(name, tenant_id.as_deref(), outcome.label(), resp.duration_ms);
+    state.axon.tool_invoked(
+        name,
+        tenant_id.as_deref(),
+        outcome.label(),
+        resp.duration_ms,
+    );
     if outcome == crate::metrics::Outcome::Error {
         state.axon.tool_failed(name, error_code.as_deref(), retries);
     }
@@ -288,6 +290,7 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+/// Implements the behavior exposed by JsonRpcError.
 impl JsonRpcError {
     /// `-32601 Method not found` error for an unknown method name.
     fn method_not_found(method: &str) -> Self {
@@ -309,16 +312,19 @@ impl JsonRpcError {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies enabled default off.
     fn enabled_default_off() {
         std::env::remove_var("HERMES_MCP_ENABLED");
         assert!(!is_enabled());
     }
 
     #[test]
+    /// Verifies enabled when true.
     fn enabled_when_true() {
         std::env::set_var("HERMES_MCP_ENABLED", "true");
         assert!(is_enabled());

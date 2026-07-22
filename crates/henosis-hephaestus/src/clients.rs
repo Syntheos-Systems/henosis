@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use henosis_hermes::{
     circuit::CircuitRegistry,
-    credd_client::CreddClient,
+    phylaxd_client::PhylaxdClient,
     registry::build_registry,
     tool::{InvokeContext, ProviderBases},
 };
@@ -58,6 +58,7 @@ pub enum ClientError {
     Other(String),
 }
 
+/// Converts the source error into the client-facing error type.
 impl From<OrchestratorError> for ClientError {
     /// Map orchestrator errors into the legacy `ClientError` shape so
     /// `tasks.rs` call sites remain unchanged.
@@ -94,6 +95,7 @@ pub struct Clients {
     services: Services,
 }
 
+/// Implements the behavior exposed by Clients.
 impl Clients {
     /// Construct from a Config. Builds a single shared reqwest client used
     /// by every dependent client so the connection pool is unified across
@@ -108,24 +110,24 @@ impl Clients {
             .expect("reqwest client build");
         let auth = ProviderChain::from_config(&cfg);
 
-        // Build the in-process Hermes invoker. credd URL and token are read
+        // Build the in-process Hermes invoker. phylaxd URL and token are read
         // from environment variables matching Hermes's own config conventions so
-        // Hephaestus and Hermes share the same credd endpoint without duplicating
+        // Hephaestus and Hermes share the same phylaxd endpoint without duplicating
         // the values in Hephaestus's Config struct.
-        let credd_url = std::env::var("CREDD_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4400".to_string());
-        let credd_token = std::env::var("HERMES_CREDD_TOKEN")
+        let phylaxd_url =
+            std::env::var("PHYLAXD_URL").unwrap_or_else(|_| "http://127.0.0.1:3100".to_string());
+        let phylaxd_token = std::env::var("HERMES_PHYLAXD_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
         let hermes_public_url = std::env::var("HERMES_PUBLIC_URL")
             .ok()
             .filter(|s| !s.is_empty());
 
-        let credd = Arc::new(CreddClient::new(credd_url, credd_token));
+        let phylaxd = Arc::new(PhylaxdClient::new(phylaxd_url, phylaxd_token));
         let registry = Arc::new(build_registry());
         let circuits = Arc::new(CircuitRegistry::new());
         let ctx = InvokeContext {
-            credd,
+            phylaxd,
             bases: ProviderBases::default(),
             hermes_public_url,
         };

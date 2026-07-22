@@ -1,23 +1,23 @@
 //! Bootstrap-bearer resolver for the memory client.
 //!
 //! Copy-and-owned from `kleos-lib/src/cred/bootstrap.rs` (Story 4.1). Talks to
-//! credd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch the
+//! phylaxd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch the
 //! per-agent bearer at process startup without any plaintext key on disk.
 //!
 //! Resolution order:
 //!
 //! 1. `KLEOS_API_KEY` / `ENGRAM_API_KEY` env vars (test/debug overrides).
-//! 2. credd via `CREDD_SOCKET` (Unix domain) or `CREDD_BIND` (TCP, default
-//!    `127.0.0.1:4400`). Auth is the value of `CREDD_AGENT_KEY` (a scoped
+//! 2. phylaxd via `PHYLAXD_SOCKET` (Unix domain) or `PHYLAXD_BIND` (TCP, default
+//!    `127.0.0.1:3100`). Auth is the value of `PHYLAXD_AGENT_KEY` (a scoped
 //!    bootstrap-agent token).
 //!
 //! The Kleos source also offered an ECDH/PIV bootstrap path that shells to a
 //! YubiKey via python3. This crate is software-key only (no PIV/PKCS#11 runtime
 //! dependency), so that branch is intentionally dropped; the token path is the
-//! only credd transport here.
+//! only phylaxd transport here.
 //!
 //! Results are cached in process memory keyed by agent slot; the cache honors
-//! the `expires_at` field returned by credd so a leaked bearer goes stale on its
+//! the `expires_at` field returned by phylaxd so a leaked bearer goes stale on its
 //! own TTL.
 
 use std::collections::HashMap;
@@ -30,20 +30,20 @@ use thiserror::Error;
 /// Errors produced by [`resolve_api_key`].
 #[derive(Debug, Error)]
 pub enum CredError {
-    /// `CREDD_AGENT_KEY` env var is missing; cannot authenticate to credd.
-    #[error("CREDD_AGENT_KEY is not set; cannot authenticate to credd")]
+    /// `PHYLAXD_AGENT_KEY` env var is missing; cannot authenticate to phylaxd.
+    #[error("PHYLAXD_AGENT_KEY is not set; cannot authenticate to phylaxd")]
     NoAgentKey,
 
-    /// credd is unreachable (socket not found, connection refused, etc.).
-    #[error("credd unreachable: {0}")]
+    /// phylaxd is unreachable (socket not found, connection refused, etc.).
+    #[error("phylaxd unreachable: {0}")]
     Unreachable(String),
 
-    /// credd returned a response that could not be parsed.
-    #[error("bad response from credd: {0}")]
+    /// phylaxd returned a response that could not be parsed.
+    #[error("bad response from phylaxd: {0}")]
     BadResponse(String),
 
-    /// credd response did not include a `key` field.
-    #[error("credd response is missing the 'key' field")]
+    /// phylaxd response did not include a `key` field.
+    #[error("phylaxd response is missing the 'key' field")]
     MissingKey,
 
     /// Caller supplied an invalid argument (e.g. an unsafe agent slot).
@@ -61,7 +61,7 @@ struct CacheEntry {
 }
 
 /// Process-lifetime cache: slot -> (key, expires_at). A miss or expired hit
-/// triggers a fresh fetch from credd.
+/// triggers a fresh fetch from phylaxd.
 static KEY_CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 
 /// Retrieve a cached bearer for `slot`, evicting it if expired.
@@ -128,7 +128,7 @@ fn read_hostname() -> String {
 
 /// Resolve the Kleos API key for `agent_slot`. See module docs for order.
 pub async fn resolve_api_key(agent_slot: &str) -> Result<String, CredError> {
-    // SECURITY (L7): agent_slot is interpolated into the credd request path
+    // SECURITY (L7): agent_slot is interpolated into the phylaxd request path
     // (/bootstrap/kleos-bearer?agent=...). Reject anything outside a safe
     // identifier charset so it cannot inject extra query parameters, path
     // segments, or CR/LF into the request line.
@@ -158,17 +158,17 @@ pub async fn resolve_api_key(agent_slot: &str) -> Result<String, CredError> {
         return Ok(cached);
     }
 
-    let token = env::var("CREDD_AGENT_KEY").map_err(|_| CredError::NoAgentKey)?;
+    let token = env::var("PHYLAXD_AGENT_KEY").map_err(|_| CredError::NoAgentKey)?;
     if token.is_empty() {
         return Err(CredError::NoAgentKey);
     }
 
     let path = format!("/bootstrap/kleos-bearer?agent={}", agent_slot);
 
-    let body: serde_json::Value = if let Ok(sock) = env::var("CREDD_SOCKET") {
+    let body: serde_json::Value = if let Ok(sock) = env::var("PHYLAXD_SOCKET") {
         unix_get_json(&sock, &path, &token).await?
     } else {
-        let bind = env::var("CREDD_BIND").unwrap_or_else(|_| "127.0.0.1:4400".into());
+        let bind = env::var("PHYLAXD_BIND").unwrap_or_else(|_| "127.0.0.1:3100".into());
         tcp_get_json(&bind, &path, &token).await?
     };
 
@@ -230,7 +230,7 @@ async fn unix_get_json(
         .await
         .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
 
-    // Cap the response and bound the read so a rogue local credd cannot OOM or
+    // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -276,7 +276,7 @@ async fn tcp_get_json(bind: &str, path: &str, token: &str) -> Result<serde_json:
         .await
         .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
 
-    // Cap the response and bound the read so a rogue local credd cannot OOM or
+    // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -362,17 +362,17 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    /// Test: no env no credd returns error.
-    async fn no_env_no_credd_returns_error() {
+    /// Test: no env no phylaxd returns error.
+    async fn no_env_no_phylaxd_returns_error() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         env::remove_var("KLEOS_API_KEY");
         env::remove_var("ENGRAM_API_KEY");
-        env::remove_var("CREDD_AGENT_KEY");
-        env::remove_var("CREDD_SOCKET");
-        env::remove_var("CREDD_BIND");
+        env::remove_var("PHYLAXD_AGENT_KEY");
+        env::remove_var("PHYLAXD_SOCKET");
+        env::remove_var("PHYLAXD_BIND");
         // With the ECDH/PIV branch dropped, resolution falls straight through to
-        // the token path, so a missing CREDD_AGENT_KEY yields NoAgentKey.
-        let result = resolve_api_key("no-credd-slot-unique-xyz").await;
+        // the token path, so a missing PHYLAXD_AGENT_KEY yields NoAgentKey.
+        let result = resolve_api_key("no-phylaxd-slot-unique-xyz").await;
         assert!(
             matches!(result, Err(CredError::NoAgentKey)),
             "expected NoAgentKey, got {:?}",

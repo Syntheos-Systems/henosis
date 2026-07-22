@@ -1,6 +1,6 @@
-//! HTTP client for the credd credential daemon.
+//! HTTP client for the phylaxd credential authority.
 //!
-//! Adapters call `CreddClient::fetch_token` to resolve OAuth bearer tokens and
+//! Adapters call `PhylaxdClient::fetch_token` to resolve OAuth bearer tokens and
 //! `fetch_raw_secret` for non-OAuth secrets (e.g. webhook signing keys). The
 //! client also wires into `RefreshRegistry` so the background OAuth refresh
 //! daemon knows which (tenant, provider) pairs to keep alive.
@@ -13,11 +13,11 @@ use thiserror::Error;
 
 use crate::oauth_refresh::RefreshRegistry;
 
-/// Errors returned by credd credential resolution calls.
+/// Errors returned by phylaxd credential resolution calls.
 #[derive(Debug, Error)]
-pub enum CreddError {
-    /// The credd daemon could not be reached over the network.
-    #[error("credd unreachable at {url}: {source}")]
+pub enum PhylaxdError {
+    /// The phylaxd daemon could not be reached over the network.
+    #[error("phylaxd unreachable at {url}: {source}")]
     Unreachable {
         /// The URL that was attempted.
         url: String,
@@ -25,39 +25,39 @@ pub enum CreddError {
         source: reqwest::Error,
     },
     /// The tenant has no provisioned credential for this provider.
-    #[error("tenant not authorized for provider {provider} (credd slot {category}/{name})")]
+    #[error("tenant not authorized for provider {provider} (phylaxd slot {category}/{name})")]
     TenantNotAuthorized {
         /// The provider name (e.g. "google", "github").
         provider: String,
-        /// The credd category (e.g. "google_oauth").
+        /// The phylaxd category (e.g. "google_oauth").
         category: String,
-        /// The credd slot name (typically the tenant ID).
+        /// The phylaxd slot name (typically the tenant ID).
         name: String,
     },
-    /// No `HERMES_CREDD_TOKEN` is set; the client cannot authenticate.
-    #[error("credd auth missing -- set HERMES_CREDD_TOKEN")]
+    /// No `HERMES_PHYLAXD_TOKEN` is set; the client cannot authenticate.
+    #[error("phylaxd auth missing -- set HERMES_PHYLAXD_TOKEN")]
     AuthMissing,
-    /// Credd returned a non-success HTTP status.
-    #[error("credd returned {status}: {body}")]
+    /// Phylaxd returned a non-success HTTP status.
+    #[error("phylaxd returned {status}: {body}")]
     Upstream {
         /// HTTP status code.
         status: u16,
         /// Response body (truncated to 512 bytes).
         body: String,
     },
-    /// The credd response did not contain an `access_token` or `value` field.
-    #[error("credd response missing access_token field")]
+    /// The phylaxd response did not contain an `access_token` or `value` field.
+    #[error("phylaxd response missing access_token field")]
     MalformedResponse,
 }
 
-/// Wire format for the credd `/resolve/raw` request body.
+/// Wire format for the phylaxd `/resolve/raw` request body.
 #[derive(Debug, Serialize)]
 struct RawRequest<'a> {
     category: &'a str,
     name: &'a str,
 }
 
-/// Wire format for the credd `/resolve/raw` response body.
+/// Wire format for the phylaxd `/resolve/raw` response body.
 #[derive(Debug, Deserialize)]
 struct RawResponse {
     #[allow(dead_code)]
@@ -67,29 +67,30 @@ struct RawResponse {
     value: Value,
 }
 
-/// Wire format for the credd `/secret/{category}/{name}` PUT request body.
+/// Wire format for the phylaxd `/secret/{category}/{name}` PUT request body.
 #[derive(Debug, Serialize)]
 struct StoreRequest<'a> {
     data: &'a Value,
 }
 
-/// HTTP client for the credd credential daemon. Cloneable; intended to be
-/// shared via `Arc<CreddClient>` across all in-flight invocations.
+/// HTTP client for the phylaxd credential daemon. Cloneable; intended to be
+/// shared via `Arc<PhylaxdClient>` across all in-flight invocations.
 #[derive(Debug, Clone)]
-pub struct CreddClient {
+pub struct PhylaxdClient {
     /// Shared HTTP client with connect and read timeouts.
     http: reqwest::Client,
-    /// Base URL of the credd daemon.
+    /// Base URL of the phylaxd daemon.
     base_url: String,
-    /// Bearer token for authenticating to credd.
+    /// Bearer token for authenticating to phylaxd.
     token: Option<String>,
     /// Optional refresh registry to register (tenant, provider) pairs after a
     /// successful token fetch.
     refresh_registry: Option<RefreshRegistry>,
 }
 
-impl CreddClient {
-    /// Construct a new client for the given credd base URL and optional bearer
+/// Implements authenticated credential reads, refreshes, and updates against phylaxd.
+impl PhylaxdClient {
+    /// Construct a new client for the given phylaxd base URL and optional bearer
     /// token.
     pub fn new(base_url: String, token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
@@ -118,8 +119,12 @@ impl CreddClient {
     ///
     /// Slot mapping: category=`{provider}_oauth`, name=`{tenant_id}`.
     /// SecretData primary value is read as a JSON string, or as `.access_token` if structured.
-    pub async fn fetch_token(&self, tenant_id: &str, provider: &str) -> Result<String, CreddError> {
-        let token = self.token.as_deref().ok_or(CreddError::AuthMissing)?;
+    pub async fn fetch_token(
+        &self,
+        tenant_id: &str,
+        provider: &str,
+    ) -> Result<String, PhylaxdError> {
+        let token = self.token.as_deref().ok_or(PhylaxdError::AuthMissing)?;
 
         let category = format!("{provider}_oauth");
         let url = format!("{}/resolve/raw", self.base_url.trim_end_matches('/'));
@@ -134,14 +139,14 @@ impl CreddClient {
             })
             .send()
             .await
-            .map_err(|source| CreddError::Unreachable {
+            .map_err(|source| PhylaxdError::Unreachable {
                 url: url.clone(),
                 source,
             })?;
 
         let status = resp.status();
         if status.as_u16() == 404 {
-            return Err(CreddError::TenantNotAuthorized {
+            return Err(PhylaxdError::TenantNotAuthorized {
                 provider: provider.to_string(),
                 category,
                 name: tenant_id.to_string(),
@@ -149,13 +154,16 @@ impl CreddClient {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CreddError::Upstream {
+            return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
                 body: truncate(&body, 512),
             });
         }
 
-        let parsed: RawResponse = resp.json().await.map_err(|_| CreddError::MalformedResponse)?;
+        let parsed: RawResponse = resp
+            .json()
+            .await
+            .map_err(|_| PhylaxdError::MalformedResponse)?;
 
         // SecretData shapes we accept:
         // 1. JSON object with "access_token": "..."
@@ -168,11 +176,11 @@ impl CreddClient {
                 } else if let Some(Value::String(s)) = map.get("value") {
                     s.clone()
                 } else {
-                    return Err(CreddError::MalformedResponse);
+                    return Err(PhylaxdError::MalformedResponse);
                 }
             }
             Value::String(s) => s.clone(),
-            _ => return Err(CreddError::MalformedResponse),
+            _ => return Err(PhylaxdError::MalformedResponse),
         };
 
         if let Some(reg) = &self.refresh_registry {
@@ -191,8 +199,8 @@ impl CreddClient {
         &self,
         category: &str,
         name: &str,
-    ) -> Result<String, CreddError> {
-        let token = self.token.as_deref().ok_or(CreddError::AuthMissing)?;
+    ) -> Result<String, PhylaxdError> {
+        let token = self.token.as_deref().ok_or(PhylaxdError::AuthMissing)?;
         let url = format!("{}/resolve/raw", self.base_url.trim_end_matches('/'));
 
         let resp = self
@@ -202,14 +210,14 @@ impl CreddClient {
             .json(&RawRequest { category, name })
             .send()
             .await
-            .map_err(|source| CreddError::Unreachable {
+            .map_err(|source| PhylaxdError::Unreachable {
                 url: url.clone(),
                 source,
             })?;
 
         let status = resp.status();
         if status.as_u16() == 404 {
-            return Err(CreddError::TenantNotAuthorized {
+            return Err(PhylaxdError::TenantNotAuthorized {
                 provider: name.to_string(),
                 category: category.to_string(),
                 name: name.to_string(),
@@ -217,21 +225,24 @@ impl CreddClient {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CreddError::Upstream {
+            return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
                 body: truncate(&body, 512),
             });
         }
 
-        let parsed: RawResponse = resp.json().await.map_err(|_| CreddError::MalformedResponse)?;
+        let parsed: RawResponse = resp
+            .json()
+            .await
+            .map_err(|_| PhylaxdError::MalformedResponse)?;
         match parsed.value {
             Value::String(s) => Ok(s),
             Value::Object(map) => map
                 .get("value")
                 .or_else(|| map.get("access_token"))
                 .and_then(|v| v.as_str().map(String::from))
-                .ok_or(CreddError::MalformedResponse),
-            _ => Err(CreddError::MalformedResponse),
+                .ok_or(PhylaxdError::MalformedResponse),
+            _ => Err(PhylaxdError::MalformedResponse),
         }
     }
 
@@ -241,8 +252,8 @@ impl CreddClient {
         &self,
         tenant_id: &str,
         provider: &str,
-    ) -> Result<Value, CreddError> {
-        let token = self.token.as_deref().ok_or(CreddError::AuthMissing)?;
+    ) -> Result<Value, PhylaxdError> {
+        let token = self.token.as_deref().ok_or(PhylaxdError::AuthMissing)?;
         let category = format!("{provider}_oauth");
         let url = format!("{}/resolve/raw", self.base_url.trim_end_matches('/'));
 
@@ -256,14 +267,14 @@ impl CreddClient {
             })
             .send()
             .await
-            .map_err(|source| CreddError::Unreachable {
+            .map_err(|source| PhylaxdError::Unreachable {
                 url: url.clone(),
                 source,
             })?;
 
         let status = resp.status();
         if status.as_u16() == 404 {
-            return Err(CreddError::TenantNotAuthorized {
+            return Err(PhylaxdError::TenantNotAuthorized {
                 provider: provider.to_string(),
                 category,
                 name: tenant_id.to_string(),
@@ -271,17 +282,20 @@ impl CreddClient {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CreddError::Upstream {
+            return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
                 body: truncate(&body, 512),
             });
         }
-        let parsed: RawResponse = resp.json().await.map_err(|_| CreddError::MalformedResponse)?;
+        let parsed: RawResponse = resp
+            .json()
+            .await
+            .map_err(|_| PhylaxdError::MalformedResponse)?;
         Ok(parsed.value)
     }
 
     /// Write a refreshed secret back via PUT /secret/{category}/{name}. The
-    /// credd token must have master rights for this endpoint to accept the
+    /// phylaxd token must have master rights for this endpoint to accept the
     /// update; otherwise the call fails with 401/403 and the caller logs a
     /// warning.
     pub async fn update_secret(
@@ -289,8 +303,8 @@ impl CreddClient {
         tenant_id: &str,
         provider: &str,
         new_value: &Value,
-    ) -> Result<(), CreddError> {
-        let token = self.token.as_deref().ok_or(CreddError::AuthMissing)?;
+    ) -> Result<(), PhylaxdError> {
+        let token = self.token.as_deref().ok_or(PhylaxdError::AuthMissing)?;
         let category = format!("{provider}_oauth");
         let url = format!(
             "{}/secret/{}/{}",
@@ -306,7 +320,7 @@ impl CreddClient {
             .json(&StoreRequest { data: new_value })
             .send()
             .await
-            .map_err(|source| CreddError::Unreachable {
+            .map_err(|source| PhylaxdError::Unreachable {
                 url: url.clone(),
                 source,
             })?;
@@ -314,7 +328,7 @@ impl CreddClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CreddError::Upstream {
+            return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
                 body: truncate(&body, 512),
             });

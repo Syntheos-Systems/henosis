@@ -24,6 +24,7 @@ pub enum ProviderKind {
     OpenAiCompat,
 }
 
+/// Implements the behavior exposed by ProviderKind.
 impl ProviderKind {
     /// Parse the `HEPHAESTUS_PROVIDER` env value. Named `parse_env` (rather
     /// than `from_str`) so it does not collide with the `std::str::FromStr`
@@ -50,7 +51,7 @@ pub struct Config {
     pub env: DeployEnv,
     /// Base URL of the Kleos memory service.
     pub kleos_url: String,
-    /// credd slot holding the Kleos bearer token.
+    /// phylaxd slot holding the Kleos bearer token.
     pub kleos_token_slot: String,
     /// Base URL of the Chiasm coordination service.
     pub chiasm_url: String,
@@ -58,7 +59,7 @@ pub struct Config {
     pub chiasm_agent: String,
     /// Default project name for Chiasm tasks.
     pub chiasm_project: String,
-    /// Optional credd slot for Chiasm auth (None = unauthenticated).
+    /// Optional phylaxd slot for Chiasm auth (None = unauthenticated).
     pub chiasm_token_slot: Option<String>,
     /// Base URL of the Axon event bus (may be the same host as Kleos).
     pub axon_url: String,
@@ -105,7 +106,7 @@ pub struct Config {
     /// default Messages endpoint; for OpenAI-compat this is the base URL of
     /// the upstream service (without `/chat/completions`).
     pub provider_url: Option<String>,
-    /// credd slot containing the API key for the active provider. Only used
+    /// phylaxd slot containing the API key for the active provider. Only used
     /// by OpenAI-compat; Anthropic resolves credentials through the existing
     /// `ProviderChain` regardless of this setting.
     pub provider_key_slot: Option<String>,
@@ -115,6 +116,7 @@ pub struct Config {
     pub provider_api_key: Option<String>,
 }
 
+/// Implements the behavior exposed by Config.
 impl Config {
     /// Load all configuration from environment variables. Every field has a
     /// documented default; the service can start without any env vars set
@@ -143,7 +145,7 @@ impl Config {
             port,
             env,
             kleos_url: env_or("KLEOS_URL", "http://127.0.0.1:4200"),
-            kleos_token_slot: env_or("KLEOS_TOKEN_CRED_SLOT", "engram-rust/claude-code-wsl"),
+            kleos_token_slot: env_or("KLEOS_TOKEN_CRED_SLOT", "henosis/kleos-api"),
             chiasm_url: env_or("CHIASM_URL", "http://127.0.0.1:4300"),
             chiasm_agent: env_or("CHIASM_AGENT", "hephaestus"),
             chiasm_project: env_or("CHIASM_PROJECT", "hephaestus-smoke"),

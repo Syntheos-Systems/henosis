@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate};
+use crate::adapters::common::{build_http, phylaxd_error_to_response, send_with_retry, truncate};
 use crate::tool::{
     err, error_response, InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema,
 };
 
 /// Tool ID for the send_message adapter.
 const TOOL_ID: &str = "slack.send_message";
-/// credd provider tag for Slack.
+/// phylaxd provider tag for Slack.
 const PROVIDER: &str = "slack";
 /// Slack chat.postMessage API endpoint.
 const CHAT_POST_URL: &str = "https://slack.com/api/chat.postMessage";
@@ -23,7 +23,9 @@ const CHAT_POST_URL: &str = "https://slack.com/api/chat.postMessage";
 pub struct SlackSendMessageTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for SlackSendMessageTool.
 impl Tool for SlackSendMessageTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: TOOL_ID.to_string(),
@@ -54,10 +56,12 @@ impl Tool for SlackSendMessageTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
@@ -69,9 +73,9 @@ impl Tool for SlackSendMessageTool {
             Err(msg) => return error_response(TOOL_ID, "bad_request", msg, None),
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response(TOOL_ID, &e),
+            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),
         };
 
         let http = match build_http() {
@@ -209,10 +213,7 @@ fn parse_args(args: &Value) -> Result<SlackArgs, String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let blocks = obj
-        .get("blocks")
-        .filter(|v| v.is_array())
-        .cloned();
+    let blocks = obj.get("blocks").filter(|v| v.is_array()).cloned();
     Ok(SlackArgs {
         channel: pull_required("channel")?,
         text: pull_required("text")?,
@@ -222,10 +223,12 @@ fn parse_args(args: &Value) -> Result<SlackArgs, String> {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies parse minimal.
     fn parse_minimal() {
         let v = json!({"channel":"#general","text":"hi"});
         let a = parse_args(&v).unwrap();
@@ -234,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse with thread and blocks.
     fn parse_with_thread_and_blocks() {
         let v = json!({
             "channel": "C123",
@@ -247,12 +251,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse rejects missing text.
     fn parse_rejects_missing_text() {
         let v = json!({"channel":"#general"});
         assert!(parse_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies parse rejects empty channel.
     fn parse_rejects_empty_channel() {
         let v = json!({"channel":"","text":"hi"});
         assert!(parse_args(&v).is_err());

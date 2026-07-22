@@ -43,7 +43,7 @@ pub struct ToolResult {
 }
 
 /// In-process Hermes tool invoker. Holds a fully-built registry, a circuit
-/// breaker registry, and the per-invocation context (credd client + provider
+/// breaker registry, and the per-invocation context (phylaxd client + provider
 /// base URLs). Replaces the former `reqwest`-backed HTTP client.
 pub struct HermesClient {
     /// The populated tool registry from `henosis_hermes::registry::build_registry`.
@@ -54,11 +54,20 @@ pub struct HermesClient {
     ctx: InvokeContext,
 }
 
+/// Implements the behavior exposed by HermesClient.
 impl HermesClient {
     /// Construct an in-process Hermes client. The caller is responsible for
     /// building the registry, circuits, and context before calling this.
-    pub fn new(registry: Arc<ToolRegistry>, circuits: Arc<CircuitRegistry>, ctx: InvokeContext) -> Self {
-        Self { registry, circuits, ctx }
+    pub fn new(
+        registry: Arc<ToolRegistry>,
+        circuits: Arc<CircuitRegistry>,
+        ctx: InvokeContext,
+    ) -> Self {
+        Self {
+            registry,
+            circuits,
+            ctx,
+        }
     }
 
     /// Dispatch a tool call in-process through the Hermes registry and circuit
@@ -77,7 +86,10 @@ impl HermesClient {
         let tool = match self.registry.get(tool_name) {
             Some(t) => t,
             None => {
-                warn!(tool = tool_name, "hermes in-process: tool not found in registry");
+                warn!(
+                    tool = tool_name,
+                    "hermes in-process: tool not found in registry"
+                );
                 return error_result(
                     tool_use_id,
                     "tool_not_found",
@@ -95,7 +107,8 @@ impl HermesClient {
         // underlying InvokeContext is Clone so we can cheaply specialise it.
         let ctx = self.ctx.clone();
 
-        let (resp, _retries) = invoke_with_circuit(&self.circuits, &tool, tool_name, &ctx, req).await;
+        let (resp, _retries) =
+            invoke_with_circuit(&self.circuits, &tool, tool_name, &ctx, req).await;
 
         if resp.success {
             let content = resp

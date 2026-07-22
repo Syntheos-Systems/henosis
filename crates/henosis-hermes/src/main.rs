@@ -31,18 +31,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config::from_env();
     let port = cfg.port;
-    let credd_url = cfg.credd_url.clone();
-    let credd_token_missing = cfg.credd_token.is_none();
+    let phylaxd_url = cfg.phylaxd_url.clone();
+    let phylaxd_token_missing = cfg.phylaxd_token.is_none();
     let state = AppState::from_config(cfg);
 
     info!(
-        "{SERVICE} {VERSION} -- {} tools registered, credd at {}",
+        "{SERVICE} {VERSION} -- {} tools registered, phylaxd at {}",
         state.registry.list().len(),
-        credd_url,
+        phylaxd_url,
     );
-    if credd_token_missing {
+    if phylaxd_token_missing {
         info!(
-            "HERMES_CREDD_TOKEN not set -- adapters needing OAuth will return credd_auth_missing"
+            "HERMES_PHYLAXD_TOKEN not set -- adapters needing OAuth will return phylaxd_auth_missing"
         );
     }
 

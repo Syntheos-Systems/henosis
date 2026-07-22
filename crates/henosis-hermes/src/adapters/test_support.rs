@@ -1,5 +1,5 @@
 //! Test-only support: a wiremock-backed `test_adapter!` macro and a context
-//! builder that points credd and provider base URLs at a mock server.
+//! builder that points phylaxd and provider base URLs at a mock server.
 //!
 //! The macro covers the common adapter shape -- one upstream call returning a
 //! canned body. Multi-call or special-case adapters write manual wiremock
@@ -8,14 +8,17 @@
 
 use std::sync::Arc;
 
-use crate::credd_client::CreddClient;
+use crate::phylaxd_client::PhylaxdClient;
 use crate::tool::{InvokeContext, ProviderBases};
 
-/// Build an `InvokeContext` whose credd client and provider base URLs all
+/// Build an `InvokeContext` whose phylaxd client and provider base URLs all
 /// point at a single mock server.
 pub fn test_ctx(base: &str) -> InvokeContext {
     InvokeContext {
-        credd: Arc::new(CreddClient::new(base.to_string(), Some("test-credd-token".to_string()))),
+        phylaxd: Arc::new(PhylaxdClient::new(
+            base.to_string(),
+            Some("test-phylaxd-token".to_string()),
+        )),
         bases: ProviderBases {
             linear: base.to_string(),
             notion: base.to_string(),
@@ -24,7 +27,7 @@ pub fn test_ctx(base: &str) -> InvokeContext {
     }
 }
 
-/// Generate a `#[tokio::test]` that mounts a credd token mock plus one
+/// Generate a `#[tokio::test]` that mounts a phylaxd token mock plus one
 /// upstream mock, invokes the tool, and asserts top-level result fields.
 macro_rules! test_adapter {
     (
@@ -37,9 +40,10 @@ macro_rules! test_adapter {
         expect: { $($key:expr => $val:tt),* $(,)? }
     ) => {
         #[tokio::test]
+        /// Verifies $name.
         async fn $name() {
             let server = ::wiremock::MockServer::start().await;
-            // credd token resolution mock.
+            // phylaxd token resolution mock.
             ::wiremock::Mock::given(::wiremock::matchers::method("POST"))
                 .and(::wiremock::matchers::path("/resolve/raw"))
                 .respond_with(::wiremock::ResponseTemplate::new(200).set_body_json(

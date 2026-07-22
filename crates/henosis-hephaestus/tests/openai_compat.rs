@@ -37,6 +37,7 @@ struct Mocks {
     _tmp: TempDir,
 }
 
+/// Implements the behavior exposed by Mocks.
 impl Mocks {
     /// Spin up all mocks and pre-populate the standard 200 responses for
     /// the coordination services. The LLM mock is configured per-test.
@@ -80,12 +81,9 @@ impl Mocks {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let cred = tmp.path().join("credentials.json");
-        tokio::fs::write(
-            &cred,
-            br#"{"claudeAiOauth":{"accessToken":"test-token"}}"#,
-        )
-        .await
-        .expect("cred write");
+        tokio::fs::write(&cred, br#"{"claudeAiOauth":{"accessToken":"test-token"}}"#)
+            .await
+            .expect("cred write");
 
         Self {
             openai,
@@ -100,7 +98,7 @@ impl Mocks {
 
     /// Build a Config wired for the OpenAI-compat provider. The provider URL
     /// points at the mock; the API key is set inline so the factory does
-    /// not need credd.
+    /// not need phylaxd.
     fn config(&self) -> Config {
         Config {
             port: 0,
@@ -233,9 +231,14 @@ async fn openai_compat_happy_path() {
         .and_then(|s| s.as_str())
         .expect("task_id");
 
-    let final_state = poll_status(&base, task_id, TaskStatus::Completed, Duration::from_secs(5))
-        .await
-        .expect("task did not reach Completed");
+    let final_state = poll_status(
+        &base,
+        task_id,
+        TaskStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("task did not reach Completed");
     assert_eq!(
         final_state.get("output").and_then(|s| s.as_str()),
         Some("openai-ok")

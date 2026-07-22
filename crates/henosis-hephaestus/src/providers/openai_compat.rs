@@ -6,7 +6,7 @@
 //! Hephaestus-stable name reported via `Provider::name()`.
 //!
 //! Auth is intentionally simple: a static API key resolved at construction
-//! time, either from the env var `HEPHAESTUS_PROVIDER_KEY` or from a credd
+//! time, either from the env var `HEPHAESTUS_PROVIDER_KEY` or from a phylaxd
 //! slot named in `HEPHAESTUS_PROVIDER_KEY_SLOT`. There is no token refresh
 //! because the supported endpoints all use long-lived keys.
 

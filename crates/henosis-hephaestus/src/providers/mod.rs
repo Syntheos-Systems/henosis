@@ -74,8 +74,8 @@ pub async fn build_provider(
 }
 
 /// Resolve the OpenAI-compatible API key from the configured sources. The env
-/// var `HEPHAESTUS_PROVIDER_KEY` wins over the credd slot, so tests and local
-/// dev can override without touching credd. If neither resolves, return a
+/// var `HEPHAESTUS_PROVIDER_KEY` wins over the phylaxd slot, so tests and local
+/// dev can override without touching phylaxd. If neither resolves, return a
 /// clear error so server startup fails fast rather than at first request.
 async fn resolve_openai_key(cfg: &Config, services: &Services) -> Result<String> {
     if let Some(k) = cfg.provider_api_key.as_deref()

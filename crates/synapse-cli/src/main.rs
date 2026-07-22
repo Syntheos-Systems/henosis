@@ -624,7 +624,7 @@ fn harden_synapse_dir_perms() {}
 
 /// Probe the PIV identity at startup and emit a visible warning if the
 /// signer cannot be built. A red warning means no signer at all (Kleos
-/// requests will fall back to KLEOS_API_KEY/credd, which still works but
+/// requests will fall back to KLEOS_API_KEY/phylaxd, which still works but
 /// loses non-repudiation for Broca audit entries). A yellow warning means
 /// the YubiKey wasn't reachable but a file/env key is present.
 ///
@@ -654,7 +654,7 @@ fn piv_status_warning() {
 }
 
 /// Build a Kleos client with the same auth cascade as kleos-cli:
-/// PIV YubiKey → KLEOS_API_KEY env → credd bootstrap.
+/// PIV YubiKey → KLEOS_API_KEY env → phylaxd bootstrap.
 async fn bootstrap_kleos_client() -> henosis_memory_client::Client {
     ensure_piv_pin();
     let base_url =

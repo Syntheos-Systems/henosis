@@ -1,27 +1,29 @@
 //! Linear adapters: create_issue, list_issues, update_issue, search, create_webhook.
 //!
 //! All tools hit Linear's GraphQL API at `https://api.linear.app/graphql`.
-//! Authentication is via an API key fetched from credd under the `linear` provider.
+//! Authentication is via an API key fetched from phylaxd under the `linear` provider.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate};
+use crate::adapters::common::{build_http, phylaxd_error_to_response, send_with_retry, truncate};
 use crate::tool::{
     err, error_response, InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema,
 };
 
 /// Linear GraphQL API endpoint.
 const GQL_URL: &str = "https://api.linear.app/graphql";
-/// credd provider tag for all Linear tools.
+/// phylaxd provider tag for all Linear tools.
 const PROVIDER: &str = "linear";
 
 /// Create a Linear issue in the given team.
 pub struct LinearCreateIssueTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for LinearCreateIssueTool.
 impl Tool for LinearCreateIssueTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "linear.create_issue".to_string(),
@@ -52,6 +54,7 @@ impl Tool for LinearCreateIssueTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
@@ -61,6 +64,7 @@ impl Tool for LinearCreateIssueTool {
         crate::tool::RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let (tenant_id, obj) = match prep_request("linear.create_issue", &req) {
             Ok(r) => r,
@@ -97,9 +101,9 @@ mutation CreateIssue($teamId:String! $title:String! $description:String $priorit
   }
 }"#;
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("linear.create_issue", &e),
+            Err(e) => return phylaxd_error_to_response("linear.create_issue", &e),
         };
         let outcome = match linear_gql(&token, query, &vars, &self.retry_policy()).await {
             Ok(o) => o,
@@ -131,7 +135,9 @@ mutation CreateIssue($teamId:String! $title:String! $description:String $priorit
 pub struct LinearListIssuesTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for LinearListIssuesTool.
 impl Tool for LinearListIssuesTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "linear.list_issues".to_string(),
@@ -158,10 +164,12 @@ impl Tool for LinearListIssuesTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let (tenant_id, obj) = match prep_request("linear.list_issues", &req) {
             Ok(r) => r,
@@ -195,9 +203,9 @@ query ListIssues($filter:IssueFilter $first:Int) {
   }
 }"#;
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("linear.list_issues", &e),
+            Err(e) => return phylaxd_error_to_response("linear.list_issues", &e),
         };
         let outcome = match linear_gql(&token, query, &vars, &self.retry_policy()).await {
             Ok(o) => o,
@@ -238,7 +246,9 @@ query ListIssues($filter:IssueFilter $first:Int) {
 pub struct LinearUpdateIssueTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for LinearUpdateIssueTool.
 impl Tool for LinearUpdateIssueTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "linear.update_issue".to_string(),
@@ -262,10 +272,12 @@ impl Tool for LinearUpdateIssueTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let (tenant_id, obj) = match prep_request("linear.update_issue", &req) {
             Ok(r) => r,
@@ -293,7 +305,12 @@ impl Tool for LinearUpdateIssueTool {
             input.insert("assigneeId".into(), json!(a));
         }
         if input.is_empty() {
-            return error_response("linear.update_issue", "bad_request", "no updatable fields provided", Some("supply at least one of title/description/priority/state_id/assignee_id"));
+            return error_response(
+                "linear.update_issue",
+                "bad_request",
+                "no updatable fields provided",
+                Some("supply at least one of title/description/priority/state_id/assignee_id"),
+            );
         }
 
         let vars = json!({ "id": issue_id, "input": input });
@@ -305,9 +322,9 @@ mutation UpdateIssue($id:String! $input:IssueUpdateInput!) {
   }
 }"#;
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("linear.update_issue", &e),
+            Err(e) => return phylaxd_error_to_response("linear.update_issue", &e),
         };
         let outcome = match linear_gql(&token, query, &vars, &self.retry_policy()).await {
             Ok(o) => o,
@@ -335,7 +352,9 @@ mutation UpdateIssue($id:String! $input:IssueUpdateInput!) {
 pub struct LinearSearchTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for LinearSearchTool.
 impl Tool for LinearSearchTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "linear.search".to_string(),
@@ -359,10 +378,12 @@ impl Tool for LinearSearchTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let (tenant_id, obj) = match prep_request("linear.search", &req) {
             Ok(r) => r,
@@ -396,9 +417,9 @@ query SearchIssues($term:String! $filter:IssueFilter $first:Int) {
   }
 }"#;
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("linear.search", &e),
+            Err(e) => return phylaxd_error_to_response("linear.search", &e),
         };
         let outcome = match linear_gql(&token, gql, &vars, &self.retry_policy()).await {
             Ok(o) => o,
@@ -439,7 +460,9 @@ query SearchIssues($term:String! $filter:IssueFilter $first:Int) {
 pub struct LinearCreateWebhookTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for LinearCreateWebhookTool.
 impl Tool for LinearCreateWebhookTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "linear.create_webhook".to_string(),
@@ -472,6 +495,7 @@ impl Tool for LinearCreateWebhookTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
@@ -481,6 +505,7 @@ impl Tool for LinearCreateWebhookTool {
         crate::tool::RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let (tenant_id, obj) = match prep_request("linear.create_webhook", &req) {
             Ok(r) => r,
@@ -515,9 +540,9 @@ mutation CreateWebhook($teamId:String! $url:String! $label:String $resourceTypes
   }
 }"#;
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("linear.create_webhook", &e),
+            Err(e) => return phylaxd_error_to_response("linear.create_webhook", &e),
         };
         let outcome = match linear_gql(&token, query, &vars, &self.retry_policy()).await {
             Ok(o) => o,
@@ -557,20 +582,21 @@ async fn linear_gql(
 ) -> Result<Value, InvokeResponse> {
     let http = build_http().map_err(|e| linear_prep("linear", e.to_string()))?;
     let body = json!({ "query": query, "variables": variables });
-    let request = http
-        .post(GQL_URL)
-        .bearer_auth(token)
-        .json(&body);
+    let request = http.post(GQL_URL).bearer_auth(token).json(&body);
 
-    let outcome = send_with_retry(request, policy).await.map_err(|e| {
-        InvokeResponse {
+    let outcome = send_with_retry(request, policy)
+        .await
+        .map_err(|e| InvokeResponse {
             tool_id: "linear".into(),
             success: false,
             result: None,
-            error: Some(err("linear_unreachable", format!("linear api request failed: {e}"), None)),
+            error: Some(err(
+                "linear_unreachable",
+                format!("linear api request failed: {e}"),
+                None,
+            )),
             duration_ms: 0,
-        }
-    })?;
+        })?;
 
     if !outcome.status.is_success() {
         warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "linear api error");
@@ -638,10 +664,9 @@ fn prep_request<'a>(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| error_response(tool_id, "bad_request", "tenant_id is required", None))?;
-    let obj = req
-        .args
-        .as_object()
-        .ok_or_else(|| error_response(tool_id, "bad_request", "args must be a JSON object", None))?;
+    let obj = req.args.as_object().ok_or_else(|| {
+        error_response(tool_id, "bad_request", "args must be a JSON object", None)
+    })?;
     Ok((tenant_id, obj))
 }
 
@@ -680,10 +705,12 @@ fn issue_summary(node: &Value) -> Value {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies issue summary maps fields.
     fn issue_summary_maps_fields() {
         let node = json!({
             "id": "i1",
@@ -701,6 +728,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies issue summary tolerates missing fields.
     fn issue_summary_tolerates_missing_fields() {
         let node = json!({ "id": "i2", "identifier": "ENG-1" });
         let s = issue_summary(&node);
@@ -709,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies opt str trims and rejects empty.
     fn opt_str_trims_and_rejects_empty() {
         let obj = json!({ "k": "  hello  ", "empty": "" });
         let m = obj.as_object().unwrap();
@@ -718,6 +747,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies req str returns error on missing.
     fn req_str_returns_error_on_missing() {
         let obj = json!({ "x": 1 });
         let m = obj.as_object().unwrap();
@@ -725,6 +755,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies req str returns trimmed value.
     fn req_str_returns_trimmed_value() {
         let obj = json!({ "title": "  hi  " });
         let m = obj.as_object().unwrap();
@@ -732,15 +763,23 @@ mod tests {
     }
 
     #[test]
+    /// Verifies prep request rejects missing tenant.
     fn prep_request_rejects_missing_tenant() {
-        let req = InvokeRequest { tenant_id: None, args: json!({}) };
+        let req = InvokeRequest {
+            tenant_id: None,
+            args: json!({}),
+        };
         let result = prep_request("t", &req);
         assert!(result.is_err());
     }
 
     #[test]
+    /// Verifies prep request rejects non object args.
     fn prep_request_rejects_non_object_args() {
-        let req = InvokeRequest { tenant_id: Some("t".into()), args: json!("bad") };
+        let req = InvokeRequest {
+            tenant_id: Some("t".into()),
+            args: json!("bad"),
+        };
         let result = prep_request("t", &req);
         assert!(result.is_err());
     }
@@ -753,6 +792,7 @@ mod tests {
         use super::*;
         use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
 
+        /// Verifies start linear mock.
         async fn start_linear_mock(response_body: Value) -> MockServer {
             let server = MockServer::start().await;
             Mock::given(method("POST"))

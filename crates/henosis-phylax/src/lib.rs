@@ -5,10 +5,10 @@
 //! secret injected -- so credential material never crosses the agent boundary. It backs the
 //! dispatcher's `phylax` gate slot.
 //!
-//! This is a copy-and-own absorption (the agent-forge pattern): Kleos keeps shipping `kleos-phylax`
-//! standalone, while this crate is Henosis's own snapshot reworked onto the principal model
+//! Henosis owns this credential-policy implementation locally while upstream Kleos remains
+//! unchanged. This crate is a snapshot reworked onto the principal model
 //! (ownership is a [`syntheos_contracts::TenantId`], not a `user_id: i64`), with its own
-//! field-level encryption, typed Axon events instead of an audit table, and the credd auth /
+//! field-level encryption, typed Axon events instead of an audit table, and the phylaxd auth /
 //! approval-flow / SSH-CA machinery deliberately left behind (authn is the dispatcher's job;
 //! human-in-the-loop is the Human gate's).
 //!

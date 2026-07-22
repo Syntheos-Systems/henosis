@@ -36,7 +36,7 @@ fn extract_memory_id(value: &Value) -> i64 {
 }
 
 /// Lazily-initialised Kleos client with the same auth cascade as kleos-cli:
-/// PIV YubiKey → KLEOS_API_KEY env → credd bootstrap.
+/// PIV YubiKey → KLEOS_API_KEY env → phylaxd bootstrap.
 /// Expects PIV_PIN to already be in the env (set by main.rs ensure_piv_pin).
 pub(crate) async fn client() -> anyhow::Result<&'static henosis_memory_client::Client> {
     static CLIENT: OnceCell<henosis_memory_client::Client> = OnceCell::const_new();
@@ -1692,7 +1692,10 @@ impl AgentTool for HandoffSearchTool {
 
         match client()
             .await?
-            .get(&format!("/handoffs/search?q={}", urlencoding::encode(query)))
+            .get(&format!(
+                "/handoffs/search?q={}",
+                urlencoding::encode(query)
+            ))
             .await
         {
             Ok(resp) => Ok(ToolResult {

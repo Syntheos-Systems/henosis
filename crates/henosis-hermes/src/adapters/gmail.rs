@@ -1,6 +1,6 @@
 //! Gmail adapters: send, read, search, and list_labels.
 //!
-//! All tools authenticate via Google OAuth tokens resolved from credd.
+//! All tools authenticate via Google OAuth tokens resolved from phylaxd.
 //! The send adapter builds a full RFC2822 MIME message and base64url-encodes
 //! it before posting to the Gmail API.
 
@@ -10,14 +10,15 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate};
+use crate::adapters::common::{build_http, phylaxd_error_to_response, send_with_retry, truncate};
 use crate::tool::{
-    err, error_response, InvokeContext, InvokeRequest, InvokeResponse, RetryPolicy, Tool, ToolSchema,
+    err, error_response, InvokeContext, InvokeRequest, InvokeResponse, RetryPolicy, Tool,
+    ToolSchema,
 };
 
 /// Tool ID for the send adapter.
 const TOOL_ID: &str = "gmail.send";
-/// credd provider tag for all Gmail/Google tools.
+/// phylaxd provider tag for all Gmail/Google tools.
 const PROVIDER: &str = "google";
 /// Gmail API endpoint for sending messages.
 const GMAIL_SEND_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
@@ -26,12 +27,15 @@ const GMAIL_SEND_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/mes
 pub struct GmailSendTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GmailSendTool.
 impl Tool for GmailSendTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: TOOL_ID.to_string(),
             name: "Send Email".to_string(),
-            description: "Send an email via Gmail on behalf of the authenticated tenant.".to_string(),
+            description: "Send an email via Gmail on behalf of the authenticated tenant."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["to", "subject", "body"],
@@ -55,6 +59,7 @@ impl Tool for GmailSendTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
@@ -65,6 +70,7 @@ impl Tool for GmailSendTool {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
@@ -76,9 +82,9 @@ impl Tool for GmailSendTool {
             Err(msg) => return error_response(TOOL_ID, "bad_request", msg, None),
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response(TOOL_ID, &e),
+            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),
         };
 
         let raw_mime = build_mime(&args);
@@ -133,8 +139,16 @@ impl Tool for GmailSendTool {
         }
 
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
-        let message_id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let thread_id = parsed.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let message_id = parsed
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let thread_id = parsed
+            .get("threadId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         InvokeResponse {
             tool_id: TOOL_ID.into(),
@@ -165,7 +179,9 @@ struct GmailArgs {
 
 /// Parse and validate `gmail.send` arguments.
 fn parse_args(args: &Value) -> Result<GmailArgs, String> {
-    let obj = args.as_object().ok_or_else(|| "args must be a JSON object".to_string())?;
+    let obj = args
+        .as_object()
+        .ok_or_else(|| "args must be a JSON object".to_string())?;
     let pull_required = |k: &str| -> Result<String, String> {
         obj.get(k)
             .and_then(|v| v.as_str())
@@ -228,7 +244,9 @@ const GMAIL_MESSAGES_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me
 pub struct GmailReadTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GmailReadTool.
 impl Tool for GmailReadTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gmail.read".to_string(),
@@ -263,32 +281,62 @@ impl Tool for GmailReadTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gmail.read", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response("gmail.read", "bad_request", "tenant_id is required", None)
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gmail.read", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gmail.read",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let message_id = match obj.get("message_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let message_id = match obj
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(m) => m.to_string(),
-            None => return error_response("gmail.read", "bad_request", "'message_id' is required", None),
+            None => {
+                return error_response(
+                    "gmail.read",
+                    "bad_request",
+                    "'message_id' is required",
+                    None,
+                )
+            }
         };
         let format = match obj.get("format").and_then(|v| v.as_str()) {
             Some(f) if ["full", "metadata", "minimal"].contains(&f) => f,
-            Some(f) => return error_response("gmail.read", "bad_request", format!("invalid format '{f}'"), Some("use full, metadata, or minimal")),
+            Some(f) => {
+                return error_response(
+                    "gmail.read",
+                    "bad_request",
+                    format!("invalid format '{f}'"),
+                    Some("use full, metadata, or minimal"),
+                )
+            }
             None => "full",
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gmail.read", &e),
+            Err(e) => return phylaxd_error_to_response("gmail.read", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
@@ -296,10 +344,20 @@ impl Tool for GmailReadTool {
         };
 
         let url = format!("{GMAIL_MESSAGES_URL}/{message_id}");
-        let request = http.get(&url).bearer_auth(&token).query(&[("format", format)]);
+        let request = http
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("format", format)]);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gmail.read", "gmail_unreachable", format!("gmail api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gmail.read",
+                    "gmail_unreachable",
+                    format!("gmail api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "gmail read error");
@@ -344,7 +402,10 @@ fn extract_headers(payload: &Value) -> Value {
         for h in arr {
             let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(name.to_ascii_lowercase().as_str(), "from" | "to" | "subject" | "date" | "cc") {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "from" | "to" | "subject" | "date" | "cc"
+            ) {
                 out.insert(name.to_ascii_lowercase(), Value::String(value.to_string()));
             }
         }
@@ -355,10 +416,15 @@ fn extract_headers(payload: &Value) -> Value {
 /// Walk a MIME tree depth-first, preferring text/plain and falling back to
 /// text/html, returning the first decoded body found.
 fn extract_body(payload: &Value) -> String {
+    /// Finds the requested MIME body within a nested message part.
     fn find(part: &Value, want: &str) -> Option<String> {
         let mime = part.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
         if mime == want {
-            if let Some(data) = part.get("body").and_then(|b| b.get("data")).and_then(|v| v.as_str()) {
+            if let Some(data) = part
+                .get("body")
+                .and_then(|b| b.get("data"))
+                .and_then(|v| v.as_str())
+            {
                 return Some(String::from_utf8_lossy(&decode_b64url(data)).into_owned());
             }
         }
@@ -378,6 +444,7 @@ fn extract_body(payload: &Value) -> String {
 
 /// Collect attachment metadata (filename, mime, size) from a MIME tree.
 fn extract_attachments(payload: &Value) -> Vec<Value> {
+    /// Collects attachment metadata from nested message parts.
     fn walk(part: &Value, out: &mut Vec<Value>) {
         let filename = part.get("filename").and_then(|v| v.as_str()).unwrap_or("");
         let has_attach_id = part
@@ -424,12 +491,16 @@ fn parse_message(msg: &Value) -> Value {
 pub struct GmailSearchTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GmailSearchTool.
 impl Tool for GmailSearchTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gmail.search".to_string(),
             name: "Search Email".to_string(),
-            description: "Search Gmail messages with Gmail query syntax and return summarized hits.".to_string(),
+            description:
+                "Search Gmail messages with Gmail query syntax and return summarized hits."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["query"],
@@ -451,29 +522,54 @@ impl Tool for GmailSearchTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gmail.search", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response("gmail.search", "bad_request", "tenant_id is required", None)
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gmail.search", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gmail.search",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let query = match obj.get("query").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let query = match obj
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(q) => q.to_string(),
-            None => return error_response("gmail.search", "bad_request", "'query' is required", None),
+            None => {
+                return error_response("gmail.search", "bad_request", "'query' is required", None)
+            }
         };
-        let max_results = obj.get("max_results").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 100);
-        let page_token = obj.get("page_token").and_then(|v| v.as_str()).map(str::to_string);
+        let max_results = obj
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 100);
+        let page_token = obj
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gmail.search", &e),
+            Err(e) => return phylaxd_error_to_response("gmail.search", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
@@ -489,7 +585,14 @@ impl Tool for GmailSearchTool {
         }
         let outcome = match send_with_retry(list_req, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gmail.search", "gmail_unreachable", format!("gmail api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gmail.search",
+                    "gmail_unreachable",
+                    format!("gmail api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "gmail search error");
@@ -516,7 +619,11 @@ impl Tool for GmailSearchTool {
                     .collect()
             })
             .unwrap_or_default();
-        let next = listing.get("nextPageToken").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let next = listing
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Fetch lightweight metadata for each hit so the caller gets useful
         // context (from/subject/date) without a second round trip.
@@ -576,12 +683,15 @@ const GMAIL_LABELS_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/l
 pub struct GmailListLabelsTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GmailListLabelsTool.
 impl Tool for GmailListLabelsTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gmail.list_labels".to_string(),
             name: "List Email Labels".to_string(),
-            description: "List Gmail labels (system and user) for the authenticated tenant.".to_string(),
+            description: "List Gmail labels (system and user) for the authenticated tenant."
+                .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
             output_schema: json!({
                 "type": "object",
@@ -592,28 +702,46 @@ impl Tool for GmailListLabelsTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gmail.list_labels", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gmail.list_labels",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gmail.list_labels", &e),
+            Err(e) => return phylaxd_error_to_response("gmail.list_labels", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gmail.list_labels", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gmail.list_labels", "internal_error", e.to_string(), None)
+            }
         };
 
         let request = http.get(GMAIL_LABELS_URL).bearer_auth(&token);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gmail.list_labels", "gmail_unreachable", format!("gmail api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gmail.list_labels",
+                    "gmail_unreachable",
+                    format!("gmail api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "gmail labels error");
@@ -650,9 +778,33 @@ fn map_labels(resp: &Value) -> Vec<Value> {
             arr.iter()
                 .map(|l| {
                     let mut obj = serde_json::Map::new();
-                    obj.insert("id".into(), Value::String(l.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()));
-                    obj.insert("name".into(), Value::String(l.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string()));
-                    obj.insert("type".into(), Value::String(l.get("type").and_then(|v| v.as_str()).unwrap_or("user").to_string()));
+                    obj.insert(
+                        "id".into(),
+                        Value::String(
+                            l.get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    );
+                    obj.insert(
+                        "name".into(),
+                        Value::String(
+                            l.get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    );
+                    obj.insert(
+                        "type".into(),
+                        Value::String(
+                            l.get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("user")
+                                .to_string(),
+                        ),
+                    );
                     if let Some(c) = l.get("messagesTotal") {
                         obj.insert("messages_total".into(), c.clone());
                     }
@@ -667,10 +819,12 @@ fn map_labels(resp: &Value) -> Vec<Value> {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies mime includes required headers.
     fn mime_includes_required_headers() {
         let args = GmailArgs {
             to: "alice@example.com".into(),
@@ -687,6 +841,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies base64url strips padding.
     fn base64url_strips_padding() {
         let encoded = URL_SAFE_NO_PAD.encode("abc".as_bytes());
         assert_eq!(encoded, "YWJj");
@@ -696,12 +851,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse args rejects empty.
     fn parse_args_rejects_empty() {
         let v = json!({ "to": "", "subject": "s", "body": "b" });
         assert!(parse_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies parse args optional cc bcc.
     fn parse_args_optional_cc_bcc() {
         let v = json!({ "to": "a@b", "subject": "s", "body": "b", "cc": "c@d" });
         let args = parse_args(&v).unwrap();
@@ -710,6 +867,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies subject encodes non ascii.
     fn subject_encodes_non_ascii() {
         assert_eq!(encode_subject("hello"), "hello");
         let utf8 = encode_subject("héllo");
@@ -718,12 +876,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies decode b64url handles padded and unpadded.
     fn decode_b64url_handles_padded_and_unpadded() {
         assert_eq!(decode_b64url("aGVsbG8"), b"hello"); // no padding
         assert_eq!(decode_b64url("aGVsbG8="), b"hello"); // padded
     }
 
     #[test]
+    /// Verifies extract headers pulls standard fields.
     fn extract_headers_pulls_standard_fields() {
         let payload = json!({
             "headers": [
@@ -739,6 +899,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies extract body prefers plain then html.
     fn extract_body_prefers_plain_then_html() {
         // text/plain present at a nested part.
         let payload = json!({
@@ -759,6 +920,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies extract attachments finds files.
     fn extract_attachments_finds_files() {
         let payload = json!({
             "parts": [
@@ -768,11 +930,15 @@ mod tests {
         });
         let att = extract_attachments(&payload);
         assert_eq!(att.len(), 1);
-        assert_eq!(att[0].get("filename").and_then(|v| v.as_str()), Some("doc.pdf"));
+        assert_eq!(
+            att[0].get("filename").and_then(|v| v.as_str()),
+            Some("doc.pdf")
+        );
         assert_eq!(att[0].get("size").and_then(|v| v.as_i64()), Some(1234));
     }
 
     #[test]
+    /// Verifies parse message flattens shape.
     fn parse_message_flattens_shape() {
         let msg = json!({
             "id": "m1",
@@ -788,10 +954,16 @@ mod tests {
         let out = parse_message(&msg);
         assert_eq!(out.get("id").and_then(|v| v.as_str()), Some("m1"));
         assert_eq!(out.get("body").and_then(|v| v.as_str()), Some("body text"));
-        assert_eq!(out.get("labels").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
+        assert_eq!(
+            out.get("labels")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(2)
+        );
     }
 
     #[test]
+    /// Verifies summarize message extracts meta.
     fn summarize_message_extracts_meta() {
         let msg = json!({
             "id": "m2",
@@ -805,6 +977,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies map labels compacts and keeps counts.
     fn map_labels_compacts_and_keeps_counts() {
         let resp = json!({
             "labels": [
@@ -814,7 +987,10 @@ mod tests {
         });
         let labels = map_labels(&resp);
         assert_eq!(labels.len(), 2);
-        assert_eq!(labels[0].get("messages_total").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(
+            labels[0].get("messages_total").and_then(|v| v.as_i64()),
+            Some(42)
+        );
         assert!(labels[1].get("messages_total").is_none());
         assert_eq!(labels[1].get("type").and_then(|v| v.as_str()), Some("user"));
     }

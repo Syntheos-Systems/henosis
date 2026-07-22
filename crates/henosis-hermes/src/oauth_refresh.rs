@@ -1,10 +1,10 @@
 //! Background OAuth refresh daemon.
 //!
-//! Each successful `CreddClient::fetch_token` call registers the
+//! Each successful `PhylaxdClient::fetch_token` call registers the
 //! `(tenant_id, provider)` pair in a `RefreshRegistry`. The daemon ticks
 //! every `interval` seconds (default 60s), inspects each registered slot's
 //! `expires_at`, and if it's within `skew` of now, calls the provider's
-//! refresh endpoint and writes the new bundle back via credd.
+//! refresh endpoint and writes the new bundle back via phylaxd.
 //!
 //! Currently implements Google OAuth refresh (used by gmail/gdrive/gcal).
 //! GitHub PATs and Slack bot tokens generally do not expire, so they are
@@ -19,10 +19,10 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::credd_client::{CreddClient, CreddError};
+use crate::phylaxd_client::{PhylaxdClient, PhylaxdError};
 
 /// Thread-safe set of `(tenant_id, provider)` pairs that need periodic OAuth
-/// refresh. Populated by `CreddClient::fetch_token` and consumed by
+/// refresh. Populated by `PhylaxdClient::fetch_token` and consumed by
 /// `OAuthRefreshDaemon`.
 #[derive(Debug, Clone, Default)]
 pub struct RefreshRegistry {
@@ -30,6 +30,7 @@ pub struct RefreshRegistry {
     inner: Arc<RwLock<HashSet<(String, String)>>>,
 }
 
+/// Implements the behavior exposed by RefreshRegistry.
 impl RefreshRegistry {
     /// Register a `(tenant_id, provider)` pair for periodic refresh. Idempotent.
     pub async fn register(&self, tenant_id: &str, provider: &str) {
@@ -63,6 +64,7 @@ pub struct GoogleClient {
     pub client_secret: String,
 }
 
+/// Implements the behavior exposed by GoogleClient.
 impl GoogleClient {
     /// Read `HERMES_GOOGLE_CLIENT_ID` and `HERMES_GOOGLE_CLIENT_SECRET` from
     /// the environment. Returns `None` when either is absent or empty.
@@ -84,8 +86,8 @@ impl GoogleClient {
 pub struct OAuthRefreshDaemon {
     /// Source of (tenant, provider) pairs to refresh.
     pub registry: RefreshRegistry,
-    /// Credd client for reading and writing token records.
-    pub credd: Arc<CreddClient>,
+    /// Phylaxd client for reading and writing token records.
+    pub phylaxd: Arc<PhylaxdClient>,
     /// Axon URL for publishing refresh events; `None` disables publishing.
     pub axon_url: Option<String>,
     /// Google OAuth client credentials; `None` disables Google refresh.
@@ -98,13 +100,14 @@ pub struct OAuthRefreshDaemon {
     pub http: reqwest::Client,
 }
 
+/// Implements the behavior exposed by OAuthRefreshDaemon.
 impl OAuthRefreshDaemon {
-    /// Construct a daemon from the given registry and credd client, reading
+    /// Construct a daemon from the given registry and phylaxd client, reading
     /// `AXON_URL` and Google credentials from the environment.
-    pub fn new(registry: RefreshRegistry, credd: Arc<CreddClient>) -> Self {
+    pub fn new(registry: RefreshRegistry, phylaxd: Arc<PhylaxdClient>) -> Self {
         Self {
             registry,
-            credd,
+            phylaxd,
             axon_url: std::env::var("AXON_URL").ok(),
             google: GoogleClient::from_env(),
             interval: Duration::from_secs(60),
@@ -128,7 +131,7 @@ impl OAuthRefreshDaemon {
                 );
             }
             let mut ticker = tokio::time::interval(self.interval);
-            // First tick fires immediately; skip it so we don't slam credd
+            // First tick fires immediately; skip it so we don't slam phylaxd
             // before any tokens have been registered.
             ticker.tick().await;
             loop {
@@ -156,14 +159,14 @@ impl OAuthRefreshDaemon {
     }
 
     /// Attempt to refresh one (tenant, provider) token. Reads the current
-    /// record from credd, checks expiry, calls the provider's refresh endpoint,
+    /// record from phylaxd, checks expiry, calls the provider's refresh endpoint,
     /// and writes the merged bundle back.
     async fn refresh_one(&self, tenant: &str, provider: &str) -> Result<(), RefreshError> {
         let record = self
-            .credd
+            .phylaxd
             .fetch_full_record(tenant, provider)
             .await
-            .map_err(|e| RefreshError::Credd(e.to_string()))?;
+            .map_err(|e| RefreshError::Phylaxd(e.to_string()))?;
 
         let expires_at = record
             .get("expires_at")
@@ -203,10 +206,10 @@ impl OAuthRefreshDaemon {
         // the original refresh_token if Google omits it from the response).
         let merged = merge_refresh_response(&record, &new_bundle);
 
-        self.credd
+        self.phylaxd
             .update_secret(tenant, provider, &merged)
             .await
-            .map_err(|e| RefreshError::Credd(e.to_string()))?;
+            .map_err(|e| RefreshError::Phylaxd(e.to_string()))?;
 
         info!(%tenant, %provider, "oauth token refreshed");
         self.publish_axon(tenant, provider).await;
@@ -304,9 +307,9 @@ pub enum RefreshError {
     /// The upstream provider returned an error.
     #[error("provider error: {0}")]
     Provider(String),
-    /// A credd operation failed.
-    #[error("credd error: {0}")]
-    Credd(String),
+    /// A phylaxd operation failed.
+    #[error("phylaxd error: {0}")]
+    Phylaxd(String),
 }
 
 /// Merge the OAuth refresh response with the prior secret record so we keep
@@ -335,16 +338,19 @@ fn merge_refresh_response(prior: &Value, response: &Value) -> Value {
 }
 
 #[allow(unused)]
-fn _ignored(c: &CreddError) {
+/// Keeps the credential error type linked for compile-time coverage.
+fn _ignored(c: &PhylaxdError) {
     // Silence dead-code lint when no provider is configured at compile time.
     let _ = c;
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[tokio::test]
+    /// Verifies registry dedups.
     async fn registry_dedups() {
         let r = RefreshRegistry::default();
         r.register("t1", "google").await;
@@ -354,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies merge carries refresh token.
     fn merge_carries_refresh_token() {
         let prior = json!({
             "access_token": "old",

@@ -86,8 +86,8 @@ mod tests {
         audit::AuditTrail,
         axon::AxonPublisher,
         circuit::CircuitRegistry,
-        credd_client::CreddClient,
         metrics::MetricsRegistry,
+        phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
         AppState as HermesState, ToolRegistry,
@@ -245,8 +245,7 @@ mod tests {
             .await
             .expect("task");
         let reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
-        let plutus: Arc<dyn PolicyBackend> =
-            Arc::new(MockPolicyBackend::with_role(Role::Admin));
+        let plutus: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::with_role(Role::Admin));
         let gates = live_gate_chain(
             &EidolonPolicy::default(),
             thymus,
@@ -261,7 +260,7 @@ mod tests {
         let executor = HenosisExecutor::new(
             HermesState {
                 registry: Arc::new(ToolRegistry::new()),
-                credd: Arc::new(CreddClient::new("http://127.0.0.1:1".to_string(), None)),
+                phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
                 rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                     capacity: 60,
                     refill_per_sec: 1.0,

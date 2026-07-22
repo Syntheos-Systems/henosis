@@ -7,7 +7,7 @@
 //!
 //! The skeleton implements the `Tool` trait with a populated `ToolSchema`
 //! drawn from the OpenAPI operation, and a placeholder `invoke` that
-//! validates `tenant_id`, fetches a credd token under a TODO provider tag,
+//! validates `tenant_id`, fetches a phylaxd token under a TODO provider tag,
 //! and calls the upstream URL. The user fills in argument parsing, response
 //! shaping, and provider-specific auth headers.
 
@@ -269,7 +269,7 @@ fn emit_skeleton(op: &Operation) -> String {
     s.push_str(
         "//!\n\
          //! TODO before merging:\n\
-         //!  1. Replace PROVIDER with the credd provider tag (e.g. \"stripe\").\n\
+         //!  1. Replace PROVIDER with the phylaxd provider tag (e.g. \"stripe\").\n\
          //!  2. Implement parse_args to validate the JSON args from the caller.\n\
          //!  3. Build the upstream request -- query params, headers, body.\n\
          //!  4. Shape the success response into the adapter's result envelope.\n\
@@ -281,7 +281,7 @@ fn emit_skeleton(op: &Operation) -> String {
         "use async_trait::async_trait;\n\
          use serde_json::{json, Value};\n\
          use tracing::warn;\n\n\
-         use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate};\n\
+         use crate::adapters::common::{build_http, phylaxd_error_to_response, send_with_retry, truncate};\n\
          use crate::tool::{\n    \
             err, error_response, InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema,\n\
          };\n\n",
@@ -289,7 +289,9 @@ fn emit_skeleton(op: &Operation) -> String {
     s.push_str(&format!("const TOOL_ID: &str = \"{tool_id}\";\n"));
     s.push_str("const PROVIDER: &str = \"TODO_PROVIDER\";\n");
     s.push_str(&format!("const ENDPOINT: &str = \"{}\";\n\n", op.path));
-    s.push_str(&format!("/// Adapter for the `{tool_id}` tool (generated skeleton).\n"));
+    s.push_str(&format!(
+        "/// Adapter for the `{tool_id}` tool (generated skeleton).\n"
+    ));
     s.push_str(&format!("pub struct {struct_name};\n\n"));
 
     s.push_str("#[async_trait]\n");
@@ -309,12 +311,14 @@ fn emit_skeleton(op: &Operation) -> String {
     );
 
     let method_lower = op.method.to_lowercase();
-    s.push_str("    async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {\n");
+    s.push_str(
+        "    async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {\n",
+    );
     s.push_str(
         "        let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {\n            Some(t) => t.to_string(),\n            None => return error_response(TOOL_ID, \"bad_request\", \"tenant_id is required\", None),\n        };\n\n",
     );
     s.push_str(
-        "        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {\n            Ok(t) => t,\n            Err(e) => return credd_error_to_response(TOOL_ID, &e),\n        };\n\n",
+        "        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {\n            Ok(t) => t,\n            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),\n        };\n\n",
     );
     s.push_str(
         "        let http = match build_http() {\n            Ok(c) => c,\n            Err(e) => return error_response(TOOL_ID, \"internal_error\", e.to_string(), None),\n        };\n\n",
@@ -326,9 +330,7 @@ fn emit_skeleton(op: &Operation) -> String {
     s.push_str(
         "        let outcome = match send_with_retry(request, &self.retry_policy()).await {\n            Ok(o) => o,\n            Err(e) => {\n                return InvokeResponse {\n                    tool_id: TOOL_ID.into(),\n                    success: false,\n                    result: None,\n                    error: Some(err(\"upstream_unreachable\", format!(\"upstream request failed: {e}\"), None)),\n                    duration_ms: 0,\n                };\n            }\n        };\n\n",
     );
-    s.push_str(
-        "        let status = outcome.status;\n        let body_text = outcome.body;\n\n",
-    );
+    s.push_str("        let status = outcome.status;\n        let body_text = outcome.body;\n\n");
     s.push_str(
         "        if !status.is_success() {\n            warn!(status = %status, body = %truncate(&body_text, 256), \"upstream api error\");\n            return InvokeResponse {\n                tool_id: TOOL_ID.into(),\n                success: false,\n                result: None,\n                error: Some(json!({\n                    \"code\": \"upstream_api_error\",\n                    \"message\": format!(\"upstream returned HTTP {}\", status.as_u16()),\n                    \"status\": status.as_u16(),\n                    \"body\": truncate(&body_text, 512),\n                })),\n                duration_ms: 0,\n            };\n        }\n\n",
     );
@@ -375,10 +377,12 @@ fn camel_case(s: &str) -> String {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies camel case basic.
     fn camel_case_basic() {
         assert_eq!(camel_case("foo_bar"), "FooBar");
         assert_eq!(camel_case("get_user_by_id"), "GetUserById");
@@ -386,30 +390,40 @@ mod tests {
     }
 
     #[test]
+    /// Verifies camel case hyphens.
     fn camel_case_hyphens() {
         assert_eq!(camel_case("create-issue"), "CreateIssue");
     }
 
     #[test]
+    /// Verifies sanitize path strips slashes and braces.
     fn sanitize_path_strips_slashes_and_braces() {
         assert_eq!(sanitize_path("/users/{id}/posts"), "users__id__posts");
         assert_eq!(sanitize_path("/v2/api-spec"), "v2_api_spec");
     }
 
     #[test]
+    /// Verifies parse out extracts path.
     fn parse_out_extracts_path() {
-        let args: Vec<String> = vec!["cmd".into(), "spec.yaml".into(), "--out".into(), "foo.rs".into()];
+        let args: Vec<String> = vec![
+            "cmd".into(),
+            "spec.yaml".into(),
+            "--out".into(),
+            "foo.rs".into(),
+        ];
         let p = parse_out(&args).unwrap();
         assert_eq!(p, PathBuf::from("foo.rs"));
     }
 
     #[test]
+    /// Verifies parse out missing returns none.
     fn parse_out_missing_returns_none() {
         let args: Vec<String> = vec!["cmd".into(), "spec.yaml".into()];
         assert!(parse_out(&args).is_none());
     }
 
     #[test]
+    /// Verifies emit skeleton contains struct and impl.
     fn emit_skeleton_contains_struct_and_impl() {
         let op = Operation {
             operation_id: "create_issue".into(),
@@ -428,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies emit skeleton includes test stub.
     fn emit_skeleton_includes_test_stub() {
         let op = Operation {
             operation_id: "list_users".into(),

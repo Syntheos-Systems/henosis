@@ -4,17 +4,17 @@
 pub struct Config {
     /// TCP port Hermes listens on (default 4800, override with `HERMES_PORT`).
     pub port: u16,
-    /// Base URL of the credd credential daemon (default `http://127.0.0.1:4400`).
-    pub credd_url: String,
-    /// Bearer token for authenticating to credd. When absent, OAuth-requiring
-    /// adapters return `credd_auth_missing`.
-    pub credd_token: Option<String>,
+    /// Base URL of the phylaxd credential daemon (default `http://127.0.0.1:3100`).
+    pub phylaxd_url: String,
+    /// Bearer token for authenticating to phylaxd. When absent, OAuth-requiring
+    /// adapters return `phylaxd_auth_missing`.
+    pub phylaxd_token: Option<String>,
     #[allow(dead_code)]
     /// Base URL of the Kleos memory/event service (unused at runtime; reserved
     /// for future direct Kleos integration).
     pub kleos_url: String,
     #[allow(dead_code)]
-    /// Credd slot name for the Kleos API token.
+    /// Phylaxd slot name for the Kleos API token.
     pub kleos_token_slot: String,
     /// Externally-reachable base URL for this Hermes instance (e.g.
     /// `https://hermes.example.com`). Auto-populates webhook delivery URLs in
@@ -22,6 +22,7 @@ pub struct Config {
     pub public_url: Option<String>,
 }
 
+/// Loads Hermes network, storage, and credential-broker settings from the environment.
 impl Config {
     /// Construct a `Config` from environment variables, using defaults for any
     /// unset variables.
@@ -31,11 +32,15 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<u16>().ok())
                 .unwrap_or(4800),
-            credd_url: env_or("CREDD_URL", "http://127.0.0.1:4400"),
-            credd_token: std::env::var("HERMES_CREDD_TOKEN").ok().filter(|s| !s.is_empty()),
+            phylaxd_url: env_or("PHYLAXD_URL", "http://127.0.0.1:3100"),
+            phylaxd_token: std::env::var("HERMES_PHYLAXD_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             kleos_url: env_or("KLEOS_URL", "http://127.0.0.1:4200"),
-            kleos_token_slot: env_or("KLEOS_TOKEN_CRED_SLOT", "engram-rust/claude-code-wsl"),
-            public_url: std::env::var("HERMES_PUBLIC_URL").ok().filter(|s| !s.is_empty()),
+            kleos_token_slot: env_or("KLEOS_TOKEN_CRED_SLOT", "henosis/kleos-api"),
+            public_url: std::env::var("HERMES_PUBLIC_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }

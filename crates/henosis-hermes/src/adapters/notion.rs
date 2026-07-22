@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::adapters::common::{build_http, credd_error_to_response, send_with_retry, truncate, HttpOutcome};
+use crate::adapters::common::{
+    build_http, phylaxd_error_to_response, send_with_retry, truncate, HttpOutcome,
+};
 use crate::tool::{
     error_response, InvokeContext, InvokeRequest, InvokeResponse, RetryPolicy, Tool, ToolSchema,
 };
 
-/// credd provider tag for all Notion tools.
+/// phylaxd provider tag for all Notion tools.
 const PROVIDER: &str = "notion";
 /// Notion API version pinned on all requests.
 const NOTION_VERSION: &str = "2022-06-28";
@@ -33,16 +35,20 @@ async fn notion_prep(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| error_response(tool_id, "bad_request", "tenant_id is required", None))?;
     let token = ctx
-        .credd
+        .phylaxd
         .fetch_token(tenant, PROVIDER)
         .await
-        .map_err(|e| credd_error_to_response(tool_id, &e))?;
-    let http = build_http().map_err(|e| error_response(tool_id, "internal_error", e.to_string(), None))?;
+        .map_err(|e| phylaxd_error_to_response(tool_id, &e))?;
+    let http =
+        build_http().map_err(|e| error_response(tool_id, "internal_error", e.to_string(), None))?;
     Ok((token, http))
 }
 
 /// Map a Notion HTTP outcome to either parsed JSON or a structured error.
-fn notion_finish(tool_id: &str, res: Result<HttpOutcome, reqwest::Error>) -> Result<Value, InvokeResponse> {
+fn notion_finish(
+    tool_id: &str,
+    res: Result<HttpOutcome, reqwest::Error>,
+) -> Result<Value, InvokeResponse> {
     match res {
         Err(e) => Err(error_response(
             tool_id,
@@ -93,7 +99,9 @@ fn title_property(title: &str) -> Value {
 pub struct NotionSearchTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for NotionSearchTool.
 impl Tool for NotionSearchTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "notion.search".to_string(),
@@ -117,15 +125,25 @@ impl Tool for NotionSearchTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "notion.search";
         let obj = req.args.as_object().cloned().unwrap_or_default();
-        let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let page_size = obj.get("page_size").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 100);
+        let query = obj
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let page_size = obj
+            .get("page_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 100);
 
         let mut payload = json!({ "query": query, "page_size": page_size });
         if let Some(f) = obj.get("filter").and_then(|v| v.as_str()) {
@@ -138,7 +156,10 @@ impl Tool for NotionSearchTool {
         };
         let url = format!("{}/v1/search", ctx.bases.notion.trim_end_matches('/'));
         let request = notion_headers(http.post(&url), &token).json(&payload);
-        match notion_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match notion_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => ok(
                 tool_id,
                 json!({
@@ -159,12 +180,15 @@ impl Tool for NotionSearchTool {
 pub struct NotionGetPageTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for NotionGetPageTool.
 impl Tool for NotionGetPageTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "notion.get_page".to_string(),
             name: "Get Notion Page".to_string(),
-            description: "Fetch a Notion page's properties plus its first 100 child blocks.".to_string(),
+            description: "Fetch a Notion page's properties plus its first 100 child blocks."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["page_id"],
@@ -179,14 +203,20 @@ impl Tool for NotionGetPageTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "notion.get_page";
         let obj = req.args.as_object().cloned().unwrap_or_default();
-        let page_id = obj.get("page_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let page_id = obj
+            .get("page_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let (token, http) = match notion_prep(ctx, req.tenant_id.as_deref(), tool_id).await {
             Ok(v) => v,
@@ -195,15 +225,27 @@ impl Tool for NotionGetPageTool {
         let base = ctx.bases.notion.trim_end_matches('/');
 
         let page_req = notion_headers(http.get(format!("{base}/v1/pages/{page_id}")), &token);
-        let page = match notion_finish(tool_id, send_with_retry(page_req, &self.retry_policy()).await) {
+        let page = match notion_finish(
+            tool_id,
+            send_with_retry(page_req, &self.retry_policy()).await,
+        ) {
             Ok(v) => v,
             Err(r) => return r,
         };
 
-        let blocks_req = notion_headers(http.get(format!("{base}/v1/blocks/{page_id}/children")), &token)
-            .query(&[("page_size", "100")]);
-        let blocks = match notion_finish(tool_id, send_with_retry(blocks_req, &self.retry_policy()).await) {
-            Ok(v) => v.get("results").cloned().unwrap_or_else(|| Value::Array(vec![])),
+        let blocks_req = notion_headers(
+            http.get(format!("{base}/v1/blocks/{page_id}/children")),
+            &token,
+        )
+        .query(&[("page_size", "100")]);
+        let blocks = match notion_finish(
+            tool_id,
+            send_with_retry(blocks_req, &self.retry_policy()).await,
+        ) {
+            Ok(v) => v
+                .get("results")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(vec![])),
             Err(r) => return r,
         };
 
@@ -219,7 +261,9 @@ impl Tool for NotionGetPageTool {
 pub struct NotionCreatePageTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for NotionCreatePageTool.
 impl Tool for NotionCreatePageTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "notion.create_page".to_string(),
@@ -245,20 +289,30 @@ impl Tool for NotionCreatePageTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Returns the retry policy for this tool operation.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "notion.create_page";
         let obj = req.args.as_object().cloned().unwrap_or_default();
-        let parent_id = obj.get("parent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let parent_id = obj
+            .get("parent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let parent_type = obj.get("parent_type").and_then(|v| v.as_str()).unwrap_or("page");
+        let parent_type = obj
+            .get("parent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("page");
 
         let parent = if parent_type == "database" {
             json!({ "database_id": parent_id })
@@ -287,7 +341,10 @@ impl Tool for NotionCreatePageTool {
         };
         let url = format!("{}/v1/pages", ctx.bases.notion.trim_end_matches('/'));
         let request = notion_headers(http.post(&url), &token).json(&payload);
-        match notion_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        match notion_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => ok(
                 tool_id,
                 json!({
@@ -308,7 +365,9 @@ impl Tool for NotionCreatePageTool {
 pub struct NotionAppendBlocksTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for NotionAppendBlocksTool.
 impl Tool for NotionAppendBlocksTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "notion.append_blocks".to_string(),
@@ -328,27 +387,44 @@ impl Tool for NotionAppendBlocksTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Returns the retry policy for this tool operation.
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tool_id = "notion.append_blocks";
         let obj = req.args.as_object().cloned().unwrap_or_default();
-        let page_id = obj.get("page_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let children = obj.get("children").cloned().unwrap_or_else(|| Value::Array(vec![]));
+        let page_id = obj
+            .get("page_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let children = obj
+            .get("children")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![]));
 
         let (token, http) = match notion_prep(ctx, req.tenant_id.as_deref(), tool_id).await {
             Ok(v) => v,
             Err(r) => return r,
         };
-        let url = format!("{}/v1/blocks/{page_id}/children", ctx.bases.notion.trim_end_matches('/'));
-        let request = notion_headers(http.patch(&url), &token).json(&json!({ "children": children }));
-        match notion_finish(tool_id, send_with_retry(request, &self.retry_policy()).await) {
+        let url = format!(
+            "{}/v1/blocks/{page_id}/children",
+            ctx.bases.notion.trim_end_matches('/')
+        );
+        let request =
+            notion_headers(http.patch(&url), &token).json(&json!({ "children": children }));
+        match notion_finish(
+            tool_id,
+            send_with_retry(request, &self.retry_policy()).await,
+        ) {
             Ok(v) => ok(
                 tool_id,
                 json!({ "results": v.get("results").cloned().unwrap_or_else(|| Value::Array(vec![])) }),
@@ -359,28 +435,31 @@ impl Tool for NotionAppendBlocksTool {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
     use crate::adapters::test_support::test_ctx;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Build a credd mock for Notion token resolution.
-    fn credd_mock() -> Mock {
-        Mock::given(method("POST")).and(path("/resolve/raw")).respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
+    /// Build a phylaxd mock for Notion token resolution.
+    fn phylaxd_mock() -> Mock {
+        Mock::given(method("POST"))
+            .and(path("/resolve/raw"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "category": "notion_oauth", "name": "t", "value": { "access_token": "test-token" }
-            })),
-        )
+            })))
     }
 
     #[test]
+    /// Verifies title property shape.
     fn title_property_shape() {
         let p = title_property("Hello");
         assert_eq!(p["title"][0]["text"]["content"], json!("Hello"));
     }
 
     #[test]
+    /// Verifies mutating tools non idempotent.
     fn mutating_tools_non_idempotent() {
         assert_eq!(NotionCreatePageTool.retry_policy().max_retries, 0);
         assert_eq!(NotionAppendBlocksTool.retry_policy().max_retries, 0);
@@ -412,21 +491,32 @@ mod tests {
     #[tokio::test]
     async fn get_page_merges_page_and_blocks() {
         let server = MockServer::start().await;
-        credd_mock().mount(&server).await;
+        phylaxd_mock().mount(&server).await;
         Mock::given(method("GET"))
             .and(path("/v1/pages/PG1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "PG1", "object": "page" })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "id": "PG1", "object": "page" })),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/v1/blocks/PG1/children"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": [ { "id": "blk1" } ] })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": [ { "id": "blk1" } ] })),
+            )
             .mount(&server)
             .await;
 
         let ctx = test_ctx(&server.uri());
         let resp = NotionGetPageTool
-            .invoke(&ctx, InvokeRequest { tenant_id: Some("t".into()), args: json!({ "page_id": "PG1" }) })
+            .invoke(
+                &ctx,
+                InvokeRequest {
+                    tenant_id: Some("t".into()),
+                    args: json!({ "page_id": "PG1" }),
+                },
+            )
             .await;
         assert!(resp.success, "error: {:?}", resp.error);
         let result = resp.result.unwrap();

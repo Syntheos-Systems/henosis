@@ -174,7 +174,7 @@ pub async fn invoke_controlled(
     }
 
     let ctx = InvokeContext {
-        credd: state.credd.clone(),
+        phylaxd: state.phylaxd.clone(),
         bases: crate::tool::ProviderBases::default(),
         hermes_public_url: state.public_url.clone(),
     };
@@ -389,8 +389,8 @@ mod tests {
     use crate::audit::{AuditQuery, AuditTrail};
     use crate::axon::AxonPublisher;
     use crate::circuit::CircuitRegistry;
-    use crate::credd_client::CreddClient;
     use crate::metrics::MetricsRegistry;
+    use crate::phylaxd_client::PhylaxdClient;
     use crate::rate_limit::{RateLimitConfig, RateLimiter};
     use crate::tenant_config::{TenantAdapterConfig, TenantConfigStore};
     use crate::tool::{Tool, ToolSchema};
@@ -446,7 +446,7 @@ mod tests {
         let axon = AxonPublisher::from_env();
         let state = AppState {
             registry: Arc::new(registry),
-            credd: Arc::new(CreddClient::new("http://127.0.0.1:1".to_string(), None)),
+            phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                 capacity,
                 refill_per_sec: 0.0001,

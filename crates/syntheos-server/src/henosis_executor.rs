@@ -237,8 +237,8 @@ mod tests {
         audit::AuditTrail,
         axon::AxonPublisher,
         circuit::CircuitRegistry,
-        credd_client::CreddClient,
         metrics::MetricsRegistry,
+        phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
         InvokeContext, InvokeResponse, Tool, ToolRegistry, ToolSchema,
@@ -294,7 +294,7 @@ mod tests {
         let axon = AxonPublisher::from_env();
         let hermes = HermesState {
             registry: Arc::new(registry),
-            credd: Arc::new(CreddClient::new("http://127.0.0.1:1".to_string(), None)),
+            phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                 capacity: 60,
                 refill_per_sec: 1.0,

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::credd_client::CreddClient;
+use crate::phylaxd_client::PhylaxdClient;
 
 /// JSON-Schema-like description of one tool: its ID, human name, description,
 /// input/output schemas, category, and auth requirements. Serialized verbatim
@@ -35,7 +35,7 @@ pub struct ToolSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvokeRequest {
     /// Tenant on whose behalf the call runs. Used to resolve OAuth tokens from
-    /// credd and to key the rate-limiter bucket. `None` routes as `_anon`.
+    /// phylaxd and to key the rate-limiter bucket. `None` routes as `_anon`.
     pub tenant_id: Option<String>,
     /// Tool-specific arguments, validated against `ToolSchema::input_schema`
     /// before the adapter sees them.
@@ -69,6 +69,7 @@ pub struct ProviderBases {
     pub notion: String,
 }
 
+/// Provides secure defaults for ProviderBases.
 impl Default for ProviderBases {
     /// Returns the production base URLs for all providers.
     fn default() -> Self {
@@ -84,7 +85,7 @@ impl Default for ProviderBases {
 #[derive(Clone)]
 pub struct InvokeContext {
     /// Credential daemon client for OAuth token and raw secret resolution.
-    pub credd: Arc<CreddClient>,
+    pub phylaxd: Arc<PhylaxdClient>,
     /// Overridable provider base URLs (real hosts in production, mock server
     /// in tests).
     pub bases: ProviderBases,
@@ -112,6 +113,7 @@ pub struct RetryPolicy {
     pub idempotent: bool,
 }
 
+/// Provides secure defaults for RetryPolicy.
 impl Default for RetryPolicy {
     /// Standard exponential-backoff policy: up to 3 retries, 500ms base delay,
     /// 30s cap, retryable on 429/500/502/503, idempotent.
@@ -126,6 +128,7 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Implements the behavior exposed by RetryPolicy.
 impl RetryPolicy {
     /// Policy for operations that must not be silently replayed (e.g. sending
     /// an email). No retries; network failures surface to the caller.
@@ -191,7 +194,12 @@ pub fn err(code: &str, message: impl Into<String>, hint: Option<&str>) -> Value 
 
 /// Build a failed `InvokeResponse` with a structured error envelope. Shorthand
 /// used throughout the adapters to return early on errors.
-pub fn error_response(tool_id: &str, code: &str, message: impl Into<String>, hint: Option<&str>) -> InvokeResponse {
+pub fn error_response(
+    tool_id: &str,
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<&str>,
+) -> InvokeResponse {
     InvokeResponse {
         tool_id: tool_id.to_string(),
         success: false,
@@ -202,10 +210,12 @@ pub fn error_response(tool_id: &str, code: &str, message: impl Into<String>, hin
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies backoff grows exponentially.
     fn backoff_grows_exponentially() {
         let p = RetryPolicy::default();
         assert_eq!(p.backoff_delay_ms(0, 0), 500);
@@ -214,6 +224,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies backoff caps at max delay.
     fn backoff_caps_at_max_delay() {
         let p = RetryPolicy::default();
         // attempt 20 would be astronomically large; must clamp to max.
@@ -221,12 +232,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies backoff adds jitter.
     fn backoff_adds_jitter() {
         let p = RetryPolicy::default();
         assert_eq!(p.backoff_delay_ms(0, 123), 623);
     }
 
     #[test]
+    /// Verifies non idempotent disables retry.
     fn non_idempotent_disables_retry() {
         let p = RetryPolicy::non_idempotent();
         assert_eq!(p.max_retries, 0);
@@ -234,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies default retryable statuses.
     fn default_retryable_statuses() {
         let p = RetryPolicy::default();
         assert!(p.is_retryable_status(429));

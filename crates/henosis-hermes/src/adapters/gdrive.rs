@@ -1,6 +1,6 @@
 //! Google Drive adapters: list, upload, download, get_metadata.
 //!
-//! All tools authenticate via Google OAuth tokens resolved from credd under
+//! All tools authenticate via Google OAuth tokens resolved from phylaxd under
 //! the `google` provider tag. The upload adapter builds a hand-crafted
 //! `multipart/related` body to avoid pulling in reqwest's multipart feature.
 
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::adapters::common::{
-    build_http, credd_error_to_response, send_with_retry, send_with_retry_bytes, truncate,
+    build_http, phylaxd_error_to_response, send_with_retry, send_with_retry_bytes, truncate,
 };
 use crate::tool::{
     err, error_response, InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolSchema,
@@ -19,7 +19,7 @@ use crate::tool::{
 
 /// Tool ID for the list adapter.
 const TOOL_ID: &str = "gdrive.list";
-/// credd provider tag for all Google Drive tools.
+/// phylaxd provider tag for all Google Drive tools.
 const PROVIDER: &str = "google";
 /// Drive v3 files list endpoint.
 const DRIVE_LIST_URL: &str = "https://www.googleapis.com/drive/v3/files";
@@ -32,7 +32,9 @@ const DRIVE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files
 pub struct GDriveListTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GDriveListTool.
 impl Tool for GDriveListTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: TOOL_ID.to_string(),
@@ -59,10 +61,12 @@ impl Tool for GDriveListTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
@@ -74,9 +78,9 @@ impl Tool for GDriveListTool {
             Err(msg) => return error_response(TOOL_ID, "bad_request", msg, None),
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response(TOOL_ID, &e),
+            Err(e) => return phylaxd_error_to_response(TOOL_ID, &e),
         };
 
         let http = match build_http() {
@@ -93,16 +97,13 @@ impl Tool for GDriveListTool {
         };
         let page_size = args.page_size.unwrap_or(25).clamp(1, 1000);
 
-        let mut request = http
-            .get(DRIVE_LIST_URL)
-            .bearer_auth(&token)
-            .query(&[
-                ("pageSize", page_size.to_string()),
-                (
-                    "fields",
-                    "nextPageToken,files(id,name,mimeType,modifiedTime,size)".into(),
-                ),
-            ]);
+        let mut request = http.get(DRIVE_LIST_URL).bearer_auth(&token).query(&[
+            ("pageSize", page_size.to_string()),
+            (
+                "fields",
+                "nextPageToken,files(id,name,mimeType,modifiedTime,size)".into(),
+            ),
+        ]);
         if let Some(q) = q {
             request = request.query(&[("q", q)]);
         }
@@ -218,7 +219,9 @@ fn parse_args(args: &Value) -> Result<GDriveArgs, String> {
 pub struct GDriveUploadTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GDriveUploadTool.
 impl Tool for GDriveUploadTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gdrive.upload".to_string(),
@@ -248,6 +251,7 @@ impl Tool for GDriveUploadTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
@@ -257,10 +261,18 @@ impl Tool for GDriveUploadTool {
         crate::tool::RetryPolicy::non_idempotent()
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gdrive.upload", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gdrive.upload",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let args = match parse_upload_args(&req.args) {
             Ok(a) => a,
@@ -269,7 +281,14 @@ impl Tool for GDriveUploadTool {
         let bytes = match args.encoding.as_str() {
             "base64" => match STANDARD.decode(args.content.as_bytes()) {
                 Ok(b) => b,
-                Err(e) => return error_response("gdrive.upload", "bad_request", format!("content is not valid base64: {e}"), None),
+                Err(e) => {
+                    return error_response(
+                        "gdrive.upload",
+                        "bad_request",
+                        format!("content is not valid base64: {e}"),
+                        None,
+                    )
+                }
             },
             _ => args.content.into_bytes(),
         };
@@ -277,13 +296,15 @@ impl Tool for GDriveUploadTool {
             .mime_type
             .unwrap_or_else(|| detect_mime(&args.name).to_string());
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gdrive.upload", &e),
+            Err(e) => return phylaxd_error_to_response("gdrive.upload", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gdrive.upload", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gdrive.upload", "internal_error", e.to_string(), None)
+            }
         };
 
         let mut metadata = json!({ "name": args.name });
@@ -296,13 +317,26 @@ impl Tool for GDriveUploadTool {
         let request = http
             .post(DRIVE_UPLOAD_URL)
             .bearer_auth(&token)
-            .query(&[("uploadType", "multipart"), ("fields", "id,name,webViewLink")])
-            .header("Content-Type", format!("multipart/related; boundary={boundary}"))
+            .query(&[
+                ("uploadType", "multipart"),
+                ("fields", "id,name,webViewLink"),
+            ])
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={boundary}"),
+            )
             .body(body);
 
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gdrive.upload", "gdrive_unreachable", format!("drive api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gdrive.upload",
+                    "gdrive_unreachable",
+                    format!("drive api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "drive upload error");
@@ -350,7 +384,9 @@ struct UploadArgs {
 
 /// Parse and validate `gdrive.upload` arguments.
 fn parse_upload_args(args: &Value) -> Result<UploadArgs, String> {
-    let obj = args.as_object().ok_or_else(|| "args must be a JSON object".to_string())?;
+    let obj = args
+        .as_object()
+        .ok_or_else(|| "args must be a JSON object".to_string())?;
     let name = obj
         .get("name")
         .and_then(|v| v.as_str())
@@ -363,13 +399,35 @@ fn parse_upload_args(args: &Value) -> Result<UploadArgs, String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| "'content' is required and must be a string".to_string())?;
-    let encoding = obj.get("encoding").and_then(|v| v.as_str()).unwrap_or("text").to_string();
+    let encoding = obj
+        .get("encoding")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text")
+        .to_string();
     if encoding != "text" && encoding != "base64" {
-        return Err(format!("invalid encoding '{encoding}' (use text or base64)"));
+        return Err(format!(
+            "invalid encoding '{encoding}' (use text or base64)"
+        ));
     }
-    let folder_id = obj.get("folder_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let mime_type = obj.get("mime_type").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    Ok(UploadArgs { name, content, encoding, folder_id, mime_type })
+    let folder_id = obj
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mime_type = obj
+        .get("mime_type")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(UploadArgs {
+        name,
+        content,
+        encoding,
+        folder_id,
+        mime_type,
+    })
 }
 
 /// Build a `multipart/related` body: a JSON metadata part followed by the raw
@@ -412,7 +470,9 @@ fn detect_mime(name: &str) -> &'static str {
 pub struct GDriveDownloadTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GDriveDownloadTool.
 impl Tool for GDriveDownloadTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gdrive.download".to_string(),
@@ -440,36 +500,73 @@ impl Tool for GDriveDownloadTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gdrive.download", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gdrive.download",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gdrive.download", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gdrive.download",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let file_id = match obj.get("file_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let file_id = match obj
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(f) => f.to_string(),
-            None => return error_response("gdrive.download", "bad_request", "'file_id' is required", None),
+            None => {
+                return error_response(
+                    "gdrive.download",
+                    "bad_request",
+                    "'file_id' is required",
+                    None,
+                )
+            }
         };
         let encoding = match obj.get("encoding").and_then(|v| v.as_str()) {
             Some(e) if e == "text" || e == "base64" => e,
-            Some(e) => return error_response("gdrive.download", "bad_request", format!("invalid encoding '{e}'"), Some("use text or base64")),
+            Some(e) => {
+                return error_response(
+                    "gdrive.download",
+                    "bad_request",
+                    format!("invalid encoding '{e}'"),
+                    Some("use text or base64"),
+                )
+            }
             None => "text",
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gdrive.download", &e),
+            Err(e) => return phylaxd_error_to_response("gdrive.download", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gdrive.download", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gdrive.download", "internal_error", e.to_string(), None)
+            }
         };
 
         // Metadata prefetch for name/mime/size.
@@ -478,7 +575,9 @@ impl Tool for GDriveDownloadTool {
             .bearer_auth(&token)
             .query(&[("fields", "name,mimeType,size")]);
         let meta = match send_with_retry(meta_req, &self.retry_policy()).await {
-            Ok(o) if o.status.is_success() => serde_json::from_str::<Value>(&o.body).unwrap_or(Value::Null),
+            Ok(o) if o.status.is_success() => {
+                serde_json::from_str::<Value>(&o.body).unwrap_or(Value::Null)
+            }
             Ok(o) => {
                 return InvokeResponse {
                     tool_id: "gdrive.download".into(),
@@ -493,7 +592,14 @@ impl Tool for GDriveDownloadTool {
                     duration_ms: 0,
                 };
             }
-            Err(e) => return error_response("gdrive.download", "gdrive_unreachable", format!("drive api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gdrive.download",
+                    "gdrive_unreachable",
+                    format!("drive api request failed: {e}"),
+                    None,
+                )
+            }
         };
 
         // Media download (raw bytes preserved).
@@ -516,7 +622,14 @@ impl Tool for GDriveDownloadTool {
                     duration_ms: 0,
                 };
             }
-            Err(e) => return error_response("gdrive.download", "gdrive_unreachable", format!("drive media request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gdrive.download",
+                    "gdrive_unreachable",
+                    format!("drive media request failed: {e}"),
+                    None,
+                )
+            }
         };
 
         let content = match encoding {
@@ -547,7 +660,9 @@ impl Tool for GDriveDownloadTool {
 pub struct GDriveGetMetadataTool;
 
 #[async_trait]
+/// Implements the Hermes tool contract for GDriveGetMetadataTool.
 impl Tool for GDriveGetMetadataTool {
+    /// Returns the public schema for this tool.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool_id: "gdrive.get_metadata".to_string(),
@@ -566,31 +681,61 @@ impl Tool for GDriveGetMetadataTool {
         }
     }
 
+    /// Returns the credential-provider identifier for this tool.
     fn provider(&self) -> &'static str {
         PROVIDER
     }
 
+    /// Validates and executes one tool invocation.
     async fn invoke(&self, ctx: &InvokeContext, req: InvokeRequest) -> InvokeResponse {
         let tenant_id = match req.tenant_id.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => t.to_string(),
-            None => return error_response("gdrive.get_metadata", "bad_request", "tenant_id is required", None),
+            None => {
+                return error_response(
+                    "gdrive.get_metadata",
+                    "bad_request",
+                    "tenant_id is required",
+                    None,
+                )
+            }
         };
         let obj = match req.args.as_object() {
             Some(o) => o,
-            None => return error_response("gdrive.get_metadata", "bad_request", "args must be a JSON object", None),
+            None => {
+                return error_response(
+                    "gdrive.get_metadata",
+                    "bad_request",
+                    "args must be a JSON object",
+                    None,
+                )
+            }
         };
-        let file_id = match obj.get("file_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        let file_id = match obj
+            .get("file_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(f) => f.to_string(),
-            None => return error_response("gdrive.get_metadata", "bad_request", "'file_id' is required", None),
+            None => {
+                return error_response(
+                    "gdrive.get_metadata",
+                    "bad_request",
+                    "'file_id' is required",
+                    None,
+                )
+            }
         };
 
-        let token = match ctx.credd.fetch_token(&tenant_id, PROVIDER).await {
+        let token = match ctx.phylaxd.fetch_token(&tenant_id, PROVIDER).await {
             Ok(t) => t,
-            Err(e) => return credd_error_to_response("gdrive.get_metadata", &e),
+            Err(e) => return phylaxd_error_to_response("gdrive.get_metadata", &e),
         };
         let http = match build_http() {
             Ok(c) => c,
-            Err(e) => return error_response("gdrive.get_metadata", "internal_error", e.to_string(), None),
+            Err(e) => {
+                return error_response("gdrive.get_metadata", "internal_error", e.to_string(), None)
+            }
         };
 
         let request = http
@@ -599,7 +744,14 @@ impl Tool for GDriveGetMetadataTool {
             .query(&[("fields", "*")]);
         let outcome = match send_with_retry(request, &self.retry_policy()).await {
             Ok(o) => o,
-            Err(e) => return error_response("gdrive.get_metadata", "gdrive_unreachable", format!("drive api request failed: {e}"), None),
+            Err(e) => {
+                return error_response(
+                    "gdrive.get_metadata",
+                    "gdrive_unreachable",
+                    format!("drive api request failed: {e}"),
+                    None,
+                )
+            }
         };
         if !outcome.status.is_success() {
             warn!(status = %outcome.status, body = %truncate(&outcome.body, 256), "drive metadata error");
@@ -628,10 +780,12 @@ impl Tool for GDriveGetMetadataTool {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 
     #[test]
+    /// Verifies parse empty args.
     fn parse_empty_args() {
         let a = parse_args(&Value::Null).unwrap();
         assert!(a.query.is_none());
@@ -639,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse full args.
     fn parse_full_args() {
         let v = json!({
             "query": "name contains 'plan'",
@@ -652,11 +807,13 @@ mod tests {
     }
 
     #[test]
+    /// Verifies parse rejects non object.
     fn parse_rejects_non_object() {
         assert!(parse_args(&json!("bad")).is_err());
     }
 
     #[test]
+    /// Verifies upload args defaults encoding to text.
     fn upload_args_defaults_encoding_to_text() {
         let v = json!({ "name": "a.txt", "content": "hello" });
         let a = parse_upload_args(&v).unwrap();
@@ -665,12 +822,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies upload args rejects missing content.
     fn upload_args_rejects_missing_content() {
         let v = json!({ "name": "a.txt" });
         assert!(parse_upload_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies upload args allows empty content.
     fn upload_args_allows_empty_content() {
         let v = json!({ "name": "a.txt", "content": "" });
         let a = parse_upload_args(&v).unwrap();
@@ -678,12 +837,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies upload args rejects bad encoding.
     fn upload_args_rejects_bad_encoding() {
         let v = json!({ "name": "a.txt", "content": "x", "encoding": "hex" });
         assert!(parse_upload_args(&v).is_err());
     }
 
     #[test]
+    /// Verifies detect mime known and default.
     fn detect_mime_known_and_default() {
         assert_eq!(detect_mime("notes.md"), "text/markdown");
         assert_eq!(detect_mime("photo.JPG"), "image/jpeg");
@@ -692,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies multipart related has both parts.
     fn multipart_related_has_both_parts() {
         let body = build_multipart_related("B", &json!({"name": "f"}), "text/plain", b"hi");
         let s = String::from_utf8_lossy(&body);

@@ -38,9 +38,9 @@ pub mod circuit;
 /// Runtime configuration loaded from environment variables.
 pub mod config;
 
-/// Credential daemon (credd) HTTP client used by adapters to fetch OAuth tokens
+/// Credential daemon (phylaxd) HTTP client used by adapters to fetch OAuth tokens
 /// and raw secrets.
-pub mod credd_client;
+pub mod phylaxd_client;
 
 /// MCP (Model Context Protocol) JSON-RPC bridge at `POST /mcp`. Gated by
 /// `HERMES_MCP_ENABLED=true`.
@@ -105,7 +105,7 @@ pub struct AppState {
     /// The populated tool registry (all adapter implementations).
     pub registry: Arc<registry::ToolRegistry>,
     /// Credential daemon client for OAuth token and secret resolution.
-    pub credd: Arc<credd_client::CreddClient>,
+    pub phylaxd: Arc<phylaxd_client::PhylaxdClient>,
     /// Token-bucket rate limiter (per tenant+tool).
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// Per-provider circuit breaker registry.
@@ -133,11 +133,11 @@ impl AppState {
     pub fn from_config(config: config::Config) -> Self {
         let registry = Arc::new(build_registry());
         let refresh_registry = oauth_refresh::RefreshRegistry::default();
-        let credd = Arc::new(
-            credd_client::CreddClient::new(config.credd_url, config.credd_token)
+        let phylaxd = Arc::new(
+            phylaxd_client::PhylaxdClient::new(config.phylaxd_url, config.phylaxd_token)
                 .with_refresh_registry(refresh_registry.clone()),
         );
-        oauth_refresh::OAuthRefreshDaemon::new(refresh_registry, credd.clone()).spawn();
+        oauth_refresh::OAuthRefreshDaemon::new(refresh_registry, phylaxd.clone()).spawn();
 
         let axon = axon::AxonPublisher::from_env();
         let audit = Arc::new(audit::AuditTrail::new(axon.clone()));
@@ -145,7 +145,7 @@ impl AppState {
 
         Self {
             registry,
-            credd,
+            phylaxd,
             rate_limiter: Arc::new(rate_limit::RateLimiter::new(
                 rate_limit::RateLimitConfig::default(),
             )),

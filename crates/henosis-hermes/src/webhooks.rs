@@ -40,6 +40,7 @@ pub enum Provider {
     Notion,
 }
 
+/// Implements the behavior exposed by Provider.
 impl Provider {
     /// Parse a provider from the URL path segment.
     pub fn parse(s: &str) -> Option<Self> {
@@ -187,7 +188,7 @@ fn event_type(provider: Provider, headers: &HeaderMap, body: &Value) -> String {
 /// `POST /webhooks/{provider}`: verify, normalize, and publish an inbound
 /// webhook. The raw body is read before parsing so the signature is checked
 /// over the exact bytes the provider signed. An invalid signature is rejected
-/// (401) and never published; an unverifiable secret (missing/credd error) also
+/// (401) and never published; an unverifiable secret (missing/phylaxd error) also
 /// fails closed.
 pub async fn ingest(
     State(state): State<AppState>,
@@ -258,15 +259,15 @@ async fn verify_inbound(
     }
 
     let secret = state
-        .credd
+        .phylaxd
         .fetch_raw_secret("webhooks", &format!("{}-secret", provider.as_str()))
         .await
         .map_err(|e| format!("webhook secret unavailable: {e}"))?;
 
     let ok = match provider {
         Provider::GitHub => {
-            let sig = header(headers, "x-hub-signature-256")
-                .ok_or("missing X-Hub-Signature-256")?;
+            let sig =
+                header(headers, "x-hub-signature-256").ok_or("missing X-Hub-Signature-256")?;
             verify_github(secret.as_bytes(), body, sig)
         }
         Provider::Linear => {
@@ -300,6 +301,7 @@ fn now_rfc3339() -> String {
 }
 
 #[cfg(test)]
+/// Contains focused unit tests for this module.
 mod tests {
     use super::*;
 

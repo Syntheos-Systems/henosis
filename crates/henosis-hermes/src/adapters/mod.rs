@@ -9,7 +9,7 @@
 #[macro_use]
 mod test_support;
 
-/// Shared HTTP retry helpers, client builder, and credd error mapping.
+/// Shared HTTP retry helpers, client builder, and phylaxd error mapping.
 pub mod common;
 /// Google Calendar adapters (list_events, create_event, update_event, delete_event).
 pub mod gcal;
