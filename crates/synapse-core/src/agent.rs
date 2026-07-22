@@ -261,7 +261,7 @@ pub fn agent_turn_with_pricing(
             for (id, name, args) in &tool_uses {
                 let input: serde_json::Value = serde_json::from_str(args)
                     .unwrap_or_else(|e| {
-                        log::warn!("failed to parse tool args for {}: {}", name, e);
+                        log::warn!("failed to parse tool args for {name}: {e}");
                         serde_json::Value::Object(Default::default())
                     });
                 content_blocks.push(ContentBlock::ToolUse {
@@ -290,7 +290,7 @@ pub fn agent_turn_with_pricing(
                         let name = name.clone();
                         let input: serde_json::Value = serde_json::from_str(args)
                             .unwrap_or_else(|e| {
-                                log::warn!("failed to parse tool args for {}: {}", name, e);
+                                log::warn!("failed to parse tool args for {name}: {e}");
                                 serde_json::Value::Object(Default::default())
                             });
                         let cwd = cwd.clone();
@@ -301,7 +301,7 @@ pub fn agent_turn_with_pricing(
                             let exec_result = match decision {
                                 GateDecision::Deny(reason) => {
                                     synapse_tools::ToolResult {
-                                        content: format!("tool gate denied {}: {}", name, reason),
+                                        content: format!("tool gate denied {name}: {reason}"),
                                         is_error: true,
                                     }
                                 }
