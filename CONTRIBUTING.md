@@ -6,6 +6,7 @@ agent runtime.
 ## Prerequisites
 
 - Rust 1.88 or newer
+- Rust 1.94 or newer for `henosis-cognition` and the `cognition` feature
 - Cargo, OpenSSL development headers, and ripgrep
 - PostgreSQL for Plutus-backed server or installer tests
 
@@ -19,7 +20,8 @@ cargo test --locked --workspace --exclude henosis-cognition
 ```
 
 `henosis-cognition` compiles the vendored Kleos machine-learning stack. Test it when your change
-touches Cognition, embedded memory, vector search, or the `cognition` feature.
+touches Cognition, embedded memory, vector search, or the `cognition` feature, using Rust 1.94 or
+newer.
 
 ## Change requirements
 

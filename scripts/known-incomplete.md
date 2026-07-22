@@ -65,12 +65,12 @@ were from the adversarial verification pass.
 The 2026-07-20 completion audit found and closed two additional live-composition gaps that the
 empty ledger and stub scan had missed. `syntheos-server` now installs `HenosisExecutor` instead of
 `DenyExecutor`; it executes ordinary tools through Hermes's shared controlled path, preserving
-tenant configuration, rate limiting, circuits, metrics, audit, and Axon, while Phylax
-use-without-holding actions use the same `PhylaxStore` as the required real gate.
+tenant configuration, rate limiting, circuits, metrics, audit, and Axon, while legacy in-process
+credential operations use the same store as the required credential-policy gate.
 The server also subscribes once to dispatcher action events and projects every event into Broca,
 plus task-correlated events into an append-only Chiasm task-activity projection. The production
-gate chain no longer substitutes a deny gate when the Phylax key is absent; missing authority
-configuration is an explicit boot error.
+gate chain no longer substitutes a deny gate when the credential-policy key is absent; missing
+authority configuration is an explicit boot error.
 
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
@@ -79,14 +79,7 @@ configuration is an explicit boot error.
 
 ## Dependency advisories (not code half-wires)
 
-GitHub Dependabot remediation (2026-06-22). The rustls-webpki HIGH + 2 LOW, the SQLx MED, and the
-jsonwebtoken 3x MED were fixed by bumping the Postgres stack to sqlx 0.8.6 (via the vendored
-Postgres-only facade in `vendor/sqlx`, see its VENDOR.md) and jsonwebtoken to 10 (`rust_crypto`).
-Two advisories remain, both blocked upstream behind the pristine vendored `kleos-lib`
-(the opentelemetry one surfaced 2026-06-29 from a fresh disclosure on a pre-existing
-transitive dep, not introduced by any Henosis change):
-
-| Advisory | Sev | Crate | Why unfixed | Closes when |
-|----------|-----|-------|-------------|-------------|
-| GHSA-w9wp-h8wv-79jx | MED | `opentelemetry_sdk 0.27.1` | Pulled transitively by the vendored `kleos-lib` (`opentelemetry` / `opentelemetry-otlp` / `tracing-opentelemetry`), which is PRISTINE and cannot be bumped without a re-vendor. The bug is unbounded memory allocation in W3C Baggage propagation -- a code path Henosis never exercises: `kleos-lib` compiles only under `--features cognition`, and the facade uses its memory/search/context surface, not OTel baggage. | the vendored `kleos-lib` advances its opentelemetry pin (or upstream kleos-lib bumps it) |
-| GHSA-rhfx-m35p-ff5j | LOW | `lru 0.12.5` | Pulled transitively by `ratatui 0.29` (synapse-tui) and `tantivy 0.24` (lancedb <- kleos-lib, cognition). Both pin `lru ^0.12`; the fix lands in `0.16.3`, unreachable without major ratatui/tantivy bumps and a vendored-kleos-lib edit. The bug is a Miri-level Stacked-Borrows UB in `IterMut`, not reachable in our usage. | ratatui/tantivy advance their `lru` pin (or kleos-lib's vendored version moves) |
+The CI dependency gate runs `cargo audit` against the full lockfile. Its sole vulnerability
+exception is `RUSTSEC-2023-0071`, whose reviewed scope and removal condition are recorded in
+`SECURITY.md`. RustSec informational warnings do not fail `cargo audit`; the current warnings cover
+unmaintained `paste` and `ttf-parser`, unsound `lru::IterMut`, and the yanked `spin 0.9.8` release.

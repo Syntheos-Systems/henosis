@@ -34,11 +34,11 @@ Human, agent, CLI, TUI, HTTP, MCP, or Rift
         Kleos memory and Cognition services
 ```
 
-The dispatcher applies the gate chain in that order. The current source calls the last internal
-slot `phylax`, a stale name retained by the in-process implementation. The server rejects a
-different order and refuses to start without the required Plutus and credential-policy
-authorities. An allowed action executes through Hermes or an internal handler, then publishes
-typed lifecycle events through Axon.
+The dispatcher applies the gate chain in that order. The fifth slot uses the legacy in-process
+credential-policy implementation while the `phylaxd` integration is completed. The server rejects
+a different order and refuses to start without the required Plutus and credential-policy
+authorities. An allowed action executes through Hermes or an internal handler, then publishes typed
+lifecycle events through Axon.
 
 This structure gives one agent a continuous record of who it is, what it has done, which
 capabilities it has earned, and which work remains after a restart.
@@ -64,6 +64,7 @@ The installer supports Linux and installs `syntheos-server` as a systemd user se
 install needs:
 
 - Git, Rust 1.88 or newer, Cargo, OpenSSL, and ripgrep
+- Rust 1.94 or newer when building the optional `cognition` feature
 - A reachable PostgreSQL database for the Plutus authority
 - `curl` or `wget` for the startup health check
 - A systemd user manager, unless you pass `--no-service`
@@ -120,8 +121,11 @@ binaries have separate configuration and launch paths.
 
 ## API surfaces
 
-The integrated server binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` selects another address. Its
-base routes include:
+The integrated server binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` selects another IP socket
+address. Its kernel APIs currently use caller-asserted tenant and principal IDs, so the server
+rejects non-loopback binds by default. `SYNTHEOS_ALLOW_INSECURE_REMOTE=1` permits a deliberate
+development bind only when an authenticated private boundary protects the server. Its base routes
+include:
 
 - `/health`, `/version`, `/enroll`, and `/dispatch`
 - Chiasm task, Soma agent, Broca action, Loom workflow, and Thymus quality APIs
@@ -130,7 +134,12 @@ base routes include:
 - Optional Stripe entitlement webhook when its signing secret is configured
 
 The standalone Rift server supplies room, message, membership, upload, bridge-control, and
-WebSocket APIs. Synapse ships CLI and TUI clients for provider-backed agent sessions.
+WebSocket APIs. It defaults to `127.0.0.1:3200`, requires distinct `JWT_SECRET` and
+`RIFT_BRIDGE_SECRET` values of at least 32 bytes, and limits browser access to local origins unless
+`RIFT_CORS_ORIGINS` supplies an explicit comma-separated allowlist. The standalone memory gateway
+also rejects non-loopback binds unless `SYNTHEOS_GATEWAY_ALLOW_INSECURE_REMOTE=1` is set behind a
+trusted authenticated boundary. Synapse ships CLI and TUI clients for provider-backed agent
+sessions.
 
 ## Providers and product boundaries
 
@@ -143,7 +152,7 @@ authority chain remains part of the product security model.
 | Hephaestus models | Anthropic or an OpenAI-compatible endpoint such as OpenAI, Ollama, Azure, or OpenRouter | Selected through environment configuration |
 | Rift embeddings | OpenAI-compatible HTTP, shared in-process Kleos bge-m3, or token overlap | Runtime and feature configuration |
 | Rift memory | External Kleos HTTP or in-process Cognition | External by default; embedded with the `cognition` feature |
-| Pistis room state | `RoomStateSource` trait | Integrated server uses an empty in-memory source pending live room materialization |
+| Pistis policy | Proprietary decision core with a `RoomStateSource` input | The decision core is a locked Henosis component; its separate source repository remains private, while room-state providers can implement the public trait |
 | Plutus policy data | `PolicyBackend` trait | Integrated server uses PostgreSQL |
 | Human approval | `Approver` trait | Integrated server uses the Rift approval registry |
 | Tool adapters | Hermes tool trait and registry | Adding a provider requires a Rust adapter and registry entry |
@@ -153,21 +162,17 @@ Kleos is the native memory and cognition system. PostgreSQL is the production Pl
 The ordered policy chain is intentional Henosis architecture, while traits isolate its data
 sources and callers.
 
-### Credential migration gap
+### Credential integration gap
 
-`phylaxd` is the credential broker behind `cred`. It superseded `credd` and retains a
-credd-compatible API, which is why some client types, environment variables, socket names, and
-error messages still contain the old name.
+`phylaxd` is the credential broker behind `cred`. Hermes uses its compatibility API for OAuth
+tokens and webhook secrets needed by Gmail, Google Calendar, Google Drive, GitHub, Linear, Notion,
+and similar adapters. Henosis-owned external-broker clients use `phylaxd` terminology; the
+compatibility wire endpoints remain an implementation detail of the broker.
 
-Hermes uses that compatibility API for OAuth tokens and webhook secrets needed by Gmail, Google
-Calendar, Google Drive, GitHub, Linear, Notion, and similar adapters. Its client and configuration
-still use the legacy `CreddClient`, `CREDD_URL`, and `HERMES_CREDD_TOKEN` names.
-
-The repository also contains an absorbed `henosis-phylax` crate and currently wires it into the
-integrated server as the fifth policy gate and an in-process credential store. It came from a
-separate credential experiment and is not the intended credential architecture. Before the
-credential integration is complete, Henosis must replace that path with `phylaxd` and retire its
-`SYNTHEOS_PHYLAX_KEY` and `SYNTHEOS_PHYLAX_DB` configuration.
+The repository also contains a legacy in-process credential-policy crate wired as the fifth gate
+and credential store. That crate came from a discontinued experiment and is not the intended
+credential architecture. Henosis must replace that path with `phylaxd` before the credential
+integration is considered complete.
 
 ## Build and test
 
@@ -190,6 +195,7 @@ cargo build --locked -p syntheos-server --features cognition
 ```
 
 The Cognition build compiles the vendored Kleos machine-learning and vector-search dependencies.
+It requires Rust 1.94 or newer, matching the pinned Kleos upstream workspace.
 The stub scan requires ripgrep. Run the repository checks with:
 
 ```sh
@@ -202,10 +208,20 @@ cargo test --locked --workspace
 
 ## Active-development limits
 
+- Kernel APIs use caller-asserted tenant and principal IDs. Keep the integrated server on loopback;
+  non-loopback binds require an explicit insecure-development override and an authenticated private
+  boundary.
+- Rift has no in-process authentication rate limiter. Keep it on loopback or put a rate-limiting
+  proxy in front of it.
+- Rift attachment URLs are opaque bearer capabilities, not authenticated download routes. Do not
+  use them for sensitive files. Attachment file reclamation is incomplete.
+- Logout and password changes revoke Rift refresh tokens. Already issued access tokens remain valid
+  for their 24-hour lifetime. Rotate `JWT_SECRET` to invalidate them after an account or signing-key
+  compromise.
 - The integrated Pistis gate uses an empty in-memory room-state source. Requests that require room capabilities fail closed until live room state is connected.
 - Hephaestus has a placeholder production Plutus token provider for tenant-scoped Anthropic authentication. Development credentials and OpenAI-compatible providers use separate paths.
-- Credential handling is split between the canonical `phylaxd` broker, legacy credd-named Hermes
-  compatibility code, and the stale in-process `henosis-phylax` path described above.
+- Credential handling is split between the canonical `phylaxd` broker and the legacy in-process
+  credential-policy path described above.
 - The default Rift bridge expects a reachable Kleos HTTP service. An embedded memory path requires the `cognition` feature.
 - The source installer configures `syntheos-server`; it does not provision PostgreSQL or install every workspace binary.
 - Public APIs and persistence formats have no stable compatibility guarantee yet.

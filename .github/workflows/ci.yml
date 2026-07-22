@@ -40,6 +40,17 @@ jobs:
       - name: Scan for unfinished production code
         run: ./scripts/stub-scan.sh
 
+  dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install RustSec audit tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit locked dependencies
+        run: ./scripts/dependency-audit.sh
+
   secrets:
     name: Secret scan
     runs-on: ubuntu-24.04
