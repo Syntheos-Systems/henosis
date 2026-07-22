@@ -27,8 +27,9 @@ declared ceiling via `execution::preflight::apply_runtime_policy`) were FIXED an
 was RESOLVED as deliberate design (not a half-wire) and removed: the bridge's HTTP-default memory
 path is the intended architecture, not an incomplete wire. In-process cognition memory is opt-in
 via `--features cognition` (which pulls the vendored kleos-lib ML stack in), exactly mirroring
-syntheos-server, so the default build stays ML-free; KLEOS :4200 coexists permanently (Zan,
-2026-06-18), so routing default-build memory to :4200 over HTTP is a chosen tradeoff, not a TODO.
+syntheos-server, so the default build stays ML-free; KLEOS :4200 coexists permanently (project
+decision, 2026-06-18), so routing default-build memory to :4200 over HTTP is a chosen tradeoff,
+not a TODO.
 Both `HttpMemoryBackend` and `CognitionMemoryBackend` are fully wired and selected at compile time.
 
 The final three deferred build-plan rows were closed 2026-06-29:

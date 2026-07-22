@@ -1,164 +1,139 @@
 # Henosis
 
-An autonomous agent operating system. One runtime, one authority model, one
-coordination plane, one tool/action path, one memory system, one operator
-surface, one deployment story.
+Henosis is an agent runtime built around one identity model, one authorization path, and one event-driven coordination plane. The repository is under active development. APIs, storage schemas, and deployment requirements may change before the first stable release.
 
-Henosis unifies the independent services -- Kleos, Phylax, Pistis, Rift,
-Synapse, Hephaestus, Hermes, and future Athena/Plutus -- into a single Cargo
-workspace that boots as one process. Services keep their domain
-authority and behavior; the OS provides shared contracts, canonical identity,
-typed events, and a unified action dispatcher so they compose instead of
-collide.
+The Cargo workspace combines the Syntheos kernel authorities with agent execution, chat, memory, tools, workflows, and operator services. Each subsystem owns its state and communicates through typed Rust contracts and Axon events.
 
 ## Architecture
 
-Four internal layers:
-
-```
- External Surfaces     MCP, CLI, HTTP APIs, Rift Web, Athena Web, compatibility shims
+```text
+External surfaces
+  HTTP APIs, MCP, CLI, TUI, Rift chat, operator API
         |
- Runtime Services      Rift (chat), Synapse (cognition), Hephaestus (execution), Hermes (tools)
+Runtime services
+  Synapse, Hephaestus, Hermes, Rift
         |
- Kernel Services       Kleos (memory), Axon (events), Chiasm (coordination), Soma (presence),
-                        Broca (narration), Loom (workflows), Thymus (evaluation), Agent-Forge
-                        (reasoning protocol), Eidolon (supervision), Phylax (secrets), Pistis
-                        (identity/trust), Plutus (tenancy/billing)
+Syntheos kernel
+  Identity, Axon, Chiasm, Soma, Broca, Loom, Thymus
+  Pistis, Plutus, Eidolon, Human approval, Phylax
         |
- Storage Engines        Postgres, SQLite (Kleos), service-owned schemas
+Storage and cognition
+  SQLite, Postgres, Kleos, optional in-process Cognition
 ```
 
-Services share canonical contracts -- principal identity, tenant, event
-envelope, task reference, tool invocation, credential handle -- but own their
-operational state. Internal communication is in-process Rust APIs and typed
-Axon event subscriptions, not HTTP between old daemons.
+The `syntheos-server` binary composes the kernel and its canonical action dispatcher. Rift, its agent bridge, Synapse clients, and compatibility gateways also ship as workspace binaries.
 
-## What's Inside
+## Action authorization
 
-| Subsystem | Role |
-|-----------|------|
-| **Kleos** | Long-term memory: ingestion, dedup, embeddings, FSRS spaced repetition, search, context assembly, recall scheduling |
-| **Axon** | Pub/sub event fabric: channels, fanout, retention, subscriptions, replay cursors, typed envelopes |
-| **Chiasm** | Task coordination: status, assignment, claims, dependencies, heartbeats, queues, operator visibility |
-| **Soma** | Agent presence and registry: online/idle/offline, heartbeat, capability advertisement, health |
-| **Broca** | Narration service: consumes events and service metadata, produces human-readable action feeds |
-| **Loom** | Workflow orchestration: DAG execution, scheduling, retries, durable step state |
-| **Thymus** | Evaluation and quality: rubrics, metrics, drift detection, score history |
-| **Agent-Forge** | Structured reasoning and verification protocol: spec, hypothesis, approach, challenge, evidence |
-| **Eidolon** | Supervisor/evaluator: input/output gating, content checks, policy enforcement, drift detection |
-| **Phylax** | Secret authority and credential vault: Vaultwarden-compatible API, agent-native grants, leases, approval-gated reads, ECDH/PIV bootstrap, audit |
-| **Pistis** | Identity, trust, and capabilities: signed event log, admission, grants/revocations, persona scopes, trust computation, cryptographic verification |
-| **Rift** | Conversation platform: rooms, messages, memberships, realtime WebSocket, human/agent bridge |
-| **Synapse** | Agent cognition runtime: LLM provider abstraction, tool loop, sessions, hooks, scheduled runs |
-| **Hephaestus** | Stateful executor: process lifecycle, checkpoints, cancellation, resume, execution logs |
-| **Hermes** | External tool gateway: Gmail/Drive/Calendar/GitHub/Slack adapters, OAuth refresh, rate limits, MCP bridge |
-| **Plutus** | Tenancy, billing, RBAC, quota enforcement (future) |
-| **Athena** | Operator workbench UI and SDK (future) |
+Henosis sends tool and system actions through one ordered gate chain:
 
-## Unified Action Dispatch
-
-Every action an autonomous agent takes flows through one dispatcher:
-
-```
-request context { tenant, principal, persona, session, room?, task?, workflow? }
-  |
-  v
-syntheos action dispatcher
-  |-- resolve tool/action from skills + adapter registries
-  |-- PistisGate:  capability/persona authorization
-  |-- PlutusGate:  tenant role, quota, billing, rate limits
-  |-- EidolonGate: content/prompt-injection/policy checks (input)
-  |-- HumanGate:   approval for destructive or high-risk operations
-  |-- PhylaxGate:  credential authorization, approval, lease, resolve mode
-  |-- execute:     Synapse in-process tool | Hermes external adapter | OS internal action
-  |-- EidolonGate: output filtering/redaction/drift checks
-  |-- Axon:        publish redacted tool/action event
-  |-- Chiasm:      update task progress
-  |-- Broca:       narrate for humans
-  |-- Thymus:      evaluate if scored
-  |-- Kleos:       promote if worth remembering
-  |
-  v
-result
+```text
+invocation
+  -> Pistis capability and trust policy
+  -> Plutus tenant, role, quota, and rate policy
+  -> Eidolon input policy
+  -> human approval when required
+  -> Phylax credential policy
+  -> Hermes, Phylax, or internal execution
+  -> Eidolon output filtering
+  -> Axon event publication and service projections
 ```
 
-The agent runtime never calls Hermes, Phylax, shell, or external APIs
-directly. It calls the dispatcher.
+The server rejects a gate chain with a different order. Production startup also requires the Plutus and Phylax authorities; it does not replace missing authorities with allow or deny placeholders.
 
-## Principal Identity
+## Subsystems
 
-One canonical principal ID per human, agent, service account, or integration.
-Each service maintains its own projection:
+| Subsystem | Responsibility |
+|-----------|----------------|
+| Axon | Typed event publication, subscriptions, retention, and replay |
+| Chiasm | Task state, claims, dependencies, activity, and queues |
+| Soma | Agent presence, health, and capability advertisement |
+| Broca | Human-readable action narration |
+| Loom | Durable workflow DAGs and step execution |
+| Thymus | Evaluations, quality history, and drift signals |
+| Pistis | Capability grants, trust, admission, and room authority |
+| Plutus | Organizations, roles, quotas, rate limits, and billing entitlements |
+| Eidolon | Input policy, supervision, output filtering, and redaction |
+| Phylax | Encrypted credentials, grants, leases, and use-without-holding execution |
+| Rift | Rooms, messages, membership, WebSockets, and human approval |
+| Synapse | Provider-neutral chat requests, tool loops, sessions, and clients |
+| Hephaestus | Stateful agent execution, checkpoints, cancellation, and resume |
+| Hermes | External SaaS adapters, OAuth refresh, rate limits, circuits, and MCP |
+| Cognition | Optional in-process access to the vendored Kleos cognitive core |
+| Agent-Forge | Task specifications, hypotheses, review gates, and verification records |
 
-- **Soma** -- presence, heartbeat, availability, capabilities
-- **Rift** -- display name, avatar, room role, chat preferences
-- **Pistis** -- signed admission, persona grants, capability grants, trust evidence
-- **Phylax** -- secret scopes, leases, token/grant binding, approval policy
-- **Identity keys** -- external API signing, MCP auth, PIV/software keys
-- **Plutus** -- tenant roles, entitlements, quotas, billing subject
+## Provider and backend boundaries
 
-They share the principal key and contract. They do not erase each other.
+Henosis separates configurable providers from product authorities.
 
-## Memory Model
+| Area | Available substitutions | Boundary |
+|------|-------------------------|----------|
+| Synapse LLM | Anthropic, OpenAI-compatible endpoints, Ollama, Azure OpenAI, OpenCode Zen, OpenAI Codex, Palantir Foundry, Claude Max | Runtime provider configuration |
+| Hephaestus LLM | Anthropic or an OpenAI-compatible endpoint such as OpenAI, Ollama, Azure, or OpenRouter | Runtime environment configuration |
+| Rift embeddings | OpenAI-compatible HTTP endpoint, shared in-process Kleos bge-m3, or token-overlap mode | Runtime configuration plus the optional `cognition` feature |
+| Rift memory | External Kleos HTTP service or in-process Cognition | Compile-time `cognition` feature and bridge configuration |
+| Hermes tools | Tool implementations register through a common trait and registry | New adapters require Rust code; bundled OAuth adapters resolve credentials through `credd` |
+| Pistis room state | `RoomStateSource` trait | The server still uses an in-memory source pending live room materialization |
+| Plutus policy reads | `PolicyBackend` trait | The production server uses Postgres |
+| Human approval | `Approver` trait | The production server uses the Rift approval registry |
 
-Kleos stores what the OS should remember. Operational data is not
-automatically memory -- promotion is explicit and typed:
+The Syntheos authority roles and their gate order define the product security model. Replacing a data source behind an authority does not remove that authority from the dispatcher.
 
-| Type | Source | Meaning |
-|------|--------|---------|
-| `chat_insight` | Rift | A message or thread became durable knowledge |
-| `task_outcome` | Chiasm/Hephaestus/Agent-Forge | A completed task result with evidence |
-| `credential_decision` | Phylax | A credential access decision worth retaining |
-| `pistis_snapshot` | Pistis | A materialized trust/capability state snapshot |
-| `quality_signal` | Thymus | An eval or drift result worth future retrieval |
-| `workflow_checkpoint` | Loom/Hephaestus | A checkpoint worth resuming or teaching from |
+Kleos remains the native memory and cognition system. The Rift bridge uses the Kleos HTTP API in its default build. Enabling `cognition` embeds the vendored `kleos-lib` facade and its optional local bge-m3 provider in the process.
 
-Rift messages stay in Rift. Axon events stay in Axon. Phylax audit stays in
-Phylax. Kleos stores what the OS should remember.
+## Build
 
-## Autonomy Loop
-
-The full cognitive-behavioral loop:
-
-```
-sense -> deliberate -> plan -> authorize -> act -> observe -> remember
-```
-
-Loom DAGs wire Chiasm task surfaces to Hephaestus execution. Agent-Forge
-evidence is part of task/run completion. Human interruption and approval flow
-through Rift, Athena, and MCP.
-
-## Build and Run
-
-Single Cargo workspace. One binary, feature-gated:
+Install a Rust toolchain compatible with the workspace lockfile, then run:
 
 ```sh
-cargo build --release -p syntheos-server          # full OS
-cargo build --release -p syntheos-server --no-default-features --features kernel,rift  # just kernel + chat
+cargo build --workspace
 ```
 
-Default ports:
+Build the integrated server without the local cognitive core:
 
-| Port | Surface |
-|------|---------|
-| 4200 | Core API (memory, Axon, Chiasm, Soma, Broca, Loom, Thymus, admin) |
-| 4510 | Memory gateway (FrameShift compatibility shim) |
-| 3200 | Rift (REST + WebSocket chat) |
-| 4700 | Hephaestus (task submission/control) |
-| 4800 | Hermes (external tool invocation) |
-| 8080 | Phylax (Vaultwarden-compatible + agent-native API) |
-| 9091 | MCP (external agent integration) |
-| 5000 | Plutus (tenancy + billing, future) |
-| 4900 | Athena (operator workbench, future) |
+```sh
+cargo build -p syntheos-server
+```
 
-## Current Status
+Build it with in-process Cognition:
 
-Early workspace. The memory gateway (`syntheos-memory-gateway`) is the first
-crate, translating between FrameShift's wire contract and Kleos's memory API
-with Ed25519 identity signing. The unified architecture plan covers 11
-absorption waves bringing the independent services into the workspace over
-approximately 24 weeks.
+```sh
+cargo build -p syntheos-server --features cognition
+```
+
+The `cognition` feature compiles the vendored Kleos machine-learning dependencies. Default builds leave that stack out.
+
+## Running the server
+
+`syntheos-server` binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` overrides it. A production-shaped boot requires at least:
+
+- `SYNTHEOS_PLUTUS_DB`, a Postgres connection URL
+- `SYNTHEOS_PLUTUS_OPERATOR_TENANT`, a tenant UUID used for first-boot organization setup
+- `SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL`, a principal UUID used for first-boot organization setup
+- `SYNTHEOS_PHYLAX_KEY`, a 64-character hexadecimal master key
+
+SQLite-backed services write under `data/` unless their `SYNTHEOS_*_DB` variables select other paths. Optional surfaces use their own environment variables, including the operator JWT, Stripe webhook, Eidolon supervisor, Hephaestus provider, and Cognition database settings.
+
+Do not use development keys in a deployed instance. Keep secrets outside the repository and inject them through the deployment environment or credential service.
+
+## Development status
+
+The core workspace builds and contains working implementations for the dispatcher, kernel stores, authorization gates, Hermes execution, task and narration projections, agent execution, Rift, Synapse, and optional Cognition.
+
+The following work remains open:
+
+- Hephaestus production tenant-scoped Anthropic authentication has a placeholder Plutus token provider. Development mode can use local Claude credentials, and OpenAI-compatible providers use their configured key path.
+- The integrated server constructs an empty in-memory Pistis room-state source. Capability-bearing requests fail closed until a live source supplies signed room state.
+- The default Rift bridge memory path requires a reachable Kleos HTTP service. In-process memory requires a build with `--features cognition`.
+- Hermes bundles adapters for several SaaS providers, but adding a different service requires a Rust adapter and registry entry.
+- Public APIs and persistence formats have not reached a stable compatibility guarantee.
+
+See [`scripts/known-incomplete.md`](scripts/known-incomplete.md) for the maintained wiring ledger and dependency advisory status.
+
+## Security and issue reports
+
+Open a GitHub issue for reproducible bugs that do not expose sensitive data. Send security reports through a private maintainer channel until the project publishes a security policy and disclosure address.
 
 ## License
 
-Elastic License 2.0 (ELv2). See `LICENSE`.
+Henosis uses the Elastic License 2.0. See [`LICENSE`](LICENSE).
