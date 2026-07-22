@@ -234,7 +234,7 @@ impl AgentTool for KleosStoreTool {
             Ok(resp) => {
                 let id = resp.get("id").map(|v| v.to_string()).unwrap_or_default();
                 Ok(ToolResult {
-                    content: format!("Stored (id: {})", id),
+                    content: format!("Stored (id: {id})"),
                     is_error: false,
                 })
             }
@@ -355,10 +355,7 @@ impl AgentTool for KleosListTool {
                             let category = m.get("category").and_then(|v| v.as_str()).unwrap_or("");
                             let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
                             let preview: String = content.chars().take(120).collect();
-                            output.push_str(&format!(
-                                "#{} [{}:{}] {}\n",
-                                id, source, category, preview
-                            ));
+                            output.push_str(&format!("#{id} [{source}:{category}] {preview}\n"));
                         }
                         Ok(ToolResult {
                             content: output,

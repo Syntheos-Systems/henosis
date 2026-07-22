@@ -5,19 +5,24 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
+/// Lists directory entries with type indicators and human-readable sizes.
 pub struct LsTool;
 
+/// Implements the agent tool contract for directory listings.
 #[async_trait::async_trait]
 impl AgentTool for LsTool {
+    /// Returns the directory-listing tool's stable registry name.
     fn name(&self) -> &str {
         "ls"
     }
 
+    /// Describes directory listing output.
     fn description(&self) -> &str {
         "List the contents of a directory. Shows file type indicators, \
          names, and sizes."
     }
 
+    /// Returns the accepted directory path parameter.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -30,6 +35,7 @@ impl AgentTool for LsTool {
         })
     }
 
+    /// Reads, orders, and renders entries from the requested directory.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let dir_str = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -39,7 +45,7 @@ impl AgentTool for LsTool {
             Ok(rd) => rd,
             Err(e) => {
                 return Ok(ToolResult {
-                    content: format!("Error listing directory: {}", e),
+                    content: format!("Error listing directory: {e}"),
                     is_error: true,
                 });
             }
@@ -72,7 +78,7 @@ impl AgentTool for LsTool {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    entries.push((format!("<error: {}>", e), 0, EntryKind::Unknown));
+                    entries.push((format!("<error: {e}>"), 0, EntryKind::Unknown));
                 }
             }
         }
@@ -98,8 +104,8 @@ impl AgentTool for LsTool {
         let mut lines = vec![format!("{}:", dir.display())];
         for (name, size, kind) in &entries {
             let display_name = match kind {
-                EntryKind::Dir => format!("{}/", name),
-                EntryKind::Symlink => format!("{}@", name),
+                EntryKind::Dir => format!("{name}/"),
+                EntryKind::Symlink => format!("{name}@"),
                 EntryKind::File | EntryKind::Unknown => name.clone(),
             };
 
@@ -109,9 +115,9 @@ impl AgentTool for LsTool {
             };
 
             if size_str.is_empty() {
-                lines.push(format!("  {}", display_name));
+                lines.push(format!("  {display_name}"));
             } else {
-                lines.push(format!("  {:8}  {}", size_str, display_name));
+                lines.push(format!("  {size_str:8}  {display_name}"));
             }
         }
 
@@ -122,6 +128,7 @@ impl AgentTool for LsTool {
     }
 }
 
+/// Classifies directory entries for sorting and display.
 enum EntryKind {
     Dir,
     File,
@@ -129,9 +136,10 @@ enum EntryKind {
     Unknown,
 }
 
+/// Formats a byte count with a compact binary unit suffix.
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     } else if bytes < 1024 * 1024 {
         format!("{:.1}K", bytes as f64 / 1024.0)
     } else if bytes < 1024 * 1024 * 1024 {
@@ -141,6 +149,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Resolves a directory path relative to the execution directory.
 fn resolve_path(cwd: &Path, p: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(p);
     if path.is_absolute() {

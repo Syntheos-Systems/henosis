@@ -7,19 +7,24 @@ use std::path::Path;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
+/// Finds files whose relative paths match a glob expression.
 pub struct GlobTool;
 
+/// Implements the agent tool contract for file discovery.
 #[async_trait::async_trait]
 impl AgentTool for GlobTool {
+    /// Returns the glob tool's stable registry name.
     fn name(&self) -> &str {
         "glob"
     }
 
+    /// Describes recursive path-pattern matching behavior.
     fn description(&self) -> &str {
         "Find files matching a glob pattern. Supports *, **, and ? wildcards. \
          Returns matching paths sorted by modification time (newest first)."
     }
 
+    /// Returns the accepted glob pattern and search-root parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -37,6 +42,7 @@ impl AgentTool for GlobTool {
         })
     }
 
+    /// Searches the requested root and returns matches ordered by modification time.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -84,7 +90,7 @@ impl AgentTool for GlobTool {
 
         if matches.is_empty() {
             return Ok(ToolResult {
-                content: format!("No files matched pattern: {}", pattern),
+                content: format!("No files matched pattern: {pattern}"),
                 is_error: false,
             });
         }
@@ -111,6 +117,7 @@ fn glob_path_matches(pattern: &str, path: &str) -> bool {
     )
 }
 
+/// Recursively matches tokenized glob and path characters.
 fn glob_path_chars(pat: &[char], txt: &[char]) -> bool {
     match (pat.first(), txt.first()) {
         (None, None) => true,
@@ -155,6 +162,7 @@ fn glob_path_chars(pat: &[char], txt: &[char]) -> bool {
     }
 }
 
+/// Resolves a search root relative to the execution directory.
 fn resolve_path(cwd: &Path, p: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(p);
     if path.is_absolute() {

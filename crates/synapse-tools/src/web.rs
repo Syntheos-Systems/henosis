@@ -147,7 +147,7 @@ async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) ->
 
 /// Convert bounded response bytes to panic-free lossy UTF-8 output.
 fn render_body(body: &[u8], max_bytes: usize, truncated: bool) -> String {
-    let mut rendered = String::from_utf8_lossy(&body).into_owned();
+    let mut rendered = String::from_utf8_lossy(body).into_owned();
     if truncated {
         rendered.push_str(&format!("...\n[truncated at {max_bytes} bytes]"));
     }
@@ -232,108 +232,6 @@ impl AgentTool for WebFetchTool {
             content: body,
             is_error: false,
         })
-    }
-}
-
-/// Exercises SSRF classification, byte limits, and safe response rendering.
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// Verifies representative public addresses remain fetchable.
-    #[test]
-    fn accepts_public_addresses() {
-        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
-        assert!(is_public_ip("2001:4860:4860::8888".parse().unwrap()));
-    }
-
-    /// Verifies local, private, special-use, and mapped addresses are rejected.
-    #[test]
-    fn rejects_non_public_addresses() {
-        for raw in [
-            "0.0.0.0",
-            "10.0.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "169.254.169.254",
-            "172.16.0.1",
-            "192.168.0.1",
-            "198.18.0.1",
-            "224.0.0.1",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "100::1",
-            "2001:10::1",
-            "2001:20::1",
-            "2001:db8::1",
-            "3fff::1",
-            "5f00::1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(!is_public_ip(raw.parse().unwrap()), "accepted {raw}");
-        }
-    }
-
-    /// Verifies mixed DNS answers fail closed instead of selecting only a public answer.
-    #[test]
-    fn rejects_mixed_dns_answers() {
-        let result = select_public_address(
-            "example.test",
-            443,
-            [
-                "93.184.216.34".parse().unwrap(),
-                "127.0.0.1".parse().unwrap(),
-            ],
-        );
-
-        assert!(result.is_err());
-    }
-
-    /// Verifies response limits reject invalid values and retain the documented default.
-    #[test]
-    fn validates_response_limits() {
-        assert_eq!(max_response_bytes(&json!({})).unwrap(), DEFAULT_MAX_BYTES);
-        assert!(max_response_bytes(&json!({"max_bytes": 0})).is_err());
-        assert!(max_response_bytes(&json!({"max_bytes": 1.5})).is_err());
-        assert!(max_response_bytes(&json!({"max_bytes": HARD_MAX_BYTES + 1})).is_err());
-    }
-
-    /// Verifies truncating within a multibyte sequence cannot panic.
-    #[test]
-    fn renders_split_utf8_without_panicking() {
-        let rendered = render_body(&[0xe2, 0x82], 2, true);
-
-        assert!(rendered.contains('\u{fffd}'));
-        assert!(rendered.ends_with("[truncated at 2 bytes]"));
-    }
-
-    /// Verifies literal private targets are rejected before any connection attempt.
-    #[tokio::test]
-    async fn web_fetch_rejects_private_literal_targets() {
-        let result = WebFetchTool
-            .execute(json!({"url": "http://127.0.0.1/admin"}), Path::new("/tmp"))
-            .await;
-
-        assert!(result.is_err());
-    }
-
-    /// Verifies non-HTTP schemes and embedded credentials fail closed.
-    #[tokio::test]
-    async fn web_fetch_rejects_unsafe_url_forms() {
-        let file_result = WebFetchTool
-            .execute(json!({"url": "file:///etc/passwd"}), Path::new("/tmp"))
-            .await;
-        let credential_result = WebFetchTool
-            .execute(
-                json!({"url": "https://user:secret@example.com/"}),
-                Path::new("/tmp"),
-            )
-            .await;
-
-        assert!(file_result.is_err());
-        assert!(credential_result.is_err());
     }
 }
 
@@ -436,7 +334,7 @@ impl AgentTool for WebSearchTool {
                 .trim();
 
             if !title.is_empty() {
-                results.push(format!("• {}\n  {}\n  {}", title, url, snippet));
+                results.push(format!("• {title}\n  {url}\n  {snippet}"));
             }
         }
 
@@ -451,5 +349,107 @@ impl AgentTool for WebSearchTool {
                 is_error: false,
             })
         }
+    }
+}
+
+/// Exercises SSRF classification, byte limits, and safe response rendering.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Verifies representative public addresses remain fetchable.
+    #[test]
+    fn accepts_public_addresses() {
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    /// Verifies local, private, special-use, and mapped addresses are rejected.
+    #[test]
+    fn rejects_non_public_addresses() {
+        for raw in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "100::1",
+            "2001:10::1",
+            "2001:20::1",
+            "2001:db8::1",
+            "3fff::1",
+            "5f00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!is_public_ip(raw.parse().unwrap()), "accepted {raw}");
+        }
+    }
+
+    /// Verifies mixed DNS answers fail closed instead of selecting only a public answer.
+    #[test]
+    fn rejects_mixed_dns_answers() {
+        let result = select_public_address(
+            "example.test",
+            443,
+            [
+                "93.184.216.34".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ],
+        );
+
+        assert!(result.is_err());
+    }
+
+    /// Verifies response limits reject invalid values and retain the documented default.
+    #[test]
+    fn validates_response_limits() {
+        assert_eq!(max_response_bytes(&json!({})).unwrap(), DEFAULT_MAX_BYTES);
+        assert!(max_response_bytes(&json!({"max_bytes": 0})).is_err());
+        assert!(max_response_bytes(&json!({"max_bytes": 1.5})).is_err());
+        assert!(max_response_bytes(&json!({"max_bytes": HARD_MAX_BYTES + 1})).is_err());
+    }
+
+    /// Verifies truncating within a multibyte sequence cannot panic.
+    #[test]
+    fn renders_split_utf8_without_panicking() {
+        let rendered = render_body(&[0xe2, 0x82], 2, true);
+
+        assert!(rendered.contains('\u{fffd}'));
+        assert!(rendered.ends_with("[truncated at 2 bytes]"));
+    }
+
+    /// Verifies literal private targets are rejected before any connection attempt.
+    #[tokio::test]
+    async fn web_fetch_rejects_private_literal_targets() {
+        let result = WebFetchTool
+            .execute(json!({"url": "http://127.0.0.1/admin"}), Path::new("/tmp"))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// Verifies non-HTTP schemes and embedded credentials fail closed.
+    #[tokio::test]
+    async fn web_fetch_rejects_unsafe_url_forms() {
+        let file_result = WebFetchTool
+            .execute(json!({"url": "file:///etc/passwd"}), Path::new("/tmp"))
+            .await;
+        let credential_result = WebFetchTool
+            .execute(
+                json!({"url": "https://user:secret@example.com/"}),
+                Path::new("/tmp"),
+            )
+            .await;
+
+        assert!(file_result.is_err());
+        assert!(credential_result.is_err());
     }
 }

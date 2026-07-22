@@ -5,20 +5,25 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
+/// Replaces exact text within files and reports a compact diff.
 pub struct EditTool;
 
+/// Implements the agent tool contract for file edits.
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
+    /// Returns the edit tool's stable registry name.
     fn name(&self) -> &str {
         "edit"
     }
 
+    /// Describes exact string replacement behavior.
     fn description(&self) -> &str {
         "Replace a specific string in a file with a new string. \
          By default the old_string must appear exactly once in the file. \
          Use replace_all to replace every occurrence."
     }
 
+    /// Returns the accepted file and replacement parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -44,6 +49,7 @@ impl AgentTool for EditTool {
         })
     }
 
+    /// Applies the requested replacement and returns a unified diff snippet.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -86,7 +92,7 @@ impl AgentTool for EditTool {
             Ok(s) => s,
             Err(e) => {
                 return Ok(ToolResult {
-                    content: format!("Error reading file: {}", e),
+                    content: format!("Error reading file: {e}"),
                     is_error: true,
                 });
             }
@@ -104,9 +110,8 @@ impl AgentTool for EditTool {
         if !replace_all && count > 1 {
             return Ok(ToolResult {
                 content: format!(
-                    "old_string appears {} times in the file. \
+                    "old_string appears {count} times in the file. \
                      Provide more context to make it unique, or set replace_all to true.",
-                    count
                 ),
                 is_error: true,
             });
@@ -120,7 +125,7 @@ impl AgentTool for EditTool {
 
         if let Err(e) = tokio::fs::write(&path, new_content.as_bytes()).await {
             return Ok(ToolResult {
-                content: format!("Failed to write file: {}", e),
+                content: format!("Failed to write file: {e}"),
                 is_error: true,
             });
         }
@@ -165,7 +170,7 @@ fn unified_diff_snippet(original: &str, new_content: &str, path: &str) -> String
     let new_start = start;
 
     let mut out = String::new();
-    out.push_str(&format!("--- {}\n+++ {}\n", path, path));
+    out.push_str(&format!("--- {path}\n+++ {path}\n"));
     out.push_str(&format!(
         "@@ -{},{} +{},{} @@\n",
         start + 1,
@@ -188,6 +193,7 @@ fn unified_diff_snippet(original: &str, new_content: &str, path: &str) -> String
     out
 }
 
+/// Resolves a user-supplied file path relative to the execution directory.
 fn resolve_path(cwd: &Path, file_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(file_path);
     if p.is_absolute() {

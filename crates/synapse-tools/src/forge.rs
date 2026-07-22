@@ -6,10 +6,12 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
+/// Returns the configured Agent-Forge service URL.
 fn forge_url() -> String {
     std::env::var("FORGE_URL").unwrap_or_else(|_| "http://127.0.0.1:4201".to_string())
 }
 
+/// Invokes an Agent-Forge HTTP tool and extracts its textual response.
 async fn forge_call(tool_name: &str, args: &Value) -> Result<String> {
     let url = format!("{}/tool/{}", forge_url(), tool_name);
     let client = reqwest::Client::new();
@@ -23,7 +25,7 @@ async fn forge_call(tool_name: &str, args: &Value) -> Result<String> {
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("forge {} error {}: {}", tool_name, status, text);
+        anyhow::bail!("forge {tool_name} error {status}: {text}");
     }
 
     let body: Value = resp.json().await?;
@@ -44,17 +46,21 @@ async fn forge_call(tool_name: &str, args: &Value) -> Result<String> {
 
 pub struct RepoMapTool;
 
+/// Implements the agent tool contract for repository maps.
 #[async_trait::async_trait]
 impl AgentTool for RepoMapTool {
+    /// Returns the repository-map tool's stable registry name.
     fn name(&self) -> &str {
         "repo_map"
     }
 
+    /// Describes structural repository mapping.
     fn description(&self) -> &str {
         "Generate a structural map of a codebase showing files, functions, and classes \
          ranked by importance. Use before touching any unfamiliar codebase."
     }
 
+    /// Returns the repository-map parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -66,6 +72,7 @@ impl AgentTool for RepoMapTool {
         })
     }
 
+    /// Requests a structural map for the supplied repository path.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("path").is_none() {
@@ -88,17 +95,21 @@ impl AgentTool for RepoMapTool {
 
 pub struct SearchCodeTool;
 
+/// Implements the agent tool contract for structural code search.
 #[async_trait::async_trait]
 impl AgentTool for SearchCodeTool {
+    /// Returns the code-search tool's stable registry name.
     fn name(&self) -> &str {
         "search_code"
     }
 
+    /// Describes structural symbol search.
     fn description(&self) -> &str {
         "Find functions, classes, or variables by name using AST-aware search. \
          More precise than grep for code structure."
     }
 
+    /// Returns the code-search parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -112,6 +123,7 @@ impl AgentTool for SearchCodeTool {
         })
     }
 
+    /// Searches the supplied repository for matching code symbols.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("path").is_none() {
@@ -134,17 +146,21 @@ impl AgentTool for SearchCodeTool {
 
 pub struct LogHypothesisTool;
 
+/// Implements the agent tool contract for hypothesis logging.
 #[async_trait::async_trait]
 impl AgentTool for LogHypothesisTool {
+    /// Returns the hypothesis tool's stable registry name.
     fn name(&self) -> &str {
         "log_hypothesis"
     }
 
+    /// Describes pre-fix hypothesis logging.
     fn description(&self) -> &str {
         "Log a debugging hypothesis before attempting a fix. Required before editing code \
          to fix a bug. Forces structured reasoning about root cause."
     }
 
+    /// Returns the hypothesis parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -158,6 +174,7 @@ impl AgentTool for LogHypothesisTool {
         })
     }
 
+    /// Records a debugging hypothesis with Agent-Forge.
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         match forge_call("log_hypothesis", &params).await {
             Ok(text) => Ok(ToolResult {
@@ -176,17 +193,21 @@ impl AgentTool for LogHypothesisTool {
 
 pub struct LogOutcomeTool;
 
+/// Implements the agent tool contract for hypothesis outcomes.
 #[async_trait::async_trait]
 impl AgentTool for LogOutcomeTool {
+    /// Returns the outcome tool's stable registry name.
     fn name(&self) -> &str {
         "log_outcome"
     }
 
+    /// Describes hypothesis outcome recording.
     fn description(&self) -> &str {
         "Log the outcome of a fix attempt. Required after every fix. Records whether \
          hypothesis was correct and what actually worked."
     }
 
+    /// Returns the outcome parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -200,6 +221,7 @@ impl AgentTool for LogOutcomeTool {
         })
     }
 
+    /// Records the observed result of a prior hypothesis.
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         match forge_call("log_outcome", &params).await {
             Ok(text) => Ok(ToolResult {
@@ -218,17 +240,21 @@ impl AgentTool for LogOutcomeTool {
 
 pub struct RecallErrorsTool;
 
+/// Implements the agent tool contract for prior-error recall.
 #[async_trait::async_trait]
 impl AgentTool for RecallErrorsTool {
+    /// Returns the error-recall tool's stable registry name.
     fn name(&self) -> &str {
         "recall_errors"
     }
 
+    /// Describes previous-error retrieval.
     fn description(&self) -> &str {
         "Search past agent mistakes and debugging outcomes. Check this before debugging \
          to avoid repeating known wrong hypotheses."
     }
 
+    /// Returns the error-recall parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -240,6 +266,7 @@ impl AgentTool for RecallErrorsTool {
         })
     }
 
+    /// Searches Agent-Forge for relevant prior failures.
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         match forge_call("recall_errors", &params).await {
             Ok(text) => Ok(ToolResult {
@@ -258,17 +285,21 @@ impl AgentTool for RecallErrorsTool {
 
 pub struct TestImpactTool;
 
+/// Implements the agent tool contract for test-impact analysis.
 #[async_trait::async_trait]
 impl AgentTool for TestImpactTool {
+    /// Returns the test-impact tool's stable registry name.
     fn name(&self) -> &str {
         "test_impact"
     }
 
+    /// Describes test-impact analysis.
     fn description(&self) -> &str {
         "Given a list of changed files, returns which tests to run. Use instead of \
          running the full test suite after every change."
     }
 
+    /// Returns the test-impact parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -280,6 +311,7 @@ impl AgentTool for TestImpactTool {
         })
     }
 
+    /// Identifies tests affected by the supplied code change.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("path").is_none() {
@@ -302,17 +334,21 @@ impl AgentTool for TestImpactTool {
 
 pub struct ExecuteTool;
 
+/// Implements the agent tool contract for Forge-managed command execution.
 #[async_trait::async_trait]
 impl AgentTool for ExecuteTool {
+    /// Returns the execution tool's stable registry name.
     fn name(&self) -> &str {
         "execute"
     }
 
+    /// Describes Forge-managed command execution.
     fn description(&self) -> &str {
         "Run a command and return structured output. Use for running code, builds, or scripts. \
          Returns exit code, stdout, stderr separately."
     }
 
+    /// Returns the execution parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -325,6 +361,7 @@ impl AgentTool for ExecuteTool {
         })
     }
 
+    /// Runs a command through the Agent-Forge service.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("cwd").is_none() {
@@ -347,17 +384,21 @@ impl AgentTool for ExecuteTool {
 
 pub struct VerifyTool;
 
+/// Implements the agent tool contract for verification commands.
 #[async_trait::async_trait]
 impl AgentTool for VerifyTool {
+    /// Returns the verification tool's stable registry name.
     fn name(&self) -> &str {
         "verify"
     }
 
+    /// Describes evidence-producing verification.
     fn description(&self) -> &str {
         "Run a test command and return structured pass/fail results. \
          Parses test output to extract failures."
     }
 
+    /// Returns the verification parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -370,6 +411,7 @@ impl AgentTool for VerifyTool {
         })
     }
 
+    /// Runs a verification command through Agent-Forge.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("cwd").is_none() {
@@ -392,17 +434,21 @@ impl AgentTool for VerifyTool {
 
 pub struct AstSearchTool;
 
+/// Implements the agent tool contract for AST-aware search.
 #[async_trait::async_trait]
 impl AgentTool for AstSearchTool {
+    /// Returns the AST-search tool's stable registry name.
     fn name(&self) -> &str {
         "ast_search"
     }
 
+    /// Describes syntax-tree-aware code search.
     fn description(&self) -> &str {
         "Structural code search using ast-grep patterns. Finds code by structure, not text. \
          Example: 'console.log($$$)' finds all console.log calls regardless of arguments."
     }
 
+    /// Returns the AST-search parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -415,6 +461,7 @@ impl AgentTool for AstSearchTool {
         })
     }
 
+    /// Searches syntax trees within the supplied repository path.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("path").is_none() {
@@ -437,17 +484,21 @@ impl AgentTool for AstSearchTool {
 
 pub struct ProseAnalyzeTool;
 
+/// Implements the agent tool contract for prose analysis.
 #[async_trait::async_trait]
 impl AgentTool for ProseAnalyzeTool {
+    /// Returns the prose-analysis tool's stable registry name.
     fn name(&self) -> &str {
         "prose_analyze"
     }
 
+    /// Describes prose-pattern analysis.
     fn description(&self) -> &str {
         "Analyze written text for AI-sounding patterns, readability, and voice consistency. \
          Required before finalizing any natural language content."
     }
 
+    /// Returns the prose-analysis parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -459,6 +510,7 @@ impl AgentTool for ProseAnalyzeTool {
         })
     }
 
+    /// Analyzes supplied prose for learned writing patterns.
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         match forge_call("prose_analyze", &params).await {
             Ok(text) => Ok(ToolResult {
@@ -477,17 +529,21 @@ impl AgentTool for ProseAnalyzeTool {
 
 pub struct ProseLearnTool;
 
+/// Implements the agent tool contract for prose-pattern learning.
 #[async_trait::async_trait]
 impl AgentTool for ProseLearnTool {
+    /// Returns the prose-learning tool's stable registry name.
     fn name(&self) -> &str {
         "prose_learn"
     }
 
+    /// Describes prose-pattern learning.
     fn description(&self) -> &str {
         "Save approved text as a voice profile sample. Call when the operator approves written content \
          or submits their own text as reference."
     }
 
+    /// Returns the prose-learning parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -499,6 +555,7 @@ impl AgentTool for ProseLearnTool {
         })
     }
 
+    /// Records a prose pattern with Agent-Forge.
     async fn execute(&self, params: Value, _cwd: &Path) -> Result<ToolResult> {
         match forge_call("prose_learn", &params).await {
             Ok(text) => Ok(ToolResult {
@@ -517,16 +574,20 @@ impl AgentTool for ProseLearnTool {
 
 pub struct SessionDiffTool;
 
+/// Implements the agent tool contract for session diff review.
 #[async_trait::async_trait]
 impl AgentTool for SessionDiffTool {
+    /// Returns the session-diff tool's stable registry name.
     fn name(&self) -> &str {
         "session_diff"
     }
 
+    /// Describes session-level change review.
     fn description(&self) -> &str {
         "Show all changes made in the current session. Use to audit work before declaring done."
     }
 
+    /// Returns the session-diff parameter schema.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -536,6 +597,7 @@ impl AgentTool for SessionDiffTool {
         })
     }
 
+    /// Audits repository changes accumulated during the current session.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let mut args = params.clone();
         if args.get("path").is_none() {

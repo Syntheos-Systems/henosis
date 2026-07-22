@@ -7,19 +7,24 @@ use std::path::Path;
 
 const DEFAULT_LIMIT: usize = 2000;
 
+/// Reads bounded, line-numbered text from files.
 pub struct ReadTool;
 
+/// Implements the agent tool contract for file reads.
 #[async_trait::async_trait]
 impl AgentTool for ReadTool {
+    /// Returns the read tool's stable registry name.
     fn name(&self) -> &str {
         "read"
     }
 
+    /// Describes line-oriented file reading behavior.
     fn description(&self) -> &str {
         "Read the contents of a file with line numbers. Supports optional \
          line offset and limit for reading large files in chunks."
     }
 
+    /// Returns the accepted file, offset, and line-limit parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -41,6 +46,7 @@ impl AgentTool for ReadTool {
         })
     }
 
+    /// Reads the requested text range and renders it with one-based line numbers.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -71,7 +77,7 @@ impl AgentTool for ReadTool {
             Ok(b) => b,
             Err(e) => {
                 return Ok(ToolResult {
-                    content: format!("Error reading file: {}", e),
+                    content: format!("Error reading file: {e}"),
                     is_error: true,
                 });
             }
@@ -100,7 +106,7 @@ impl AgentTool for ReadTool {
         let mut output = String::new();
         for (i, line) in slice.iter().enumerate() {
             let lineno = start + i + 1; // back to 1-based for display
-            output.push_str(&format!("{:>6}\t{}\n", lineno, line));
+            output.push_str(&format!("{lineno:>6}\t{line}\n"));
         }
 
         if output.is_empty() {
@@ -114,6 +120,7 @@ impl AgentTool for ReadTool {
     }
 }
 
+/// Resolves a file path relative to the execution directory.
 fn resolve_path(cwd: &Path, file_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(file_path);
     if p.is_absolute() {

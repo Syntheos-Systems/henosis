@@ -11,19 +11,24 @@ use tokio::time::timeout;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024; // 50 KB
 
+/// Executes bounded shell commands and returns combined process output.
 pub struct BashTool;
 
+/// Implements the agent tool contract for shell command execution.
 #[async_trait::async_trait]
 impl AgentTool for BashTool {
+    /// Returns the shell tool's stable registry name.
     fn name(&self) -> &str {
         "bash"
     }
 
+    /// Describes the shell command execution capability.
     fn description(&self) -> &str {
         "Execute a shell command and return combined stdout+stderr. \
          Use for running builds, tests, CLI tools, or any system command."
     }
 
+    /// Returns the accepted command and timeout parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -41,6 +46,7 @@ impl AgentTool for BashTool {
         })
     }
 
+    /// Executes a command from the supplied working directory within the timeout.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let command = match params.get("command").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
@@ -72,11 +78,11 @@ impl AgentTool for BashTool {
 
         match result {
             Err(_elapsed) => Ok(ToolResult {
-                content: format!("Command timed out after {}ms", timeout_ms),
+                content: format!("Command timed out after {timeout_ms}ms"),
                 is_error: true,
             }),
             Ok(Err(e)) => Ok(ToolResult {
-                content: format!("Failed to spawn command: {}", e),
+                content: format!("Failed to spawn command: {e}"),
                 is_error: true,
             }),
             Ok(Ok(output)) => {
@@ -98,7 +104,7 @@ impl AgentTool for BashTool {
                 let is_error = !output.status.success();
 
                 if is_error && text.is_empty() {
-                    text = format!("Process exited with code {}", exit_code);
+                    text = format!("Process exited with code {exit_code}");
                 }
 
                 Ok(ToolResult {
@@ -111,6 +117,7 @@ impl AgentTool for BashTool {
 }
 
 #[cfg(target_os = "windows")]
+/// Constructs a Windows command-shell process.
 fn build_command(command: &str) -> Command {
     let mut cmd = Command::new("cmd");
     cmd.args(["/C", command]);
@@ -118,6 +125,7 @@ fn build_command(command: &str) -> Command {
 }
 
 #[cfg(not(target_os = "windows"))]
+/// Constructs a POSIX shell process.
 fn build_command(command: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]);

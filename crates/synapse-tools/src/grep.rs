@@ -11,19 +11,24 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const CONTEXT_LINES: usize = 2;
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024; // 10 MB — skip larger files
 
+/// Searches text files with regular expressions and bounded context output.
 pub struct GrepTool;
 
+/// Implements the agent tool contract for content search.
 #[async_trait::async_trait]
 impl AgentTool for GrepTool {
+    /// Returns the grep tool's stable registry name.
     fn name(&self) -> &str {
         "grep"
     }
 
+    /// Describes regular-expression search behavior.
     fn description(&self) -> &str {
         "Search file contents using a regex pattern. Returns matching file paths, \
          line numbers, and surrounding context lines."
     }
 
+    /// Returns the accepted search, path, filter, and result-limit parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -49,6 +54,7 @@ impl AgentTool for GrepTool {
         })
     }
 
+    /// Searches eligible text files and renders matching lines with context.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let pattern_str = match params.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -64,7 +70,7 @@ impl AgentTool for GrepTool {
             Ok(r) => r,
             Err(e) => {
                 return Ok(ToolResult {
-                    content: format!("Invalid regex pattern: {}", e),
+                    content: format!("Invalid regex pattern: {e}"),
                     is_error: true,
                 });
             }
@@ -140,7 +146,7 @@ impl AgentTool for GrepTool {
             }
 
             let display_path = file_path.to_string_lossy();
-            results.push(format!("=== {} ===", display_path));
+            results.push(format!("=== {display_path} ==="));
 
             for (idx, _line) in &file_matches {
                 if total_matches >= max_results {
@@ -161,13 +167,13 @@ impl AgentTool for GrepTool {
 
         if results.is_empty() {
             return Ok(ToolResult {
-                content: format!("No matches found for pattern: {}", pattern_str),
+                content: format!("No matches found for pattern: {pattern_str}"),
                 is_error: false,
             });
         }
 
         if total_matches >= max_results {
-            results.push(format!("[Results truncated at {} matches]", max_results));
+            results.push(format!("[Results truncated at {max_results} matches]"));
         }
 
         Ok(ToolResult {
@@ -190,18 +196,20 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
         let alternatives = &pattern[brace_start + 1..brace_end];
         return alternatives
             .split(',')
-            .any(|alt| glob_matches(&format!("{}{}{}", prefix, alt, suffix), name));
+            .any(|alt| glob_matches(&format!("{prefix}{alt}{suffix}"), name));
     }
 
     glob_match_simple(pattern, name)
 }
 
+/// Matches a filename against a glob expression without brace expansion.
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = name.chars().collect();
     glob_match_chars(&pat, &txt)
 }
 
+/// Recursively matches tokenized filename glob characters.
 fn glob_match_chars(pat: &[char], txt: &[char]) -> bool {
     match (pat.first(), txt.first()) {
         (None, None) => true,
@@ -226,6 +234,7 @@ fn glob_match_chars(pat: &[char], txt: &[char]) -> bool {
     }
 }
 
+/// Resolves a search path relative to the execution directory.
 fn resolve_path(cwd: &Path, p: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(p);
     if path.is_absolute() {
