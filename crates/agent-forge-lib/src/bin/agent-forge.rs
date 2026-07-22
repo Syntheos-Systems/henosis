@@ -119,7 +119,7 @@ fn main() {
     let db = match Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
-            let output = Output::error(format!("Database error: {}", e));
+            let output = Output::error(format!("Database error: {e}"));
             write_output(&cli.output, &output).ok();
             std::process::exit(1);
         }
@@ -136,7 +136,7 @@ fn main() {
     };
 
     if let Err(e) = write_output(&cli.output, &output) {
-        eprintln!("Failed to write output: {}", e);
+        eprintln!("Failed to write output: {e}");
         std::process::exit(1);
     }
 }
