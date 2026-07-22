@@ -158,10 +158,7 @@ pub async fn invoke_controlled(
             result: None,
             error: Some(err(
                 "rate_limited",
-                format!(
-                    "tenant '{}' over rate limit for tool '{}'",
-                    tenant_for_limit, tool_id
-                ),
+                format!("tenant '{tenant_for_limit}' over rate limit for tool '{tool_id}'"),
                 Some(&format!("retry in ~{retry_after_secs}s")),
             )),
             duration_ms: 0,
