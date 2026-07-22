@@ -269,7 +269,7 @@ impl KleosClient {
     /// Recall a single memory by its (string) id.
     pub async fn get(&self, id: &str) -> Result<Memory, GatewayError> {
         let kid = parse_id(id)?;
-        let path = format!("/memory/{}", kid);
+        let path = format!("/memory/{kid}");
         let resp = self
             .send_authenticated("GET", &path, "", &[], |rb| rb)
             .await?;
@@ -280,7 +280,7 @@ impl KleosClient {
 
     /// List memories with limit/offset paging.
     pub async fn list(&self, limit: usize, offset: usize) -> Result<Vec<Memory>, GatewayError> {
-        let query = format!("limit={}&offset={}", limit, offset);
+        let query = format!("limit={limit}&offset={offset}");
         let resp = self
             .send_authenticated("GET", "/list", &query, &[], |rb| rb)
             .await?;
@@ -292,7 +292,7 @@ impl KleosClient {
     /// Forget (soft-delete) a single memory by its (string) id.
     pub async fn forget(&self, id: &str) -> Result<(), GatewayError> {
         let kid = parse_id(id)?;
-        let path = format!("/memory/{}/forget", kid);
+        let path = format!("/memory/{kid}/forget");
         let body_value = json!({});
         let body_bytes = serde_json::to_vec(&body_value)
             .expect("json serialisation of static structure never fails");
