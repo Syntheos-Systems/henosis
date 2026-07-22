@@ -1,0 +1,39 @@
+# Extend the scanner's maintained default rules instead of replacing them.
+[extend]
+useDefault = true
+
+# Anthropic beta feature headers are protocol identifiers, not credentials.
+[[allowlists]]
+description = "Anthropic beta protocol headers"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''crates/henosis-hephaestus/src/providers/anthropic\.rs$''',
+  '''crates/synapse-provider/src/anthropic\.rs$''',
+]
+regexes = [
+  '''claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14''',
+  '''oauth-2025-04-20,interleaved-thinking-2025-05-14''',
+]
+
+# This exact fixed hex value exercises encryption-key parsing in vendored tests.
+[[allowlists]]
+description = "Vendored deterministic encryption-key test vector"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''vendor/kleos/kleos-lib/src/artifacts_crypto\.rs$''']
+regexes = ['''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''']
+
+# This exact static Ed25519 vector exercises validated PKCS8 parsing in two tests.
+[[allowlists]]
+description = "Deterministic Ed25519 PKCS8 parser test vector"
+targetRules = ["private-key"]
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''crates/syntheos-memory-gateway/src/signing\.rs$''',
+  '''crates/henosis-memory-client/src/signer\.rs$''',
+]
+regexes = ['''MC4CAQAwBQYDK2VwBCIEIOPCl74iq4xOqq3sRD1BBudy7TXys619cwpAVmFec8ZL''']
