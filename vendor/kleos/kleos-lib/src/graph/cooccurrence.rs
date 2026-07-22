@@ -36,6 +36,51 @@ pub async fn record_cooccurrence(
     Ok(())
 }
 
+/// Record a batch of pairwise co-occurrences in a single transaction.
+/// Each pair is normalized to canonical order (smaller id first) so that
+/// (A, B) and (B, A) accumulate into the same row, matching
+/// `record_cooccurrence`. One transaction with a cached statement replaces a
+/// per-pair `db.write` round-trip, which matters because callers record
+/// O(n^2) pairs per memory.
+///
+/// Row failures are tolerated per pair (warn + continue), preserving the
+/// per-pair fault isolation the old independent `record_cooccurrence` calls
+/// had: a single FK violation (an entity deleted between candidate collection
+/// and this write) must not roll back the up-to-C(50,2) already-valid pairs
+/// sharing the transaction.
+#[tracing::instrument(skip(db, pairs), fields(pair_count = pairs.len()))]
+pub async fn record_cooccurrences_batch(
+    db: &Database,
+    pairs: Vec<(i64, i64)>,
+    user_id: i64,
+) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    db.transaction(move |tx| {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO entity_cooccurrences \
+             (entity_a_id, entity_b_id, count, user_id) \
+             VALUES (?1, ?2, 1, ?3) \
+             ON CONFLICT(entity_a_id, entity_b_id) DO UPDATE SET \
+               count = count + 1, \
+               last_seen_at = datetime('now')",
+        )?;
+        for (a, b) in pairs {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            if let Err(e) = stmt.execute(rusqlite::params![lo, hi, user_id]) {
+                tracing::warn!(
+                    entity_a = lo,
+                    entity_b = hi,
+                    "co-occurrence pair skipped: {e}"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Full rebuild of co-occurrence table.
 /// Clears all existing co-occurrences and recomputes from all memory-entity links.
 #[tracing::instrument(skip(db))]
@@ -53,7 +98,10 @@ pub async fn rebuild_cooccurrences(db: &Database, user_id: i64) -> Result<i64> {
     })
     .await?;
 
-    // Fetch all memory -> entity links for this user's memories
+    // Fetch all memory -> entity links for this user's memories. The inner
+    // me.id ordering preserves link-insertion order per memory, which is the
+    // extraction order the live path capped by -- so rebuild's cap keeps the
+    // same first-N subset the original recording did.
     let memory_entities: HashMap<i64, Vec<i64>> = db
         .read(move |conn| {
             let mut stmt = conn.prepare(
@@ -62,7 +110,7 @@ pub async fn rebuild_cooccurrences(db: &Database, user_id: i64) -> Result<i64> {
                      JOIN memory_entities me ON me.memory_id = m.id \
                      WHERE m.is_forgotten = 0 AND m.is_archived = 0 \
                        AND m.user_id = ?1 \
-                     ORDER BY m.created_at DESC",
+                     ORDER BY m.created_at DESC, me.id ASC",
             )?;
 
             let mut memory_entities: HashMap<i64, Vec<i64>> = HashMap::new();
@@ -83,19 +131,31 @@ pub async fn rebuild_cooccurrences(db: &Database, user_id: i64) -> Result<i64> {
         })
         .await?;
 
-    // For each memory, create co-occurrence pairs from its entities
+    // For each memory, create co-occurrence pairs from its entities. Pairing
+    // per memory is capped and batched into one transaction, matching the
+    // live recording path in extract_and_link_entities (O(n^2) DoS bound).
+    // First-occurrence dedup in linkage order (NOT sort-by-id) so the capped
+    // subset is the same first-N-extracted entities the live path pairs.
     let mut total_pairs: i64 = 0;
     for entities in memory_entities.values() {
-        let mut sorted = entities.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-
-        for i in 0..sorted.len() {
-            for j in (i + 1)..sorted.len() {
-                record_cooccurrence(db, sorted[i], sorted[j], user_id).await?;
-                total_pairs += 1;
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut ordered: Vec<i64> = Vec::with_capacity(entities.len());
+        for &entity_id in entities {
+            if seen.insert(entity_id) {
+                ordered.push(entity_id);
             }
         }
+        ordered.truncate(crate::validation::MAX_COOCCURRENCE_ENTITIES);
+
+        let mut pairs: Vec<(i64, i64)> =
+            Vec::with_capacity(ordered.len() * ordered.len().saturating_sub(1) / 2);
+        for i in 0..ordered.len() {
+            for j in (i + 1)..ordered.len() {
+                pairs.push((ordered[i], ordered[j]));
+            }
+        }
+        total_pairs += pairs.len() as i64;
+        record_cooccurrences_batch(db, pairs, user_id).await?;
     }
 
     info!(pairs = total_pairs, user_id, "cooccurrences_rebuilt");

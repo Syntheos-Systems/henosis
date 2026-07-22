@@ -81,12 +81,14 @@ check_mirror() {
 # Check one component and update the run counters.
 check_component() {
   local vendor_file="$1"
-  local vendor_dir mode pin upstream checkout mapping count
+  local vendor_dir mode pin upstream ref checkout mapping count
   local -a upstream_paths=()
   vendor_dir="$(dirname "$vendor_file")"
   mode="$(field Mode "$vendor_file")"
   pin="$(field Pin "$vendor_file")"
   upstream="$(field Upstream "$vendor_file")"
+  ref="$(field Ref "$vendor_file")"
+  ref="${ref:-HEAD}"
 
   if [ -z "$mode" ] || [ -z "$pin" ] || [ -z "$upstream" ]; then
     echo "ERROR $vendor_file: Mode, Pin, and Upstream are required" >&2
@@ -114,6 +116,11 @@ check_component() {
     FAILURES=$((FAILURES + 1))
     return
   fi
+  if ! git -C "$checkout" cat-file -e "${ref}^{commit}" 2>/dev/null; then
+    echo "ERROR $vendor_dir: ref '$ref' is not a commit in $checkout" >&2
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
 
   if [ "$mode" = "PRISTINE" ]; then
     count=0
@@ -134,9 +141,9 @@ check_component() {
   fi
 
   if [ "${#upstream_paths[@]}" -gt 0 ]; then
-    count="$(git -C "$checkout" rev-list --count "${pin}..HEAD" -- "${upstream_paths[@]}" 2>/dev/null || echo 0)"
+    count="$(git -C "$checkout" rev-list --count "${pin}..${ref}" -- "${upstream_paths[@]}" 2>/dev/null || echo 0)"
   else
-    count="$(git -C "$checkout" rev-list --count "${pin}..HEAD" -- 2>/dev/null || echo 0)"
+    count="$(git -C "$checkout" rev-list --count "${pin}..${ref}" -- 2>/dev/null || echo 0)"
   fi
   if [ "$count" -gt 0 ]; then
     echo "BEHIND $vendor_dir: $count upstream commit(s) after $pin"

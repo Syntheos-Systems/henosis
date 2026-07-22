@@ -6,6 +6,7 @@
 
 use super::types::{QuotaConfig, TenantConfig, TenantHandle, TenantRow, TenantStatus};
 use crate::db::Database;
+#[cfg(feature = "ml")]
 use crate::vector::LanceIndex;
 use crate::{EngError, Result};
 use std::collections::HashMap;
@@ -31,7 +32,10 @@ pub struct TenantLoader {
     /// Per-tenant locks that collapse concurrent first-touch loads into one open path.
     load_guards: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 
-    /// Dimension of embedding vectors.
+    /// Dimension of embedding vectors. Only read by the ml-gated Lance
+    /// index construction; retained unconditionally to keep the constructor
+    /// signature feature-independent.
+    #[cfg_attr(not(feature = "ml"), allow(dead_code))]
     vector_dimensions: usize,
 
     /// Whether to enable chunk-level vector search on tenant databases.
@@ -119,6 +123,18 @@ impl TenantLoader {
         if row.status == TenantStatus::Deleting {
             return Err(EngError::NotFound("tenant is being deleted".to_string()));
         }
+        // A tombstoned tenant is permanently gone and a stuck one is frozen
+        // pending manual intervention (see /admin/deprovisions/stuck).
+        // Without these checks the loader silently recreated the shard
+        // directory and DB pool for a tenant that must not serve requests.
+        if row.status == TenantStatus::Tombstone {
+            return Err(EngError::NotFound("tenant is tombstoned".to_string()));
+        }
+        if row.status == TenantStatus::Stuck {
+            return Err(EngError::Internal(
+                "tenant deprovision is stuck; manual intervention required".to_string(),
+            ));
+        }
 
         #[cfg(test)]
         {
@@ -137,44 +153,53 @@ impl TenantLoader {
             .map_err(|e| EngError::Internal(format!("failed to create tenant directory: {}", e)))?;
 
         // Load the vector index first so it can be handed to the Database.
-        let lance_path = tenant_dir.join("hnsw").join("memories.lance");
-        if let Some(parent) = lance_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                EngError::Internal(format!("failed to create lance directory: {}", e))
-            })?;
-        }
+        // ml-off builds carry no ANN backend: both indices stay None and the
+        // shard runs FTS + sqlite-vec, mirroring the non-tenant
+        // `open_vector_indices` stub.
+        /// Local alias for the optional trait-object index handles.
+        type OptIndex = Option<Arc<dyn crate::vector::VectorIndex>>;
+        #[cfg(feature = "ml")]
+        let (vector_index, chunk_vector_index): (OptIndex, OptIndex) = {
+            let lance_path = tenant_dir.join("hnsw").join("memories.lance");
+            if let Some(parent) = lance_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    EngError::Internal(format!("failed to create lance directory: {}", e))
+                })?;
+            }
 
-        let vector_index: Arc<dyn crate::vector::VectorIndex> = Arc::new(
-            LanceIndex::open(
-                lance_path.to_string_lossy().as_ref(),
-                self.vector_dimensions,
-            )
-            .await
-            .map_err(|e| EngError::Internal(format!("failed to open vector index: {}", e)))?,
-        );
+            let vector_index: Arc<dyn crate::vector::VectorIndex> = Arc::new(
+                LanceIndex::open(
+                    lance_path.to_string_lossy().as_ref(),
+                    self.vector_dimensions,
+                )
+                .await
+                .map_err(|e| EngError::Internal(format!("failed to open vector index: {}", e)))?,
+            );
 
-        let chunk_vector_index: Option<Arc<dyn crate::vector::VectorIndex>> = if self
-            .use_chunk_vector_search
-        {
-            match LanceIndex::open_with_table(
-                lance_path.to_string_lossy().as_ref(),
-                self.vector_dimensions,
-                crate::vector::lance::CHUNK_TABLE_NAME,
-            )
-            .await
-            {
-                Ok(idx) => Some(Arc::new(idx)),
-                Err(e) => {
-                    debug!(
+            let chunk_vector_index: OptIndex = if self.use_chunk_vector_search {
+                match LanceIndex::open_with_table(
+                    lance_path.to_string_lossy().as_ref(),
+                    self.vector_dimensions,
+                    crate::vector::CHUNK_TABLE_NAME,
+                )
+                .await
+                {
+                    Ok(idx) => Some(Arc::new(idx)),
+                    Err(e) => {
+                        debug!(
                             "chunk vector index unavailable for tenant {}: {} (falling back to centroid)",
                             tenant_id, e
                         );
-                    None
+                        None
+                    }
                 }
-            }
-        } else {
-            None
+            } else {
+                None
+            };
+            (Some(vector_index), chunk_vector_index)
         };
+        #[cfg(not(feature = "ml"))]
+        let (vector_index, chunk_vector_index): (OptIndex, OptIndex) = (None, None);
 
         // Open the tenant's SQLite pool. The existing deployment path is
         // `tenants/<id>/kleos.db`; migration (tenant chain v1+) runs inside
@@ -186,7 +211,7 @@ impl TenantLoader {
         let owner_user_id = row.user_id.parse::<i64>().ok();
         let mut db = Database::open_tenant(
             &db_path,
-            Some(Arc::clone(&vector_index)),
+            vector_index.clone(),
             self.encryption_key,
             owner_user_id,
         )
@@ -263,20 +288,36 @@ impl TenantLoader {
             return Ok(());
         }
 
-        // Find idle tenants to evict
+        // Find tenants to evict, preferring idle ones.
         let to_evict = {
             let handles = self.handles.read().await;
+            let excess = current_count.saturating_sub(self.config.max_resident) + 1;
+
             let mut candidates: Vec<_> = handles
                 .iter()
                 .filter(|(_, h)| h.idle_duration() > self.config.idle_timeout)
                 .map(|(id, h)| (id.clone(), h.idle_duration()))
                 .collect();
 
+            // Under sustained load every resident handle can be younger than
+            // idle_timeout, which used to leave `candidates` empty and let the
+            // resident count grow past max_resident without bound. Fall back
+            // to LRU over ALL handles: the idle ones still sort first (longest
+            // idle_duration), so this is a strict superset of the old
+            // behavior. Note the loader has no in-use pinning; an evicted
+            // handle's Arc keeps in-flight work alive, and the next
+            // get_or_load re-opens the shard.
+            if candidates.len() < excess {
+                candidates = handles
+                    .iter()
+                    .map(|(id, h)| (id.clone(), h.idle_duration()))
+                    .collect();
+            }
+
             // Sort by idle duration (longest idle first)
             candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             // Take enough to get under the limit
-            let excess = current_count.saturating_sub(self.config.max_resident) + 1;
             candidates
                 .into_iter()
                 .take(excess)
@@ -416,5 +457,80 @@ mod tests {
             1,
             "only one slow-path tenant open should execute"
         );
+    }
+
+    /// Tombstoned and stuck tenants must be rejected before any shard state is
+    /// (re)created. Pre-fix, both statuses fell through the Suspended/Deleting
+    /// checks and the loader happily rebuilt the shard directory and DB pool
+    /// for a tenant that is permanently gone or frozen for manual repair.
+    #[tokio::test]
+    async fn load_tenant_rejects_tombstone_and_stuck() {
+        let dir = tempdir().expect("tempdir");
+        let loader = TenantLoader::new(dir.path().to_path_buf(), test_config(), 8, false, None);
+
+        let mut row = test_row("tenant_tomb", "user_tomb");
+        row.status = TenantStatus::Tombstone;
+        let err = match loader.get_or_load(&row.tenant_id, &row).await {
+            Ok(_) => panic!("tombstoned tenant must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, EngError::NotFound(_)),
+            "tombstone maps to NotFound, got {err:?}"
+        );
+
+        let mut row = test_row("tenant_stuck", "user_stuck");
+        row.status = TenantStatus::Stuck;
+        let err = match loader.get_or_load(&row.tenant_id, &row).await {
+            Ok(_) => panic!("stuck tenant must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, EngError::Internal(_)),
+            "stuck maps to Internal, got {err:?}"
+        );
+
+        assert_eq!(
+            loader.resident_count().await,
+            0,
+            "no shard state may be created for rejected statuses"
+        );
+    }
+
+    /// When every resident handle is younger than idle_timeout, going over
+    /// max_resident must fall back to LRU eviction instead of letting the
+    /// resident count grow without bound (pre-fix: the idle filter left the
+    /// candidate list empty and no eviction ever happened under load).
+    #[tokio::test]
+    async fn over_cap_load_evicts_least_recently_touched() {
+        let dir = tempdir().expect("tempdir");
+        // max_resident = 3, idle_timeout = 100ms per test_config(); the 10ms
+        // gaps below keep every handle well under the idle threshold.
+        let loader = TenantLoader::new(dir.path().to_path_buf(), test_config(), 8, false, None);
+
+        for n in 1..=4 {
+            let row = test_row(&format!("tenant_{n}"), &format!("user_{n}"));
+            loader
+                .get_or_load(&row.tenant_id, &row)
+                .await
+                .expect("load tenant");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            loader.resident_count().await,
+            3,
+            "resident count must stay at max_resident"
+        );
+        assert!(
+            !loader.is_loaded("tenant_1").await,
+            "the least-recently-touched tenant is the one evicted"
+        );
+        for n in 2..=4 {
+            assert!(
+                loader.is_loaded(&format!("tenant_{n}")).await,
+                "tenant_{n} must remain resident"
+            );
+        }
     }
 }

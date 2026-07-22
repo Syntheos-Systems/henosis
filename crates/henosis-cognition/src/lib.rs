@@ -39,33 +39,33 @@ use tokio::sync::Semaphore;
 // embedding applications (syntheos-server, henosis-rift-bridge) can construct
 // requests and read results through `henosis_cognition::*` without taking a
 // direct dependency on the vendored `kleos-lib`.
+pub use kleos_lib::Result as KleosResult;
+pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
 pub use kleos_lib::context::types::{ContextOptions, ContextResult};
 pub use kleos_lib::embeddings::EmbeddingProvider;
+pub use kleos_lib::forge::approaches::ApproachItem;
+pub use kleos_lib::graph::types::{
+    CommunitiesResult, CommunityStats, CreateEntityRequest, CreateRelationshipRequest, Entity,
+    EntityMemorySearchResult, EntityRelationship, GraphBuildOptions, GraphBuildResult,
+    PageRankResult, PageRankUpdateResult,
+};
 pub use kleos_lib::handoffs::{
     Handoff, HandoffFilters, HandoffStats, SearchResult as HandoffSearchResult,
     StoreParams as HandoffStoreParams, StoreResult as HandoffStoreResult,
+};
+pub use kleos_lib::intelligence::types::{
+    CausalAncestor, CausalChain, CausalLink, Contradiction, Digest, MemoryHealthReport, Reflection,
 };
 pub use kleos_lib::llm::local::LocalModelClient;
 pub use kleos_lib::memory::types::{
     ListOptions, Memory, SearchRequest, SearchResult, StoreRequest, StoreResult,
 };
+pub use kleos_lib::personality::{StoredProfile, StoredSignal};
 pub use kleos_lib::scratchpad::ScratchEntry;
 pub use kleos_lib::skills::{
     CreateSkillRequest, EvolutionFeedRow, ExecutionRecord, Skill, SkillJudgment, SkillKind,
     ToolQuality, UpdateSkillRequest,
 };
-pub use kleos_lib::personality::{StoredProfile, StoredSignal};
-pub use kleos_lib::graph::types::{
-    CreateEntityRequest, CreateRelationshipRequest, Entity, EntityRelationship,
-    EntityMemorySearchResult, GraphBuildOptions, GraphBuildResult, CommunitiesResult,
-    CommunityStats, PageRankResult, PageRankUpdateResult,
-};
-pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
-pub use kleos_lib::intelligence::types::{
-    CausalAncestor, CausalChain, CausalLink, Contradiction, Digest, MemoryHealthReport, Reflection,
-};
-pub use kleos_lib::forge::approaches::ApproachItem;
-pub use kleos_lib::Result as KleosResult;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -276,6 +276,7 @@ impl Cognition {
             self.user_id,
             self.embedder.clone(),
             self.llm.clone(),
+            None,
         )
         .await?;
         Ok(result)
@@ -310,7 +311,14 @@ impl Cognition {
         ttl_minutes: i64,
     ) -> Result<()> {
         Ok(kleos_lib::scratchpad::upsert_entry(
-            &self.db, session, agent, model, key, value, ttl_minutes,
+            &self.db,
+            self.user_id,
+            session,
+            agent,
+            model,
+            key,
+            value,
+            ttl_minutes,
         )
         .await?)
     }
@@ -322,27 +330,33 @@ impl Cognition {
         model: Option<&str>,
         session: Option<&str>,
     ) -> Result<Vec<ScratchEntry>> {
-        Ok(kleos_lib::scratchpad::list_entries(&self.db, agent, model, session).await?)
+        Ok(
+            kleos_lib::scratchpad::list_entries(&self.db, self.user_id, agent, model, session)
+                .await?,
+        )
     }
 
     /// Load every entry for one scratchpad session in creation order.
     pub async fn scratchpad_get_session(&self, session: &str) -> Result<Vec<ScratchEntry>> {
-        Ok(kleos_lib::scratchpad::get_session_entries(&self.db, session).await?)
+        Ok(kleos_lib::scratchpad::get_session_entries(&self.db, self.user_id, session).await?)
     }
 
     /// Look up a single non-expired scratchpad value by namespace and key.
     pub async fn scratchpad_get(&self, namespace: &str, key: &str) -> Result<Option<String>> {
-        Ok(kleos_lib::scratchpad::get_by_namespace_key(&self.db, namespace, key).await?)
+        Ok(
+            kleos_lib::scratchpad::get_by_namespace_key(&self.db, self.user_id, namespace, key)
+                .await?,
+        )
     }
 
     /// Delete every scratchpad entry for one session.
     pub async fn scratchpad_delete_session(&self, session: &str) -> Result<()> {
-        Ok(kleos_lib::scratchpad::delete_session(&self.db, session).await?)
+        Ok(kleos_lib::scratchpad::delete_session(&self.db, self.user_id, session).await?)
     }
 
     /// Delete one key from one scratchpad session.
     pub async fn scratchpad_delete_key(&self, session: &str, key: &str) -> Result<()> {
-        Ok(kleos_lib::scratchpad::delete_session_key(&self.db, session, key).await?)
+        Ok(kleos_lib::scratchpad::delete_session_key(&self.db, self.user_id, session, key).await?)
     }
 
     // -- Handoff pass-throughs ------------------------------------------------
@@ -516,17 +530,15 @@ impl Cognition {
         evidence: Option<&str>,
         agent: Option<&str>,
     ) -> Result<StoredSignal> {
-        Ok(
-            kleos_lib::personality::store_signal(
-                &self.db,
-                signal_type,
-                value,
-                evidence,
-                self.user_id,
-                agent,
-            )
-            .await?,
+        Ok(kleos_lib::personality::store_signal(
+            &self.db,
+            signal_type,
+            value,
+            evidence,
+            self.user_id,
+            agent,
         )
+        .await?)
     }
 
     /// List the most recent personality signals for the session user (up to `limit`).
@@ -546,9 +558,7 @@ impl Cognition {
 
     /// Return the personality profile and staleness flag for injection, or `None`
     /// when no profile has been persisted yet for the session user.
-    pub async fn personality_get_profile_for_injection(
-        &self,
-    ) -> Result<Option<(String, bool)>> {
+    pub async fn personality_get_profile_for_injection(&self) -> Result<Option<(String, bool)>> {
         Ok(kleos_lib::personality::get_profile_for_injection(&self.db, self.user_id).await?)
     }
 
@@ -572,11 +582,7 @@ impl Cognition {
     }
 
     /// List entities for the session user ordered by occurrence count.
-    pub async fn graph_list_entities(
-        &self,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Entity>> {
+    pub async fn graph_list_entities(&self, limit: usize, offset: usize) -> Result<Vec<Entity>> {
         Ok(
             kleos_lib::graph::entities::list_entities(&self.db, self.user_id, limit, offset)
                 .await?,
@@ -612,15 +618,13 @@ impl Cognition {
         damping: f64,
         max_iterations: u32,
     ) -> Result<PageRankResult> {
-        Ok(
-            kleos_lib::graph::pagerank::compute_pagerank(
-                &self.db,
-                self.user_id,
-                damping,
-                max_iterations,
-            )
-            .await?,
+        Ok(kleos_lib::graph::pagerank::compute_pagerank(
+            &self.db,
+            self.user_id,
+            damping,
+            max_iterations,
         )
+        .await?)
     }
 
     /// Recompute and persist PageRank scores for the session user.
@@ -631,10 +635,12 @@ impl Cognition {
     /// Detect Louvain communities in the session user's memory graph.
     /// `max_iterations` caps the Louvain optimization passes (clamped to 100 internally).
     pub async fn graph_detect_communities(&self, max_iterations: u32) -> Result<CommunitiesResult> {
-        Ok(
-            kleos_lib::graph::communities::detect_communities(&self.db, self.user_id, max_iterations)
-                .await?,
+        Ok(kleos_lib::graph::communities::detect_communities(
+            &self.db,
+            self.user_id,
+            max_iterations,
         )
+        .await?)
     }
 
     /// Return community membership statistics for the session user.
@@ -647,16 +653,12 @@ impl Cognition {
     /// List all Hopfield patterns persisted for the session user.
     /// Each pattern corresponds to a stored memory embedding in the brain substrate.
     pub async fn brain_list_patterns(&self) -> Result<Vec<BrainPattern>> {
-        Ok(
-            kleos_lib::brain::hopfield::pattern::list_patterns(&self.db, self.user_id).await?,
-        )
+        Ok(kleos_lib::brain::hopfield::pattern::list_patterns(&self.db, self.user_id).await?)
     }
 
     /// Fetch a single Hopfield pattern by id for the session user.
     pub async fn brain_get_pattern(&self, id: i64) -> Result<BrainPattern> {
-        Ok(
-            kleos_lib::brain::hopfield::pattern::get_pattern(&self.db, id, self.user_id).await?,
-        )
+        Ok(kleos_lib::brain::hopfield::pattern::get_pattern(&self.db, id, self.user_id).await?)
     }
 
     /// Count the total number of brain edges (associative links) for the session user.
@@ -699,11 +701,8 @@ impl Cognition {
     /// found. Runs a DB-only FTS comparison; no LLM is required.
     pub async fn intelligence_scan_contradictions(&self) -> Result<Vec<Contradiction>> {
         Ok(
-            kleos_lib::intelligence::contradiction::scan_all_contradictions(
-                &self.db,
-                self.user_id,
-            )
-            .await?,
+            kleos_lib::intelligence::contradiction::scan_all_contradictions(&self.db, self.user_id)
+                .await?,
         )
     }
 
@@ -717,16 +716,12 @@ impl Cognition {
 
     /// List stored causal chains for the session user, newest first.
     pub async fn intelligence_list_causal_chains(&self, limit: usize) -> Result<Vec<CausalChain>> {
-        Ok(
-            kleos_lib::intelligence::causal::list_chains(&self.db, self.user_id, limit).await?,
-        )
+        Ok(kleos_lib::intelligence::causal::list_chains(&self.db, self.user_id, limit).await?)
     }
 
     /// List stored periodic digests for the session user, newest first.
     pub async fn intelligence_list_digests(&self, limit: usize) -> Result<Vec<Digest>> {
-        Ok(
-            kleos_lib::intelligence::digests::list_digests(&self.db, self.user_id, limit).await?,
-        )
+        Ok(kleos_lib::intelligence::digests::list_digests(&self.db, self.user_id, limit).await?)
     }
 
     // -- Forge pass-throughs ---------------------------------------------------
@@ -873,10 +868,7 @@ impl Cognition {
         query: Option<String>,
         limit: Option<usize>,
     ) -> Result<serde_json::Value> {
-        Ok(
-            kleos_lib::forge::session::session_recall(&self.db, self.user_id, query, limit)
-                .await?,
-        )
+        Ok(kleos_lib::forge::session::session_recall(&self.db, self.user_id, query, limit).await?)
     }
 }
 
@@ -985,7 +977,11 @@ mod tests {
                 "feature".into(),
                 vec!["foo widget appears".into(), "foo widget saves state".into()],
                 "fn foo_widget() -> Widget".into(),
-                vec!["empty state".into(), "max items".into(), "concurrent writes".into()],
+                vec![
+                    "empty state".into(),
+                    "max items".into(),
+                    "concurrent writes".into(),
+                ],
                 None,
                 None,
             )
@@ -1011,7 +1007,10 @@ mod tests {
             .await
             .expect("forge_session_learn");
         assert!(
-            learned["id"].as_str().expect("learn id").starts_with("learn_")
+            learned["id"]
+                .as_str()
+                .expect("learn id")
+                .starts_with("learn_")
         );
     }
 
@@ -1041,7 +1040,10 @@ mod tests {
             .expect("open cognitive core");
         let edge_count = cog.brain_count_edges().await.expect("brain_count_edges");
         assert_eq!(edge_count, 0, "new DB has no brain edges");
-        let patterns = cog.brain_list_patterns().await.expect("brain_list_patterns");
+        let patterns = cog
+            .brain_list_patterns()
+            .await
+            .expect("brain_list_patterns");
         assert!(patterns.is_empty(), "new DB has no brain patterns");
     }
 
@@ -1198,6 +1200,68 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "phase");
         assert_eq!(entries[0].value, "wave2");
+    }
+
+    /// Scratchpad rows with matching namespaces and keys remain isolated by the facade owner.
+    #[tokio::test]
+    async fn lite_session_scratchpad_isolates_users() {
+        let db = Database::connect_memory()
+            .await
+            .expect("open shared in-memory database");
+        let first = Cognition::from_database(db).with_user_id(41);
+        let second = Cognition {
+            db: first.db.clone(),
+            embedder: None,
+            llm: None,
+            user_id: 42,
+            handoff_gc_sem: Arc::new(Semaphore::new(1)),
+        };
+
+        first
+            .scratchpad_put("shared-session", "tester", "model", "key", "first", 60)
+            .await
+            .expect("first user put");
+        second
+            .scratchpad_put("shared-session", "tester", "model", "key", "second", 60)
+            .await
+            .expect("second user put");
+
+        assert_eq!(
+            first
+                .scratchpad_get("tester", "key")
+                .await
+                .expect("first user get")
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            second
+                .scratchpad_get("tester", "key")
+                .await
+                .expect("second user get")
+                .as_deref(),
+            Some("second")
+        );
+
+        first
+            .scratchpad_delete_session("shared-session")
+            .await
+            .expect("first user delete");
+        assert!(
+            first
+                .scratchpad_list(None, None, Some("shared-session"))
+                .await
+                .expect("first user list")
+                .is_empty()
+        );
+        assert_eq!(
+            second
+                .scratchpad_list(None, None, Some("shared-session"))
+                .await
+                .expect("second user list")
+                .len(),
+            1
+        );
     }
 
     /// The durability proof: a memory stored through a path-backed session is

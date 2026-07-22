@@ -16,7 +16,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (43);
 CREATE TABLE IF NOT EXISTS handoffs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     project TEXT NOT NULL,
     branch TEXT,
     directory TEXT,

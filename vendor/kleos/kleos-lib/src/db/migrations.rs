@@ -32,6 +32,13 @@ pub struct Migration {
     /// When true the up/down fn is wrapped in a SAVEPOINT so it rolls back
     /// automatically on failure.
     pub transactional: bool,
+    /// When true the up fn is a `PRAGMA foreign_keys`-toggling table rebuild that
+    /// cannot run inside a SAVEPOINT (the pragma is a silent no-op there). Such
+    /// migrations must be `transactional: false`; `apply_migration_up` wraps them
+    /// atomically via `apply_fk_rebuild` (foreign keys OFF outside any
+    /// transaction, then the whole apply in one BEGIN..COMMIT) so a crash
+    /// mid-rebuild rolls back and retries instead of bricking the database.
+    pub fk_rebuild: bool,
 }
 
 // --- Migration plan (returned by dry_run and migrate_down) ---
@@ -76,6 +83,7 @@ macro_rules! migration {
             up: $up,
             down: None,
             transactional: false,
+            fk_rebuild: false,
         }
     };
     // No down, transactional
@@ -86,6 +94,20 @@ macro_rules! migration {
             up: $up,
             down: None,
             transactional: true,
+            fk_rebuild: false,
+        }
+    };
+    // No down, foreign-key table rebuild. Toggles PRAGMA foreign_keys, so it
+    // cannot use a SAVEPOINT; apply_migration_up wraps it atomically via
+    // apply_fk_rebuild (foreign keys OFF outside any tx, then one BEGIN..COMMIT).
+    ($ver:expr, $desc:expr, $up:expr, fkrebuild) => {
+        Migration {
+            version: $ver,
+            description: $desc,
+            up: $up,
+            down: None,
+            transactional: false,
+            fk_rebuild: true,
         }
     };
     // With down, not transactional
@@ -96,6 +118,7 @@ macro_rules! migration {
             up: $up,
             down: Some($down),
             transactional: false,
+            fk_rebuild: false,
         }
     };
     // With down, transactional
@@ -106,6 +129,7 @@ macro_rules! migration {
             up: $up,
             down: Some($down),
             transactional: true,
+            fk_rebuild: false,
         }
     };
 }
@@ -155,7 +179,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         26,
         "drop_user_id_scratchpad",
-        run_migration_drop_user_id_scratchpad
+        run_migration_drop_user_id_scratchpad,
+        fkrebuild
     ),
     // DROP COLUMN is destructive; no safe inverse without a backup.
     migration!(
@@ -174,7 +199,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         31,
         "drop_user_id_projects",
-        run_migration_drop_user_id_projects
+        run_migration_drop_user_id_projects,
+        fkrebuild
     ),
     // DROP COLUMN is destructive; no safe inverse without a backup.
     migration!(
@@ -193,32 +219,56 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         36,
         "drop_user_id_ingestion_hashes",
-        run_migration_drop_user_id_ingestion_hashes
+        run_migration_drop_user_id_ingestion_hashes,
+        fkrebuild
     ),
     // UNIQUE rebuild + DROP COLUMN is destructive; no safe inverse without a backup.
-    migration!(37, "drop_user_id_loom", run_migration_drop_user_id_loom),
+    migration!(
+        37,
+        "drop_user_id_loom",
+        run_migration_drop_user_id_loom,
+        fkrebuild
+    ),
     // UNIQUE/PK rebuild + DROP COLUMN is destructive; no safe inverse without a backup.
-    migration!(38, "drop_user_id_graph", run_migration_drop_user_id_graph),
+    migration!(
+        38,
+        "drop_user_id_graph",
+        run_migration_drop_user_id_graph,
+        fkrebuild
+    ),
     // DROP COLUMN + index swap is destructive; no safe inverse without a backup.
-    migration!(39, "drop_user_id_thymus", run_migration_drop_user_id_thymus),
+    migration!(
+        39,
+        "drop_user_id_thymus",
+        run_migration_drop_user_id_thymus,
+        fkrebuild
+    ),
     // UNIQUE rebuild + DROP COLUMN is destructive; no safe inverse without a backup.
     migration!(
         40,
         "drop_user_id_portability",
-        run_migration_drop_user_id_portability
+        run_migration_drop_user_id_portability,
+        fkrebuild
     ),
     migration!(
         41,
         "drop_user_id_intelligence",
-        run_migration_drop_user_id_intelligence
+        run_migration_drop_user_id_intelligence,
+        fkrebuild
     ),
     // Shape B + FTS shadow rebuild is destructive; no safe inverse without a backup.
-    migration!(42, "drop_user_id_skills", run_migration_drop_user_id_skills),
+    migration!(
+        42,
+        "drop_user_id_skills",
+        run_migration_drop_user_id_skills,
+        fkrebuild
+    ),
     // DROP INDEX + DROP COLUMN is destructive; no safe inverse without a backup.
     migration!(
         43,
         "drop_user_id_episodes",
-        run_migration_drop_user_id_episodes
+        run_migration_drop_user_id_episodes,
+        fkrebuild
     ),
     // C-R3-004: re-add user_id to monolith projects + broca_actions so
     // single-DB deployments are safe even when tenant sharding is disabled.
@@ -226,7 +276,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         44,
         "readd_user_id_projects",
-        run_migration_readd_user_id_projects
+        run_migration_readd_user_id_projects,
+        fkrebuild
     ),
     migration!(45, "readd_user_id_broca", run_migration_readd_user_id_broca),
     // Sparkling Fairy Stage 1: identity tables for PIV-Everywhere auth.
@@ -244,7 +295,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         48,
         "drop_api_keys_agent_fk",
-        run_migration_drop_api_keys_agent_fk
+        run_migration_drop_api_keys_agent_fk,
+        fkrebuild
     ),
     migration!(49, "supervisor_injections", run_migration_supervisor_injections, down: down_migration_supervisor_injections, tx),
     migration!(50, "gate_requests_session_id", run_migration_gate_requests_session_id, down: down_migration_gate_requests_session_id, tx),
@@ -293,7 +345,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         67,
         "readd_user_id_soma_agents",
-        run_migration_readd_user_id_soma_agents
+        run_migration_readd_user_id_soma_agents,
+        fkrebuild
     ),
     migration!(68, "readd_user_id_axon_events", run_migration_readd_user_id_axon_events, down: down_migration_readd_user_id_axon_events, tx),
     migration!(69, "readd_user_id_chiasm_tasks", run_migration_readd_user_id_chiasm_tasks, down: down_migration_readd_user_id_chiasm_tasks, tx),
@@ -306,7 +359,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         72,
         "readd_user_id_graph_entities",
-        run_migration_readd_user_id_graph_entities
+        run_migration_readd_user_id_graph_entities,
+        fkrebuild
     ),
     migration!(73, "readd_user_id_episodes", run_migration_readd_user_id_episodes, down: down_migration_readd_user_id_episodes, tx),
     // Re-adds user_id to the remaining 5 intelligence tables that v71 skipped:
@@ -317,7 +371,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         74,
         "readd_user_id_intelligence_remainder",
-        run_migration_readd_user_id_intelligence_remainder
+        run_migration_readd_user_id_intelligence_remainder,
+        fkrebuild
     ),
     // Re-adds user_id to the 5 thymus tables that migration 39 dropped:
     // rubrics (UNIQUE rebuild -- index changes from name to (user_id, name)),
@@ -328,7 +383,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         75,
         "readd_user_id_thymus",
-        run_migration_readd_user_id_thymus
+        run_migration_readd_user_id_thymus,
+        fkrebuild
     ),
     // Re-adds user_id to entity_cooccurrences that v38 dropped.
     // structured_facts already got user_id from v64 (memory-core).
@@ -347,7 +403,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         77,
         "readd_user_id_user_preferences",
-        run_migration_readd_user_id_user_preferences
+        run_migration_readd_user_id_user_preferences,
+        fkrebuild
     ),
     // Re-adds user_id to skill_records that v42 dropped via REBUILD.
     // UNIQUE changes from (name, agent, version) to (name, agent, version, user_id).
@@ -356,7 +413,8 @@ pub static MIGRATIONS: &[Migration] = &[
     migration!(
         78,
         "readd_user_id_skills",
-        run_migration_readd_user_id_skills
+        run_migration_readd_user_id_skills,
+        fkrebuild
     ),
     // Re-adds user_id to brain_edges that v38 dropped.
     // Simple ADD COLUMN -- UNIQUE(source_id, target_id, edge_type) does not include user_id.
@@ -421,6 +479,87 @@ pub static MIGRATIONS: &[Migration] = &[
     // the Kleos tenant DB so forge.db can be deleted. All tables are prefixed
     // `forge_` and carry `user_id` for monolith-mode row isolation.
     migration!(91, "forge_tables", run_migration_forge_tables, tx),
+    // Re-add user_id to scratchpad (reverses migration 26). Restores tenant
+    // isolation for the monolith scratchpad: list/get/delete/upsert are scoped
+    // by user_id again. 12-step rebuild toggles PRAGMA foreign_keys, so it runs
+    // outside a transaction (no `tx`), like migration 26.
+    migration!(
+        92,
+        "readd_user_id_scratchpad",
+        run_migration_readd_user_id_scratchpad,
+        fkrebuild
+    ),
+    // facts_fts FTS5 index over structured_facts for the L5 facts retrieval channel.
+    // Additive: create the virtual table + sync triggers and rebuild from existing rows so
+    // upgraded installs get a populated index. Fresh installs already create facts_fts via
+    // AUXILIARY_SCHEMA_STATEMENTS; both paths are IF NOT EXISTS / idempotent. No PRAGMA toggle,
+    // so it runs transactionally.
+    migration!(93, "facts_fts", run_migration_facts_fts, tx),
+    // Rebuild all 6 global FTS tables with the language-neutral unicode61+diacritics
+    // tokenizer (drops English-only porter stemming). Pure DDL + FTS rebuild, no
+    // PRAGMA toggle, so transactional.
+    migration!(
+        94,
+        "fts_unicode61_diacritics",
+        run_migration_fts_unicode61,
+        tx
+    ),
+    // v95: nullable memories.lang column, populated by detect_lang on write.
+    migration!(95, "add_memory_lang", run_migration_add_memory_lang, tx),
+    // v96: attention_notes — persistent, tenant-scoped sticky reminders. No
+    // decay, no expiry; agents delete explicitly when done.
+    migration!(96, "attention_notes", run_migration_attention_notes, tx),
+    // v97: re-add user_id to axon_subscriptions with UNIQUE(agent, channel,
+    // user_id). Table rebuild (widens the UNIQUE key), so notx -- the rebuild
+    // toggles PRAGMA foreign_keys, which SQLite forbids inside a SAVEPOINT.
+    migration!(
+        97,
+        "readd_user_id_axon_subscriptions",
+        run_migration_readd_user_id_axon_subscriptions,
+        fkrebuild
+    ),
+    // v98: re-add user_id to axon_cursors with PRIMARY KEY(agent, channel,
+    // user_id). Table rebuild, so notx.
+    migration!(
+        98,
+        "readd_user_id_axon_cursors",
+        run_migration_readd_user_id_axon_cursors,
+        fkrebuild
+    ),
+    // v99: correct the datetime('now', 'utc') double-UTC-conversion defaults on
+    // handoffs, handoff_atoms, atom_entity_links, enrollment_invites, and
+    // frameshift_growth. SQLite's 'utc' modifier treats its input as localtime,
+    // so applying it to the already-UTC 'now' skews the stored value by the
+    // host's UTC offset (-2h under CEST). Rebuilds each affected table with a
+    // plain datetime('now') default and backfills skewed rows via the exact
+    // per-row inverse datetime(col, 'localtime'). Table rebuilds, so fkrebuild.
+    migration!(
+        99,
+        "tz_default_rebuild",
+        run_migration_tz_default_rebuild,
+        fkrebuild
+    ),
+    // v100: skill_records.duration_sample_count -- denominator for the running
+    // avg_duration_ms. Previously the average divided by execution_count, so
+    // executions that reported no duration silently dragged the average toward
+    // zero weight ([51]). Backfills existing rows with execution_count where an
+    // average exists (best available approximation of past sample counts).
+    migration!(
+        100,
+        "skill_duration_sample_count",
+        run_migration_skill_duration_sample_count,
+        tx
+    ),
+    // v101: drop enrollment_invites ([44]). The invite endpoint minted tokens
+    // that no enrollment path ever consumed -- dead auth surface. The endpoint
+    // is removed; the table follows. Rows are hash-only tokens with 24h expiry
+    // (all long expired or unusable), so this is not a data-loss migration.
+    migration!(
+        101,
+        "drop_enrollment_invites",
+        run_migration_drop_enrollment_invites,
+        tx
+    ),
 ];
 
 // --- Version constants ---
@@ -491,8 +630,10 @@ pub fn run_migrations_to(conn: &rusqlite::Connection, target_version: u32) -> Re
 /// DB-1: for transactional migrations the up fn and the schema_version insert
 /// are wrapped in one SAVEPOINT so they commit atomically; on error the
 /// savepoint is rolled back, leaving neither the partial DDL nor the version
-/// row. Non-transactional migrations (which toggle PRAGMA foreign_keys, illegal
-/// inside a SAVEPOINT) run bare and depend on their own idempotent construction.
+/// row. `fk_rebuild` migrations (which toggle PRAGMA foreign_keys, illegal inside
+/// a SAVEPOINT) instead go through `apply_fk_rebuild`, which achieves the same
+/// atomicity with a plain BEGIN..COMMIT and foreign keys toggled outside it. The
+/// remaining plain migrations are idempotent, additive statements and run bare.
 fn apply_migration_up(conn: &rusqlite::Connection, m: &Migration) -> Result<()> {
     let version = m.version as i64;
     if m.transactional {
@@ -513,11 +654,82 @@ fn apply_migration_up(conn: &rusqlite::Connection, m: &Migration) -> Result<()> 
                 Err(e)
             }
         }
+    } else if m.fk_rebuild {
+        apply_fk_rebuild(conn, || {
+            (m.up)(conn)?;
+            record_migration(conn, version, m.description)
+        })
     } else {
         (m.up)(conn)?;
         record_migration(conn, version, m.description)?;
         Ok(())
     }
+}
+
+/// Apply a foreign-key table-rebuild migration atomically.
+///
+/// The up fn toggles `PRAGMA foreign_keys` for a SQLite table rebuild, and that
+/// pragma is a silent no-op inside a SAVEPOINT/transaction -- which is why these
+/// migrations cannot use the transactional path. Running the rebuild as bare
+/// autocommitting statements, however, is not crash-safe: a crash or kill
+/// between the rebuild's RENAME/CREATE/INSERT/DROP steps leaves the database with
+/// a half-rebuilt schema, and because `record_migration` never runs, a retry
+/// re-executes the rebuild against the partial state (e.g. RENAME on an
+/// already-renamed table) and fails.
+///
+/// This follows SQLite's own ALTER TABLE procedure: disable foreign keys OUTSIDE
+/// any transaction (the only place the pragma takes effect), then wrap the whole
+/// apply -- rebuild plus the `schema_version` record -- in one BEGIN..COMMIT. A
+/// crash mid-rebuild rolls the transaction back, so the version stays unrecorded
+/// and the migration retries cleanly on the next startup. Foreign keys are
+/// re-enabled after the transaction closes: every such migration's SQL ends with
+/// `PRAGMA foreign_keys = ON` (a no-op inside the transaction), so leaving
+/// enforcement ON is the established postcondition, and a fresh SQLite connection
+/// defaults foreign_keys OFF.
+fn apply_fk_rebuild(conn: &rusqlite::Connection, apply: impl FnOnce() -> Result<()>) -> Result<()> {
+    // Disable FK enforcement before opening the transaction (the rebuild renames
+    // and drops FK-referenced tables). If BEGIN itself fails, foreign keys were
+    // already toggled OFF (that half of the batch autocommitted, no transaction
+    // was open yet), so re-enable them before returning.
+    if let Err(e) = conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN;") {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        return Err(EngError::from(e));
+    }
+    let outcome = match apply() {
+        Ok(()) => match conn.execute_batch("COMMIT;") {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A failed COMMIT leaves the rebuild uncommitted; roll it back so
+                // the database is not left half-migrated. If the recovery ROLLBACK
+                // also fails the connection is unusable -- surface that distinctly.
+                if let Err(re) = conn.execute_batch("ROLLBACK;") {
+                    tracing::error!(
+                        commit_error = %e,
+                        rollback_error = %re,
+                        "fk-rebuild migration COMMIT failed and recovery ROLLBACK also failed; connection unusable"
+                    );
+                }
+                Err(EngError::from(e))
+            }
+        },
+        Err(e) => {
+            // Roll back the partial rebuild so a crash/error never leaves the
+            // database half-migrated with the version falsely recorded.
+            if let Err(re) = conn.execute_batch("ROLLBACK;") {
+                tracing::error!(
+                    apply_error = %e,
+                    rollback_error = %re,
+                    "fk-rebuild migration failed and recovery ROLLBACK also failed; connection unusable"
+                );
+            }
+            Err(e)
+        }
+    };
+    // Re-enable foreign keys outside the now-closed transaction, reproducing the
+    // postcondition every fk-rebuild migration's trailing `PRAGMA foreign_keys =
+    // ON` used to establish in autocommit.
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    outcome
 }
 
 /// Inserts a row into schema_version to record that a migration has been applied.
@@ -1700,6 +1912,7 @@ fn run_migration_readd_user_id_soma_agents(conn: &rusqlite::Connection) -> Resul
          CREATE TABLE soma_agents (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              name TEXT NOT NULL,
+             -- agent role/category discriminator for soma_agents
              type TEXT NOT NULL,
              description TEXT,
              capabilities TEXT NOT NULL DEFAULT '[]',
@@ -1761,6 +1974,436 @@ fn run_migration_readd_user_id_axon_events(conn: &rusqlite::Connection) -> Resul
         "CREATE INDEX IF NOT EXISTS idx_axon_events_user ON axon_events(user_id, channel, id);",
     )?;
     info!("Migration 68 complete: user_id re-added to axon_events");
+    Ok(())
+}
+
+/// Migration 97: re-add `user_id` to `axon_subscriptions` with
+/// `UNIQUE(agent, channel, user_id)`. Migration 34 dropped user_id under the
+/// per-shard-only isolation assumption; in shared-monolith mode every tenant
+/// shares this table, so a channel-only webhook fan-out delivered one tenant's
+/// event payloads to another tenant's subscribed URL (cross-tenant
+/// exfiltration). The UNIQUE key must widen to include `user_id` so two tenants
+/// can subscribe the same (agent, channel); `ALTER` cannot change a UNIQUE
+/// constraint, so this uses the table rebuild (migration 67 pattern).
+///
+/// `axon_subscriptions` has no FK references; the rebuild preserves `id` values
+/// and runs with `PRAGMA foreign_keys = OFF`. Legacy rows backfill to
+/// `user_id = 1`. Idempotent: no-op if `user_id` is already present.
+fn run_migration_readd_user_id_axon_subscriptions(conn: &rusqlite::Connection) -> Result<()> {
+    let has_user_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('axon_subscriptions') WHERE name = 'user_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_id > 0 {
+        info!("axon_subscriptions.user_id already present, migration 97 is a no-op");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA legacy_alter_table = 1;
+
+         ALTER TABLE axon_subscriptions RENAME TO _axon_subscriptions_old_v97;
+
+         DROP INDEX IF EXISTS idx_axon_subs_channel;
+
+         CREATE TABLE axon_subscriptions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             agent TEXT NOT NULL,
+             channel TEXT NOT NULL,
+             filter_type TEXT,
+             webhook_url TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             user_id INTEGER NOT NULL DEFAULT 1,
+             UNIQUE(agent, channel, user_id)
+         );
+
+         INSERT INTO axon_subscriptions
+             (id, agent, channel, filter_type, webhook_url, created_at, user_id)
+         SELECT id, agent, channel, filter_type, webhook_url, created_at, 1
+         FROM _axon_subscriptions_old_v97;
+
+         DROP TABLE _axon_subscriptions_old_v97;
+
+         CREATE INDEX idx_axon_subs_channel ON axon_subscriptions(channel);
+         CREATE INDEX idx_axon_subs_user ON axon_subscriptions(user_id, channel);
+
+         PRAGMA legacy_alter_table = 0;
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    info!(
+        "Migration 97 complete: user_id re-added to axon_subscriptions with UNIQUE(agent, channel, user_id)"
+    );
+    Ok(())
+}
+
+/// Migration 98: re-add `user_id` to `axon_cursors` with
+/// `PRIMARY KEY(agent, channel, user_id)`. Migration 34 dropped it; the cursor
+/// PK on (agent, channel) is shared across tenants in monolith mode, so one
+/// tenant's `consume` advanced a cursor another tenant then skipped past.
+/// Widening the PRIMARY KEY requires a table rebuild (migration 67 pattern).
+///
+/// `axon_cursors` has no FK references and no AUTOINCREMENT id; the rebuild runs
+/// with `PRAGMA foreign_keys = OFF`. Legacy rows backfill to `user_id = 1`.
+/// Idempotent: no-op if `user_id` is already present.
+fn run_migration_readd_user_id_axon_cursors(conn: &rusqlite::Connection) -> Result<()> {
+    let has_user_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('axon_cursors') WHERE name = 'user_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_id > 0 {
+        info!("axon_cursors.user_id already present, migration 98 is a no-op");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA legacy_alter_table = 1;
+
+         ALTER TABLE axon_cursors RENAME TO _axon_cursors_old_v98;
+
+         CREATE TABLE axon_cursors (
+             agent TEXT NOT NULL,
+             channel TEXT NOT NULL,
+             last_event_id INTEGER NOT NULL DEFAULT 0,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             user_id INTEGER NOT NULL DEFAULT 1,
+             PRIMARY KEY(agent, channel, user_id)
+         );
+
+         INSERT INTO axon_cursors
+             (agent, channel, last_event_id, updated_at, user_id)
+         SELECT agent, channel, last_event_id, updated_at, 1
+         FROM _axon_cursors_old_v98;
+
+         DROP TABLE _axon_cursors_old_v98;
+
+         PRAGMA legacy_alter_table = 0;
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    info!(
+        "Migration 98 complete: user_id re-added to axon_cursors with PRIMARY KEY(agent, channel, user_id)"
+    );
+    Ok(())
+}
+
+/// Returns true when `table`'s live CREATE TABLE text still carries the buggy
+/// `datetime('now', 'utc')` default expression. SQLite's 'utc' modifier treats
+/// its input as localtime and converts it to UTC, so applying it to the
+/// already-UTC 'now' double-converts and skews the stored value by the host's
+/// UTC offset. The check is whitespace-insensitive so formatting differences
+/// between historical schema sources cannot mask a hit, and it returns false
+/// for a missing table so guarded rebuilds are safe no-ops on partial schemas.
+pub(crate) fn table_has_utc_default(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|s| {
+        let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("datetime('now','utc')")
+    }))
+}
+
+/// Migration 99: rebuild the five tables whose `created_at`-family columns
+/// defaulted to `datetime('now', 'utc')` -- handoffs, handoff_atoms,
+/// atom_entity_links, enrollment_invites, and frameshift_growth -- replacing
+/// the default with plain `datetime('now')` and backfilling the skewed rows.
+///
+/// The backfill maps each stored value through `datetime(col, 'localtime')`,
+/// which is the exact inverse of the buggy write under the same host timezone:
+/// the bad default subtracted the host's UTC offset in effect at write time,
+/// and 'localtime' adds the offset in effect at the stored instant (DST-aware
+/// via the host tzdata, so summer rows shift by the summer offset and winter
+/// rows by the winter offset). Rows written within the offset window of a DST
+/// transition can land 1h off; that ambiguity is inherent to inverting a
+/// local-time round-trip. Hosts running on UTC wrote no skew and the inversion
+/// is the identity there.
+///
+/// Every rebuild is guarded on the buggy default still being present in the
+/// live schema (`table_has_utc_default`), so fresh databases -- whose creation
+/// migrations now carry the corrected default -- skip both the rebuild and the
+/// data transform. `handoff_atoms.last_seen_at` needs a carve-out: the re-seen
+/// UPDATE path always wrote it correctly with `datetime('now')`, so only rows
+/// still on their insert default (`seen_count <= 1`) are transformed.
+///
+/// Runs under `apply_fk_rebuild` (foreign keys OFF outside the transaction,
+/// one BEGIN..COMMIT around the whole rebuild) per the migration 67/97/98
+/// house pattern; the in-SQL PRAGMA statements document the requirement.
+fn run_migration_tz_default_rebuild(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA legacy_alter_table = 1;")?;
+
+    if table_has_utc_default(conn, "handoffs")? {
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM handoffs", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE handoffs RENAME TO _handoffs_old_v99;
+
+             DROP TRIGGER IF EXISTS handoffs_fts_ai;
+             DROP TRIGGER IF EXISTS handoffs_fts_ad;
+             DROP TRIGGER IF EXISTS handoffs_fts_au;
+             DROP INDEX IF EXISTS idx_handoffs_project;
+             DROP INDEX IF EXISTS idx_handoffs_created;
+             DROP INDEX IF EXISTS idx_handoffs_hash;
+             DROP INDEX IF EXISTS idx_handoffs_agent;
+             DROP INDEX IF EXISTS idx_handoffs_type;
+             DROP INDEX IF EXISTS idx_handoffs_session;
+             DROP INDEX IF EXISTS idx_handoffs_model;
+             DROP INDEX IF EXISTS idx_handoffs_restore;
+             DROP INDEX IF EXISTS idx_handoffs_user_created;
+
+             CREATE TABLE handoffs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 project TEXT NOT NULL,
+                 branch TEXT,
+                 directory TEXT,
+                 agent TEXT DEFAULT 'unknown',
+                 -- handoff kind discriminator for handoffs (e.g. manual, auto)
+                 type TEXT DEFAULT 'manual',
+                 content TEXT NOT NULL,
+                 metadata TEXT,
+                 session_id TEXT,
+                 model TEXT,
+                 host TEXT,
+                 content_hash TEXT
+             );
+
+             INSERT INTO handoffs
+                 (id, user_id, created_at, project, branch, directory, agent, type,
+                  content, metadata, session_id, model, host, content_hash)
+             SELECT id, user_id,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    project, branch, directory, agent, type,
+                    content, metadata, session_id, model, host, content_hash
+             FROM _handoffs_old_v99;
+
+             DROP TABLE _handoffs_old_v99;
+
+             CREATE INDEX idx_handoffs_project ON handoffs(project, created_at DESC);
+             CREATE INDEX idx_handoffs_created ON handoffs(created_at DESC);
+             CREATE INDEX idx_handoffs_hash ON handoffs(content_hash);
+             CREATE INDEX idx_handoffs_agent ON handoffs(agent, created_at DESC);
+             CREATE INDEX idx_handoffs_type ON handoffs(type, created_at DESC);
+             CREATE INDEX idx_handoffs_session ON handoffs(session_id);
+             CREATE INDEX idx_handoffs_model ON handoffs(model, created_at DESC);
+             CREATE INDEX idx_handoffs_restore ON handoffs(project, type, agent, created_at DESC);
+             CREATE INDEX idx_handoffs_user_created ON handoffs(user_id, created_at DESC);
+
+             CREATE TRIGGER handoffs_fts_ai AFTER INSERT ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(rowid, content) VALUES (new.id, new.content);
+             END;
+             CREATE TRIGGER handoffs_fts_ad AFTER DELETE ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(handoffs_fts, rowid, content) VALUES('delete', old.id, old.content);
+             END;
+             CREATE TRIGGER handoffs_fts_au AFTER UPDATE OF content ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(handoffs_fts, rowid, content) VALUES('delete', old.id, old.content);
+                 INSERT INTO handoffs_fts(rowid, content) VALUES (new.id, new.content);
+             END;",
+        )?;
+        info!(
+            rows,
+            "Migration 99: handoffs rebuilt, created_at backfilled to true UTC"
+        );
+    } else {
+        info!("Migration 99: handoffs default already correct, skipping rebuild");
+    }
+
+    if table_has_utc_default(conn, "handoff_atoms")? {
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM handoff_atoms", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE handoff_atoms RENAME TO _handoff_atoms_old_v99;
+
+             DROP INDEX IF EXISTS idx_atoms_project_type;
+             DROP INDEX IF EXISTS idx_atoms_salience;
+             DROP INDEX IF EXISTS idx_atoms_atom_id;
+             DROP INDEX IF EXISTS idx_atoms_handoff;
+             DROP INDEX IF EXISTS idx_atoms_last_seen;
+             DROP INDEX IF EXISTS idx_atoms_user_project;
+             DROP INDEX IF EXISTS idx_atoms_status;
+
+             CREATE TABLE handoff_atoms (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 atom_id         TEXT NOT NULL,
+                 handoff_id      INTEGER NOT NULL,
+                 user_id         INTEGER NOT NULL DEFAULT 1,
+                 project         TEXT NOT NULL,
+                 atom_type       TEXT NOT NULL,
+                 content         TEXT NOT NULL,
+                 canonical_form  TEXT NOT NULL,
+                 salience        REAL NOT NULL DEFAULT 0.5,
+                 confidence      REAL NOT NULL DEFAULT 0.5,
+                 status          TEXT NOT NULL DEFAULT 'active',
+                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                 seen_count      INTEGER NOT NULL DEFAULT 1,
+                 decay_immune    INTEGER NOT NULL DEFAULT 0,
+                 superseded_by   TEXT,
+                 metadata        TEXT
+             );
+
+             INSERT INTO handoff_atoms
+                 (id, atom_id, handoff_id, user_id, project, atom_type, content,
+                  canonical_form, salience, confidence, status, created_at,
+                  last_seen_at, seen_count, decay_immune, superseded_by, metadata)
+             SELECT id, atom_id, handoff_id, user_id, project, atom_type, content,
+                    canonical_form, salience, confidence, status,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    CASE WHEN seen_count <= 1
+                         THEN COALESCE(datetime(last_seen_at, 'localtime'), last_seen_at)
+                         ELSE last_seen_at END,
+                    seen_count, decay_immune, superseded_by, metadata
+             FROM _handoff_atoms_old_v99;
+
+             DROP TABLE _handoff_atoms_old_v99;
+
+             CREATE INDEX idx_atoms_project_type ON handoff_atoms(project, atom_type, status);
+             CREATE INDEX idx_atoms_salience ON handoff_atoms(project, salience DESC);
+             CREATE INDEX idx_atoms_atom_id ON handoff_atoms(atom_id);
+             CREATE INDEX idx_atoms_handoff ON handoff_atoms(handoff_id);
+             CREATE INDEX idx_atoms_last_seen ON handoff_atoms(last_seen_at DESC);
+             CREATE INDEX idx_atoms_user_project ON handoff_atoms(user_id, project, status);
+             CREATE INDEX idx_atoms_status ON handoff_atoms(status, atom_type);",
+        )?;
+        info!(rows, "Migration 99: handoff_atoms rebuilt, timestamps backfilled (last_seen_at only where seen_count <= 1)");
+    } else {
+        info!("Migration 99: handoff_atoms default already correct, skipping rebuild");
+    }
+
+    if table_has_utc_default(conn, "atom_entity_links")? {
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM atom_entity_links", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE atom_entity_links RENAME TO _atom_entity_links_old_v99;
+
+             DROP INDEX IF EXISTS idx_ael_atom;
+             DROP INDEX IF EXISTS idx_ael_entity;
+
+             CREATE TABLE atom_entity_links (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 atom_id     TEXT NOT NULL,
+                 entity_id   INTEGER NOT NULL,
+                 user_id     INTEGER NOT NULL,
+                 created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                 UNIQUE(atom_id, entity_id)
+             );
+
+             INSERT INTO atom_entity_links (id, atom_id, entity_id, user_id, created_at)
+             SELECT id, atom_id, entity_id, user_id,
+                    COALESCE(datetime(created_at, 'localtime'), created_at)
+             FROM _atom_entity_links_old_v99;
+
+             DROP TABLE _atom_entity_links_old_v99;
+
+             CREATE INDEX idx_ael_atom ON atom_entity_links(atom_id);
+             CREATE INDEX idx_ael_entity ON atom_entity_links(entity_id);",
+        )?;
+        info!(
+            rows,
+            "Migration 99: atom_entity_links rebuilt, created_at backfilled"
+        );
+    } else {
+        info!("Migration 99: atom_entity_links default already correct, skipping rebuild");
+    }
+
+    if table_has_utc_default(conn, "enrollment_invites")? {
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM enrollment_invites", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE enrollment_invites RENAME TO _enrollment_invites_old_v99;
+
+             DROP INDEX IF EXISTS idx_enrollment_invites_token;
+             DROP INDEX IF EXISTS idx_enrollment_invites_user;
+
+             CREATE TABLE enrollment_invites (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 token_hash TEXT    NOT NULL UNIQUE,
+                 method     TEXT    NOT NULL DEFAULT 'fido2',
+                 created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+                 expires_at TEXT    NOT NULL,
+                 consumed_at TEXT
+             );
+
+             INSERT INTO enrollment_invites
+                 (id, user_id, token_hash, method, created_at, expires_at, consumed_at)
+             SELECT id, user_id, token_hash, method,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    COALESCE(datetime(expires_at, 'localtime'), expires_at),
+                    consumed_at
+             FROM _enrollment_invites_old_v99;
+
+             DROP TABLE _enrollment_invites_old_v99;
+
+             CREATE INDEX idx_enrollment_invites_token ON enrollment_invites(token_hash);
+             CREATE INDEX idx_enrollment_invites_user ON enrollment_invites(user_id, created_at DESC);",
+        )?;
+        info!(
+            rows,
+            "Migration 99: enrollment_invites rebuilt, created_at/expires_at backfilled"
+        );
+    } else {
+        info!("Migration 99: enrollment_invites default already correct, skipping rebuild");
+    }
+
+    if table_has_utc_default(conn, "frameshift_growth")? {
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM frameshift_growth", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE frameshift_growth RENAME TO _frameshift_growth_old_v99;
+
+             DROP INDEX IF EXISTS idx_fsgrowth_user_cursor;
+             DROP INDEX IF EXISTS idx_fsgrowth_persona;
+             DROP INDEX IF EXISTS idx_fsgrowth_project;
+             DROP INDEX IF EXISTS idx_fsgrowth_scope;
+
+             CREATE TABLE frameshift_growth (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 persona TEXT,
+                 project_id TEXT,
+                 scope TEXT,
+                 content TEXT NOT NULL,
+                 metadata TEXT,
+                 host TEXT,
+                 content_hash TEXT NOT NULL,
+                 UNIQUE(user_id, content_hash)
+             );
+
+             INSERT INTO frameshift_growth
+                 (id, user_id, created_at, persona, project_id, scope, content,
+                  metadata, host, content_hash)
+             SELECT id, user_id,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    persona, project_id, scope, content, metadata, host, content_hash
+             FROM _frameshift_growth_old_v99;
+
+             DROP TABLE _frameshift_growth_old_v99;
+
+             CREATE INDEX idx_fsgrowth_user_cursor ON frameshift_growth(user_id, id);
+             CREATE INDEX idx_fsgrowth_persona ON frameshift_growth(user_id, persona, created_at DESC);
+             CREATE INDEX idx_fsgrowth_project ON frameshift_growth(user_id, project_id, created_at DESC);
+             CREATE INDEX idx_fsgrowth_scope ON frameshift_growth(user_id, scope, created_at DESC);",
+        )?;
+        info!(
+            rows,
+            "Migration 99: frameshift_growth rebuilt, created_at backfilled"
+        );
+    } else {
+        info!("Migration 99: frameshift_growth default already correct, skipping rebuild");
+    }
+
+    conn.execute_batch("PRAGMA legacy_alter_table = 0;")?;
+    info!("Migration 99 complete: tz defaults corrected and skewed timestamps backfilled");
     Ok(())
 }
 
@@ -1964,6 +2607,7 @@ fn run_migration_readd_user_id_graph_entities(conn: &rusqlite::Connection) -> Re
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              name TEXT NOT NULL,
              entity_type TEXT NOT NULL DEFAULT 'concept',
+             -- entity subtype discriminator for entities
              type TEXT NOT NULL DEFAULT 'generic',
              description TEXT,
              aliases TEXT,
@@ -2627,6 +3271,74 @@ fn run_migration_drop_user_id_scratchpad(conn: &rusqlite::Connection) -> Result<
     Ok(())
 }
 
+// --- Migration 92: re-add user_id to scratchpad (reverses migration 26) ---
+
+/// Migration 92: re-add `user_id` to scratchpad via the 12-step rebuild path,
+/// reversing migration 26. Migration 26 dropped user_id and widened the
+/// constraint to UNIQUE(session, agent, entry_key), which left the monolith
+/// scratchpad unscoped: in single-DB mode every tenant shares one table, so an
+/// unscoped read (`scratchpad::list_entries`) leaked other users' working
+/// memory into `assemble_context`, and an unscoped delete or ON CONFLICT upsert
+/// could clobber another tenant's row.
+///
+/// This rebuilds the table WITH user_id and the tightened
+/// UNIQUE(user_id, session, agent, entry_key). Existing rows carry no user
+/// attribution (the column was dropped by migration 26), so they backfill to
+/// user_id=1, matching migration 26's "all surviving rows were user_id=1"
+/// assumption; new writes are correctly scoped by the caller. Idempotent: if
+/// scratchpad already has user_id the migration is a no-op.
+fn run_migration_readd_user_id_scratchpad(conn: &rusqlite::Connection) -> Result<()> {
+    let has_user_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scratchpad') WHERE name = 'user_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_id == 1 {
+        info!("scratchpad.user_id already present, migration 92 is a no-op");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+
+         ALTER TABLE scratchpad RENAME TO _scratchpad_old_v91;
+
+         DROP INDEX IF EXISTS idx_scratchpad_agent;
+         DROP INDEX IF EXISTS idx_scratchpad_session;
+         DROP INDEX IF EXISTS idx_scratchpad_expires;
+
+         CREATE TABLE scratchpad (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             user_id INTEGER NOT NULL DEFAULT 1,
+             agent TEXT NOT NULL DEFAULT 'unknown',
+             session TEXT NOT NULL DEFAULT 'default',
+             model TEXT NOT NULL DEFAULT '',
+             entry_key TEXT NOT NULL,
+             value TEXT NOT NULL DEFAULT '',
+             expires_at TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             UNIQUE(user_id, session, agent, entry_key)
+         );
+
+         INSERT INTO scratchpad (id, agent, session, model, entry_key, value, expires_at, created_at, updated_at)
+         SELECT id, agent, session, model, entry_key, value, expires_at, created_at, updated_at
+         FROM _scratchpad_old_v91;
+
+         DROP TABLE _scratchpad_old_v91;
+
+         CREATE INDEX idx_scratchpad_agent ON scratchpad(agent);
+         CREATE INDEX idx_scratchpad_session ON scratchpad(session);
+         CREATE INDEX idx_scratchpad_expires ON scratchpad(expires_at) WHERE expires_at IS NOT NULL;
+         CREATE INDEX idx_scratchpad_user ON scratchpad(user_id);
+
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    info!("Migration 92 complete: user_id re-added to scratchpad");
+    Ok(())
+}
+
 // --- Migration 27: drop user_id from sessions (simple DROP INDEX + DROP COLUMN) ---
 
 /// Migration 27: drop user_id shim from sessions. No UNIQUE or FK references
@@ -3074,6 +3786,7 @@ fn run_migration_drop_user_id_graph(conn: &rusqlite::Connection) -> Result<()> {
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              name TEXT NOT NULL,
              entity_type TEXT NOT NULL DEFAULT 'concept',
+             -- entity subtype discriminator for entities
              type TEXT NOT NULL DEFAULT 'generic',
              description TEXT,
              aliases TEXT,
@@ -3753,7 +4466,7 @@ fn run_migration_frameshift_growth(conn: &rusqlite::Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS frameshift_growth (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
             persona TEXT,
             project_id TEXT,
             scope TEXT,
@@ -3858,6 +4571,165 @@ fn run_migration_forge_tables(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_forge_specs_gate ON forge_specs(user_id, session_id, status);
         CREATE INDEX IF NOT EXISTS idx_forge_specs_user ON forge_specs(user_id, created_at DESC);",
     )?;
+    Ok(())
+}
+
+/// Migration 93: facts_fts FTS5 index over structured_facts for the L5 facts channel.
+///
+/// External-content FTS5 over `structured_facts` (subject/predicate/object/verb). Creates the
+/// virtual table and its INSERT/DELETE/UPDATE sync triggers, then rebuilds the index from the
+/// existing rows so upgraded installs get a populated index immediately. Idempotent: the
+/// `IF NOT EXISTS` statements no-op on fresh installs (which already created facts_fts via
+/// `AUXILIARY_SCHEMA_STATEMENTS`), and the FTS5 'rebuild' command fully replaces the shadow
+/// tables. No `PRAGMA foreign_keys` toggle, so it runs inside the migration SAVEPOINT.
+fn run_migration_facts_fts(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        // Index user_id so the facts channel's `sf.user_id = ?` filter has B-tree support on
+        // multi-user monolith DBs (tenant shards already carry idx_facts_user from v14).
+        "CREATE INDEX IF NOT EXISTS idx_facts_user ON structured_facts(user_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            subject, predicate, object, verb,
+            content='structured_facts', content_rowid='id',
+            tokenize='porter unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS facts_fts_insert AFTER INSERT ON structured_facts BEGIN
+            INSERT INTO facts_fts(rowid, subject, predicate, object, verb)
+            VALUES (new.id, new.subject, new.predicate, new.object, new.verb);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_fts_delete AFTER DELETE ON structured_facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object, verb)
+            VALUES ('delete', old.id, old.subject, old.predicate, old.object, old.verb);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_fts_update AFTER UPDATE ON structured_facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object, verb)
+            VALUES ('delete', old.id, old.subject, old.predicate, old.object, old.verb);
+            INSERT INTO facts_fts(rowid, subject, predicate, object, verb)
+            VALUES (new.id, new.subject, new.predicate, new.object, new.verb);
+        END;
+        INSERT INTO facts_fts(facts_fts) VALUES('rebuild');",
+    )?;
+    info!("Migration 93 complete: facts_fts virtual table + triggers created and rebuilt");
+    Ok(())
+}
+
+/// Migration 94: rebuild the six global external-content FTS5 tables with the
+/// language-neutral `unicode61 remove_diacritics 2` tokenizer so existing
+/// databases match the schema_sql.rs change (drops English-only porter stemming,
+/// folds diacritics so e.g. Hauser/Häuser and francais/français match). Each
+/// virtual table is dropped, recreated with the new tokenizer, then rebuilt from
+/// its content table. The base-table `*_fts_insert/delete/update` triggers live
+/// independently of the virtual table and survive the drop, so they are left in
+/// place; the column lists below are the verbatim shapes from schema_sql.rs.
+fn run_migration_fts_unicode61(conn: &rusqlite::Connection) -> Result<()> {
+    // (table name, recreate SQL) for each external-content FTS table.
+    const RECREATE: &[(&str, &str)] = &[
+        (
+            "memories_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                content, category, source,
+                content='memories', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+        (
+            "episodes_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+                title, summary, agent,
+                content='episodes', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+        (
+            "messages_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content, role,
+                content='messages', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+        (
+            "skills_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+                name, description, code,
+                content='skill_records', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+        (
+            "artifacts_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
+                name, content,
+                content='artifacts', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+        (
+            "facts_fts",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+                subject, predicate, object, verb,
+                content='structured_facts', content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )",
+        ),
+    ];
+    for (name, create_sql) in RECREATE {
+        conn.execute(&format!("DROP TABLE IF EXISTS {name}"), [])?;
+        conn.execute_batch(create_sql)?;
+        conn.execute(&format!("INSERT INTO {name}({name}) VALUES('rebuild')"), [])?;
+    }
+    info!("Migration 94 complete: 6 global FTS tables rebuilt with unicode61+diacritics tokenizer");
+    Ok(())
+}
+
+/// Migration 95: add a nullable `lang` column to the global `memories` table for
+/// the detected ISO 639-1 content language. Nullable with no backfill -- NULL
+/// means "unknown / treat as en". Populated by detect_lang on subsequent writes.
+fn run_migration_add_memory_lang(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute("ALTER TABLE memories ADD COLUMN lang TEXT", [])?;
+    info!("Migration 95 complete: memories.lang column added");
+    Ok(())
+}
+
+/// v101: drop the enrollment_invites table -- the invite feature was dead
+/// surface (tokens were minted but never consumable) and its endpoint is gone.
+fn run_migration_drop_enrollment_invites(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute("DROP TABLE IF EXISTS enrollment_invites", [])?;
+    info!("Migration 101 complete: enrollment_invites dropped");
+    Ok(())
+}
+
+/// v100: add skill_records.duration_sample_count and backfill it from
+/// execution_count for rows that already carry an average (the closest
+/// available approximation of how many samples produced that average).
+fn run_migration_skill_duration_sample_count(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "ALTER TABLE skill_records ADD COLUMN duration_sample_count INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE skill_records SET duration_sample_count = execution_count \
+         WHERE avg_duration_ms IS NOT NULL",
+        [],
+    )?;
+    info!("Migration 100 complete: skill_records.duration_sample_count added");
+    Ok(())
+}
+
+/// Migration 96: creates the attention_notes table for user-priority reminders.
+fn run_migration_attention_notes(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS attention_notes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            content     TEXT NOT NULL,
+            priority    INTEGER NOT NULL DEFAULT 5 CHECK (priority BETWEEN 1 AND 10),
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_attention_notes_user_priority
+            ON attention_notes(user_id, priority DESC, created_at ASC);",
+    )?;
+    info!("Migration 96 complete: attention_notes table created");
     Ok(())
 }
 
@@ -4301,11 +5173,12 @@ fn run_migration_handoffs_global(conn: &rusqlite::Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS handoffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
             project TEXT NOT NULL,
             branch TEXT,
             directory TEXT,
             agent TEXT DEFAULT 'unknown',
+            -- handoff kind discriminator for handoffs (e.g. manual, auto)
             type TEXT DEFAULT 'manual',
             content TEXT NOT NULL,
             metadata TEXT,
@@ -4369,7 +5242,7 @@ fn run_migration_user_active_and_invites(conn: &rusqlite::Connection) -> Result<
              user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
              token_hash TEXT    NOT NULL UNIQUE,
              method     TEXT    NOT NULL DEFAULT 'fido2',
-             created_at TEXT    NOT NULL DEFAULT (datetime('now', 'utc')),
+             created_at TEXT    NOT NULL DEFAULT (datetime('now')),
              expires_at TEXT    NOT NULL,
              consumed_at TEXT
          );
@@ -4648,8 +5521,8 @@ fn run_migration_handoff_atoms(conn: &rusqlite::Connection) -> Result<()> {
             salience        REAL NOT NULL DEFAULT 0.5,
             confidence      REAL NOT NULL DEFAULT 0.5,
             status          TEXT NOT NULL DEFAULT 'active',
-            created_at      TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
-            last_seen_at    TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
             seen_count      INTEGER NOT NULL DEFAULT 1,
             decay_immune    INTEGER NOT NULL DEFAULT 0,
             superseded_by   TEXT,
@@ -4667,7 +5540,7 @@ fn run_migration_handoff_atoms(conn: &rusqlite::Connection) -> Result<()> {
             atom_id     TEXT NOT NULL,
             entity_id   INTEGER NOT NULL,
             user_id     INTEGER NOT NULL,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(atom_id, entity_id)
         );
         CREATE INDEX IF NOT EXISTS idx_ael_atom ON atom_entity_links(atom_id);
@@ -4897,6 +5770,7 @@ mod tests {
             },
             down: None,
             transactional: true,
+            fk_rebuild: false,
         };
 
         let r = apply_migration_up(&conn, &failing);
@@ -4921,6 +5795,170 @@ mod tests {
         assert_eq!(
             probe_exists, 0,
             "partial DDL must be rolled back by the savepoint"
+        );
+    }
+
+    /// An `fk_rebuild` migration that crashes mid-rebuild must roll back
+    /// atomically: the original table + rows survive, no half-rebuilt artifacts
+    /// remain, the version is not recorded (so it retries on next startup), and
+    /// foreign_keys is restored ON. This is the crash-mid-rebuild path the older
+    /// bare execution left un-atomic.
+    #[test]
+    fn failed_fk_rebuild_migration_rolls_back_and_records_nothing() {
+        let conn = open_test_db();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_version (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL);
+             INSERT INTO t (id, x) VALUES (1, 'orig');",
+        )
+        .unwrap();
+
+        let failing = Migration {
+            version: 9998,
+            description: "failing_fk_rebuild",
+            up: |c| {
+                // Partial rebuild (rename + recreate), then crash before copying
+                // rows / dropping the old table -- the window that used to leave a
+                // half-rebuilt schema behind.
+                c.execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     ALTER TABLE t RENAME TO _t_old;
+                     CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL, y TEXT);",
+                )?;
+                Err(crate::EngError::Internal("boom mid-rebuild".into()))
+            },
+            down: None,
+            transactional: false,
+            fk_rebuild: true,
+        };
+
+        let r = apply_migration_up(&conn, &failing);
+        assert!(r.is_err(), "the fk-rebuild up fn returned Err");
+
+        // Original table + row survive the rollback.
+        let x: String = conn
+            .query_row("SELECT x FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(x, "orig", "original table + row survive rollback");
+
+        // The renamed-away table and the rebuilt schema are rolled back.
+        let old: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_t_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "renamed-away table must not survive rollback");
+        let has_y: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('t') WHERE name='y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_y, 0, "rebuilt schema must be rolled back");
+
+        // Version not recorded -> the migration retries on next startup.
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_version WHERE version = 9998",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 0, "failed fk-rebuild must not be recorded");
+
+        // foreign_keys restored ON.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys restored to ON after apply_fk_rebuild");
+    }
+
+    /// A real `fk_rebuild` migration driven through the runner (so through
+    /// `apply_fk_rebuild`) must preserve populated rows and their FK-child
+    /// relationships, leave no dangling references, and keep ON DELETE CASCADE
+    /// enforcement live. Migration 67 rebuilds `soma_agents` (preserving ids)
+    /// while `soma_agent_logs.agent_id` references it ON DELETE CASCADE. The base
+    /// schema ships `soma_agents` without `user_id`, so v67 genuinely rebuilds.
+    #[test]
+    fn soma_agents_v67_rebuild_preserves_fk_children_through_runner() {
+        let conn = open_test_db();
+        // Build the monolith up to just before the v67 soma_agents rebuild.
+        run_migrations_to(&conn, 66).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Seed a parent agent and a child log referencing it ON DELETE CASCADE.
+        conn.execute(
+            "INSERT INTO soma_agents (name, type) VALUES ('agent-1', 'worker')",
+            [],
+        )
+        .unwrap();
+        let agent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO soma_agent_logs (agent_id, message) VALUES (?1, 'hello')",
+            rusqlite::params![agent_id],
+        )
+        .unwrap();
+
+        // Apply v67 through the runner (apply_fk_rebuild wraps the rebuild).
+        run_migrations_to(&conn, 67).unwrap();
+
+        // Parent survived, id preserved, legacy row backfilled to user_id = 1.
+        let (name, uid): (String, i64) = conn
+            .query_row(
+                "SELECT name, user_id FROM soma_agents WHERE id = ?1",
+                rusqlite::params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "agent-1", "parent row survives the v67 rebuild");
+        assert_eq!(uid, 1, "legacy row backfilled to system owner");
+
+        // Child survived and still references the preserved parent id.
+        let child: i64 = conn
+            .query_row(
+                "SELECT agent_id FROM soma_agent_logs WHERE message = 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child, agent_id, "child FK still references the parent id");
+
+        // No dangling foreign keys anywhere after the rebuild.
+        let dangling: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0, "no dangling FK references after v67 rebuild");
+
+        // Enforcement is live: deleting the parent cascades to the child.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys ON after the fk-rebuild");
+        conn.execute(
+            "DELETE FROM soma_agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM soma_agent_logs WHERE agent_id = ?1",
+                rusqlite::params![agent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "ON DELETE CASCADE still enforced after v67 rebuild"
         );
     }
 
@@ -4950,6 +5988,69 @@ mod tests {
             "MIGRATIONS array contains v{highest_in_array} but run_migrations only applied up to v{applied}. \
              Did you add an entry to the MIGRATIONS array without adding the matching dispatch block?"
         );
+    }
+
+    /// Migration 94: rebuilding the global FTS tables with the unicode61+diacritics
+    /// tokenizer must preserve row parity, fold diacritics for keyword match, run
+    /// idempotently on an already-populated DB, and leave the sync triggers firing.
+    #[test]
+    fn migration_94_rebuild_parity_folds_diacritics_triggers_fire() {
+        let conn = open_test_db();
+        run_migrations(&conn).expect("fresh migrate to head (includes v94)");
+        // Populate with German + French content before re-running the rebuild.
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('Häuser stehen am Fluss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('La forêt française est dense')",
+            [],
+        )
+        .unwrap();
+        let base: i64 = conn
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+
+        // Re-run the rebuild migration directly: idempotent, preserves parity.
+        super::run_migration_fts_unicode61(&conn).expect("rerun migration 94");
+        let fts: i64 = conn
+            .query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, base, "FTS row parity after rebuild");
+
+        // Diacritic-folded keyword match: the umlaut/accent is dropped in the query.
+        let de: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'hauser'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(de, 1, "'hauser' folds to match 'Häuser'");
+        let fr: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'foret'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fr, 1, "'foret' folds to match 'forêt'");
+
+        // The base-table sync trigger still fires after the rebuild.
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('Müller wohnt in München')",
+            [],
+        )
+        .unwrap();
+        let trig: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'munchen'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trig, 1, "post-rebuild trigger fires and folds 'München'");
     }
 
     /// Migration 84: the control-DB `instance_grants` table backs Space

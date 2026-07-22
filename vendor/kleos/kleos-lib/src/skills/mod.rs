@@ -91,11 +91,14 @@ pub async fn create_skill(db: &Database, req: CreateSkillRequest) -> Result<Skil
     let (version, root_skill_id) = if let Some(parent_id) = req.parent_skill_id {
         let result = db
             .read(move |conn| {
+                // Scope the parent lookup to this tenant. Without the user_id predicate a
+                // caller could name another tenant's skill as parent, leaking its
+                // version/root metadata and forging a cross-tenant lineage link.
                 let mut stmt = conn.prepare(
                     "SELECT version, root_skill_id FROM skill_records \
-                     WHERE id = ?1",
+                     WHERE id = ?1 AND user_id = ?2",
                 )?;
-                let mut rows = stmt.query(params![parent_id])?;
+                let mut rows = stmt.query(params![parent_id, user_id])?;
                 if let Some(row) = rows.next()? {
                     let pv: i32 = row.get(0)?;
                     let pr: Option<i64> = row.get(1)?;
@@ -357,6 +360,7 @@ pub async fn recompute_skill(db: &Database, id: i64, user_id: i64) -> Result<Ski
                     failure_count = 0, \
                     execution_count = 0, \
                     avg_duration_ms = NULL, \
+                    duration_sample_count = 0, \
                     trust_score = 0.0, \
                     updated_at = datetime('now') \
                  WHERE id = ?1",
@@ -431,11 +435,19 @@ pub async fn record_execution(
             )?;
         }
 
-        // Update avg_duration_ms
+        // Update avg_duration_ms. Finding [51]: the running average divides by
+        // duration_sample_count (executions that actually reported a duration),
+        // not execution_count -- otherwise duration-less executions inflate the
+        // denominator and drag the average toward zero. The sample counter is
+        // incremented in the same statement so numerator and denominator move
+        // together.
         if let Some(dur) = duration_ms {
             conn.execute(
-                "UPDATE skill_records SET avg_duration_ms = \
-                 COALESCE((avg_duration_ms * (execution_count - 1) + ?1) / execution_count, ?1), \
+                "UPDATE skill_records SET \
+                 avg_duration_ms = COALESCE( \
+                     (avg_duration_ms * duration_sample_count + ?1) / (duration_sample_count + 1), \
+                     ?1), \
+                 duration_sample_count = duration_sample_count + 1, \
                  updated_at = datetime('now') WHERE id = ?2",
                 params![dur, skill_id],
             )?;
@@ -753,15 +765,18 @@ pub async fn list_recent_evolutions(
 #[tracing::instrument(skip(db))]
 pub async fn get_lineage(db: &Database, skill_id: i64, user_id: i64) -> Result<Vec<i64>> {
     get_skill(db, skill_id, user_id).await?;
-    // Only return parents that also belong to the caller; filter out any foreign-tenant ids
-    // even if the lineage table ever held one from a pre-patch row.
+    // Only return parents that also belong to the caller. skill_lineage_parents
+    // has no user_id column, so ownership is enforced by joining skill_records
+    // on parent_id and filtering by user_id -- this actually performs the
+    // foreign-tenant filtering the prior comment only claimed.
     db.read(move |conn| {
         let mut stmt = conn.prepare(
             "SELECT slp.parent_id FROM skill_lineage_parents slp \
-                 WHERE slp.skill_id = ?1",
+                 JOIN skill_records sr ON sr.id = slp.parent_id \
+                 WHERE slp.skill_id = ?1 AND sr.user_id = ?2",
         )?;
         let parents = stmt
-            .query_map(params![skill_id], |row| row.get(0))?
+            .query_map(params![skill_id, user_id], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(parents)
     })

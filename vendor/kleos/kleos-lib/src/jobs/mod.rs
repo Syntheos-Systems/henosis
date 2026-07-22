@@ -15,10 +15,14 @@
 //! failures are surfaced via `tracing::warn` / `tracing::error`, never
 //! swallowed -- regressions break CI via the swallowed-errors sweep.
 
+pub mod community_detection;
 pub mod deprovision;
 pub mod disk_sampler;
 pub mod pagerank_refresh;
-#[cfg(feature = "tenant-sharding")]
+// Ungated ([5]): TenantRegistry itself is not feature-gated and the server
+// builds without `tenant-sharding`, so the gate compiled this job out of the
+// binary that actually needed it -- sharded deployments got no pagerank
+// refresh at all.
 pub mod pagerank_refresh_tenant;
 pub mod types;
 pub use types::*;
@@ -26,6 +30,7 @@ pub use types::*;
 // Durable job queue with retries (ported from TS jobs/index.ts + scheduler.ts)
 use crate::db::Database;
 use crate::Result;
+use futures::FutureExt;
 use rusqlite::params;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,16 +60,6 @@ fn job_timeout_for(job_type: &str) -> Duration {
     } else {
         Duration::from_millis(120_000)
     }
-}
-
-/// Ensure the jobs and scheduler lease tables exist.
-#[tracing::instrument(skip(db))]
-pub async fn ensure_schema(db: &Database) -> Result<()> {
-    db.write(|conn| {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3, error TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), claimed_at TEXT, completed_at TEXT, next_retry_at TEXT); CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, next_retry_at); CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type, status); CREATE TABLE IF NOT EXISTS scheduler_leases (job_name TEXT PRIMARY KEY, holder_id TEXT NOT NULL, acquired_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT NOT NULL, last_run_at TEXT);")?;
-        Ok(())
-    })
-    .await
 }
 
 /// Enqueue a pending job and return its row id.
@@ -122,9 +117,17 @@ pub async fn claim_next_job(db: &Database) -> Result<Option<Job>> {
 
             match row {
                 Ok((id, jt, pl, att, ma, created_at, next_retry_at)) => {
-                    tx.execute(
-                        "UPDATE jobs SET status = 'running', claimed_at = datetime('now'), attempts = attempts + 1 WHERE id = ?1",
+                    // Read back the stored claimed_at via RETURNING instead of
+                    // taking a second clock reading in Rust. Job.claimed_at is
+                    // the lease token the finalizers compare against the row
+                    // (JOB-2); when the two clock reads straddled a second
+                    // boundary, every finalizer for this job silently no-oped
+                    // and the job hung at 'running' until recover_stuck_jobs.
+                    let claimed_at: String = tx.query_row(
+                        "UPDATE jobs SET status = 'running', claimed_at = datetime('now'), attempts = attempts + 1 \
+                         WHERE id = ?1 RETURNING claimed_at",
                         params![id],
+                        |row| row.get(0),
                     )?;
                     Some(Job {
                         id,
@@ -135,7 +138,7 @@ pub async fn claim_next_job(db: &Database) -> Result<Option<Job>> {
                         max_attempts: ma,
                         error: None,
                         created_at,
-                        claimed_at: Some(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+                        claimed_at: Some(claimed_at),
                         completed_at: None,
                         next_retry_at,
                     })
@@ -527,18 +530,44 @@ pub async fn process_next_job(db: &Database) -> Result<bool> {
     };
     let timeout = job_timeout_for(&job.job_type);
 
-    match tokio::time::timeout(timeout, handler(payload)).await {
-        Ok(Ok(())) => {
+    // Contain handler panics. An unwinding handler future would otherwise
+    // propagate through process_next_job and kill the whole worker loop, and
+    // because no finalizer runs, the row stays 'running' until
+    // recover_stuck_jobs requeues it -- a deterministically-panicking payload
+    // then loops forever, since the attempts >= max_attempts check lives in
+    // exactly the code the panic skips. catch_unwind keeps the future
+    // directly owned by tokio::time::timeout, preserving cancel-on-timeout
+    // semantics (a tokio::spawn-based variant would leave a timed-out
+    // handler running detached).
+    let handler_fut = std::panic::AssertUnwindSafe(handler(payload)).catch_unwind();
+    match tokio::time::timeout(timeout, handler_fut).await {
+        Ok(Ok(Ok(()))) => {
             complete_job(db, job.id, &claimed_at).await?;
             debug!(job_id = job.id, job_type = %job.job_type, attempt = job.attempts, "job completed");
         }
-        Ok(Err(err)) => {
+        Ok(Ok(Err(err))) => {
             let err_msg = err.to_string();
             if job.attempts >= job.max_attempts {
                 fail_job(db, job.id, &claimed_at, &err_msg).await?;
             } else {
                 let delay_sec = 10_i64 * i64::from(job.attempts) * i64::from(job.attempts);
                 retry_job(db, job.id, &claimed_at, &err_msg, delay_sec).await?;
+            }
+        }
+        Ok(Err(panic_payload)) => {
+            let reason = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "opaque panic payload".to_string());
+            let err_msg = format!("job handler panicked: {reason}");
+            if job.attempts >= job.max_attempts {
+                fail_job(db, job.id, &claimed_at, &err_msg).await?;
+                error!(job_id = job.id, job_type = %job.job_type, "job handler panicked -- giving up after max attempts");
+            } else {
+                let delay_sec = 10_i64 * i64::from(job.attempts) * i64::from(job.attempts);
+                retry_job(db, job.id, &claimed_at, &err_msg, delay_sec).await?;
+                warn!(job_id = job.id, job_type = %job.job_type, "job handler panicked -- scheduled for retry");
             }
         }
         Err(_) => {
@@ -555,72 +584,7 @@ pub async fn process_next_job(db: &Database) -> Result<bool> {
     Ok(true)
 }
 
-// -- Scheduler leases (ported from TS jobs/scheduler.ts) --
-/// Acquire or renew a scheduler lease for the current holder.
-#[tracing::instrument(skip(db), fields(job_name = %job_name, holder_id = %holder_id))]
-pub async fn acquire_lease(
-    db: &Database,
-    job_name: &str,
-    holder_id: &str,
-    ttl_sec: i64,
-) -> Result<bool> {
-    let job_name = job_name.to_string();
-    let holder_id = holder_id.to_string();
-    let modifier = format!("+{} seconds", ttl_sec);
-    db.write(move |conn| {
-        let n = conn.execute(
-            "INSERT INTO scheduler_leases (job_name, holder_id, expires_at) \
-                 VALUES (?1, ?2, datetime('now', ?3)) \
-                 ON CONFLICT(job_name) DO UPDATE SET \
-                   holder_id = ?2, \
-                   acquired_at = datetime('now'), \
-                   expires_at = datetime('now', ?3) \
-                 WHERE expires_at < datetime('now') OR holder_id = ?2",
-            params![job_name, holder_id, modifier],
-        )?;
-        Ok(n > 0)
-    })
-    .await
-}
-
-/// Release a scheduler lease held by the current holder.
-#[tracing::instrument(skip(db), fields(job_name = %job_name, holder_id = %holder_id))]
-pub async fn release_lease(db: &Database, job_name: &str, holder_id: &str) -> Result<()> {
-    let job_name = job_name.to_string();
-    let holder_id = holder_id.to_string();
-    db.write(move |conn| {
-        conn.execute(
-            "DELETE FROM scheduler_leases WHERE job_name = ?1 AND holder_id = ?2",
-            params![job_name, holder_id],
-        )?;
-        Ok(())
-    })
-    .await
-}
-
-/// Extend a scheduler lease and record that the holder ran the job.
-#[tracing::instrument(skip(db), fields(job_name = %job_name, holder_id = %holder_id))]
-pub async fn touch_lease(
-    db: &Database,
-    job_name: &str,
-    holder_id: &str,
-    ttl_sec: i64,
-) -> Result<bool> {
-    let job_name = job_name.to_string();
-    let holder_id = holder_id.to_string();
-    let modifier = format!("+{} seconds", ttl_sec);
-    db.write(move |conn| {
-        let n = conn
-            .execute(
-                "UPDATE scheduler_leases SET expires_at = datetime('now', ?3), last_run_at = datetime('now') WHERE job_name = ?1 AND holder_id = ?2",
-                params![job_name, holder_id, modifier],
-            )?;
-        Ok(n > 0)
-    })
-    .await
-}
-
-/// Unit tests for durable jobs and scheduler lease helpers.
+/// Unit tests for durable jobs.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,5 +793,111 @@ mod tests {
         assert_eq!(stats.failed, 1, "poison payload must fail permanently");
         assert_eq!(stats.pending, 0, "poison payload must not be requeued");
         assert_eq!(stats.running, 0);
+    }
+
+    /// The Job returned by claim_next_job must carry the exact claimed_at the
+    /// UPDATE stored. Pre-fix, the struct took a second clock reading in Rust;
+    /// when the two reads straddled a second boundary, every lease-gated
+    /// finalizer for that job silently no-oped (JOB-2) and the row hung at
+    /// 'running' until recover_stuck_jobs.
+    #[tokio::test]
+    async fn claimed_at_in_struct_matches_stored_row() {
+        let db = Database::connect_memory().await.expect("in-memory db");
+
+        let job_id = enqueue_job(&db, "test.lease_token", "{}", 3)
+            .await
+            .expect("enqueue");
+
+        let job = claim_next_job(&db)
+            .await
+            .expect("claim")
+            .expect("one pending job");
+        assert_eq!(job.id, job_id);
+
+        let stored: String = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT claimed_at FROM jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("read claimed_at");
+        assert_eq!(
+            job.claimed_at.as_deref(),
+            Some(stored.as_str()),
+            "struct lease token must equal the stored value"
+        );
+    }
+
+    /// A panicking handler must feed the normal retry path instead of
+    /// unwinding through process_next_job: first attempt of a two-attempt job
+    /// lands back at pending.
+    #[tokio::test]
+    async fn panicking_handler_is_retried_not_stuck() {
+        let db = Database::connect_memory().await.expect("in-memory db");
+
+        register_job_handler("test.panics_retry", |_payload| async move {
+            panic!("boom");
+        })
+        .await;
+
+        enqueue_job(&db, "test.panics_retry", "{}", 2)
+            .await
+            .expect("enqueue");
+
+        let processed = process_next_job(&db)
+            .await
+            .expect("panic must not propagate out of process_next_job");
+        assert!(processed);
+
+        let stats = get_job_stats(&db).await.expect("stats");
+        assert_eq!(stats.pending, 1, "first panic schedules a retry");
+        assert_eq!(stats.running, 0, "row must not hang at running");
+        assert_eq!(stats.failed, 0);
+    }
+
+    /// A panicking handler that has exhausted max_attempts must reach the
+    /// terminal failed state. Pre-fix this was impossible: the attempts check
+    /// lived in exactly the code the panic skipped, so a deterministically
+    /// panicking payload looped forever via recover_stuck_jobs.
+    #[tokio::test]
+    async fn panicking_handler_fails_after_max_attempts() {
+        let db = Database::connect_memory().await.expect("in-memory db");
+
+        register_job_handler("test.panics_final", |_payload| async move {
+            panic!("boom");
+        })
+        .await;
+
+        enqueue_job(&db, "test.panics_final", "{}", 1)
+            .await
+            .expect("enqueue");
+
+        let processed = process_next_job(&db)
+            .await
+            .expect("panic must not propagate out of process_next_job");
+        assert!(processed);
+
+        let stats = get_job_stats(&db).await.expect("stats");
+        assert_eq!(stats.failed, 1, "exhausted attempts must fail terminally");
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.running, 0);
+
+        let error: Option<String> = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT error FROM jobs WHERE type = 'test.panics_final'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("read error");
+        assert!(
+            error.unwrap_or_default().contains("panicked: boom"),
+            "panic reason must be recorded on the row"
+        );
     }
 }

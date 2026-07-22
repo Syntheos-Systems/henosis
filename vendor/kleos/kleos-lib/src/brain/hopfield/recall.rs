@@ -8,36 +8,44 @@ use super::network::{self, HopfieldNetwork};
 use super::pattern::{self, BrainPattern};
 
 // ---------------------------------------------------------------------------
-// Causal keyword tables -- ported from eidolon absorb.rs
+// Causal keyword tables, ported from eidolon absorb.rs and sourced from the
+// i18n lexicon (causal_strong, causal_context, causal_weak, negation_marker)
+// across every supported language. Hardcoded English-only constants were
+// removed. compute_causal_score runs per memory pair inside the Hopfield
+// update loop, so each set is assembled once and cached in a LazyLock rather
+// than rebuilt (8 word_class lookups + allocations) on every call.
 // ---------------------------------------------------------------------------
 
-const STRONG_CAUSAL: &[&str] = &[
-    "caused by",
-    "resulted in",
-    "led to",
-    "as a result",
-    "due to",
-    "thanks to",
-    "triggered",
-];
+use std::sync::LazyLock;
 
-const CONTEXT_CAUSAL: &[&str] = &["because", "since", "therefore", "consequently", "after"];
+/// Lowercased keywords for one lexicon class across all supported languages.
+fn lexicon_keywords(class: &'static str) -> Vec<String> {
+    crate::lexicon::supported_languages()
+        .iter()
+        .flat_map(|lang| crate::lexicon::word_class(lang, class))
+        .map(|w| w.to_lowercase())
+        .collect()
+}
 
-const WEAK_CAUSAL: &[&str] = &["broke", "fixed"];
+fn strong_causal_keywords() -> &'static [String] {
+    static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| lexicon_keywords("causal_strong"));
+    &CACHE
+}
 
-const NEGATION: &[&str] = &[
-    "not",
-    "never",
-    "didn't",
-    "wasn't",
-    "isn't",
-    "won't",
-    "can't",
-    "couldn't",
-    "wouldn't",
-    "shouldn't",
-    "no",
-];
+fn context_causal_keywords() -> &'static [String] {
+    static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| lexicon_keywords("causal_context"));
+    &CACHE
+}
+
+fn weak_causal_keywords() -> &'static [String] {
+    static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| lexicon_keywords("causal_weak"));
+    &CACHE
+}
+
+fn negation_keywords() -> &'static [String] {
+    static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| lexicon_keywords("negation_marker"));
+    &CACHE
+}
 
 // ---------------------------------------------------------------------------
 // Constants -- ported from eidolon decay.rs
@@ -300,6 +308,10 @@ async fn load_memory_content(
 ///
 /// Returns the total score. A score >= 3.0 triggers a causal edge.
 fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
+    let strong = strong_causal_keywords();
+    let context = context_causal_keywords();
+    let weak = weak_causal_keywords();
+    let negation = negation_keywords();
     let mut score = 0.0f32;
 
     // Pre-compute word indices of all causal keywords. Track each word's real
@@ -315,11 +327,11 @@ fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
         };
         let word_start = search_from + rel;
         let remaining = &text[word_start..];
-        let is_causal_kw = STRONG_CAUSAL
+        let is_causal_kw = strong
             .iter()
-            .chain(CONTEXT_CAUSAL.iter())
-            .chain(WEAK_CAUSAL.iter())
-            .any(|kw| remaining.starts_with(kw));
+            .chain(context.iter())
+            .chain(weak.iter())
+            .any(|kw| remaining.starts_with(kw.as_str()));
         if is_causal_kw {
             all_kw_word_indices.push(wi);
         }
@@ -328,7 +340,7 @@ fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
 
     let has_negation = |word_idx: usize| -> bool {
         let start = word_idx.saturating_sub(3);
-        (start..word_idx).any(|i| NEGATION.contains(&words[i]))
+        (start..word_idx).any(|i| negation.iter().any(|n| n.as_str() == words[i]))
     };
 
     let has_nearby_causal = |word_idx: usize| -> bool {
@@ -337,8 +349,8 @@ fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
             .any(|&pos| pos != word_idx && (pos as isize - word_idx as isize).unsigned_abs() <= 5)
     };
 
-    for kw in STRONG_CAUSAL {
-        if let Some(pos) = text.find(kw) {
+    for kw in strong {
+        if let Some(pos) = text.find(kw.as_str()) {
             let word_idx = text[..pos].split_whitespace().count();
             let mut pts = 2.0f32;
             if word_idx < words.len() && has_negation(word_idx) {
@@ -348,8 +360,8 @@ fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
         }
     }
 
-    for kw in CONTEXT_CAUSAL {
-        if let Some(pos) = text.find(kw) {
+    for kw in context {
+        if let Some(pos) = text.find(kw.as_str()) {
             let word_idx = text[..pos].split_whitespace().count();
             let negated = word_idx < words.len() && has_negation(word_idx);
             let has_context = has_nearby_causal(word_idx);
@@ -361,8 +373,8 @@ fn compute_causal_score(text: &str, words: &[&str]) -> f32 {
         }
     }
 
-    for kw in WEAK_CAUSAL {
-        if let Some(pos) = text.find(kw) {
+    for kw in weak {
+        if let Some(pos) = text.find(kw.as_str()) {
             let word_idx = text[..pos].split_whitespace().count();
             let mut pts = 1.0f32;
             if word_idx < words.len() && has_negation(word_idx) {
@@ -457,8 +469,22 @@ pub async fn decay_tick(
     let importance_map: std::collections::HashMap<i64, i32> =
         db_patterns.iter().map(|p| (p.id, p.importance)).collect();
 
-    // Decay each pattern in the network
-    for &id in network.pattern_ids().to_vec().iter() {
+    // The in-process Hopfield network is shared across tenants (one instance per
+    // server process, holding every user's absorbed patterns), so
+    // network.pattern_ids() spans all owners. Restrict decay, persistence, and
+    // eviction to the caller's own patterns: iterating all of them would mutate
+    // and evict other tenants' patterns from memory while only the caller's DB
+    // rows are persisted/deleted -- cross-tenant recall loss and in-memory/DB
+    // desync.
+    let owned_ids: Vec<i64> = network
+        .pattern_ids()
+        .iter()
+        .copied()
+        .filter(|&id| network.owner_of(id) == Some(user_id))
+        .collect();
+
+    // Decay each of the caller's own patterns in the network
+    for &id in owned_ids.iter() {
         let old_strength = match network.strength(id) {
             Some(s) => s,
             None => continue,
@@ -477,8 +503,8 @@ pub async fn decay_tick(
         }
     }
 
-    // Persist decayed strengths
-    for &id in network.pattern_ids() {
+    // Persist decayed strengths (caller's patterns only)
+    for &id in &owned_ids {
         if let Some(s) = network.strength(id) {
             if let Err(e) = pattern::update_strength(db, id, user_id, s).await {
                 tracing::warn!(pattern_id = id, strength = s, error = %e, "update_strength (decay persist) failed");
@@ -516,8 +542,14 @@ pub async fn prune_weak(
     user_id: i64,
     threshold: f32,
 ) -> Result<usize> {
+    // Shared network: prune only the caller's own patterns. Iterating all
+    // pattern_ids would evict other tenants' weak patterns from the in-process
+    // network while the DB delete below is scoped to user_id (see decay_tick).
     let mut dead = Vec::new();
     for &id in network.pattern_ids().to_vec().iter() {
+        if network.owner_of(id) != Some(user_id) {
+            continue;
+        }
         if let Some(s) = network.strength(id) {
             if s < threshold {
                 dead.push(id);

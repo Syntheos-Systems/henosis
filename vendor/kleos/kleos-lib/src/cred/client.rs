@@ -234,6 +234,14 @@ impl CreddClient {
             .map_err(|e| EngError::Internal(format!("invalid credd list response: {}", e)))?;
         let refs = parse_secret_refs(&payload)?;
 
+        // Scrub mode receives PLAINTEXT by design: these values are the
+        // search needles the content-scrubber matches against outbound text
+        // to redact them. A masked fetch would make redaction impossible
+        // (the scanner would hunt for the mask, not the secret). The values
+        // stay in-process; only the redacted content leaves. Restricting
+        // scrub-tier keys further requires moving the matching server-side
+        // into credd, which is an architectural change, not a fetch-time
+        // permission check.
         let mut secrets = Vec::new();
         for (service, key) in refs {
             secrets.push(
@@ -398,6 +406,9 @@ impl CreddClient {
     }
 
     fn build_url(&self, segments: &[&str]) -> Result<Url> {
+        // Every credd request below attaches the agent Bearer; refuse to send it
+        // over plaintext http to a non-loopback host (https or loopback only).
+        crate::net::guard_bearer_transport(&self.base_url)?;
         let mut url = Url::parse(&self.base_url)
             .map_err(|e| EngError::InvalidInput(format!("invalid credd url: {}", e)))?;
         {

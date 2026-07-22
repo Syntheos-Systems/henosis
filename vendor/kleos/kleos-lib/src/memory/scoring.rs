@@ -26,10 +26,96 @@ static DECAY_FLOOR_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
 pub fn decay_floor() -> f64 {
     *DECAY_FLOOR_OVERRIDE
 }
+/// Default weight applied to the PageRank graph-centrality boost in the score chain.
 pub const PAGERANK_WEIGHT: f64 = 0.15;
+/// Default minimum vector-cosine score a candidate must clear to enter the vector channel.
 pub const DEFAULT_VECTOR_FLOOR: f64 = 0.15;
-pub const RRF_K: f64 = 60.0;
+/// Default Reciprocal Rank Fusion constant. Larger K flattens the rank-position weighting
+/// (later ranks contribute relatively more); smaller K sharpens toward the top. Raised from
+/// 60 to 90 after offline-harness cross-validation: BEIR SciFact recall@10 0.936 -> 0.956 and
+/// LoCoMo metrics all up, with no golden-FTS-gate regression (single-channel fusion is
+/// rank-monotonic in K). Overridable at runtime via KLEOS_RRF_K; see `rrf_k()`.
+pub const RRF_K: f64 = 90.0;
+/// Default weight applied to the recency boost in the score chain.
 pub const RECENCY_WEIGHT: f64 = 0.15;
+
+// 2.3: make the two global ranking-boost weights tunable at runtime without a rebuild,
+// mirroring the KLEOS_DECAY_FLOOR pattern above. Recall tuning (e.g. against the offline
+// eval harness) can sweep these via env instead of recompiling. Values are clamped to a
+// sane range so a typo cannot blow up the multiplicative score chain.
+static PAGERANK_WEIGHT_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("KLEOS_PAGERANK_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|w| w.clamp(0.0, 5.0))
+        .unwrap_or(PAGERANK_WEIGHT)
+});
+/// Runtime pagerank boost weight (KLEOS_PAGERANK_WEIGHT override, clamped to [0, 5]).
+pub fn pagerank_weight() -> f64 {
+    *PAGERANK_WEIGHT_OVERRIDE
+}
+
+static RECENCY_WEIGHT_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("KLEOS_RECENCY_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|w| w.clamp(0.0, 5.0))
+        .unwrap_or(RECENCY_WEIGHT)
+});
+/// Runtime recency boost weight (KLEOS_RECENCY_WEIGHT override, clamped to [0, 5]).
+pub fn recency_weight() -> f64 {
+    *RECENCY_WEIGHT_OVERRIDE
+}
+
+// Make the reciprocal-rank-fusion constant tunable at runtime, mirroring the weight
+// overrides above. Larger K flattens the rank-position weighting (rank-1 vs rank-10 differ
+// less); smaller K sharpens it. Exposing it lets the offline eval harness sweep RRF_K
+// without a rebuild; clamped so a typo cannot collapse the fusion denominator.
+static RRF_K_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("KLEOS_RRF_K")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|k| k.clamp(1.0, 1000.0))
+        .unwrap_or(RRF_K)
+});
+/// Runtime RRF constant (KLEOS_RRF_K override, clamped to [1, 1000]).
+pub fn rrf_k() -> f64 {
+    *RRF_K_OVERRIDE
+}
+
+// B.4: optional BM25-magnitude blend. RRF is rank-only, so a strong lexical hit (high BM25)
+// and a weak one contribute identically once ranked. This weight adds a small
+// min-max-normalized magnitude term to the FTS contribution. Default 0.0 (pure RRF) until the
+// offline harness tunes it; clamped to [0,1] so it cannot dominate the rank signal.
+const DEFAULT_FTS_SCORE_BLEND: f64 = 0.0;
+static FTS_SCORE_BLEND_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("KLEOS_FTS_SCORE_BLEND")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|w| w.clamp(0.0, 1.0))
+        .unwrap_or(DEFAULT_FTS_SCORE_BLEND)
+});
+/// Runtime BM25-magnitude blend weight (KLEOS_FTS_SCORE_BLEND override, clamped to [0, 1]).
+pub fn fts_score_blend() -> f64 {
+    *FTS_SCORE_BLEND_OVERRIDE
+}
+
+// B.3: Maximal Marginal Relevance diversity weight. lambda=1.0 is pure relevance (no
+// diversification); lambda=0.0 disables MMR entirely (the default, so behavior is unchanged
+// until the harness tunes it). Lower values trade relevance for novelty, preventing a cluster
+// of near-duplicate memories from crowding the top of the result list. Clamped to [0,1].
+const DEFAULT_MMR_LAMBDA: f64 = 0.0;
+static MMR_LAMBDA_OVERRIDE: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("KLEOS_MMR_LAMBDA")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|w| w.clamp(0.0, 1.0))
+        .unwrap_or(DEFAULT_MMR_LAMBDA)
+});
+/// Runtime MMR diversity weight (KLEOS_MMR_LAMBDA override, clamped to [0, 1]; 0 disables MMR).
+pub fn mmr_lambda() -> f64 {
+    *MMR_LAMBDA_OVERRIDE
+}
 
 /// Extra classifier keywords loaded once from env vars at first use.
 /// Each var is a comma-separated list of lowercase phrases that are
@@ -289,8 +375,15 @@ pub fn classify_question_mixed(query: &str) -> HashMap<QuestionType, f64> {
 
     let total: f64 = scores.values().sum();
     if total == 0.0 {
+        // 2.4: no keyword signal means the query is ambiguous natural language. Falling
+        // back to pure FactRecall picks the NARROWEST recall posture (highest vector
+        // floor, lowest candidate multiplier, no relationship expansion), which is exactly
+        // wrong when we know least about intent. Blend FactRecall with Reasoning so the
+        // strategy keeps fact precision but widens the candidate pool and enables light
+        // relationship expansion.
         let mut m = HashMap::new();
-        m.insert(QuestionType::FactRecall, 1.0);
+        m.insert(QuestionType::FactRecall, 0.5);
+        m.insert(QuestionType::Reasoning, 0.5);
         return m;
     }
     for v in scores.values_mut() {
@@ -450,18 +543,21 @@ pub fn extract_query_date(query: &str) -> Option<String> {
                 let days = if unit.starts_with("day") {
                     n
                 } else if unit.starts_with("week") {
-                    n * 7
+                    n.saturating_mul(7)
                 } else if unit.starts_with("month") {
-                    n * 30
+                    n.saturating_mul(30)
                 } else {
                     0
                 };
                 if days > 0 {
-                    return Some(
-                        (now - chrono::Duration::days(days))
-                            .format("%Y-%m-%d")
-                            .to_string(),
-                    );
+                    // Clamp before building the Duration: an absurd N (e.g.
+                    // "99999999999 days ago" from a crafted query) would otherwise
+                    // overflow chrono's Duration or the DateTime subtraction and
+                    // panic the request. Saturating_mul above guards the unit scale.
+                    let days = days.min(MAX_QUERY_AGE_DAYS);
+                    if let Some(dt) = now.checked_sub_signed(chrono::Duration::days(days)) {
+                        return Some(dt.format("%Y-%m-%d").to_string());
+                    }
                 }
             }
         }
@@ -469,9 +565,51 @@ pub fn extract_query_date(query: &str) -> Option<String> {
     None
 }
 
+/// Upper bound (in days) that a natural-language "N units ago" query may resolve
+/// to. Clamps chrono Duration/DateTime math so a crafted query cannot overflow
+/// and panic; ~10,000 years is far past any real memory age.
+const MAX_QUERY_AGE_DAYS: i64 = 3_650_000;
+
+/// Relevance-gate decision shared by search post-filtering and context assembly.
+/// The floor is a `[0,1]` relevance value, so it must be compared against a signal
+/// on that scale: the cross-encoder-blended `score` when the reranker ran,
+/// otherwise the cosine `semantic_score`. Results with neither (FTS-only hits)
+/// carry lexical signal and are kept. The raw RRF-fusion `score` (~0.02) must
+/// never be compared against a similarity-scale floor -- that silently drops the
+/// entire semantic layer when no reranker is active to rescale it.
+pub(crate) fn passes_relevance_gate(
+    reranked: Option<bool>,
+    score: f64,
+    semantic_score: Option<f64>,
+    min_relev: f64,
+) -> bool {
+    let gate = if reranked == Some(true) {
+        Some(score)
+    } else {
+        semantic_score
+    };
+    match gate {
+        Some(s) => s >= min_relev,
+        None => true,
+    }
+}
+
+/// Pick the default relevance floor for the signal `passes_relevance_gate`
+/// will compare. The two arms live on different scales (the CE-blended score
+/// runs far lower than raw bge-m3 cosines; see
+/// `DEFAULT_RERANKED_MIN_RELEVANCE`), so each arm gets its own default. An
+/// explicit caller-supplied floor wins for both arms unchanged.
+pub(crate) fn effective_min_relevance(explicit: Option<f64>, reranked: Option<bool>) -> f64 {
+    match (explicit, reranked) {
+        (Some(x), _) => x,
+        (None, Some(true)) => crate::context::types::DEFAULT_RERANKED_MIN_RELEVANCE,
+        (None, _) => crate::context::types::DEFAULT_MIN_RELEVANCE,
+    }
+}
+
 /// Computes a reciprocal-rank score for one result position.
 pub fn rrf_score(rank: usize) -> f64 {
-    1.0 / (RRF_K + rank as f64 + 1.0)
+    1.0 / (rrf_k() + rank as f64 + 1.0)
 }
 
 /// Boosts memories that are close to the query date.
@@ -525,7 +663,7 @@ pub fn static_boost(is_static: bool, is_consolidated: bool) -> f64 {
 
 /// Converts PageRank into a small multiplicative boost.
 pub fn pagerank_boost(pagerank_score: f64) -> f64 {
-    1.0 + pagerank_score * PAGERANK_WEIGHT
+    1.0 + pagerank_score * pagerank_weight()
 }
 
 /// Computes a smooth recency curve from a memory timestamp.
@@ -585,6 +723,63 @@ mod tests {
         assert!(extract_query_date("yesterday").is_some());
         assert!(extract_query_date("last week").is_some());
         assert!(extract_query_date("3 days ago").is_some());
+    }
+
+    /// A crafted "N units ago" query with an absurd N must clamp, not panic the
+    /// request via chrono Duration/DateTime overflow.
+    #[test]
+    fn extract_relative_absurd_n_clamps_without_panicking() {
+        assert!(extract_query_date("99999999999999 days ago").is_some());
+        assert!(extract_query_date("99999999999999 months ago").is_some());
+        assert!(extract_query_date(&format!("{} weeks ago", i64::MAX)).is_some());
+    }
+
+    /// The relevance gate compares against the scale-appropriate [0,1] signal:
+    /// the CE score when reranked, the cosine semantic_score otherwise, and keeps
+    /// results that carry neither (FTS-only lexical hits).
+    #[test]
+    fn relevance_gate_uses_scale_appropriate_signal() {
+        // Reranked: gate on the already-[0,1] blended score; ignore semantic_score.
+        assert!(passes_relevance_gate(Some(true), 0.62, Some(0.10), 0.55));
+        assert!(!passes_relevance_gate(Some(true), 0.40, Some(0.99), 0.55));
+        // Not reranked: gate on cosine, ignore the tiny RRF-fusion score. A real
+        // match (cosine 0.60) now survives where the raw 0.02 fusion score would
+        // previously have dropped it against the 0.55 floor.
+        assert!(passes_relevance_gate(Some(false), 0.02, Some(0.80), 0.55));
+        assert!(passes_relevance_gate(None, 0.02, Some(0.60), 0.55));
+        assert!(!passes_relevance_gate(Some(false), 0.02, Some(0.30), 0.55));
+        // FTS-only hit (no cosine) is kept regardless of the tiny fusion score.
+        assert!(passes_relevance_gate(Some(false), 0.02, None, 0.55));
+    }
+
+    /// Each gate arm gets a scale-appropriate default floor (cosine 0.55 vs
+    /// CE-blend 0.25), while an explicit caller floor overrides both arms.
+    #[test]
+    fn effective_min_relevance_defaults_split_by_arm() {
+        use crate::context::types::{DEFAULT_MIN_RELEVANCE, DEFAULT_RERANKED_MIN_RELEVANCE};
+        // Explicit override wins on both arms.
+        assert_eq!(effective_min_relevance(Some(0.9), Some(true)), 0.9);
+        assert_eq!(effective_min_relevance(Some(0.9), None), 0.9);
+        // Reranked default is the CE-blend-scale floor.
+        assert_eq!(
+            effective_min_relevance(None, Some(true)),
+            DEFAULT_RERANKED_MIN_RELEVANCE
+        );
+        // Non-reranked (and unknown) defaults stay on the cosine-scale floor.
+        assert_eq!(
+            effective_min_relevance(None, Some(false)),
+            DEFAULT_MIN_RELEVANCE
+        );
+        assert_eq!(effective_min_relevance(None, None), DEFAULT_MIN_RELEVANCE);
+        // A wanted reranked block at the observed 0.28-0.34 band survives the
+        // new default where the old shared 0.55 floor dropped it.
+        assert!(passes_relevance_gate(
+            Some(true),
+            0.28,
+            Some(0.10),
+            effective_min_relevance(None, Some(true))
+        ));
+        assert!(!passes_relevance_gate(Some(true), 0.28, Some(0.10), 0.55));
     }
 
     /// Verifies month-day phrases normalize to a calendar date.

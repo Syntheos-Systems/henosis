@@ -237,33 +237,45 @@ impl HopfieldNetwork {
             None => return Vec::new(),
         };
 
+        // A query whose length does not match the stored pattern dimension
+        // would panic inside the ndarray dot product below; treat the mismatch
+        // as a no-match instead of crashing the caller.
+        if query.len() != self.dim {
+            return Vec::new();
+        }
+
         let q = Array1::from(l2_normalize(query));
 
         // sims = patterns @ query -- dot product of each stored pattern with query
         let sims = mat.dot(&q);
-
-        // logits[i] = beta * sims[i] * strengths[i]
         let n = sims.len();
-        let mut logits = Vec::with_capacity(n);
-        for i in 0..n {
-            logits.push(beta * sims[i] * self.strengths[i]);
-        }
 
-        // Softmax across the full population: tenant filtering after the
-        // softmax keeps the distribution comparable to the un-scoped case
-        // (filtering before would inflate the surviving tenant's scores).
-        let activations = softmax(&logits);
-
-        // Filter, collect, sort
-        let mut results: Vec<(i64, f32)> = activations
-            .iter()
-            .enumerate()
-            .filter(|(_, &a)| a >= ACTIVATION_THRESHOLD)
-            .filter(|(i, _)| match owner_user_id {
-                Some(uid) => self.user_ids[*i] == uid,
+        // Restrict to the owner's patterns BEFORE softmax. Softmax over the full
+        // multi-tenant population puts other tenants' logits in the denominator,
+        // shrinking a tenant's own activations as unrelated tenants add data (a
+        // tenant with strong matches can fall below ACTIVATION_THRESHOLD purely
+        // because the shared brain grew). Normalising over just the owner's
+        // subset makes a tenant's retrieval independent of other tenants' volume.
+        let candidates: Vec<usize> = (0..n)
+            .filter(|&i| match owner_user_id {
+                Some(uid) => self.user_ids[i] == uid,
                 None => true,
             })
-            .map(|(i, &a)| (self.pattern_ids[i], a))
+            .collect();
+
+        // logits = beta * sims[i] * strengths[i] over the candidate subset
+        let logits: Vec<f32> = candidates
+            .iter()
+            .map(|&i| beta * sims[i] * self.strengths[i])
+            .collect();
+        let activations = softmax(&logits);
+
+        // Filter by activation, collect, sort
+        let mut results: Vec<(i64, f32)> = candidates
+            .iter()
+            .zip(activations.iter())
+            .filter(|(_, &a)| a >= ACTIVATION_THRESHOLD)
+            .map(|(&i, &a)| (self.pattern_ids[i], a))
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -291,6 +303,12 @@ impl HopfieldNetwork {
             Some(m) => m,
             None => return query.to_vec(),
         };
+
+        // A dimension-mismatched query would panic in the dot product below;
+        // return it unchanged (no attractor to complete toward) instead.
+        if query.len() != self.dim {
+            return query.to_vec();
+        }
 
         let mut state = Array1::from(l2_normalize(query));
         let n = mat.nrows();

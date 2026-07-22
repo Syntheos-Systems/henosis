@@ -52,11 +52,14 @@ pub async fn pack_memories(
     // Layer 1: Static facts
     let static_candidates: Vec<PackCandidate> = db
         .read(move |conn| {
+            // status != 'pending' is the review-gate predicate: /pack assembles
+            // agent context, so pending statics must not be packed.
             let mut stmt = conn.prepare(
                 "SELECT id, content, category, importance \
                      FROM memories \
                      WHERE is_static = 1 AND is_forgotten = 0 AND is_archived = 0 \
                        AND is_consolidated = 0 AND is_latest = 1 \
+                       AND status != 'pending' \
                        AND user_id = ?1",
             )?;
             let rows = stmt.query_map(rusqlite::params![static_user_id], |row| {
@@ -82,12 +85,15 @@ pub async fn pack_memories(
     // Layer 2: High-importance memories
     let important_candidates: Vec<PackCandidate> = db
         .read(move |conn| {
+            // status != 'pending' is the review-gate predicate for the layer-2
+            // high-importance pull, which otherwise ranks unreviewed memories in.
             let mut stmt = conn.prepare(
                 "SELECT id, content, category, importance, \
                             COALESCE(decay_score, importance) as ds \
                      FROM memories \
                      WHERE is_forgotten = 0 AND is_archived = 0 AND is_latest = 1 \
-                       AND is_consolidated = 0 AND user_id = ?1 \
+                       AND is_consolidated = 0 AND status != 'pending' \
+                       AND user_id = ?1 \
                      ORDER BY ds DESC LIMIT 30",
             )?;
             let rows = stmt.query_map(rusqlite::params![important_user_id], |row| {

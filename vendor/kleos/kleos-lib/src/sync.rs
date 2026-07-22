@@ -7,6 +7,7 @@ use crate::memory;
 use crate::memory::types::StoreRequest;
 use crate::Result;
 
+/// One change record received from a peer kleos instance during sync.
 #[derive(Debug, Deserialize)]
 pub struct SyncReceiveChange {
     pub sync_id: String,
@@ -17,12 +18,15 @@ pub struct SyncReceiveChange {
     pub timestamp: Option<String>,
 }
 
+/// Summary of how many received sync changes were applied versus skipped.
 #[derive(Debug, Serialize)]
 pub struct SyncReceiveResult {
     pub applied: i64,
     pub skipped: i64,
 }
 
+/// Apply a batch of received sync changes for `user_id`, deduping inserts and
+/// scoping every read and write to that tenant's rows.
 #[tracing::instrument(skip(db, changes), fields(change_count = changes.len()))]
 pub async fn receive_sync(
     db: &Database,
@@ -44,11 +48,16 @@ pub async fn receive_sync(
                 };
 
                 let sync_id = change.sync_id.clone();
+                // Scope the dedup probe to this tenant. In shared-monolith mode sync_id is
+                // not globally unique, so an unscoped probe (a) leaks the existence of
+                // another tenant's row and (b) wrongly skips this tenant's own insert when a
+                // different tenant already holds the same sync_id.
                 let exists = db
                     .read(move |conn| {
-                        let mut stmt =
-                            conn.prepare("SELECT id FROM memories WHERE sync_id = ?1")?;
-                        let mut rows = stmt.query(rusqlite::params![sync_id])?;
+                        let mut stmt = conn.prepare(
+                            "SELECT id FROM memories WHERE sync_id = ?1 AND user_id = ?2",
+                        )?;
+                        let mut rows = stmt.query(rusqlite::params![sync_id, user_id])?;
                         Ok(rows.next()?.is_some())
                     })
                     .await?;
@@ -74,11 +83,15 @@ pub async fn receive_sync(
             }
             "delete" => {
                 let sync_id = change.sync_id.clone();
+                // Scope the soft-delete to this tenant. Without the user_id predicate any
+                // tenant could forget another tenant's memory by guessing/replaying a
+                // sync_id in shared-monolith mode.
                 let affected = db
                     .write(move |conn| {
                         Ok(conn.execute(
-                            "UPDATE memories SET is_forgotten = 1 WHERE sync_id = ?1",
-                            rusqlite::params![sync_id],
+                            "UPDATE memories SET is_forgotten = 1 \
+                             WHERE sync_id = ?1 AND user_id = ?2",
+                            rusqlite::params![sync_id, user_id],
                         )?)
                     })
                     .await?;

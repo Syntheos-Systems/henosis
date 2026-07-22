@@ -4,11 +4,15 @@ pub mod agents;
 pub mod approvals;
 pub mod artifacts;
 pub mod artifacts_crypto;
+pub mod attention;
 pub mod audit;
 pub mod auth;
 pub mod auth_piv;
 pub mod commerce;
-pub mod config;
+// Re-exported from the shared `kleos-config` crate so existing call sites keep
+// using `kleos_lib::config::*` (and `crate::config::*` within this crate) while
+// the schema lives in one place that the installer also depends on.
+pub use kleos_config::config;
 pub mod context;
 pub mod conversations;
 pub mod cred;
@@ -29,6 +33,8 @@ pub mod inbox;
 pub mod ingestion;
 pub mod intelligence;
 pub mod jobs;
+pub mod lang;
+pub mod lexicon;
 pub mod llm;
 pub mod mcp_token;
 pub mod memory;
@@ -58,13 +64,15 @@ pub mod webhooks;
 #[cfg(feature = "brain_hopfield")]
 pub mod brain;
 
-pub mod env;
-// Re-exported so call sites use `kleos_lib::kleos_env(..)` (or `crate::kleos_env`
-// within this crate) without an explicit import at every site.
-pub use env::kleos_env;
+// Environment resolution now lives in the shared `kleos-config` crate; re-export
+// it at the historical paths so call sites use `kleos_lib::kleos_env(..)` (or
+// `crate::kleos_env` within this crate) without an explicit import at every site.
+pub use kleos_config::env;
+pub use kleos_config::kleos_env;
 
 use thiserror::Error;
 
+/// Crate-wide error type spanning database, IO, auth, and domain failures.
 #[derive(Debug, Error)]
 pub enum EngError {
     #[error("database error: {0}")]
@@ -110,8 +118,10 @@ pub enum EngError {
     QuotaExceeded(String),
 }
 
+/// Convenience alias for results that fail with [`EngError`].
 pub type Result<T> = std::result::Result<T, EngError>;
 
+/// Tests for error construction and conversion behavior.
 #[cfg(test)]
 mod error_tests {
     use super::*;

@@ -419,14 +419,25 @@ fn format_scratch_age(updated_at: &str) -> String {
         mode = ?opts.mode,
     )
 )]
+/// Public entry point: assemble layered context for a query (non-streaming).
 pub async fn assemble_context(
     db: &Database,
     opts: ContextOptions,
     user_id: i64,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     llm_client: Option<Arc<LocalModelClient>>,
+    reranker: Option<Arc<dyn crate::reranker::Reranker>>,
 ) -> Result<ContextResult> {
-    assemble_context_inner(db, opts, user_id, embedding_provider, llm_client, None).await
+    assemble_context_inner(
+        db,
+        opts,
+        user_id,
+        embedding_provider,
+        llm_client,
+        reranker,
+        None,
+    )
+    .await
 }
 
 /// Streaming variant: same as `assemble_context` but sends
@@ -440,12 +451,14 @@ pub async fn assemble_context(
         mode = ?opts.mode,
     )
 )]
+// Streaming entry point: like assemble_context but emits per-phase progress events.
 pub async fn assemble_context_streaming(
     db: &Database,
     opts: ContextOptions,
     user_id: i64,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     llm_client: Option<Arc<LocalModelClient>>,
+    reranker: Option<Arc<dyn crate::reranker::Reranker>>,
     progress_tx: ProgressSender,
 ) -> Result<ContextResult> {
     assemble_context_inner(
@@ -454,6 +467,7 @@ pub async fn assemble_context_streaming(
         user_id,
         embedding_provider,
         llm_client,
+        reranker,
         Some(progress_tx),
     )
     .await
@@ -485,6 +499,7 @@ async fn assemble_context_inner(
     user_id: i64,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     llm_client: Option<Arc<LocalModelClient>>,
+    reranker: Option<Arc<dyn crate::reranker::Reranker>>,
     progress_tx: Option<ProgressSender>,
 ) -> Result<ContextResult> {
     // --- Apply mode preset ---
@@ -507,7 +522,11 @@ async fn assemble_context_inner(
     let flags = resolve_layer_flags(&opts, depth);
     let semantic_ceiling = resolve_semantic_ceiling(&context_strategy, opts.semantic_ceiling);
     let semantic_limit = resolve_semantic_limit(&context_strategy, opts.semantic_limit);
-    let min_relev = opts.min_relevance.unwrap_or(DEFAULT_MIN_RELEVANCE);
+    // Relevance floor: resolved PER RESULT at the gate below, because the two
+    // gate arms compare signals on different scales (CE-blended score vs raw
+    // cosine) and therefore carry different defaults. An explicit
+    // `opts.min_relevance` still overrides both arms.
+    let min_relevance_opt = opts.min_relevance;
 
     let truncate = |content: &str| truncate_to_token_budget(content, max_memory_tokens);
 
@@ -532,7 +551,10 @@ async fn assemble_context_inner(
 
     // ---- Phase 1: Static facts, ranked by query relevance ----
     if flags.include_static {
-        let mut statics = get_static_memories(db, user_id).await.unwrap_or_default();
+        let mut statics = get_static_memories(db, user_id).await.unwrap_or_else(|e| {
+            tracing::warn!("context assembly: static-memory fetch failed: {e}");
+            Default::default()
+        });
         if let Some(ref sf) = source_filter {
             statics.retain(|s| s.source.contains(sf.as_str()));
         }
@@ -552,15 +574,44 @@ async fn assemble_context_inner(
             relevance += (s.source_count as f64 / 20.0).min(0.1);
             scored.push((i, relevance, static_emb));
         }
-        scored.sort_by(|a, b| cmp_score_desc(a.1, b.1));
+        // 3.3: float the highest-importance pinned statics to the front so a critical
+        // permanent fact (identity, safety, owner rule) is not evicted just because it
+        // scores low on cosine similarity to the current query. Only statics at or above
+        // RESERVED_IMPORTANCE_FLOOR jump the queue (a rare, high tier); everything else
+        // keeps pure query-relevance ordering.
+        const RESERVED_IMPORTANCE_FLOOR: i32 = 9;
+        const RESERVED_STATIC_SLOTS: usize = 2;
+        scored.sort_by(|a, b| {
+            let a_pinned = statics[a.0].importance >= RESERVED_IMPORTANCE_FLOOR;
+            let b_pinned = statics[b.0].importance >= RESERVED_IMPORTANCE_FLOOR;
+            match (a_pinned, b_pinned) {
+                (true, true) => statics[b.0]
+                    .importance
+                    .cmp(&statics[a.0].importance)
+                    .then_with(|| cmp_score_desc(a.1, b.1)),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => cmp_score_desc(a.1, b.1),
+            }
+        });
 
         let static_budget_fraction = resolve_static_budget_fraction(&context_strategy);
+        let mut reserved_emitted = 0usize;
         for (idx, relevance, static_emb) in scored {
             let mem = &statics[idx];
             let truncated = truncate(&mem.content);
             let tokens = estimate_tokens(&truncated);
-            if used_tokens + tokens > (token_budget as f64 * static_budget_fraction) as usize {
+            // 3.3: guarantee a slot for up to RESERVED_STATIC_SLOTS top-importance pinned
+            // statics even under a tight static budget; the rest respect the fraction.
+            let is_reserved = mem.importance >= RESERVED_IMPORTANCE_FLOOR
+                && reserved_emitted < RESERVED_STATIC_SLOTS;
+            if !is_reserved
+                && used_tokens + tokens > (token_budget as f64 * static_budget_fraction) as usize
+            {
                 break;
+            }
+            if is_reserved {
+                reserved_emitted += 1;
             }
             blocks.push(ContextBlock {
                 id: mem.id,
@@ -608,17 +659,57 @@ async fn assemble_context_inner(
         exclude_consolidated: Some(true),
         ..Default::default()
     };
-    let semantic_results = hybrid_search(db, search_req).await.unwrap_or_default();
+    // A failed semantic search must be observable: silently defaulting to an
+    // empty result set is indistinguishable from "no relevant memories" and
+    // hides systemic DB/embedding failures from operators.
+    let mut semantic_results = hybrid_search(db, search_req).await.unwrap_or_else(|e| {
+        tracing::warn!("context assembly: semantic search failed: {e}");
+        Default::default()
+    });
     timing.search_ms = Some(t_search.elapsed().as_millis() as u64);
 
-    // Cross-encoder reranking is available via kleos_lib::reranker::Reranker.
-    // To wire it here, add a reranker: Option<Arc<dyn Reranker>> parameter
-    // to assemble_context_inner and call reranker.rerank_results(&opts.query,
-    // &mut semantic_results).await before the scoring loop below.
-    // The server AppState already holds the reranker; threading it through
-    // assemble_context's public signature is the remaining work.
+    // 3.1: context assembly is what the model actually reads, yet without this it ranks
+    // semantic memories with strictly weaker signal than /search (no cross-encoder). When a
+    // reranker is supplied, rerank the semantic results before the budget-gated selection
+    // loop below, so the highest-fidelity ordering drives which memories are selected and
+    // the order in which the model sees them.
+    if let Some(ref rr) = reranker {
+        let t_rerank = Instant::now();
+        let mut reranked = (*semantic_results).clone();
+        match rr.rerank_results(&opts.query, &mut reranked).await {
+            Ok(()) => {
+                semantic_results = Arc::new(reranked);
+                timing.rerank_ms = Some(t_rerank.elapsed().as_millis() as u64);
+            }
+            Err(e) => tracing::warn!("context reranker failed: {e}"),
+        }
+    }
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    // L2 ABSTAIN -- observability only in context assembly. The per-memory `min_relev`
+    // filter below already drops weak entries, so we deliberately do NOT empty the pool
+    // here: that would starve context of legitimately-useful-but-below-top memories.
+    // Instead, when the gate is enabled and would abstain on this query, log it so
+    // operators can see the semantic layer feeding the model was low-confidence. Default
+    // off -> this block is a no-op.
+    {
+        let cfg = crate::memory::abstain::AbstainConfig::from_env();
+        if cfg.enabled {
+            let qt = semantic_results
+                .iter()
+                .find_map(|r| r.question_type)
+                .unwrap_or(crate::memory::types::QuestionType::FactRecall);
+            let decision = crate::memory::abstain::abstain_gate(&semantic_results, qt, &cfg);
+            if decision.abstain {
+                tracing::info!(
+                    reason = decision.reason.as_deref().unwrap_or(""),
+                    signal = decision.signal,
+                    sem_top = ?decision.sem_top,
+                    ce_top = ?decision.ce_top,
+                    "context assembly: abstain gate would fire; semantic layer is low-confidence"
+                );
+            }
+        }
+    }
 
     for r in semantic_results.iter() {
         if seen_ids.contains(&r.memory.id) {
@@ -656,24 +747,27 @@ async fn assemble_context_inner(
             }
         }
 
-        let raw_score = r.score;
-        if raw_score < min_relev {
+        // Gate on a [0,1] relevance signal. r.score is the CE-blended confidence
+        // only when the reranker ran; otherwise it is the raw RRF-fusion value
+        // (~0.02) that no real match can clear, so the cosine semantic_score is
+        // used instead (FTS-only hits with no cosine are kept). The default
+        // floor is per-arm (cosine 0.55 vs CE-blend 0.25): sharing the cosine
+        // floor previously dropped wanted reranked blocks, whose blended scores
+        // sit far lower (see DEFAULT_RERANKED_MIN_RELEVANCE for the evidence).
+        if !crate::memory::scoring::passes_relevance_gate(
+            r.reranked,
+            r.score,
+            r.semantic_score,
+            crate::memory::scoring::effective_min_relevance(min_relevance_opt, r.reranked),
+        ) {
             continue;
         }
 
-        // Recency boost: last 48h get +10%
-        let mut score = raw_score;
-        if let Ok(created) = r
-            .memory
-            .created_at
-            .replace(' ', "T")
-            .parse::<chrono::DateTime<chrono::Utc>>()
-        {
-            let age_ms = now_ms - created.timestamp_millis();
-            if age_ms < RECENCY_BOOST_MS {
-                score *= 1.10;
-            }
-        }
+        // Recency is already applied exactly once, inside hybrid_search's
+        // compound score (`recency_boost`); a second +10% here double-counted
+        // it in the block's reported score without changing selection or
+        // ordering, which the budget loop above decides before this point.
+        let score = r.score;
 
         // Check if this is a fact with a parent
         let mem_detail = get_memory_without_embedding(db, r.memory.id, user_id)
@@ -885,7 +979,10 @@ async fn assemble_context_inner(
             if used_tokens >= (token_budget as f64 * 0.85) as usize {
                 break;
             }
-            let linked = get_links(db, sid, user_id).await.unwrap_or_default();
+            let linked = get_links(db, sid, user_id).await.unwrap_or_else(|e| {
+                tracing::warn!(sid, "context assembly: link expansion failed: {e}");
+                Default::default()
+            });
             for l in &linked {
                 if seen_ids.contains(&l.id) || l.is_forgotten {
                     continue;
@@ -955,7 +1052,12 @@ async fn assemble_context_inner(
     let t_recent = Instant::now();
     let recent_ceiling = (token_budget as f64 * 0.93) as usize;
     if flags.include_recent && used_tokens < recent_ceiling {
-        let recent = get_recent_dynamic(db, user_id, 5).await.unwrap_or_default();
+        let recent = get_recent_dynamic(db, user_id, 5)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("context assembly: recent-memory fetch failed: {e}");
+                Default::default()
+            });
         for r in &recent {
             if seen_ids.contains(&r.id) {
                 continue;
@@ -1093,15 +1195,21 @@ async fn assemble_context_inner(
             if !flags.include_working_memory {
                 return None;
             }
-            scratchpad::list_entries(db, None, None, session_filter)
+            scratchpad::list_entries(db, user_id, None, None, session_filter)
                 .await
+                .inspect_err(|e| tracing::warn!("context assembly: scratchpad fetch failed: {e}"))
                 .ok()
         },
         async {
             if !flags.include_current_state {
                 return None;
             }
-            get_current_state(db, user_id).await.ok()
+            get_current_state(db, user_id)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("context assembly: current-state fetch failed: {e}")
+                })
+                .ok()
         },
         async {
             if !flags.include_personality {
@@ -1109,6 +1217,7 @@ async fn assemble_context_inner(
             }
             personality::get_profile_for_injection(db, user_id)
                 .await
+                .inspect_err(|e| tracing::warn!("context assembly: personality fetch failed: {e}"))
                 .ok()
                 .flatten()
         },
@@ -1116,17 +1225,30 @@ async fn assemble_context_inner(
             if !flags.include_preferences {
                 return None;
             }
-            get_user_preferences(db, user_id).await.ok()
+            get_user_preferences(db, user_id)
+                .await
+                .inspect_err(|e| tracing::warn!("context assembly: preferences fetch failed: {e}"))
+                .ok()
         },
     );
 
-    // Process results sequentially to build supplementary sections.
+    // Process results sequentially to build supplementary sections. 3.2: every section is
+    // now token-accounted and gated against the hard token_budget, so the emitted context
+    // can no longer exceed the caller's budget and the reported utilization/token_estimate
+    // is accurate. Previously only the personality block was counted, so working_memory,
+    // current_state, preferences, and structured_facts were appended for free and could
+    // push the final string past the budget (e.g. a 4000-char working-memory block on top
+    // of layers already filled to ~95%).
     if let Some(scratch_rows) = scratch_res {
         if let Some(wm) = build_working_memory_block(&scratch_rows) {
-            supplementary.push(SupplementarySection {
-                label: "working_memory".to_string(),
-                content: wm,
-            });
+            let tokens = estimate_tokens(&wm);
+            if used_tokens + tokens <= token_budget {
+                supplementary.push(SupplementarySection {
+                    label: "working_memory".to_string(),
+                    content: wm,
+                });
+                used_tokens += tokens;
+            }
         }
     }
 
@@ -1142,16 +1264,21 @@ async fn assemble_context_inner(
                     }
                 })
                 .collect();
-            supplementary.push(SupplementarySection {
-                label: "current_state".to_string(),
-                content: format!("## Current State\n{}", state_lines.join("\n")),
-            });
+            let content = format!("## Current State\n{}", state_lines.join("\n"));
+            let tokens = estimate_tokens(&content);
+            if used_tokens + tokens <= token_budget {
+                supplementary.push(SupplementarySection {
+                    label: "current_state".to_string(),
+                    content,
+                });
+                used_tokens += tokens;
+            }
         }
     }
 
     if let Some((profile, _is_stale)) = personality_res {
         let tokens = estimate_tokens(&profile);
-        if tokens <= (token_budget as f64 * 0.10) as usize {
+        if tokens <= (token_budget as f64 * 0.10) as usize && used_tokens + tokens <= token_budget {
             supplementary.push(SupplementarySection {
                 label: "personality".to_string(),
                 content: format!("## Personality\n{}", profile),
@@ -1167,10 +1294,15 @@ async fn assemble_context_inner(
                 .iter()
                 .map(|p| format!("- [{}] {}", p.domain, p.preference))
                 .collect();
-            supplementary.push(SupplementarySection {
-                label: "preferences".to_string(),
-                content: format!("## User Preferences\n{}", pref_lines.join("\n")),
-            });
+            let content = format!("## User Preferences\n{}", pref_lines.join("\n"));
+            let tokens = estimate_tokens(&content);
+            if used_tokens + tokens <= token_budget {
+                supplementary.push(SupplementarySection {
+                    label: "preferences".to_string(),
+                    content,
+                });
+                used_tokens += tokens;
+            }
         }
     }
 
@@ -1209,10 +1341,15 @@ async fn assemble_context_inner(
                         .map(|(sf, _, is_stale)| format_structured_fact(sf, *is_stale))
                         .collect();
 
-                    supplementary.push(SupplementarySection {
-                        label: "structured_facts".to_string(),
-                        content: format!("## Extracted Facts\n{}", sf_lines.join("\n")),
-                    });
+                    let content = format!("## Extracted Facts\n{}", sf_lines.join("\n"));
+                    let tokens = estimate_tokens(&content);
+                    if used_tokens + tokens <= token_budget {
+                        supplementary.push(SupplementarySection {
+                            label: "structured_facts".to_string(),
+                            content,
+                        });
+                        used_tokens += tokens;
+                    }
                 }
             }
         }
@@ -1263,7 +1400,10 @@ async fn assemble_context_inner(
     let ctx_mem_ids: Vec<i64> = blocks.iter().map(|b| b.id).collect();
     let ctx_art_map = crate::artifacts::enrich_with_artifacts(db, user_id, &ctx_mem_ids)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("context assembly: artifact enrichment failed: {e}");
+            Default::default()
+        });
 
     let block_summaries: Vec<ContextBlockSummary> = blocks
         .iter()
@@ -1308,6 +1448,8 @@ async fn assemble_context_inner(
 
 use crate::memory::scoring::parse_date_ms;
 
+/// Freshness score in [0, 1] for a structured fact from its valid-at / approximate date,
+/// decaying with age so recent facts rank ahead of stale ones.
 fn parse_freshness(
     valid_at: Option<&str>,
     date_approx: Option<&str>,
@@ -1337,6 +1479,8 @@ fn parse_freshness(
     0.5
 }
 
+/// Render one structured fact as a context line (subject/verb/object, quantity, date, and
+/// a staleness marker when applicable).
 fn format_structured_fact(sf: &StructuredFact, is_stale: bool) -> String {
     let mut line = format!("- {} {}", sf.subject, sf.verb);
     if let Some(ref obj) = sf.object {
@@ -1362,6 +1506,7 @@ fn format_structured_fact(sf: &StructuredFact, is_stale: bool) -> String {
     line
 }
 
+/// Tests pinning the assembled-context string format and untrusted-content escaping.
 #[cfg(test)]
 mod assembly_tests {
     use super::*;
@@ -1380,6 +1525,7 @@ mod assembly_tests {
         assert!(v[3].is_nan() && v[4].is_nan());
     }
 
+    /// Build a minimal ContextBlock fixture for the formatting tests.
     fn mk(source: ContextBlockSource, content: &str) -> ContextBlock {
         ContextBlock {
             id: 0,
@@ -1400,6 +1546,7 @@ mod assembly_tests {
         format!("<user_memory>{}</user_memory>", encode_untrusted_content(s))
     }
 
+    /// Evolution section renders with the legacy heading and block spacing.
     #[test]
     fn evolution_section_format_matches_legacy() {
         let blocks = vec![
@@ -1415,6 +1562,7 @@ mod assembly_tests {
         assert_eq!(got, expected);
     }
 
+    /// Episode section renders with the legacy heading and dated bullet.
     #[test]
     fn episode_section_format_matches_legacy() {
         let blocks = vec![mk(ContextBlockSource::Episode, "ep")];
@@ -1423,6 +1571,7 @@ mod assembly_tests {
         assert_eq!(got, expected);
     }
 
+    /// Linked section renders with the legacy heading and bullet list.
     #[test]
     fn linked_section_format_matches_legacy() {
         let blocks = vec![
@@ -1434,6 +1583,7 @@ mod assembly_tests {
         assert_eq!(got, expected);
     }
 
+    /// Recent section renders with the legacy heading and dated bullet.
     #[test]
     fn recent_section_format_matches_legacy() {
         let blocks = vec![mk(ContextBlockSource::Recent, "r")];
@@ -1442,6 +1592,7 @@ mod assembly_tests {
         assert_eq!(got, expected);
     }
 
+    /// Inference section renders with the legacy heading and joined blocks.
     #[test]
     fn inference_section_format_matches_legacy() {
         let blocks = vec![
@@ -1453,11 +1604,13 @@ mod assembly_tests {
         assert_eq!(got, expected);
     }
 
+    /// No blocks and no supplementary sections produce an empty string.
     #[test]
     fn empty_blocks_produce_empty_string() {
         assert_eq!(assemble_context_string(&[], &[]), "");
     }
 
+    /// Block metadata (category/model/origin) is escaped so it cannot inject tags.
     #[test]
     fn attribution_and_category_escape_tag_delimiters() {
         // Malicious metadata appended outside the <user_memory> wrapper must
@@ -1473,6 +1626,7 @@ mod assembly_tests {
         assert!(got.contains("&lt;system&gt;"));
     }
 
+    /// Working-memory scratchpad fields are escaped so they cannot close the block.
     #[test]
     fn working_memory_fields_escape_breakout() {
         // A same-tenant agent must not be able to close the <working-memory>

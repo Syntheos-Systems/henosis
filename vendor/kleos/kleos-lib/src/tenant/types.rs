@@ -26,6 +26,7 @@ pub enum TenantStatus {
     Stuck,
 }
 
+/// String round-trip helpers for persisting the status in the registry.
 impl TenantStatus {
     /// String representation used for storage and API serialization.
     pub fn as_str(&self) -> &'static str {
@@ -57,9 +58,11 @@ impl TenantStatus {
 }
 
 #[cfg(test)]
+/// Tests for tenant type round-trips.
 mod tests {
     use super::*;
 
+    // Every status serializes and parses back to itself.
     #[test]
     fn tenant_status_round_trip() {
         for status in [
@@ -101,7 +104,9 @@ pub struct TenantConfig {
     pub preload_on_start: bool,
 }
 
+// Defaults sized for a small single-node deployment.
 impl Default for TenantConfig {
+    // 512 resident tenants, 15-minute idle eviction, lazy loading.
     fn default() -> Self {
         Self {
             max_resident: 512,
@@ -130,6 +135,7 @@ pub struct QuotaConfig {
     pub disk_bytes: Option<i64>,
 }
 
+// Default: unlimited quotas (enforced values come from the registry).
 impl Default for QuotaConfig {
     /// Returns an unlimited quota (all fields None). Used for tenants with no
     /// configured limits; unlimited is the backward-compatible default.
@@ -157,8 +163,10 @@ pub struct TenantHandle {
     /// The per-tenant async SQLite database (deadpool-sqlite pool).
     pub db: Arc<Database>,
 
-    /// The per-tenant vector index (LanceDB).
-    pub vector_index: Arc<dyn VectorIndex>,
+    /// The per-tenant ANN vector index (LanceDB). None when the crate is
+    /// built without the `ml` feature, matching `Database::vector_index`;
+    /// retrieval degrades to FTS + sqlite-vec.
+    pub vector_index: Option<Arc<dyn VectorIndex>>,
 
     /// When this tenant was created.
     pub created_at: SystemTime,
@@ -184,6 +192,7 @@ pub struct TenantHandle {
     pub shard_path: PathBuf,
 }
 
+/// Access-tracking and lifecycle helpers for a resident tenant.
 impl TenantHandle {
     /// Update the last access time to now.
     pub fn touch(&self) {
@@ -299,28 +308,4 @@ pub struct TenantQuotaRow {
     pub disk_bytes_used: i64,
     /// When the usage was last synced (ISO 8601 datetime).
     pub last_synced_at: Option<String>,
-}
-
-/// Configuration for tenant database connection pools.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TenantPoolConfig {
-    /// Maximum number of reader connections per tenant.
-    pub max_readers: usize,
-    /// Number of writer connections (usually 1 for SQLite).
-    pub writer_count: usize,
-    /// Busy timeout in milliseconds.
-    pub busy_timeout_ms: u64,
-    /// WAL autocheckpoint interval.
-    pub wal_autocheckpoint: u64,
-}
-
-impl Default for TenantPoolConfig {
-    fn default() -> Self {
-        Self {
-            max_readers: 4,
-            writer_count: 1,
-            busy_timeout_ms: 5_000,
-            wal_autocheckpoint: 10_000,
-        }
-    }
 }

@@ -6,6 +6,8 @@
 //! - [`vector`]       vector-search helpers over the LanceDB embeddings index.
 //! - [`vector_sync`]  backfill + replay of the `vector_sync_pending` ledger.
 //! - [`scoring`]      decay, pagerank, and per-channel scoring utilities.
+//! - [`abstain`]      L2 ABSTAIN gate -- "insufficient evidence" on low-confidence hits.
+//! - [`facts_channel`] structured_facts as an RRF retrieval channel (L5).
 //! - [`simhash`]      near-duplicate detection via SimHash / Hamming buckets.
 //! - [`types`]        request/response DTOs, `Memory`, `SearchResult`.
 //!
@@ -15,7 +17,9 @@
 //! SELECT shape and row-to-struct mapping in sync -- see the guard tests at
 //! the bottom of this file.
 
+pub mod abstain;
 pub mod auto_tag;
+pub mod facts_channel;
 pub mod fts;
 pub mod scoring;
 pub mod search;
@@ -72,8 +76,10 @@ fn parse_tags_json(tags: &Option<String>) -> Vec<String> {
 }
 
 /// Clamp user-provided importance into the supported memory range.
+/// Delegates to the shared validation helper so every write path (store,
+/// update, inbox edit_and_approve) agrees on the range.
 fn clamp_importance(value: i32) -> i32 {
-    value.clamp(1, 10)
+    crate::validation::clamp_importance_i64(value as i64) as i32
 }
 
 /// Record a failed LanceDB write into the vector_sync_pending table so a
@@ -148,6 +154,9 @@ pub async fn write_chunks(db: &Database, memory_id: i64, chunks: &[(String, Vec<
                 "LanceDB chunk vector batch insert failed for memory {}: {}",
                 memory_id, e
             );
+            // Finding [30]: ledger the failure so the replay sweeper can
+            // re-derive the batch from the memory_chunks rows written above.
+            record_vector_sync_failure(db, memory_id, 0, "chunk-insert", &e.to_string()).await;
         }
     }
 }
@@ -228,6 +237,10 @@ async fn carry_forward_chunks(db: &Database, old_memory_id: i64, new_memory_id: 
                 "LanceDB chunk carry-forward batch insert failed for memory {}: {}",
                 new_memory_id, e
             );
+            // Finding [30]: same replay path as write_chunks -- the chunk rows
+            // were already copied to new_memory_id, so 'chunk-insert' can
+            // rebuild the vectors from them.
+            record_vector_sync_failure(db, new_memory_id, 0, "chunk-insert", &e.to_string()).await;
         }
 
         // Clean up old memory's chunk vectors
@@ -265,6 +278,42 @@ fn chunk_lance_key(memory_id: i64, chunk_idx: usize) -> i64 {
 /// Decode a LanceDB chunk key back to the owning memory id.
 pub fn lance_key_to_memory_id(chunk_key: i64) -> i64 {
     chunk_key / 1000
+}
+
+/// Best-effort removal of a memory's chunk vectors from the chunk ANN index.
+///
+/// Soft deletes (delete / mark_forgotten) never fire the `memory_chunks`
+/// ON DELETE CASCADE, so without this the chunk vectors of a forgotten
+/// memory keep matching in chunk-level search. Failures are swallowed like
+/// the carry_forward_chunks cleanup loop: the vector-sync replay ledger only
+/// covers the whole-memory index, so there is no retry mechanism for chunk
+/// ops to record into.
+async fn delete_chunk_vectors(db: &Database, memory_id: i64) {
+    let Some(index) = db.chunk_vector_index.as_ref() else {
+        return;
+    };
+    let idxs: Result<Vec<usize>> = db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_idx FROM memory_chunks WHERE memory_id = ?1 ORDER BY chunk_idx",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![memory_id], |row| row.get::<_, usize>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await;
+    match idxs {
+        Ok(idxs) => {
+            for idx in idxs {
+                let key = chunk_lance_key(memory_id, idx);
+                let _ = index.delete(key).await;
+            }
+        }
+        Err(e) => warn!(
+            "chunk-vector cleanup: reading memory_chunks failed for memory {}: {}",
+            memory_id, e
+        ),
+    }
 }
 
 /// Serialize a normalized embedding into a little-endian byte blob.
@@ -344,6 +393,7 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row<'_>, owner_user_id: i64) -> Resu
         updated_at: row.get(44)?,
         is_superseded: row.get::<_, i32>(45)? != 0,
         is_consolidated: row.get::<_, i32>(46)? != 0,
+        lang: row.get(47)?,
     })
 }
 
@@ -358,14 +408,14 @@ pub(crate) const MEMORY_COLUMNS: &str = "id, content, category, source, session_
     episode_id, decay_score, confidence, sync_id, status, space_id, \
     fsrs_stability, fsrs_difficulty, fsrs_storage_strength, fsrs_retrieval_strength, \
     fsrs_learning_state, fsrs_reps, fsrs_lapses, fsrs_last_review_at, \
-    valence, arousal, dominant_emotion, created_at, updated_at, is_superseded, is_consolidated";
+    valence, arousal, dominant_emotion, created_at, updated_at, is_superseded, is_consolidated, lang";
 
 /// Number of columns in `MEMORY_COLUMNS`. Must match the highest index
 /// `row_to_memory` reads from (indices 0..MEMORY_COLUMN_COUNT-1). Consumed
 /// only by the test guard below; a non-test reference would be redundant
 /// with the SELECT list itself.
 #[cfg(test)]
-pub(crate) const MEMORY_COLUMN_COUNT: usize = 47;
+pub(crate) const MEMORY_COLUMN_COUNT: usize = 48;
 
 // -- Public CRUD functions ---
 
@@ -403,6 +453,52 @@ pub async fn store_with_chunks(
         }
     }
     store(db, req, None, false).await
+}
+
+/// Embedder-aware wrapper around [`update`], mirroring [`store_with_chunks`].
+///
+/// Finding [31]: `update` carries the old row's embedding forward when the
+/// caller supplies none, so a content edit without a client-side embedding
+/// left a stale vector attached to the new text. When content is being
+/// changed and no embedding was supplied, compute a fresh content embedding
+/// (and chunk embeddings) here. Embedding failure degrades to the previous
+/// carry-forward behavior with a warning rather than failing the update.
+pub async fn update_with_chunks(
+    db: &Database,
+    embedder: &dyn crate::embeddings::EmbeddingProvider,
+    id: i64,
+    mut req: UpdateRequest,
+    user_id: i64,
+    update_counters: bool,
+) -> Result<Memory> {
+    if let Some(content) = req.content.as_deref().map(str::trim) {
+        if !content.is_empty() {
+            if req.embedding.is_none() {
+                match embedder.embed(content).await {
+                    Ok(emb) => req.embedding = Some(emb),
+                    Err(e) => tracing::warn!("embedding failed in update_with_chunks: {}", e),
+                }
+            }
+            if req.chunk_embeddings.is_none() {
+                match crate::embeddings::chunking::chunk_and_embed(
+                    embedder,
+                    content,
+                    db.embedding_chunk_max_chars,
+                    db.embedding_chunk_overlap,
+                    db.embedding_chunk_max_chunks,
+                )
+                .await
+                {
+                    Ok(pairs) if !pairs.is_empty() => req.chunk_embeddings = Some(pairs),
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("chunk embedding failed in update_with_chunks: {}", e)
+                    }
+                }
+            }
+        }
+    }
+    update(db, id, req, user_id, update_counters).await
 }
 
 /// Store a single memory entry, enforcing content constraints and optional tenant quota.
@@ -464,17 +560,37 @@ pub async fn store(
     // 2. Compute simhash of content
     let content_hash = simhash::simhash(&content);
 
-    // 3. Check for duplicates within the owner's own memories. The user_id
+    // 3. Check for near-duplicates within the owner's own memories. The user_id
     // predicate keeps single-DB (shared) mode from deduping one user's write
     // against another user's content (and from leaking the other id back).
-    let dup_sql = "SELECT id, content FROM memories \
-        WHERE user_id = ?1 AND is_forgotten = 0 AND is_latest = 1 AND is_consolidated = 0 \
-        ORDER BY id DESC LIMIT 1000";
-
-    let duplicate = db
-        .read(move |conn| {
+    //
+    // Two scoping rules avoid collapsing distinct writes:
+    //   - An explicit version update (parent_memory_id set) is a deliberate re-store
+    //     of evolving content and must NOT be short-circuited as a duplicate of its
+    //     own predecessor; skip the scan entirely.
+    //   - Scope the scan to the same space (`space_id IS ?2`, IS so NULL matches NULL)
+    //     so a write in one space is not deduped against an identical write in another.
+    //
+    // The scan is intentionally unbounded within that scope: a recency cap
+    // (formerly LIMIT 1000) silently re-stored duplicates of anything older
+    // than the newest thousand memories. Newest-first ordering keeps the
+    // common case (duplicate of something recent) an early exit.
+    let duplicate = if req.parent_memory_id.is_some() {
+        None
+    } else {
+        let dup_space_id = req.space_id;
+        // Exclude archived/rejected rows from the dedup source: a new store must
+        // not be treated as a duplicate of a rejected memory (which would boost
+        // the rejected row instead of storing the fresh content). Rejected rows
+        // carry is_archived = 1, so the is_archived guard is the load-bearing one.
+        let dup_sql = "SELECT id, content FROM memories \
+            WHERE user_id = ?1 AND is_forgotten = 0 AND is_latest = 1 AND is_consolidated = 0 \
+              AND is_archived = 0 AND status != 'rejected' \
+              AND space_id IS ?2 \
+            ORDER BY id DESC";
+        db.read(move |conn| {
             let mut stmt = conn.prepare(dup_sql)?;
-            let mut rows = stmt.query(rusqlite::params![user_id])?;
+            let mut rows = stmt.query(rusqlite::params![user_id, dup_space_id])?;
             while let Some(row) = rows.next()? {
                 let existing_id: i64 = row.get(0)?;
                 let existing_content: String = row.get(1)?;
@@ -485,13 +601,17 @@ pub async fn store(
             }
             Ok(None)
         })
-        .await?;
+        .await?
+    };
 
     if let Some(existing_id) = duplicate {
         return Ok(StoreResult {
             id: existing_id,
             created: false,
             duplicate_of: Some(existing_id),
+            // A duplicate boost creates no new content to derive from, so it is
+            // never gated; the existing row's own derivation state is unchanged.
+            pending: false,
         });
     }
 
@@ -519,6 +639,18 @@ pub async fn store(
         req.category.clone()
     };
 
+    // Resolve the review-gate status once, before the write, so the INSERT and
+    // the returned StoreResult.pending cannot disagree. resolve_initial_status is
+    // pure over (source, importance, gate config); computing it here and passing
+    // it into the insert keeps a single source of truth for the gate decision.
+    let initial_status = resolve_initial_status(
+        &req.source,
+        importance,
+        *REVIEW_GATE_ENABLED,
+        &REVIEW_GATE_SOURCES,
+        *REVIEW_GATE_IMPORTANCE_THRESHOLD,
+    );
+
     let content_for_tx = content.clone();
     let req_for_tx = req.clone();
     let tags_json_for_tx = tags_json.clone();
@@ -540,6 +672,7 @@ pub async fn store(
                 importance,
                 tags_json_for_tx,
                 &category_for_tx,
+                initial_status,
             )?;
             // E2: increment counters atomically in the same transaction.
             if quota_for_tx.is_some() {
@@ -595,10 +728,118 @@ pub async fn store(
         id: new_id,
         created: true,
         duplicate_of: None,
+        // Surfaces the gate decision so the route can withhold fact/entity/brain
+        // derivation until this memory is approved (see resolve_initial_status).
+        pending: initial_status == "pending",
     })
 }
 
+/// Normalize a caller-supplied created_at override into the schema's TEXT
+/// datetime form ("YYYY-MM-DD HH:MM:SS", UTC). Accepts RFC3339 (with offset),
+/// "YYYY-MM-DD HH:MM:SS" (treated as UTC), and bare "YYYY-MM-DD" (midnight UTC).
+/// Returns InvalidInput on an empty or unparseable value so a bad timestamp is
+/// rejected rather than silently stored or coerced to now.
+fn normalize_created_at(raw: &str) -> Result<String> {
+    use chrono::{NaiveDate, NaiveDateTime};
+    const SQL_FMT: &str = "%Y-%m-%d %H:%M:%S";
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(EngError::InvalidInput(
+            "created_at must not be empty".to_string(),
+        ));
+    }
+    // RFC3339 / ISO-8601 with timezone -> convert to UTC.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.naive_utc().format(SQL_FMT).to_string());
+    }
+    // "YYYY-MM-DD HH:MM:SS" without zone -> assume UTC.
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, SQL_FMT) {
+        return Ok(ndt.format(SQL_FMT).to_string());
+    }
+    // Bare date -> midnight UTC.
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(nd
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is a valid time")
+            .format(SQL_FMT)
+            .to_string());
+    }
+    Err(EngError::InvalidInput(format!(
+        "created_at '{s}' is not a recognized timestamp (expected RFC3339, 'YYYY-MM-DD HH:MM:SS', or 'YYYY-MM-DD')"
+    )))
+}
+
 /// Insert a memory row inside an existing SQLite transaction.
+/// Review gate master switch. Default-off; set `KLEOS_REVIEW_GATE_ENABLED=1`
+/// to route freshly stored memories whose source is in [`REVIEW_GATE_SOURCES`]
+/// into the `pending` inbox instead of auto-approving them. When unset the
+/// store path is byte-identical to before this gate existed.
+static REVIEW_GATE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("KLEOS_REVIEW_GATE_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+});
+
+/// Lower-cased allowlist of memory sources that require review when the gate
+/// is enabled. Parsed once from the comma-separated `KLEOS_REVIEW_GATE_SOURCES`
+/// env var. Empty (the default) means nothing is gated even when the master
+/// switch is on -- a deliberately safe no-op.
+static REVIEW_GATE_SOURCES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    parse_gate_sources(std::env::var("KLEOS_REVIEW_GATE_SOURCES").ok().as_deref())
+});
+
+/// Optional importance threshold for the review gate. When set (via
+/// `KLEOS_REVIEW_GATE_IMPORTANCE_THRESHOLD`) and the master switch is on, memories
+/// whose importance is strictly greater than this value are routed to `pending`.
+/// Unset (the default) means importance never triggers the gate, preserving the
+/// source-only behavior.
+static REVIEW_GATE_IMPORTANCE_THRESHOLD: std::sync::LazyLock<Option<i32>> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("KLEOS_REVIEW_GATE_IMPORTANCE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+    });
+
+/// Parse a comma-separated source allowlist into trimmed, lower-cased entries,
+/// dropping blanks. Pure helper so the parsing is unit-testable without env.
+fn parse_gate_sources(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Decide the initial `status` for a newly stored memory. Returns `"pending"` when
+/// the gate is enabled AND either the `source` is in the allowlist or the `importance`
+/// is strictly greater than `importance_threshold`; otherwise `"approved"`, preserving
+/// historical behavior. Pure so it can be tested against explicit inputs without
+/// touching process env.
+fn resolve_initial_status(
+    source: &str,
+    importance: i32,
+    enabled: bool,
+    sources: &[String],
+    importance_threshold: Option<i32>,
+) -> &'static str {
+    if !enabled {
+        return "approved";
+    }
+    let source_gated = sources.iter().any(|s| s == &source.to_ascii_lowercase());
+    let importance_gated = importance_threshold.is_some_and(|t| importance > t);
+    if source_gated || importance_gated {
+        "pending"
+    } else {
+        "approved"
+    }
+}
+
+/// Insert one memory row inside an open transaction, returning its new id.
+// Each argument maps to a distinct memory column or the resolved gate status;
+// bundling them into a struct would only rename the same fields. The status arg
+// is passed (not recomputed here) so it stays the single source of truth shared
+// with StoreResult.pending.
+#[allow(clippy::too_many_arguments)]
 fn store_transactional_rusqlite(
     tx: &rusqlite::Transaction<'_>,
     content: &str,
@@ -607,6 +848,9 @@ fn store_transactional_rusqlite(
     importance: i32,
     tags_json: Option<String>,
     category: &str,
+    // Review-gate status resolved once in `store` and passed in so the INSERT and
+    // the returned StoreResult.pending share one decision. 'approved' or 'pending'.
+    status: &str,
 ) -> Result<i64> {
     let (version, root_memory_id) = if let Some(parent_id) = req.parent_memory_id {
         let mut stmt = tx.prepare("SELECT version, root_memory_id FROM memories WHERE id = ?1")?;
@@ -647,19 +891,28 @@ fn store_transactional_rusqlite(
     }
 
     let is_static = req.is_static.unwrap_or(false) as i32;
+    // Optional creation-timestamp override for backfill/import. A NULL bind makes
+    // COALESCE fall through to datetime('now'), preserving default behavior; an
+    // invalid value is rejected before the write.
+    let created_at_override: Option<String> = match req.created_at.as_deref() {
+        Some(raw) => Some(normalize_created_at(raw)?),
+        None => None,
+    };
     tx.execute(
         "INSERT INTO memories (
             content, category, source, session_id, importance,
             version, is_latest, parent_memory_id, root_memory_id,
             is_static, tags, status, space_id,
             fsrs_storage_strength, fsrs_retrieval_strength, fsrs_learning_state,
-            fsrs_reps, fsrs_lapses, model, sync_id, user_id
+            fsrs_reps, fsrs_lapses, model, sync_id, user_id, lang,
+            created_at
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, 1, ?7, ?8,
-            ?9, ?10, 'approved', ?11,
+            ?9, ?10, ?17, ?11,
             1.0, 1.0, 0,
-            0, 0, ?12, ?13, ?14
+            0, 0, ?12, ?13, ?14, ?15,
+            COALESCE(?16, datetime('now'))
         )",
         rusqlite::params![
             content,
@@ -675,7 +928,14 @@ fn store_transactional_rusqlite(
             req.space_id,
             Option::<String>::None,
             req.sync_id.clone(),
-            user_id
+            user_id,
+            // Best-effort content-language detection at ingest; never fails a write.
+            crate::lang::detect_lang(content),
+            created_at_override,
+            // ?17: initial review-gate status, resolved once by the caller
+            // (`store`). 'approved' unless the gate is enabled and this memory's
+            // source is allowlisted or its importance exceeds the threshold.
+            status
         ],
     )?;
 
@@ -788,6 +1048,17 @@ pub async fn list(db: &Database, opts: ListOptions) -> Result<Vec<Memory>> {
     conditions.push("is_latest = 1".to_string());
     conditions.push("is_consolidated = 0".to_string());
 
+    // Review gate: withhold memories still pending human review (matches the
+    // original inbox design: list/recall/search filter status != 'pending').
+    // `!= 'pending'` (not `= 'approved'`) is deliberate -- it preserves the
+    // trash view, where rejected+archived rows must still surface. Pre-gate
+    // rows are status='approved' so this is a no-op there; the Inbox path
+    // queries pending rows directly. Callers that must browse pending set
+    // include_pending.
+    if !opts.include_pending {
+        conditions.push("status != 'pending'".to_string());
+    }
+
     if let Some(ref cat) = opts.category {
         conditions.push(format!("category = ?{}", param_idx));
         param_values.push(rusqlite::types::Value::Text(cat.clone()));
@@ -801,6 +1072,16 @@ pub async fn list(db: &Database, opts: ListOptions) -> Result<Vec<Memory>> {
     if let Some(sid) = opts.space_id {
         conditions.push(format!("space_id = ?{}", param_idx));
         param_values.push(rusqlite::types::Value::Integer(sid));
+        param_idx += 1;
+    }
+    if let Some(ref from) = opts.from {
+        conditions.push(format!("created_at >= ?{}", param_idx));
+        param_values.push(rusqlite::types::Value::Text(from.clone()));
+        param_idx += 1;
+    }
+    if let Some(ref to) = opts.to {
+        conditions.push(format!("created_at < ?{}", param_idx));
+        param_values.push(rusqlite::types::Value::Text(to.clone()));
         param_idx += 1;
     }
 
@@ -833,6 +1114,254 @@ pub async fn list(db: &Database, opts: ListOptions) -> Result<Vec<Memory>> {
     .await
 }
 
+/// Aggregate a user's active memories into date buckets for the timeline.
+///
+/// `granularity` selects the bucket: "year" groups by year (newest first);
+/// "month" requires `year` and groups that year's rows by month number 1..12;
+/// "day" requires `year` and `month` and groups that month's rows by day 1..31.
+/// Returns (bucket, count) pairs. Only latest, non-forgotten, non-archived,
+/// non-consolidated rows for `user_id` are counted -- matching `list`.
+pub async fn calendar_counts(
+    db: &Database,
+    user_id: i64,
+    granularity: &str,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> Result<Vec<(String, i64)>> {
+    // Shared active-row predicate, identical to `list`'s visibility rules.
+    // status != 'pending' withholds review-gate pending memories from timeline
+    // counts; a no-op on pre-gate data where every row is already approved.
+    const ACTIVE: &str = "user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+                          AND is_latest = 1 AND is_consolidated = 0 AND status != 'pending'";
+
+    // Resolve the grouping expression and any extra time-scoping clauses.
+    let (group_expr, extra, params): (&str, String, Vec<rusqlite::types::Value>) = match granularity
+    {
+        "year" => (
+            "strftime('%Y', created_at)",
+            String::new(),
+            vec![rusqlite::types::Value::Integer(user_id)],
+        ),
+        "month" => {
+            let y = year.ok_or_else(|| {
+                crate::EngError::InvalidInput("year is required for month granularity".into())
+            })?;
+            (
+                "strftime('%m', created_at)",
+                " AND strftime('%Y', created_at) = ?2".to_string(),
+                vec![
+                    rusqlite::types::Value::Integer(user_id),
+                    rusqlite::types::Value::Text(format!("{y:04}")),
+                ],
+            )
+        }
+        "day" => {
+            let y = year.ok_or_else(|| {
+                crate::EngError::InvalidInput("year is required for day granularity".into())
+            })?;
+            let m = month.ok_or_else(|| {
+                crate::EngError::InvalidInput("month is required for day granularity".into())
+            })?;
+            (
+                "strftime('%d', created_at)",
+                " AND strftime('%Y', created_at) = ?2 AND strftime('%m', created_at) = ?3"
+                    .to_string(),
+                vec![
+                    rusqlite::types::Value::Integer(user_id),
+                    rusqlite::types::Value::Text(format!("{y:04}")),
+                    rusqlite::types::Value::Text(format!("{m:02}")),
+                ],
+            )
+        }
+        other => {
+            return Err(crate::EngError::InvalidInput(format!(
+                "invalid granularity: {other}"
+            )))
+        }
+    };
+
+    // Newest bucket first for year; ascending for month/day so cards read in order.
+    let order = if granularity == "year" { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT {group_expr} AS bucket, COUNT(*) AS n FROM memories \
+         WHERE {ACTIVE}{extra} GROUP BY bucket ORDER BY bucket {order}"
+    );
+
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter().cloned()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// List the owner's static (pinned) memories, ordered by importance then recency.
+///
+/// Recall must always surface pinned/static memories regardless of how recently they
+/// were written. The previous recall path listed the newest N rows and filtered
+/// `is_static` afterwards, so any pinned memory outside that recency window silently
+/// vanished. This query selects on `is_static = 1` directly and orders by importance so
+/// the most important pinned facts come first. Owner scoping and visibility predicates
+/// mirror `list` (SEC-C3: owner filter is unconditional).
+pub async fn list_static(
+    db: &Database,
+    user_id: i64,
+    space_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    // Sequential parameters; the space branch adds `space_id = ?2` and shifts LIMIT to ?3.
+    let sql = if space_id.is_some() {
+        format!(
+            "SELECT {cols} FROM memories \
+             WHERE user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+               AND is_latest = 1 AND is_consolidated = 0 AND is_static = 1 \
+               AND status != 'pending' AND space_id = ?2 \
+             ORDER BY importance DESC, created_at DESC LIMIT ?3",
+            cols = MEMORY_COLUMNS,
+        )
+    } else {
+        format!(
+            "SELECT {cols} FROM memories \
+             WHERE user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+               AND is_latest = 1 AND is_consolidated = 0 AND is_static = 1 \
+               AND status != 'pending' \
+             ORDER BY importance DESC, created_at DESC LIMIT ?2",
+            cols = MEMORY_COLUMNS,
+        )
+    };
+    let cap = limit;
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut memories = Vec::with_capacity(cap);
+        let mut rows = match space_id {
+            Some(sid) => stmt.query(rusqlite::params![user_id, sid, limit as i64])?,
+            None => stmt.query(rusqlite::params![user_id, limit as i64])?,
+        };
+        while let Some(row) = rows.next()? {
+            memories.push(row_to_memory(row, user_id)?);
+        }
+        Ok(memories)
+    })
+    .await
+}
+
+/// List the owner's high-importance memories, ordered by importance then id.
+///
+/// The recall "important" tier must rank by importance, not recency. The previous path
+/// listed the newest N rows then filtered `importance >= min`, so a high-importance
+/// memory outside the recency window never surfaced; recency outranked importance,
+/// inverting the intended priority. This query selects on `importance >= min` directly
+/// and orders by importance. Owner scoping and visibility predicates mirror `list`.
+pub async fn list_important(
+    db: &Database,
+    user_id: i64,
+    space_id: Option<i64>,
+    min_importance: i32,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    // Sequential parameters; the space branch adds `space_id = ?3` and shifts LIMIT to ?4.
+    let sql = if space_id.is_some() {
+        format!(
+            "SELECT {cols} FROM memories \
+             WHERE user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+               AND is_latest = 1 AND is_consolidated = 0 AND importance >= ?2 \
+               AND status != 'pending' AND space_id = ?3 \
+             ORDER BY importance DESC, id DESC LIMIT ?4",
+            cols = MEMORY_COLUMNS,
+        )
+    } else {
+        format!(
+            "SELECT {cols} FROM memories \
+             WHERE user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+               AND is_latest = 1 AND is_consolidated = 0 AND importance >= ?2 \
+               AND status != 'pending' \
+             ORDER BY importance DESC, id DESC LIMIT ?3",
+            cols = MEMORY_COLUMNS,
+        )
+    };
+    let cap = limit;
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut memories = Vec::with_capacity(cap);
+        let mut rows = match space_id {
+            Some(sid) => stmt.query(rusqlite::params![
+                user_id,
+                min_importance,
+                sid,
+                limit as i64
+            ])?,
+            None => stmt.query(rusqlite::params![user_id, min_importance, limit as i64])?,
+        };
+        while let Some(row) = rows.next()? {
+            memories.push(row_to_memory(row, user_id)?);
+        }
+        Ok(memories)
+    })
+    .await
+}
+
+/// Compose recall tiers under `limit`, reserving up to `min_semantic_slots` for the
+/// query-relevant semantic tier so the always-on static/important tiers cannot starve it.
+///
+/// Emission order: always-on rows (static then important) fill up to `limit - reserve`, then
+/// semantic rows fill the reserved space, then any always-on rows the cap deferred backfill
+/// the remaining slots (in case semantic came up short), then recent filler closes out. The
+/// reserve is capped at the number of semantic items actually available, so no slot is wasted
+/// when the query produced few or no semantic hits. Inputs are assumed already deduplicated
+/// across tiers by the caller; this function only orders and truncates. Generic over the row
+/// payload so callers can compose either domain rows or serialized values.
+pub fn compose_recall_tiers<T>(
+    static_items: Vec<T>,
+    important_items: Vec<T>,
+    semantic_items: Vec<T>,
+    recent_items: Vec<T>,
+    limit: usize,
+    min_semantic_slots: usize,
+) -> Vec<T> {
+    // Reserve only as many semantic slots as there are semantic items to fill them.
+    let semantic_reserve = semantic_items.len().min(min_semantic_slots);
+    let always_on_cap = limit.saturating_sub(semantic_reserve);
+    let mut output: Vec<T> = Vec::with_capacity(limit);
+    let mut deferred_always_on: Vec<T> = Vec::new();
+
+    // Always-on rows first, but only up to the cap that protects the semantic reserve.
+    for item in static_items.into_iter().chain(important_items) {
+        if output.len() < always_on_cap {
+            output.push(item);
+        } else {
+            deferred_always_on.push(item);
+        }
+    }
+    // Semantic (query-relevant) rows fill the reserved space next.
+    for item in semantic_items {
+        if output.len() >= limit {
+            break;
+        }
+        output.push(item);
+    }
+    // Backfill always-on rows the cap deferred, in case semantic was short.
+    for item in deferred_always_on {
+        if output.len() >= limit {
+            break;
+        }
+        output.push(item);
+    }
+    // Recent filler closes out any remaining slots.
+    for item in recent_items {
+        if output.len() >= limit {
+            break;
+        }
+        output.push(item);
+    }
+    output
+}
+
 /// Soft-delete an owned memory by marking it forgotten.
 #[tracing::instrument(skip(db))]
 pub async fn delete(db: &Database, id: i64, user_id: i64) -> Result<()> {
@@ -862,6 +1391,7 @@ pub async fn delete(db: &Database, id: i64, user_id: i64) -> Result<()> {
             record_vector_sync_failure(db, id, user_id, "delete", &e.to_string()).await;
         }
     }
+    delete_chunk_vectors(db, id).await;
     if let Err(e) = crate::graph::pagerank::mark_pagerank_dirty(db, 1).await {
         warn!(
             "mark_pagerank_dirty failed after delete for user {}: {}",
@@ -1045,7 +1575,24 @@ pub async fn update(
     let new_category = req.category.as_deref().unwrap_or(&old.category).to_string();
     let new_importance = clamp_importance(req.importance.unwrap_or(old.importance));
     let new_is_static = req.is_static.unwrap_or(old.is_static) as i32;
-    let new_status = req.status.as_deref().unwrap_or(&old.status).to_string();
+    // SEC-gate: the review gate assumes the storing agent cannot approve its
+    // own pending memory. Honoring a client-supplied status here was an
+    // unguarded self-approval: `POST /memory/{id}/update {"status":"approved"}`
+    // flipped a pending row to approved with only ownership auth, bypassing the
+    // dedicated review surface. Status transitions are permitted solely through
+    // the authorized inbox endpoints (inbox::approve_memory / reject_memory).
+    // Reject any attempt to change status through this generic edit path; a
+    // no-op status equal to the stored value is allowed so idempotent clients
+    // that echo the current status do not break.
+    let new_status = match req.status.as_deref() {
+        Some(requested) if requested != old.status => {
+            return Err(EngError::InvalidInput(
+                "status cannot be changed through update; use the approve/reject endpoints"
+                    .to_string(),
+            ));
+        }
+        _ => old.status.clone(),
+    };
     let new_tags_json = if req.tags.is_some() {
         normalize_tags(&req.tags)
     } else {
@@ -1229,7 +1776,7 @@ fn update_transactional_rusqlite(
             confidence, model,
             is_archived, is_fact, is_decomposed, source_count,
             episode_id, forget_after, forget_reason, decay_score,
-            sync_id, valence, arousal, dominant_emotion, user_id
+            sync_id, valence, arousal, dominant_emotion, user_id, lang
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, 1, ?7, ?8,
@@ -1239,7 +1786,7 @@ fn update_transactional_rusqlite(
             ?21, ?22,
             ?23, ?24, ?25, ?26,
             ?27, ?28, ?29, ?30,
-            ?31, ?32, ?33, ?34, ?35
+            ?31, ?32, ?33, ?34, ?35, ?36
         )",
         rusqlite::params![
             new_content,
@@ -1276,7 +1823,10 @@ fn update_transactional_rusqlite(
             old.valence,
             old.arousal,
             old.dominant_emotion.clone(),
-            user_id
+            user_id,
+            // Recompute language from the new content; do not carry the old value
+            // since an edit can change the language.
+            crate::lang::detect_lang(new_content)
         ],
     )?;
 
@@ -1331,6 +1881,7 @@ pub async fn mark_forgotten(db: &Database, id: i64, user_id: i64) -> Result<()> 
             record_vector_sync_failure(db, id, user_id, "delete", &e.to_string()).await;
         }
     }
+    delete_chunk_vectors(db, id).await;
     if let Err(e) = crate::graph::pagerank::mark_pagerank_dirty(db, 1).await {
         warn!(
             "mark_pagerank_dirty failed after mark_forgotten for user {}: {}",
@@ -1448,6 +1999,15 @@ pub async fn insert_link(
     link_type: &str,
     user_id: i64,
 ) -> Result<()> {
+    // Reject out-of-range similarity before touching the DB. NaN must be
+    // caught explicitly: every range comparison on NaN is false, so a bare
+    // range check would let NaN through and poison downstream PageRank
+    // (edge weights are similarity-derived and divided by per-node totals).
+    if !similarity.is_finite() || similarity <= 0.0 || similarity > 1.0 {
+        return Err(EngError::InvalidInput(format!(
+            "similarity must be in (0.0, 1.0], got {similarity}"
+        )));
+    }
     // Validate both memories exist and are not forgotten
     let count_sql =
         "SELECT COUNT(*) FROM memories WHERE id IN (?1, ?2) AND user_id = ?3 AND is_forgotten = 0";
@@ -1511,6 +2071,8 @@ pub async fn list_all_tags(db: &Database, user_id: i64) -> Result<Vec<TagCount>>
                  WHERE user_id = ?1
                    AND is_forgotten = 0
                    AND is_latest = 1
+                   AND is_archived = 0
+                   AND status != 'pending'
                    AND tags IS NOT NULL
                    AND tags != '[]'",
         )?;
@@ -1573,6 +2135,8 @@ pub async fn search_by_tags(
              WHERE m.user_id = ?{}
                AND m.is_forgotten = 0
                AND m.is_latest = 1
+               AND m.is_archived = 0
+               AND m.status != 'pending'
                AND m.tags IS NOT NULL
                AND (SELECT COUNT(DISTINCT je.value)
                     FROM json_each(m.tags) je
@@ -1592,6 +2156,8 @@ pub async fn search_by_tags(
              WHERE m.user_id = ?{}
                AND m.is_forgotten = 0
                AND m.is_latest = 1
+               AND m.is_archived = 0
+               AND m.status != 'pending'
                AND m.tags IS NOT NULL
                AND EXISTS (
                    SELECT 1 FROM json_each(m.tags) je
@@ -1907,6 +2473,91 @@ pub async fn get_user_stats(db: &Database, user_id: i64) -> Result<UserStats> {
 mod tests {
     use super::*;
 
+    /// The source allowlist parser trims, lower-cases, and drops blank entries.
+    #[test]
+    fn parse_gate_sources_normalizes_and_drops_blanks() {
+        assert_eq!(parse_gate_sources(None), Vec::<String>::new());
+        assert_eq!(parse_gate_sources(Some("   ")), Vec::<String>::new());
+        assert_eq!(
+            parse_gate_sources(Some(" Activity , ,Extraction,GUI ")),
+            vec![
+                "activity".to_string(),
+                "extraction".to_string(),
+                "gui".to_string()
+            ]
+        );
+    }
+
+    /// The review gate rewrites status to 'pending' only when enabled AND either the
+    /// source is in the allowlist or the importance exceeds the threshold.
+    #[test]
+    fn resolve_initial_status_only_gates_enabled_listed_sources() {
+        let sources = vec!["activity".to_string(), "extraction".to_string()];
+        // Disabled -> always approved, regardless of source or importance.
+        assert_eq!(
+            resolve_initial_status("activity", 9, false, &sources, Some(7)),
+            "approved"
+        );
+        // Enabled + listed (case-insensitive), no importance threshold -> pending.
+        assert_eq!(
+            resolve_initial_status("Activity", 5, true, &sources, None),
+            "pending"
+        );
+        // Enabled + unlisted (e.g. an explicit user store), no threshold -> approved.
+        assert_eq!(
+            resolve_initial_status("user", 5, true, &sources, None),
+            "approved"
+        );
+        // Enabled + empty allowlist, no threshold -> approved (safe no-op).
+        assert_eq!(
+            resolve_initial_status("activity", 5, true, &[], None),
+            "approved"
+        );
+    }
+
+    /// The importance trigger routes high-importance memories to 'pending' when a
+    /// threshold is configured, independent of the source allowlist. It is strictly
+    /// greater-than, gated by the master switch, and a no-op when unset.
+    #[test]
+    fn resolve_initial_status_gates_high_importance() {
+        let no_sources: Vec<String> = vec![];
+        // Enabled + importance above threshold -> pending, even with empty source list.
+        assert_eq!(
+            resolve_initial_status("user", 9, true, &no_sources, Some(7)),
+            "pending"
+        );
+        assert_eq!(
+            resolve_initial_status("user", 8, true, &no_sources, Some(7)),
+            "pending"
+        );
+        // Boundary: importance == threshold is NOT gated (strictly greater than).
+        assert_eq!(
+            resolve_initial_status("user", 7, true, &no_sources, Some(7)),
+            "approved"
+        );
+        // Below threshold -> approved.
+        assert_eq!(
+            resolve_initial_status("user", 5, true, &no_sources, Some(7)),
+            "approved"
+        );
+        // Backward compat: no threshold means importance never gates.
+        assert_eq!(
+            resolve_initial_status("user", 10, true, &no_sources, None),
+            "approved"
+        );
+        // Disabled overrides everything.
+        assert_eq!(
+            resolve_initial_status("user", 10, false, &no_sources, Some(7)),
+            "approved"
+        );
+        // Either trigger suffices: a listed source with low importance still gates.
+        let sources = vec!["activity".to_string()];
+        assert_eq!(
+            resolve_initial_status("activity", 3, true, &sources, Some(7)),
+            "pending"
+        );
+    }
+
     /// Guard: MEMORY_COLUMNS and row_to_memory must stay aligned. If this test
     /// fails, either the SELECT column list or the row_to_memory mapping
     /// drifted -- both must be updated together.
@@ -1986,6 +2637,110 @@ mod tests {
         .expect("read valence")
     }
 
+    /// Read the persisted content-language for a memory.
+    async fn read_lang(db: &Database, id: i64) -> Option<String> {
+        db.read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT lang FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("read lang")
+    }
+
+    /// Read back the raw created_at TEXT for a stored memory.
+    async fn read_created_at(db: &Database, id: i64) -> String {
+        db.read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT created_at FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("read created_at")
+    }
+
+    /// A created_at override (RFC3339 with offset) is normalized to UTC and
+    /// persisted on the stored row instead of the datetime('now') default.
+    #[tokio::test]
+    async fn store_honors_created_at_override() {
+        let db = Database::connect_memory().await.expect("in-mem db");
+        let mut req = valence_store_request("backfilled memory with explicit timestamp", 1);
+        // 13:00 at +02:00 is 11:00 UTC -> the stored value must be the UTC form.
+        req.created_at = Some("2025-04-08T13:00:00+02:00".to_string());
+        let stored = store(&db, req, None, false).await.expect("store");
+        assert_eq!(read_created_at(&db, stored.id).await, "2025-04-08 11:00:00");
+    }
+
+    /// A bare YYYY-MM-DD override is stored at midnight UTC.
+    #[tokio::test]
+    async fn store_created_at_override_accepts_bare_date() {
+        let db = Database::connect_memory().await.expect("in-mem db");
+        let mut req = valence_store_request("backfilled memory dated by day only", 1);
+        req.created_at = Some("2024-11-30".to_string());
+        let stored = store(&db, req, None, false).await.expect("store");
+        assert_eq!(read_created_at(&db, stored.id).await, "2024-11-30 00:00:00");
+    }
+
+    /// Omitting created_at preserves the default: the row is stamped with a
+    /// recent timestamp (this decade), not left null or empty.
+    #[tokio::test]
+    async fn store_without_created_at_uses_now_default() {
+        let db = Database::connect_memory().await.expect("in-mem db");
+        let req = valence_store_request("memory with no timestamp override", 1);
+        let stored = store(&db, req, None, false).await.expect("store");
+        let ts = read_created_at(&db, stored.id).await;
+        assert!(
+            ts.starts_with("202"),
+            "expected a current timestamp, got {ts}"
+        );
+    }
+
+    /// An unparseable created_at is rejected with InvalidInput rather than
+    /// being silently stored or coerced to now.
+    #[tokio::test]
+    async fn store_rejects_invalid_created_at() {
+        let db = Database::connect_memory().await.expect("in-mem db");
+        let mut req = valence_store_request("memory with a bad timestamp", 1);
+        req.created_at = Some("not-a-date".to_string());
+        let err = store(&db, req, None, false).await.expect_err("must reject");
+        assert!(matches!(err, EngError::InvalidInput(_)), "got {err:?}");
+    }
+
+    /// The store path detects and persists the content language (de/fr).
+    #[tokio::test]
+    async fn store_persists_detected_language() {
+        let db = Database::connect_memory().await.expect("in-mem db");
+        let de = store(
+            &db,
+            valence_store_request(
+                "Die Geschwindigkeitsbegrenzung auf dieser Straße beträgt fünfzig Stundenkilometer.",
+                1,
+            ),
+            None,
+            false,
+        )
+        .await
+        .expect("store de");
+        assert_eq!(read_lang(&db, de.id).await.as_deref(), Some("de"));
+
+        let fr = store(
+            &db,
+            valence_store_request(
+                "La vitesse autorisée sur cette route nationale est de cinquante kilomètres heure.",
+                1,
+            ),
+            None,
+            false,
+        )
+        .await
+        .expect("store fr");
+        assert_eq!(read_lang(&db, fr.id).await.as_deref(), Some("fr"));
+    }
+
     /// Positive affective content should persist positive valence metadata.
     #[tokio::test]
     async fn store_persists_positive_valence_for_happy_content() {
@@ -2038,5 +2793,193 @@ mod tests {
         let (valence, emotion) = read_valence(&db, stored.id).await;
         assert_eq!(valence, None, "neutral content leaves valence null");
         assert_eq!(emotion, None);
+    }
+
+    /// list with from/to bounds returns only rows whose created_at falls in
+    /// the half-open [from, to) window.
+    #[tokio::test]
+    async fn list_filters_by_date_window() {
+        use rusqlite::params;
+        let db = Database::connect_memory().await.expect("in-mem db");
+        // Seed three memories on three different days for user 1.
+        for day in ["2026-03-01", "2026-03-14", "2026-03-30"] {
+            let ts = format!("{day} 12:00:00");
+            db.write(move |conn| {
+                conn.execute(
+                    "INSERT INTO memories (content, category, source, importance, confidence, \
+                     user_id, created_at, updated_at, is_latest, is_forgotten, is_archived, is_consolidated) \
+                     VALUES ('d', 'general', 'test', 5, 1.0, 1, ?1, ?1, 1, 0, 0, 0)",
+                    params![ts],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        }
+        let opts = ListOptions {
+            user_id: Some(1),
+            from: Some("2026-03-10".to_string()),
+            to: Some("2026-03-20".to_string()),
+            ..Default::default()
+        };
+        let got = list(&db, opts).await.expect("list");
+        assert_eq!(got.len(), 1, "only the 2026-03-14 row is in window");
+    }
+
+    /// calendar_counts groups a user's memories by year and returns per-year totals.
+    #[tokio::test]
+    async fn calendar_counts_groups_by_year() {
+        use rusqlite::params;
+        let db = Database::connect_memory().await.expect("in-mem db");
+        for ts in [
+            "2025-06-01 09:00:00",
+            "2026-03-14 12:00:00",
+            "2026-08-02 18:00:00",
+        ] {
+            db.write(move |conn| {
+                conn.execute(
+                    "INSERT INTO memories (content, category, source, importance, confidence, \
+                     user_id, created_at, updated_at, is_latest, is_forgotten, is_archived, is_consolidated) \
+                     VALUES ('c', 'general', 'test', 5, 1.0, 1, ?1, ?1, 1, 0, 0, 0)",
+                    params![ts],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        }
+        let buckets = calendar_counts(&db, 1, "year", None, None)
+            .await
+            .expect("calendar");
+        assert_eq!(
+            buckets,
+            vec![("2026".to_string(), 2), ("2025".to_string(), 1)]
+        );
+    }
+
+    /// The review gate withholds status='pending' memories from default
+    /// listings and the recall tiers, while include_pending surfaces them.
+    /// Pre-gate rows (status='approved') are unaffected.
+    #[tokio::test]
+    async fn recall_withholds_pending_memories() {
+        use rusqlite::params;
+        let db = Database::connect_memory().await.expect("in-mem db");
+        for (content, status) in [("approved fact", "approved"), ("pending fact", "pending")] {
+            db.write(move |conn| {
+                conn.execute(
+                    "INSERT INTO memories (content, category, source, importance, confidence, \
+                     user_id, created_at, updated_at, is_latest, is_forgotten, is_archived, \
+                     is_consolidated, is_static, status) \
+                     VALUES (?1, 'general', 'activity', 80, 1.0, 1, '2026-03-14 12:00:00', \
+                     '2026-03-14 12:00:00', 1, 0, 0, 0, 1, ?2)",
+                    params![content, status],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        }
+
+        // Default list withholds the pending row.
+        let listed = list(
+            &db,
+            ListOptions {
+                user_id: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list");
+        assert_eq!(listed.len(), 1, "default list withholds pending");
+        assert_eq!(listed[0].content, "approved fact");
+
+        // include_pending surfaces both rows.
+        let all = list(
+            &db,
+            ListOptions {
+                user_id: Some(1),
+                include_pending: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list all");
+        assert_eq!(all.len(), 2, "include_pending surfaces pending");
+
+        // Recall tiers withhold pending.
+        let statics = list_static(&db, 1, None, 10).await.expect("static");
+        assert_eq!(statics.len(), 1, "list_static withholds pending");
+        let important = list_important(&db, 1, None, 50, 10)
+            .await
+            .expect("important");
+        assert_eq!(important.len(), 1, "list_important withholds pending");
+    }
+
+    /// Soft deletes must purge chunk vectors from the chunk ANN index.
+    /// delete()/mark_forgotten() only UPDATE `memories`, so the memory_chunks
+    /// CASCADE never fires; pre-fix, the chunk vectors of a forgotten memory
+    /// kept matching in chunk-level search forever.
+    #[cfg(feature = "ml")]
+    #[tokio::test]
+    async fn soft_delete_purges_chunk_vectors() {
+        use crate::vector::lance::LanceIndex;
+        use crate::vector::VectorIndex;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk_index = Arc::new(
+            LanceIndex::open_with_table(dir.path().to_string_lossy(), 4, "chunks_test")
+                .await
+                .expect("open chunk index"),
+        );
+        let mut db = Database::connect_memory().await.expect("in-mem db");
+        db.chunk_vector_index = Some(chunk_index.clone());
+
+        // Seed two owned memories with two chunks each.
+        let mut ids = Vec::new();
+        for content in ["chunked memory alpha", "chunked memory beta"] {
+            let id: i64 = db
+                .write(move |conn| {
+                    Ok(conn.query_row(
+                        "INSERT INTO memories (content, category, source, importance, user_id) \
+                         VALUES (?1, 'general', 'test', 5, 1) RETURNING id",
+                        rusqlite::params![content],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .expect("seed memory");
+            write_chunks(
+                &db,
+                id,
+                &[
+                    ("first chunk".to_string(), vec![1.0, 0.0, 0.0, 0.0]),
+                    ("second chunk".to_string(), vec![0.0, 1.0, 0.0, 0.0]),
+                ],
+            )
+            .await;
+            ids.push(id);
+        }
+        assert_eq!(
+            chunk_index.count().await.expect("count"),
+            4,
+            "two memories x two chunks indexed"
+        );
+
+        // delete() purges its memory's chunk vectors, leaving the other's.
+        delete(&db, ids[0], 1).await.expect("delete");
+        assert_eq!(
+            chunk_index.count().await.expect("count"),
+            2,
+            "delete() must remove the deleted memory's chunk vectors"
+        );
+
+        // mark_forgotten() purges the rest.
+        mark_forgotten(&db, ids[1], 1).await.expect("forget");
+        assert_eq!(
+            chunk_index.count().await.expect("count"),
+            0,
+            "mark_forgotten() must remove the forgotten memory's chunk vectors"
+        );
     }
 }

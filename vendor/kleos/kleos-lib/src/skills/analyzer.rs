@@ -74,7 +74,20 @@ pub async fn correct_skill_id(db: &Database, name: &str, user_id: i64) -> Result
     .await
 }
 
-pub const ANALYSIS_SYSTEM_PROMPT: &str = "You are a skill execution analyzer. Given a task, the skill that was applied, and the execution result, analyze whether the skill was helpful and provide structured feedback. Return JSON with fields: skill_applied (bool), skill_helpful (bool), tool_calls (string[]), error_category (string|null), improvement_notes (string|null).";
+/// Embedded default for the skill-execution analysis system prompt.
+/// Overridable at runtime via the prompt repository under
+/// `skills/analyze_execution/system.txt`.
+pub const ANALYSIS_SYSTEM_PROMPT_DEFAULT: &str =
+    include_str!("../../prompts/skills/analyze_execution/system.txt");
+
+/// Resolve the skill-execution analysis system prompt, honoring any runtime
+/// override.
+pub fn analysis_system_prompt() -> std::borrow::Cow<'static, str> {
+    crate::llm::prompts::load_prompt(
+        "skills/analyze_execution/system",
+        ANALYSIS_SYSTEM_PROMPT_DEFAULT,
+    )
+}
 
 /// Persist an execution analysis to the database.
 /// Inserts into execution_analyses, creates skill_judgments entries, and updates counters.
@@ -280,6 +293,7 @@ pub async fn get_capture_candidates(
                      AND NOT EXISTS ( \
                          SELECT 1 FROM skill_records sr \
                          WHERE sr.is_active = 1 \
+                           AND sr.user_id = ?4 \
                            AND ( \
                                LOWER(m.content) LIKE '%' || LOWER(sr.name) || '%' \
                                OR LOWER(m.content) LIKE '%' || LOWER(COALESCE(sr.description, '')) || '%' \
@@ -399,31 +413,37 @@ pub async fn get_derive_candidates(
     .await
 }
 
+/// Tests for edit-distance scoring and skill candidate analysis queries.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies identical strings have zero edit distance.
     #[test]
     fn test_edit_distance_identical() {
         assert_eq!(edit_distance("hello", "hello"), 0);
     }
 
+    /// Verifies a single-character deletion counts as distance 1.
     #[test]
     fn test_edit_distance_one() {
         assert_eq!(edit_distance("hello", "helo"), 1);
     }
 
+    /// Verifies a two-character transposition counts as distance 2.
     #[test]
     fn test_edit_distance_swap() {
         assert_eq!(edit_distance("abc", "bac"), 2);
     }
 
+    /// Verifies edit distance against an empty string equals the other string's length.
     #[test]
     fn test_edit_distance_empty() {
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("abc", ""), 3);
     }
 
+    /// Verifies ExecutionAnalysis deserializes correctly from JSON.
     #[test]
     fn test_analysis_deserialize() {
         let json = r#"{"skill_applied":true,"skill_helpful":false,"tool_calls":["read_file"],"error_category":"timeout","improvement_notes":"needs retry"}"#;
@@ -433,10 +453,13 @@ mod tests {
         assert_eq!(a.tool_calls.len(), 1);
     }
 
+    /// Opens a fresh in-memory database for a single test.
     async fn memory_db() -> Database {
         Database::connect_memory().await.expect("in-mem db")
     }
 
+    /// Inserts a skill_records row with the given execution/success counts
+    /// and a `created_at` offset from now, returning the new row id.
     async fn seed_skill(
         db: &Database,
         _user_id: i64,
@@ -467,6 +490,7 @@ mod tests {
         .expect("seed skill")
     }
 
+    /// Inserts a skill_tags row linking `tag` to `skill_id`.
     async fn seed_skill_tag(db: &Database, skill_id: i64, tag: &str) {
         let tag = tag.to_string();
         db.write(move |conn| {
@@ -480,6 +504,7 @@ mod tests {
         .expect("seed tag");
     }
 
+    /// Inserts a skill_lineage_parents row linking `child_id` to `parent_id`.
     async fn seed_lineage(db: &Database, child_id: i64, parent_id: i64) {
         db.write(move |conn| {
             conn.execute(
@@ -492,6 +517,8 @@ mod tests {
         .expect("seed lineage");
     }
 
+    /// Verifies a skill below the success-rate threshold is returned as a
+    /// failing candidate.
     #[tokio::test]
     async fn failing_candidates_returns_failing_skill() {
         let db = memory_db().await;
@@ -502,6 +529,8 @@ mod tests {
         assert_eq!(ids, vec![id]);
     }
 
+    /// Verifies a skill below `min_executions` is not returned as a failing
+    /// candidate even if its success rate is 0.
     #[tokio::test]
     async fn failing_candidates_ignores_underused() {
         let db = memory_db().await;
@@ -512,6 +541,8 @@ mod tests {
         assert!(ids.is_empty());
     }
 
+    /// Verifies a parent skill with a recently created fixed child is
+    /// excluded from failing candidates while the cooldown is active.
     #[tokio::test]
     async fn failing_candidates_respects_cooldown() {
         let db = memory_db().await;
@@ -540,6 +571,8 @@ mod tests {
         assert!(ids.is_empty(), "cooldown should hide parent");
     }
 
+    /// Verifies duplicate-content memories collapse to a single capture
+    /// candidate and unrelated memories are excluded.
     #[tokio::test]
     async fn capture_candidates_dedupes() {
         let db = memory_db().await;
@@ -562,6 +595,8 @@ mod tests {
         assert_eq!(rows, vec!["use ripgrep over grep".to_string()]);
     }
 
+    /// Verifies two skills sharing all tags are returned as a derive
+    /// candidate pair with a direction hint naming both skills.
     #[tokio::test]
     async fn derive_candidates_finds_similar_pair() {
         let db = memory_db().await;
@@ -577,6 +612,8 @@ mod tests {
         assert!(pairs[0].1.contains("shell-cheatsheet"));
     }
 
+    /// Verifies a pair with an existing derived child skill is suppressed
+    /// from future derive candidates.
     #[tokio::test]
     async fn derive_candidates_skip_already_derived() {
         let db = memory_db().await;

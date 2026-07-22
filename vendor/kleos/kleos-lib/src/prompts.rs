@@ -44,10 +44,15 @@ pub async fn generate_prompt(
 
             // Static facts
             {
+                // Review-gate + liveness: is_archived = 0 and is_latest = 1 drop
+                // rejected and superseded rows; status != 'pending' withholds
+                // memories still awaiting review from the generated prompt.
                 let mut stmt = conn.prepare(
                     "SELECT id, content, category, importance \
                          FROM memories \
                          WHERE is_static = 1 AND is_forgotten = 0 \
+                           AND is_archived = 0 AND is_latest = 1 \
+                           AND status != 'pending' \
                            AND is_consolidated = 0 AND user_id = ?1",
                 )?;
                 let rows = stmt.query_map(params![prompt_user_id], |row| {
@@ -67,12 +72,15 @@ pub async fn generate_prompt(
 
             // Important memories
             {
+                // status != 'pending' is the review-gate predicate: pending
+                // memories must not surface in the generated prompt.
                 let mut stmt = conn.prepare(
                     "SELECT id, content, category, importance, \
                                 COALESCE(decay_score, importance) AS ds \
                          FROM memories \
                          WHERE is_forgotten = 0 AND is_archived = 0 \
                            AND is_latest = 1 AND is_consolidated = 0 \
+                           AND status != 'pending' \
                            AND user_id = ?1 \
                          ORDER BY ds DESC LIMIT 1000",
                 )?;
@@ -243,27 +251,30 @@ pub async fn generate_header(
 // Living prompt -- Eidolon-style context block with brain recall
 // ---------------------------------------------------------------------------
 
-/// Credential scrubbing patterns. Lines matching any of these patterns AND
-/// containing "=" or ":" (but not "://" or "path") are redacted.
-const SCRUB_PATTERNS: &[&str] = &[
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
-    "private_key",
-    "bearer",
-    "authorization",
-    "credential",
-];
-
 /// Remove credential values from arbitrary text before inserting into prompts.
+///
+/// Credential keywords from the i18n
+/// lexicon, matched through fold_for_matching so that "Mot de Passe :
+/// xxx" matches "mot de passe" without depending on exact casing or
+/// accent presence. The credential_keywords class declares stem = false
+/// in the TOML so api_key / clé_privée etc. are not corrupted by
+/// morphological stemming.
 pub fn scrub_credentials(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     for line in text.lines() {
-        let line_lower = line.to_lowercase();
-        let is_cred = SCRUB_PATTERNS.iter().any(|pat| line_lower.contains(pat));
+        let is_cred = crate::lexicon::supported_languages().iter().any(|lang| {
+            let folded_line =
+                crate::lexicon::fold_word_for_class(line, lang, "credential_keywords");
+            crate::lexicon::word_class(lang, "credential_keywords")
+                .iter()
+                .any(|pat| {
+                    folded_line.contains(&crate::lexicon::fold_word_for_class(
+                        pat,
+                        lang,
+                        "credential_keywords",
+                    ))
+                })
+        });
         if is_cred
             && (line.contains('=')
                 || (line.contains(':') && !line.contains("://") && !line.contains("path")))

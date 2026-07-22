@@ -23,7 +23,9 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+// Human-readable state name for logs and metrics.
 impl std::fmt::Display for CircuitState {
+    // Writes the lowercase snake_case state name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "closed"),
@@ -64,6 +66,7 @@ pub struct CircuitBreaker {
     state: RwLock<State>,
 }
 
+// Core state machine driving Closed/Open/HalfOpen transitions and call gating.
 impl CircuitBreaker {
     /// Create a new circuit breaker.
     ///
@@ -209,17 +212,22 @@ struct InFlightGuard<'a> {
     armed: bool,
 }
 
+/// Constructs and disarms the cancellation guard for a HalfOpen probe.
 impl<'a> InFlightGuard<'a> {
+    /// Arms the guard so a dropped probe future releases its in_flight slot.
     fn new(state: &'a RwLock<State>) -> Self {
         Self { state, armed: true }
     }
 
+    /// Hands the state transition off to Phase 3 so `drop` no longer decrements in_flight.
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
+// Releases the HalfOpen in_flight slot on cancellation/panic unless disarmed.
 impl Drop for InFlightGuard<'_> {
+    // Decrements in_flight only while still armed; a no-op after `disarm`.
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -246,7 +254,9 @@ pub struct BreakerConfig {
     pub cooldown: Duration,
 }
 
+// Default legacy config: 5 consecutive failures, 30s cooldown.
 impl Default for BreakerConfig {
+    // Builds the default BreakerConfig values.
     fn default() -> Self {
         Self {
             failure_threshold: 5,
@@ -268,7 +278,9 @@ pub enum CircuitError<E> {
     Inner(E),
 }
 
+// Human-readable message for the legacy CircuitError<E> variants.
 impl<E: std::fmt::Display> std::fmt::Display for CircuitError<E> {
+    // Writes "circuit breaker open" or delegates to the inner error's Display.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Open => write!(f, "circuit breaker open"),
@@ -277,9 +289,12 @@ impl<E: std::fmt::Display> std::fmt::Display for CircuitError<E> {
     }
 }
 
+// Marker impl so CircuitError<E> satisfies std::error::Error.
 impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for CircuitError<E> {}
 
+/// Constructors and legacy-compatible operations for `LegacyCircuitBreaker`.
 impl LegacyCircuitBreaker {
+    /// Builds a legacy breaker from `BreakerConfig`, fixing half_open_max_calls to 1.
     pub fn new(config: BreakerConfig) -> Self {
         Self(CircuitBreaker::new(
             config.failure_threshold,
@@ -408,6 +423,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
+    // Builds a breaker with the given threshold and reset timeout (ms); half_open_max_calls = 1.
     fn make_breaker(threshold: u32, timeout_ms: u64) -> CircuitBreaker {
         CircuitBreaker::new(threshold, Duration::from_millis(timeout_ms), 1)
     }
@@ -435,6 +451,7 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
+    // An Open breaker rejects calls without ever invoking the wrapped op.
     #[tokio::test]
     async fn open_rejects_without_calling_op() {
         let cb = make_breaker(1, 10_000);
@@ -464,13 +481,15 @@ mod tests {
 
     #[tokio::test]
     async fn open_transitions_to_half_open_after_timeout() {
-        let cb = make_breaker(1, 50);
+        // Zero reset timeout: the std::time::Instant elapsed() gate passes on
+        // the very next call, so the Open -> HalfOpen transition is exercised
+        // without any real-clock sleep (tokio's paused clock cannot fast
+        // forward std Instants, so duration injection is the only fast path).
+        let cb = make_breaker(1, 0);
         let _: Result<()> = cb
             .call(|| async { Err(EngError::Internal("x".into())) })
             .await;
         assert_eq!(cb.state(), CircuitState::Open);
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
 
         // Calling now should enter HalfOpen and allow the probe through.
         let called = Arc::new(AtomicU32::new(0));
@@ -490,11 +509,12 @@ mod tests {
 
     #[tokio::test]
     async fn half_open_success_closes_breaker() {
-        let cb = make_breaker(1, 30);
+        // Zero reset timeout (see open_transitions_to_half_open_after_timeout)
+        // so the probe is admitted immediately with no real-clock sleep.
+        let cb = make_breaker(1, 0);
         let _: Result<()> = cb
             .call(|| async { Err(EngError::Internal("x".into())) })
             .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let r: Result<i32> = cb.call(|| async { Ok(7) }).await;
         assert_eq!(r.ok(), Some(7));
@@ -505,11 +525,13 @@ mod tests {
 
     #[tokio::test]
     async fn half_open_failure_reopens_breaker() {
-        let cb = make_breaker(1, 30);
+        // Zero reset timeout admits the probe immediately; state() is a pure
+        // snapshot (no elapsed-time recompute), so the re-Open assertion below
+        // still observes Open even though the next call could probe again.
+        let cb = make_breaker(1, 0);
         let _: Result<()> = cb
             .call(|| async { Err(EngError::Internal("x".into())) })
             .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let r: Result<()> = cb
             .call(|| async { Err(EngError::Internal("still broken".into())) })
@@ -547,16 +569,18 @@ mod tests {
 
     // -- A cancelled HalfOpen probe releases its in_flight slot ---------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_half_open_probe_releases_in_flight() {
         // half_open_max_calls = 1 (make_breaker). A probe that is dropped mid
         // flight must release its slot, or the breaker locks in HalfOpen.
-        let cb = make_breaker(1, 50);
+        // Zero reset timeout skips the Open cooldown without sleeping, and the
+        // paused clock resolves the select! race below virtually (the timers
+        // are pure tokio sleeps, so no real wall-clock time passes).
+        let cb = make_breaker(1, 0);
         let _: Result<()> = cb
             .call(|| async { Err(EngError::Internal("x".into())) })
             .await;
         assert_eq!(cb.state(), CircuitState::Open);
-        tokio::time::sleep(Duration::from_millis(80)).await;
 
         // Start a HalfOpen probe that hangs, then cancel it by dropping the
         // future (the inner op never completes Phase 3).
@@ -589,6 +613,7 @@ mod tests {
         })
     }
 
+    // Legacy adapter: an Open breaker rejects calls without invoking the op.
     #[tokio::test]
     async fn legacy_open_rejects_without_calling_op() {
         let cb = make_legacy(1, 10_000);
@@ -612,12 +637,14 @@ mod tests {
         );
     }
 
+    // Legacy adapter: a failed HalfOpen probe reopens the breaker.
     #[tokio::test]
     async fn legacy_half_open_failure_reopens() {
-        let cb = make_legacy(1, 30);
+        // Zero cooldown admits the probe immediately (same duration-injection
+        // pattern as the non-legacy tests above; no real-clock sleep).
+        let cb = make_legacy(1, 0);
         let _: std::result::Result<(), CircuitError<&str>> = cb.call(|| async { Err("x") }).await;
         assert_eq!(cb.state(), "open");
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let r: std::result::Result<(), CircuitError<&str>> =
             cb.call(|| async { Err("still broken") }).await;
@@ -625,15 +652,17 @@ mod tests {
         assert_eq!(cb.state(), "open");
     }
 
-    #[tokio::test]
+    // Legacy adapter: the first HalfOpen probe occupies the single slot itself.
+    #[tokio::test(start_paused = true)]
     async fn legacy_half_open_probe_counts_itself() {
         // CB-4 for the legacy path: after the cooldown the first probe must
         // occupy the single half-open slot (in_flight: 1), so a concurrent
         // second call is rejected instead of also slipping through.
-        let cb = make_legacy(1, 50);
+        // Zero cooldown skips the Open wait; the paused clock resolves the
+        // hanging-probe select! race below with no real wall-clock time.
+        let cb = make_legacy(1, 0);
         let _: std::result::Result<(), CircuitError<&str>> = cb.call(|| async { Err("x") }).await;
         assert_eq!(cb.state(), "open");
-        tokio::time::sleep(Duration::from_millis(80)).await;
 
         // A hanging probe occupies the slot but never reaches Phase 3.
         let probe = cb.call(|| async {

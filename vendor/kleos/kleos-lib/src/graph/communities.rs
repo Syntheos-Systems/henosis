@@ -24,22 +24,31 @@ fn edge_weight(link_type: &str, similarity: f64) -> f64 {
     similarity * tw
 }
 
-/// Run Louvain modularity optimization over the memory graph and write
-/// the resulting `community_id` back onto each memory. Bounded to 10,000
-/// nodes and 100 iterations to keep the call from running the server out
-/// of CPU on a large tenant. Returns the assignment summary that the
-/// caller turns into a JSON response.
+/// Maximum nodes (memories) Louvain processes in one run. Louvain is ~O(n^2) per pass, so this
+/// is capped to protect CPU. Default 10_000 (historical); raise per deployment via
+/// `KLEOS_COMMUNITY_MAX_NODES`, clamped to [100, 200_000] so a typo cannot uncap it.
+static COMMUNITY_MAX_NODES: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    std::env::var("KLEOS_COMMUNITY_MAX_NODES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|n| n.clamp(100, 200_000))
+        .unwrap_or(10_000)
+});
+
+/// Run Louvain modularity optimization over one owner's memory graph and write the resulting
+/// `community_id` back onto each memory. Scoped to `user_id` (each tenant shard is one owner,
+/// so the scheduled job passes the shard's parsed user_id). Bounded by `COMMUNITY_MAX_NODES`
+/// nodes and 100 iterations. Returns the assignment summary the caller turns into a response.
 #[tracing::instrument(skip(db))]
 pub async fn detect_communities(
     db: &Database,
     user_id: i64,
     max_iterations: u32,
 ) -> Result<CommunitiesResult> {
-    // SECURITY/DoS: Louvain modularity optimization runs O(n^2)-ish over the
-    // node count and O(E) per pass over edges. Cap both so a large tenant
-    // cannot run the server out of CPU and memory in a single call. Callers
-    // hitting the cap still get a best-effort result over the top-N memories.
-    const MAX_NODES: i64 = 10_000;
+    // SECURITY/DoS: Louvain runs O(n^2)-ish over nodes and O(E) per pass. Cap nodes (env-tunable
+    // via COMMUNITY_MAX_NODES) and iterations so a large tenant cannot run a CPU out; callers
+    // hitting the cap still get a best-effort result over the top-N memories by importance.
+    let max_nodes: i64 = *COMMUNITY_MAX_NODES;
     const MAX_ITERATIONS: u32 = 100;
     let max_iterations = max_iterations.clamp(1, MAX_ITERATIONS);
 
@@ -53,7 +62,7 @@ pub async fn detect_communities(
                      ORDER BY importance DESC, id DESC LIMIT ?1",
             )?;
             let ids = stmt
-                .query_map(rusqlite::params![MAX_NODES, user_id], |row| row.get(0))?
+                .query_map(rusqlite::params![max_nodes, user_id], |row| row.get(0))?
                 .collect::<std::result::Result<Vec<i64>, _>>()?;
             Ok(ids)
         })
@@ -76,16 +85,24 @@ pub async fn detect_communities(
 
     let edges: Vec<EdgeRow> = db
         .read(move |conn| {
+            // memory_links has no user_id column; isolation is via the JOIN to
+            // memories. Without the ms.user_id / mt.user_id predicate this loads
+            // every tenant's edges in shared-monolith mode (the mem_set filter
+            // below still keeps the result correct, but the load is O(all edges)
+            // repeated per owner). Scoping both endpoints keeps it to the
+            // caller's own edges. Both endpoints of an intra-user edge share the
+            // same owner, so binding user_id twice is correct.
             let mut stmt = conn.prepare(
                 "SELECT ml.source_id, ml.target_id, ml.similarity, ml.type \
                      FROM memory_links ml \
                      JOIN memories ms ON ms.id = ml.source_id \
                      JOIN memories mt ON mt.id = ml.target_id \
                      WHERE ms.is_forgotten = 0 AND mt.is_forgotten = 0 \
-                       AND ms.is_archived = 0 AND mt.is_archived = 0",
+                       AND ms.is_archived = 0 AND mt.is_archived = 0 \
+                       AND ms.user_id = ?1 AND mt.user_id = ?1",
             )?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map(rusqlite::params![user_id], |row| {
                     Ok(EdgeRow {
                         source_id: row.get(0)?,
                         target_id: row.get(1)?,
@@ -265,9 +282,13 @@ pub async fn get_community_members(
     limit: usize,
 ) -> Result<Vec<CommunityMember>> {
     db.read(move |conn| {
+        // Review-gate + liveness: is_latest = 1 drops superseded versions and
+        // status != 'pending' withholds unreviewed content from the community
+        // members endpoint.
         let mut stmt = conn.prepare(
             "SELECT id, content, category, importance, created_at FROM memories \
                  WHERE community_id = ?1 AND is_forgotten = 0 AND is_archived = 0 \
+                   AND is_latest = 1 AND status != 'pending' \
                    AND user_id = ?3 \
                  ORDER BY importance DESC, created_at DESC LIMIT ?2",
         )?;

@@ -216,10 +216,27 @@ impl OnnxInner {
         };
         // Lock released -- mean pooling and normalization are lock-free.
 
-        // 6. Handle 2D [1, dim] vs 3D [1, seq, dim] output
+        // 6. Handle 2D [1, dim] vs 3D [1, seq, dim] output. The tensor shape is
+        // reported by the model at runtime, not derived from config, so validate
+        // the config-supplied seq_len and dim against it before pooling or
+        // truncating. A silent mismatch would make mean_pool stride over the wrong
+        // layout (reading past the buffer or mixing token positions) or yield a
+        // wrong-length vector -- both corrupt the embedding without an error.
         let mut embedding = if shape.len() == 2 {
+            if shape[1] < self.dim {
+                return Err(EngError::Internal(format!(
+                    "onnx 2D output shape {:?} has dim < configured dim {}",
+                    shape, self.dim
+                )));
+            }
             raw_data
         } else if shape.len() == 3 {
+            if shape[1] != seq_len || shape[2] != self.dim {
+                return Err(EngError::Internal(format!(
+                    "onnx 3D output shape {:?} does not match expected [_, seq_len={}, dim={}]",
+                    shape, seq_len, self.dim
+                )));
+            }
             mean_pool(&raw_data, &attention_mask_for_pool, seq_len, self.dim)
         } else {
             return Err(EngError::Internal(format!(

@@ -111,6 +111,7 @@ fn store_request(content: &str, user_id: i64) -> StoreRequest {
         chunk_embeddings: None,
         sync_id: None,
         artifacts: None,
+        created_at: None,
     }
 }
 

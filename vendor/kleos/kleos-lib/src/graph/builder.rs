@@ -32,6 +32,7 @@ pub async fn build_graph_data(db: &Database, opts: &GraphBuildOptions) -> Result
                             decay_score, community_id \
                      FROM memories \
                      WHERE is_forgotten = 0 AND is_archived = 0 AND is_latest = 1 \
+                       AND status != 'pending' \
                        AND user_id = ?2 \
                      ORDER BY COALESCE(decay_score, importance) DESC \
                      LIMIT ?1",

@@ -547,6 +547,7 @@ pub async fn evaluate(db: &Database, req: EvaluateRequest) -> Result<Evaluation>
             "overall_score": eval.overall_score,
             "rubric_id": eval.rubric_id,
         }),
+        user_id,
     )
     .await;
 

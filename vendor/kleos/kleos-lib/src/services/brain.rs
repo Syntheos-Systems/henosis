@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
+// RwLock guards the in-process Hopfield state, which only exists with the
+// brain_hopfield feature.
+#[cfg(feature = "brain_hopfield")]
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -23,7 +27,9 @@ use crate::{EngError, Result};
 /// subprocess (eidolon binary) or the in-process Hopfield network.
 #[async_trait]
 pub trait BrainBackend: Send + Sync {
+    /// Whether the backend has finished initializing and can serve requests.
     fn is_ready(&self) -> bool;
+    /// Stop the backend, releasing any subprocess or in-process resources.
     async fn stop(&self);
     /// Query for activated patterns. `user_id` scopes recall to the caller's
     /// pattern space; the in-process Hopfield backend filters by owner so
@@ -47,8 +53,12 @@ pub trait BrainBackend: Send + Sync {
     async fn decay_tick(&self, user_id: i64, ticks: u32) -> Result<()>;
     /// Per-tenant brain statistics.
     async fn stats(&self, user_id: i64) -> Result<BrainStats>;
-    /// Global dream cycle (admin-only at the route layer).
-    async fn dream_cycle(&self) -> Result<BrainResponse>;
+    /// Per-tenant dream cycle. `user_id` scopes the consolidation to one
+    /// tenant's pattern space. The route/dreamer layer fans out over all
+    /// active users; admin scope is still required at the route boundary.
+    async fn dream_cycle(&self, user_id: i64) -> Result<BrainResponse>;
+    /// Record whether a set of memories/edges were useful, reinforcing or
+    /// letting them decay accordingly.
     async fn feedback_signal(
         &self,
         user_id: i64,
@@ -56,8 +66,12 @@ pub trait BrainBackend: Send + Sync {
         edge_pairs: Vec<(i64, i64)>,
         useful: bool,
     ) -> Result<BrainResponse>;
+    /// Run one neuroevolution training step over buffered feedback signals.
     async fn evolution_train(&self) -> Result<BrainResponse>;
+    /// Report current neuroevolution generation and weight statistics.
     async fn evolution_stats(&self) -> Result<BrainResponse>;
+    /// Reapply built-in instinct patterns to the network. Default is
+    /// unsupported; only backends that maintain a live network override it.
     async fn reapply_instincts(&self) -> Result<BrainResponse> {
         Err(crate::EngError::Internal(
             "reapply_instincts not supported by this backend".to_string(),
@@ -86,6 +100,7 @@ pub struct BrainMemory {
     pub tags: Option<Vec<String>>,
 }
 
+// A pair of patterns where one memory's activation displaced another's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainContradiction {
     pub winner_id: i64,
@@ -95,6 +110,7 @@ pub struct BrainContradiction {
     pub reason: String,
 }
 
+// Result of a brain query: activated memories plus any contradictions found.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrainQueryResult {
     pub activated: Vec<BrainMemory>,
@@ -104,6 +120,7 @@ pub struct BrainQueryResult {
 /// BrainStats is an opaque JSON blob from the subprocess.
 pub type BrainStats = serde_json::Value;
 
+// Envelope for every reply from the brain subprocess (or its in-process equivalent).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +179,7 @@ pub enum BrainCommand {
         seq: Option<i64>,
     },
     DreamCycle {
+        user_id: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         seq: Option<i64>,
     },
@@ -182,6 +200,7 @@ pub enum BrainCommand {
     },
 }
 
+// Query knobs accepted from the route layer (top_k, beta, spread hops).
 #[derive(Debug, Deserialize)]
 pub struct BrainQueryOptions {
     pub query: String,
@@ -193,11 +212,13 @@ pub struct BrainQueryOptions {
     pub spread_hops: Option<usize>,
 }
 
+// Request body for absorbing a memory by id into the brain.
 #[derive(Debug, Deserialize)]
 pub struct AbsorbRequest {
     pub id: i64,
 }
 
+// Request body for reporting whether memories/edges were useful.
 #[derive(Debug, Deserialize)]
 pub struct FeedbackRequest {
     pub memory_ids: Vec<i64>,
@@ -205,12 +226,14 @@ pub struct FeedbackRequest {
     pub useful: bool,
 }
 
+// Request body for a manual decay tick.
 #[derive(Debug, Deserialize)]
 pub struct DecayRequest {
     #[serde(default = "default_ticks")]
     pub ticks: u32,
 }
 
+// Default tick count for a decay request when the caller omits it.
 fn default_ticks() -> u32 {
     1
 }
@@ -220,7 +243,9 @@ pub struct BrainQueryState {
     last_query_time: AtomicU64,
 }
 
+// Constructors and accessors for BrainQueryState.
 impl BrainQueryState {
+    /// Create a new state stamped with the current time as the last query time.
     pub fn new() -> Self {
         Self {
             last_query_time: AtomicU64::new(
@@ -232,6 +257,7 @@ impl BrainQueryState {
         }
     }
 
+    /// Stamp the state with the current time, marking a query as having occurred.
     pub fn touch(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -240,21 +266,27 @@ impl BrainQueryState {
         self.last_query_time.store(now, Ordering::Relaxed);
     }
 
+    /// Read the last-recorded query timestamp (millis since epoch).
     pub fn last_query_time(&self) -> u64 {
         self.last_query_time.load(Ordering::Relaxed)
     }
 }
 
+// Default constructs a fresh, just-touched state.
 impl Default for BrainQueryState {
+    /// Delegate to `new()` so `Default::default()` behaves the same as construction.
     fn default() -> Self {
         Self::new()
     }
 }
 // --- Brain Manager (from manager.ts) ---
 
+// How long to wait for a subprocess response before treating it as timed out.
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
+// Cap on automatic subprocess restarts before giving up.
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 
+// A single in-flight request awaiting a reply from the brain subprocess.
 struct PendingRequest {
     tx: tokio::sync::oneshot::Sender<BrainResponse>,
 }
@@ -262,6 +294,7 @@ struct PendingRequest {
 /// M-014: max entries in the pending map (in-flight brain requests).
 const PENDING_CAP: usize = 1024;
 
+// Manages the eidolon subprocess: spawn, stdin/stdout JSON protocol, restarts.
 pub struct BrainManager {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
@@ -275,7 +308,9 @@ pub struct BrainManager {
     /// M-014: track reader task handles so shutdown() can abort them.
     reader_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
+// Construction, subprocess lifecycle, and the JSON request/response protocol.
 impl BrainManager {
+    /// Build a new manager pointed at the configured brain binary; does not spawn it yet.
     pub fn new(data_dir: String) -> Self {
         let backend = crate::kleos_env("BRAIN_BACKEND").unwrap_or_else(|_| "rust".into());
         let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
@@ -300,9 +335,12 @@ impl BrainManager {
         }
     }
 
+    /// Whether the subprocess has completed init and can accept commands.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
+    /// Serialize a command, send it over stdin, and await its response over the
+    /// pending-request channel with a timeout.
     async fn send_command(&self, mut cmd: BrainCommand) -> Result<BrainResponse> {
         if !self.is_ready() {
             return Err(EngError::Internal("brain_not_ready".into()));
@@ -318,7 +356,7 @@ impl BrainManager {
             BrainCommand::DecayTick { seq, .. } => *seq = Some(this_seq),
             BrainCommand::GetStats { seq, .. } => *seq = Some(this_seq),
             BrainCommand::Shutdown { seq, .. } => *seq = Some(this_seq),
-            BrainCommand::DreamCycle { seq, .. } => *seq = Some(this_seq),
+            BrainCommand::DreamCycle { seq, .. } => *seq = Some(this_seq), // user_id forwarded as-is
             BrainCommand::FeedbackSignal { seq, .. } => *seq = Some(this_seq),
             BrainCommand::EvolutionTrain { seq, .. } => *seq = Some(this_seq),
             BrainCommand::EvolutionStats { seq, .. } => *seq = Some(this_seq),
@@ -385,6 +423,7 @@ impl BrainManager {
             }
         }
     }
+    /// Spawn the subprocess (if its binary exists) and run the init handshake.
     pub async fn start(&self) -> bool {
         if !std::path::Path::new(&self.binary_path).exists() {
             info!(msg = "brain_start_skipped", reason = "binary_not_found", path = %self.binary_path);
@@ -395,6 +434,7 @@ impl BrainManager {
         self.init_brain().await
     }
 
+    /// Spawn the subprocess and wire up stdin/stdout/stderr reader tasks.
     async fn spawn_brain(&self) {
         info!(msg = "brain_spawn", binary = %self.binary_path);
 
@@ -467,6 +507,7 @@ impl BrainManager {
             handles.push(h);
         }
     }
+    /// Send the Init command to the freshly spawned subprocess and mark ready on success.
     async fn init_brain(&self) -> bool {
         // Give process a moment to start
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -509,6 +550,7 @@ impl BrainManager {
             }
         }
     }
+    /// Shut down the subprocess: send Shutdown, clear pending requests, kill the child.
     pub async fn stop(&self) {
         // Max out restart attempts to prevent auto-restart
         self.restart_attempts
@@ -590,6 +632,7 @@ impl BrainManager {
         info!(msg = "brain_shutdown_complete");
     }
 
+    /// Embed the query text and send it to the subprocess for recall.
     pub async fn query(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -620,6 +663,7 @@ impl BrainManager {
             .map_err(|e| EngError::Internal(format!("brain_query parse: {}", e)))
     }
 
+    /// Embed the memory content and send it to the subprocess to be absorbed.
     pub async fn absorb(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -649,6 +693,7 @@ impl BrainManager {
         }
         Ok(())
     }
+    /// Ask the subprocess to run `ticks` decay steps; ignores subprocess errors.
     pub async fn decay_tick(&self, ticks: u32) -> Result<()> {
         if !self.is_ready() {
             return Ok(());
@@ -659,6 +704,7 @@ impl BrainManager {
         Ok(())
     }
 
+    /// Fetch the subprocess's opaque stats blob.
     pub async fn stats(&self) -> Result<BrainStats> {
         let resp = self
             .send_command(BrainCommand::GetStats { seq: None })
@@ -671,11 +717,13 @@ impl BrainManager {
         Ok(resp.data.unwrap_or(Value::Null))
     }
 
-    pub async fn dream_cycle(&self) -> Result<BrainResponse> {
-        self.send_command(BrainCommand::DreamCycle { seq: None })
+    /// Trigger a dream/consolidation cycle for one tenant via the subprocess.
+    pub async fn dream_cycle(&self, user_id: i64) -> Result<BrainResponse> {
+        self.send_command(BrainCommand::DreamCycle { user_id, seq: None })
             .await
     }
 
+    /// Forward a feedback signal (useful/not useful) to the subprocess.
     pub async fn feedback_signal(
         &self,
         memory_ids: Vec<i64>,
@@ -691,27 +739,34 @@ impl BrainManager {
         .await
     }
 
+    /// Ask the subprocess to run one neuroevolution training step.
     pub async fn evolution_train(&self) -> Result<BrainResponse> {
         self.send_command(BrainCommand::EvolutionTrain { seq: None })
             .await
     }
 
+    /// Fetch neuroevolution stats from the subprocess.
     pub async fn evolution_stats(&self) -> Result<BrainResponse> {
         self.send_command(BrainCommand::EvolutionStats { seq: None })
             .await
     }
 }
 
+// BrainBackend impl for the subprocess manager; tenant-scoped args are
+// accepted but the subprocess protocol itself carries no tenant identity.
 #[async_trait]
 impl BrainBackend for BrainManager {
+    /// Delegate to the inherent `is_ready`.
     fn is_ready(&self) -> bool {
         self.is_ready()
     }
 
+    /// Delegate to the inherent `stop`.
     async fn stop(&self) {
         self.stop().await;
     }
 
+    // `_user_id` is accepted for trait parity but unused here; see comment below.
     async fn query(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -725,6 +780,8 @@ impl BrainBackend for BrainManager {
         self.query(embedder, text, options).await
     }
 
+    // `_user_id` is accepted for trait parity but unused: the subprocess
+    // protocol has no tenant identity.
     async fn absorb(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -734,18 +791,22 @@ impl BrainBackend for BrainManager {
         self.absorb(embedder, memory).await
     }
 
+    // `_user_id` unused; subprocess decay is global, not per-tenant.
     async fn decay_tick(&self, _user_id: i64, ticks: u32) -> Result<()> {
         self.decay_tick(ticks).await
     }
 
+    // `_user_id` unused; subprocess stats are global, not per-tenant.
     async fn stats(&self, _user_id: i64) -> Result<BrainStats> {
         self.stats().await
     }
 
-    async fn dream_cycle(&self) -> Result<BrainResponse> {
-        self.dream_cycle().await
+    /// Delegate to the inherent `dream_cycle`.
+    async fn dream_cycle(&self, user_id: i64) -> Result<BrainResponse> {
+        self.dream_cycle(user_id).await
     }
 
+    // `_user_id` unused; subprocess feedback is global, not per-tenant.
     async fn feedback_signal(
         &self,
         _user_id: i64,
@@ -756,10 +817,12 @@ impl BrainBackend for BrainManager {
         self.feedback_signal(memory_ids, edge_pairs, useful).await
     }
 
+    /// Delegate to the inherent `evolution_train`.
     async fn evolution_train(&self) -> Result<BrainResponse> {
         self.evolution_train().await
     }
 
+    /// Delegate to the inherent `evolution_stats`.
     async fn evolution_stats(&self) -> Result<BrainResponse> {
         self.evolution_stats().await
     }
@@ -785,6 +848,7 @@ pub struct HopfieldBrainManager {
     evolution: RwLock<crate::brain::evolution::EvolutionState>,
 }
 
+// Construction for the in-process Hopfield backend.
 #[cfg(feature = "brain_hopfield")]
 impl HopfieldBrainManager {
     /// Create a new in-process Hopfield brain manager. Loads patterns from
@@ -821,18 +885,25 @@ impl HopfieldBrainManager {
     }
 }
 
+// BrainBackend impl for the in-process Hopfield network: every method is
+// tenant-scoped by the `user_id` argument it receives.
 #[cfg(feature = "brain_hopfield")]
 #[async_trait]
 impl BrainBackend for HopfieldBrainManager {
+    /// Whether the network has finished loading and can serve requests.
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
 
+    /// Mark the backend not-ready. The network stays in memory; this only
+    /// gates further requests.
     async fn stop(&self) {
         self.ready.store(false, Ordering::Relaxed);
         info!(msg = "hopfield_brain_stopped");
     }
 
+    /// Embed the query, recall matching patterns for `user_id`, and hydrate
+    /// them into full BrainMemory records.
     async fn query(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -869,6 +940,8 @@ impl BrainBackend for HopfieldBrainManager {
         })
     }
 
+    /// Store the memory's pattern with causal edges to temporal neighbours,
+    /// and clear any ghost patterns it supersedes.
     async fn absorb(
         &self,
         embedder: &dyn EmbeddingProvider,
@@ -919,6 +992,7 @@ impl BrainBackend for HopfieldBrainManager {
         Ok(())
     }
 
+    /// Run `ticks` decay steps over `user_id`'s patterns and edges.
     async fn decay_tick(&self, user_id: i64, ticks: u32) -> Result<()> {
         use crate::brain::hopfield::recall;
 
@@ -940,6 +1014,7 @@ impl BrainBackend for HopfieldBrainManager {
         Ok(())
     }
 
+    /// Compute pattern-count and strength statistics scoped to `user_id`.
     async fn stats(&self, user_id: i64) -> Result<BrainStats> {
         use crate::brain::hopfield::pattern;
 
@@ -962,14 +1037,13 @@ impl BrainBackend for HopfieldBrainManager {
         }))
     }
 
-    async fn dream_cycle(&self) -> Result<BrainResponse> {
+    /// Run the full 6-stage consolidation cycle scoped to `user_id`.
+    async fn dream_cycle(&self, user_id: i64) -> Result<BrainResponse> {
         use crate::brain::dream::run_dream_cycle;
 
-        // Dream is a global maintenance pass on the shared network. Per-tenant
-        // dream scoping needs the route layer to fan out per active user; for
-        // now this consolidates against pattern-owner 1 (operator namespace)
-        // and is gated to admin scope at the route boundary.
-        let user_id: i64 = 1;
+        // Dream scoped to a single tenant's pattern space. The route/dreamer
+        // layer fans out over all active users; admin scope required at the
+        // route boundary (H-R3-001).
         let mut network = self.network.write().await;
 
         // Full 6-stage consolidation: replay, merge, prune, discover, decorrelate, resolve.
@@ -986,6 +1060,8 @@ impl BrainBackend for HopfieldBrainManager {
         })
     }
 
+    /// Reinforce useful patterns in the network and record the signal into
+    /// the evolution feedback buffer.
     async fn feedback_signal(
         &self,
         user_id: i64,
@@ -1041,6 +1117,7 @@ impl BrainBackend for HopfieldBrainManager {
         })
     }
 
+    /// Run one neuroevolution training step and persist the updated state.
     async fn evolution_train(&self) -> Result<BrainResponse> {
         let mut evo = self.evolution.write().await;
         let before = evo.generation;
@@ -1061,6 +1138,7 @@ impl BrainBackend for HopfieldBrainManager {
         })
     }
 
+    /// Report the current evolution generation and weight statistics.
     async fn evolution_stats(&self) -> Result<BrainResponse> {
         use crate::brain::evolution::EvolutionStatsResult;
 
@@ -1078,6 +1156,7 @@ impl BrainBackend for HopfieldBrainManager {
         })
     }
 
+    /// Reapply built-in instinct patterns to the network under the operator namespace.
     async fn reapply_instincts(&self) -> Result<BrainResponse> {
         use crate::brain::instincts;
 
@@ -1264,6 +1343,7 @@ pub async fn create_brain_backend(
     }
 }
 
+// Memory fields needed to absorb a row into the brain (subprocess or Hopfield).
 #[derive(Debug, Clone)]
 pub struct AbsorbMemoryData {
     pub id: i64,
@@ -1423,6 +1503,7 @@ mod tests {
         }
     }
 
+    // touch() must move last_query_time forward, never backward.
     #[test]
     fn test_brain_query_state() {
         let state = BrainQueryState::new();
@@ -1434,6 +1515,7 @@ mod tests {
         assert!(t2 >= t1);
     }
 
+    // The default decay tick count is 1.
     #[test]
     fn test_default_ticks() {
         assert_eq!(default_ticks(), 1);

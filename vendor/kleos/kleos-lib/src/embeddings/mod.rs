@@ -1,14 +1,21 @@
 pub mod chunking;
+// Model staging (download.rs) and the local ONNX embedder exist only for the
+// ml feature; the HTTP/OpenAI providers below cover remote-embedding builds.
+#[cfg(feature = "ml")]
 pub mod download;
 pub mod http;
 pub mod normalize;
+#[cfg(feature = "ml")]
 pub mod onnx;
 pub mod openai;
 
 use crate::Result;
 
+/// Object-safe text-embedding backend (local ONNX, OpenAI-compatible HTTP,
+/// or plain HTTP); consumers hold `Arc<dyn EmbeddingProvider>`.
 #[allow(clippy::type_complexity)]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Embed one text into the provider's vector space.
     fn embed<'a>(
         &'a self,
         text: &'a str,

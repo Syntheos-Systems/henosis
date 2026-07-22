@@ -1,6 +1,6 @@
 //! Shared-DB scoping regressions for per-user skill analysis (Batch I).
 //!
-//! Master's decision: skill evolution is per-user. These tests run two users
+//! The skill-evolution contract is per-user. These tests run two users
 //! against one monolith database and assert that the skill-analysis read paths
 //! never observe another user's skills when `ENGRAM_TENANT_SHARDING=0`.
 //! `skill_records` carries `user_id` (re-added in migration 78); related
@@ -129,5 +129,38 @@ async fn recent_evolutions_are_scoped() {
     assert!(
         !ids.contains(&bob),
         "another user's evolution must not appear"
+    );
+}
+
+/// create_skill must reject a parent_skill_id owned by another tenant. Before
+/// the fix the parent lookup had no user_id predicate, so a caller could name
+/// another user's skill as parent -- leaking its version/root metadata and
+/// forging a cross-tenant lineage link.
+#[tokio::test]
+async fn create_skill_rejects_cross_tenant_parent() {
+    let db = monolith().await;
+    let alice_parent = make_skill(&db, "alice_parent", 10).await;
+
+    // Bob (user 20) tries to fork alice's skill as his parent.
+    let req = CreateSkillRequest {
+        name: "bob_fork".to_string(),
+        agent: "test".to_string(),
+        description: Some("cross-tenant fork attempt".to_string()),
+        code: "fn run() {}".to_string(),
+        language: Some("rust".to_string()),
+        parent_skill_id: Some(alice_parent),
+        metadata: None,
+        user_id: Some(20),
+        tags: None,
+        tool_deps: None,
+        kind: None,
+        source_plugin: None,
+        source_path: None,
+        content_hash: None,
+    };
+    let result = kleos_lib::skills::create_skill(&db, req).await;
+    assert!(
+        result.is_err(),
+        "bob must not reference alice's skill as parent"
     );
 }

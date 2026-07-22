@@ -22,7 +22,10 @@ pub struct TenantMigration {
     /// When true the up fn is wrapped in a SAVEPOINT so it commits atomically
     /// with its schema_migrations record (DB-1). Migrations that toggle
     /// `PRAGMA foreign_keys` for a table rebuild MUST be false: that pragma is a
-    /// silent no-op inside a SAVEPOINT, which would break the rebuild.
+    /// silent no-op inside a SAVEPOINT, which would break the rebuild. Such
+    /// `notx` migrations are still applied atomically -- `apply_notx` disables
+    /// foreign keys outside any transaction and wraps the rebuild in a plain
+    /// `BEGIN..COMMIT` instead of a SAVEPOINT (see `run_tenant_migrations_to`).
     pub transactional: bool,
 }
 
@@ -38,7 +41,9 @@ macro_rules! tenant_migration {
         }
     };
     // `notx`: NOT savepoint-wrapped -- the migration toggles PRAGMA foreign_keys
-    // (illegal/no-op inside a SAVEPOINT). Relies on idempotent construction.
+    // (a no-op inside a SAVEPOINT). apply_notx still applies it atomically by
+    // disabling foreign keys outside any transaction and wrapping the rebuild in
+    // a plain BEGIN..COMMIT, so a crash mid-rebuild rolls back and retries.
     ($ver:expr, $desc:expr, $up:expr, notx) => {
         TenantMigration {
             version: $ver,
@@ -382,6 +387,68 @@ pub static TENANT_MIGRATIONS: &[TenantMigration] = &[
     // tables. All tables carry `user_id`; forge_specs and forge_hypotheses also
     // carry `session_id` for the gate enforcement query. No backfill needed.
     tenant_migration!(74, "forge_tables", apply_schema_v74_forge),
+    // Re-add user_id to scratchpad (reverses v23). v23 dropped the column on the
+    // per-shard-file isolation assumption, leaving scratchpad unscoped: in
+    // single-DB mode assemble_context working-memory and the delete/get/list
+    // paths returned or mutated other tenants' rows. The runner backfills existing
+    // scratchpad rows to the shard owner after this file runs (see
+    // TENANT_MIGRATION_READD_USER_ID_SCRATCHPAD / backfill_owner_tables_for_version).
+    tenant_migration!(
+        75,
+        "scratchpad_user_id_readd",
+        apply_schema_v75_scratchpad_user_id_readd
+    ),
+    // facts_fts FTS5 index over structured_facts for the L5 facts channel. Additive
+    // (virtual table + sync triggers + rebuild); structured_facts.user_id was already re-added
+    // and backfilled at v67, so no owner backfill arm is needed here.
+    tenant_migration!(76, "facts_fts", apply_schema_v76_facts_fts),
+    // Rebuild the tenant external-content FTS tables with the language-neutral
+    // unicode61+diacritics tokenizer (mirror of global migration 94).
+    tenant_migration!(
+        77,
+        "fts_unicode61_diacritics",
+        apply_schema_v77_fts_unicode61
+    ),
+    // v78: nullable memories.lang column (mirror of global migration 95).
+    tenant_migration!(78, "add_memory_lang", apply_schema_v78_memory_lang),
+    // v79: attention_notes table (mirror of global migration 96).
+    tenant_migration!(79, "attention_notes", apply_schema_v79_attention_notes),
+    // v80: re-add user_id to axon_subscriptions with UNIQUE(agent, channel,
+    // user_id) (mirror of global migration 97). notx: the rebuild toggles
+    // PRAGMA foreign_keys. The runner backfills existing rows to the shard owner.
+    tenant_migration!(
+        80,
+        "axon_subscriptions_user_id_readd",
+        apply_schema_v80_axon_subscriptions_readd,
+        notx
+    ),
+    // v81: re-add user_id to axon_cursors with PRIMARY KEY(agent, channel,
+    // user_id) (mirror of global migration 98). notx. Runner backfills rows.
+    tenant_migration!(
+        81,
+        "axon_cursors_user_id_readd",
+        apply_schema_v81_axon_cursors_readd,
+        notx
+    ),
+    // v82: correct the datetime('now', 'utc') double-UTC-conversion defaults on
+    // handoffs, handoff_atoms, atom_entity_links, and frameshift_growth (mirror
+    // of global migration 99) and backfill skewed rows via the per-row inverse
+    // datetime(col, 'localtime'). notx: the shard handoffs table is an FK
+    // parent (handoff_atoms.handoff_id ON DELETE CASCADE), so the rebuild must
+    // run with PRAGMA foreign_keys OFF or DROP TABLE would cascade into atoms.
+    tenant_migration!(
+        82,
+        "tz_default_rebuild",
+        apply_schema_v82_tz_default_rebuild,
+        notx
+    ),
+    // v83: skill_records.duration_sample_count (mirror of global migration
+    // 100) -- denominator for the avg_duration_ms running average ([51]).
+    tenant_migration!(
+        83,
+        "skill_duration_sample_count",
+        apply_schema_v83_skill_duration_sample_count
+    ),
 ];
 
 /// Version of the tenant migration that re-adds `user_id` to the shard memory
@@ -460,6 +527,22 @@ const TENANT_MIGRATION_READD_USER_ID_SKILLS: i64 = 69;
 /// table (reverses v24). The runner backfills existing session rows to the
 /// shard owner after this runs.
 const TENANT_MIGRATION_READD_USER_ID_SESSIONS: i64 = 72;
+
+/// Version of the tenant migration that re-adds `user_id` to the shard
+/// scratchpad table (reverses v23). The runner backfills existing scratchpad
+/// rows to the shard owner after this runs.
+const TENANT_MIGRATION_READD_USER_ID_SCRATCHPAD: i64 = 75;
+
+/// Version of the tenant migration that re-adds `user_id` to the shard
+/// axon_subscriptions table with `UNIQUE(agent, channel, user_id)` (reverses
+/// v31). The runner backfills existing subscription rows to the shard owner
+/// after the rebuild copies them at the DEFAULT.
+const TENANT_MIGRATION_READD_USER_ID_AXON_SUBSCRIPTIONS: i64 = 80;
+
+/// Version of the tenant migration that re-adds `user_id` to the shard
+/// axon_cursors table with `PRIMARY KEY(agent, channel, user_id)` (reverses
+/// v31). The runner backfills existing cursor rows to the shard owner.
+const TENANT_MIGRATION_READD_USER_ID_AXON_CURSORS: i64 = 81;
 
 /// Generates a tenant migration function that loads SQL from an external file.
 macro_rules! tenant_migration_sql {
@@ -693,6 +776,35 @@ tenant_migration_sql!(
     "../tenant/schema_v55_artifacts_fts.sql"
 );
 tenant_migration_sql!(
+    apply_schema_v76_facts_fts,
+    "v76",
+    "../tenant/schema_v76_facts_fts.sql"
+);
+// Tenant v77: rebuild FTS tables with the unicode61+diacritics tokenizer.
+tenant_migration_sql!(
+    apply_schema_v77_fts_unicode61,
+    "v77",
+    "../tenant/schema_v77_fts_unicode61.sql"
+);
+// Tenant v78: add the nullable memories.lang column.
+tenant_migration_sql!(
+    apply_schema_v78_memory_lang,
+    "v78",
+    "../tenant/schema_v78_memory_lang.sql"
+);
+// Tenant v79: attention_notes table.
+tenant_migration_sql!(
+    apply_schema_v79_attention_notes,
+    "v79",
+    "../tenant/schema_v79_attention_notes.sql"
+);
+// Tenant v83: skill_records.duration_sample_count column + backfill.
+tenant_migration_sql!(
+    apply_schema_v83_skill_duration_sample_count,
+    "v83",
+    "../tenant/schema_v83_skill_duration_sample_count.sql"
+);
+tenant_migration_sql!(
     apply_schema_v55_memories_readd,
     "v55",
     "../tenant/schema_v55_memories_readd.sql"
@@ -707,6 +819,354 @@ tenant_migration_sql!(
     "v57",
     "../tenant/schema_v57_approvals_readd.sql"
 );
+
+/// Tenant v80: re-add `user_id` to `axon_subscriptions` with
+/// `UNIQUE(agent, channel, user_id)` (reverses v31, mirror of global migration
+/// 97). Written as an inline rebuild rather than a `tenant_migration_sql!` file
+/// so it does NOT self-record its schema_migrations version: the runner records
+/// the version only after `up` succeeds, so a crash mid-rebuild is retried
+/// instead of being falsely marked complete. Idempotent: no-op if `user_id` is
+/// already present. Runs outside a SAVEPOINT (notx) because it toggles
+/// `PRAGMA foreign_keys`.
+fn apply_schema_v80_axon_subscriptions_readd(conn: &Connection) -> Result<()> {
+    let has_user_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('axon_subscriptions') WHERE name = 'user_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_id > 0 {
+        info!("axon_subscriptions.user_id already present, tenant migration 80 is a no-op");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA legacy_alter_table = 1;
+
+         ALTER TABLE axon_subscriptions RENAME TO _axon_subscriptions_old_v80;
+         DROP INDEX IF EXISTS idx_axon_subs_channel;
+
+         CREATE TABLE axon_subscriptions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             agent TEXT NOT NULL,
+             channel TEXT NOT NULL,
+             filter_type TEXT,
+             webhook_url TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             user_id INTEGER NOT NULL DEFAULT 1,
+             UNIQUE(agent, channel, user_id)
+         );
+
+         INSERT INTO axon_subscriptions
+             (id, agent, channel, filter_type, webhook_url, created_at, user_id)
+         SELECT id, agent, channel, filter_type, webhook_url, created_at, 1
+         FROM _axon_subscriptions_old_v80;
+
+         DROP TABLE _axon_subscriptions_old_v80;
+
+         CREATE INDEX idx_axon_subs_channel ON axon_subscriptions(channel);
+         CREATE INDEX idx_axon_subs_user ON axon_subscriptions(user_id, channel);
+
+         PRAGMA legacy_alter_table = 0;
+         PRAGMA foreign_keys = ON;",
+    )?;
+    info!("tenant migration 80 complete: user_id re-added to axon_subscriptions");
+    Ok(())
+}
+
+/// Tenant v81: re-add `user_id` to `axon_cursors` with
+/// `PRIMARY KEY(agent, channel, user_id)` (reverses v31, mirror of global
+/// migration 98). Inline rebuild (no self-recorded version); idempotent; notx.
+fn apply_schema_v81_axon_cursors_readd(conn: &Connection) -> Result<()> {
+    let has_user_id: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('axon_cursors') WHERE name = 'user_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_id > 0 {
+        info!("axon_cursors.user_id already present, tenant migration 81 is a no-op");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA legacy_alter_table = 1;
+
+         ALTER TABLE axon_cursors RENAME TO _axon_cursors_old_v81;
+
+         CREATE TABLE axon_cursors (
+             agent TEXT NOT NULL,
+             channel TEXT NOT NULL,
+             last_event_id INTEGER NOT NULL DEFAULT 0,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             user_id INTEGER NOT NULL DEFAULT 1,
+             PRIMARY KEY(agent, channel, user_id)
+         );
+
+         INSERT INTO axon_cursors
+             (agent, channel, last_event_id, updated_at, user_id)
+         SELECT agent, channel, last_event_id, updated_at, 1
+         FROM _axon_cursors_old_v81;
+
+         DROP TABLE _axon_cursors_old_v81;
+
+         PRAGMA legacy_alter_table = 0;
+         PRAGMA foreign_keys = ON;",
+    )?;
+    info!("tenant migration 81 complete: user_id re-added to axon_cursors");
+    Ok(())
+}
+
+/// Tenant v82: rebuild the shard tables whose timestamp columns defaulted to
+/// the buggy `datetime('now', 'utc')` expression -- handoffs, handoff_atoms,
+/// atom_entity_links, and frameshift_growth -- replacing the default with plain
+/// `datetime('now')` and backfilling skewed rows (mirror of global migration
+/// 99; see `run_migration_tz_default_rebuild` there for the full rationale).
+///
+/// The backfill maps stored values through `datetime(col, 'localtime')`, the
+/// exact DST-aware inverse of the buggy write under an unchanged host
+/// timezone. `handoff_atoms.last_seen_at` is only transformed while
+/// `seen_count <= 1`: the re-seen UPDATE path always wrote it correctly.
+/// Every rebuild is guarded on the buggy default still being present in the
+/// live shard schema, so fresh shards (whose v43/v54/v73 sources now carry the
+/// corrected default) skip both the rebuild and the transform.
+///
+/// notx: the shard handoffs table is an FK parent (handoff_atoms.handoff_id
+/// REFERENCES handoffs(id) ON DELETE CASCADE), so with foreign keys ON the
+/// DROP TABLE step would cascade-delete every atom. The runner's apply_notx
+/// disables foreign keys outside any transaction and wraps the whole rebuild
+/// in one BEGIN..COMMIT; the in-SQL PRAGMAs document the requirement.
+fn apply_schema_v82_tz_default_rebuild(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = 1;")?;
+
+    if crate::db::migrations::table_has_utc_default(conn, "handoffs")? {
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM handoffs", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE handoffs RENAME TO _handoffs_old_v82;
+
+             DROP TRIGGER IF EXISTS handoffs_fts_ai;
+             DROP TRIGGER IF EXISTS handoffs_fts_ad;
+             DROP TRIGGER IF EXISTS handoffs_fts_au;
+             DROP INDEX IF EXISTS idx_handoffs_project;
+             DROP INDEX IF EXISTS idx_handoffs_created;
+             DROP INDEX IF EXISTS idx_handoffs_hash;
+             DROP INDEX IF EXISTS idx_handoffs_agent;
+             DROP INDEX IF EXISTS idx_handoffs_type;
+             DROP INDEX IF EXISTS idx_handoffs_session;
+             DROP INDEX IF EXISTS idx_handoffs_model;
+             DROP INDEX IF EXISTS idx_handoffs_restore;
+             DROP INDEX IF EXISTS idx_handoffs_user_created;
+
+             CREATE TABLE handoffs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 project TEXT NOT NULL,
+                 branch TEXT,
+                 directory TEXT,
+                 agent TEXT DEFAULT 'unknown',
+                 -- handoff kind discriminator for handoffs (e.g. manual, auto)
+                 type TEXT DEFAULT 'manual',
+                 content TEXT NOT NULL,
+                 metadata TEXT,
+                 session_id TEXT,
+                 model TEXT,
+                 host TEXT,
+                 content_hash TEXT
+             );
+
+             INSERT INTO handoffs
+                 (id, user_id, created_at, project, branch, directory, agent, type,
+                  content, metadata, session_id, model, host, content_hash)
+             SELECT id, user_id,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    project, branch, directory, agent, type,
+                    content, metadata, session_id, model, host, content_hash
+             FROM _handoffs_old_v82;
+
+             DROP TABLE _handoffs_old_v82;
+
+             CREATE INDEX idx_handoffs_project ON handoffs(project, created_at DESC);
+             CREATE INDEX idx_handoffs_created ON handoffs(created_at DESC);
+             CREATE INDEX idx_handoffs_hash ON handoffs(content_hash);
+             CREATE INDEX idx_handoffs_agent ON handoffs(agent, created_at DESC);
+             CREATE INDEX idx_handoffs_type ON handoffs(type, created_at DESC);
+             CREATE INDEX idx_handoffs_session ON handoffs(session_id);
+             CREATE INDEX idx_handoffs_model ON handoffs(model, created_at DESC);
+             CREATE INDEX idx_handoffs_restore ON handoffs(project, type, agent, created_at DESC);
+             CREATE INDEX idx_handoffs_user_created ON handoffs(user_id, created_at DESC);
+
+             CREATE TRIGGER handoffs_fts_ai AFTER INSERT ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(rowid, content) VALUES (new.id, new.content);
+             END;
+             CREATE TRIGGER handoffs_fts_ad AFTER DELETE ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(handoffs_fts, rowid, content) VALUES('delete', old.id, old.content);
+             END;
+             CREATE TRIGGER handoffs_fts_au AFTER UPDATE OF content ON handoffs BEGIN
+                 INSERT INTO handoffs_fts(handoffs_fts, rowid, content) VALUES('delete', old.id, old.content);
+                 INSERT INTO handoffs_fts(rowid, content) VALUES (new.id, new.content);
+             END;",
+        )?;
+        info!(
+            rows,
+            "tenant migration 82: handoffs rebuilt, created_at backfilled to true UTC"
+        );
+    } else {
+        info!("tenant migration 82: handoffs default already correct, skipping rebuild");
+    }
+
+    if crate::db::migrations::table_has_utc_default(conn, "handoff_atoms")? {
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM handoff_atoms", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE handoff_atoms RENAME TO _handoff_atoms_old_v82;
+
+             DROP INDEX IF EXISTS idx_atoms_project_type;
+             DROP INDEX IF EXISTS idx_atoms_salience;
+             DROP INDEX IF EXISTS idx_atoms_atom_id;
+             DROP INDEX IF EXISTS idx_atoms_handoff;
+             DROP INDEX IF EXISTS idx_atoms_last_seen;
+             DROP INDEX IF EXISTS idx_atoms_user_project;
+             DROP INDEX IF EXISTS idx_atoms_status;
+
+             CREATE TABLE handoff_atoms (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 atom_id         TEXT NOT NULL,
+                 handoff_id      INTEGER NOT NULL REFERENCES handoffs(id) ON DELETE CASCADE,
+                 user_id         INTEGER NOT NULL,
+                 project         TEXT NOT NULL,
+                 atom_type       TEXT NOT NULL,
+                 content         TEXT NOT NULL,
+                 canonical_form  TEXT NOT NULL,
+                 salience        REAL NOT NULL DEFAULT 1.0,
+                 confidence      REAL NOT NULL DEFAULT 0.5,
+                 status          TEXT NOT NULL DEFAULT 'active',
+                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                 seen_count      INTEGER NOT NULL DEFAULT 1,
+                 decay_immune    INTEGER NOT NULL DEFAULT 0,
+                 superseded_by   TEXT,
+                 metadata        TEXT
+             );
+
+             INSERT INTO handoff_atoms
+                 (id, atom_id, handoff_id, user_id, project, atom_type, content,
+                  canonical_form, salience, confidence, status, created_at,
+                  last_seen_at, seen_count, decay_immune, superseded_by, metadata)
+             SELECT id, atom_id, handoff_id, user_id, project, atom_type, content,
+                    canonical_form, salience, confidence, status,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    CASE WHEN seen_count <= 1
+                         THEN COALESCE(datetime(last_seen_at, 'localtime'), last_seen_at)
+                         ELSE last_seen_at END,
+                    seen_count, decay_immune, superseded_by, metadata
+             FROM _handoff_atoms_old_v82;
+
+             DROP TABLE _handoff_atoms_old_v82;
+
+             CREATE INDEX idx_atoms_project_type ON handoff_atoms(project, atom_type, status);
+             CREATE INDEX idx_atoms_salience ON handoff_atoms(project, salience DESC);
+             CREATE INDEX idx_atoms_atom_id ON handoff_atoms(atom_id);
+             CREATE INDEX idx_atoms_handoff ON handoff_atoms(handoff_id);
+             CREATE INDEX idx_atoms_last_seen ON handoff_atoms(last_seen_at DESC);
+             CREATE INDEX idx_atoms_user_project ON handoff_atoms(user_id, project, status);
+             CREATE INDEX idx_atoms_status ON handoff_atoms(status, atom_type);",
+        )?;
+        info!(
+            rows,
+            "tenant migration 82: handoff_atoms rebuilt, timestamps backfilled (last_seen_at only where seen_count <= 1)"
+        );
+    } else {
+        info!("tenant migration 82: handoff_atoms default already correct, skipping rebuild");
+    }
+
+    if crate::db::migrations::table_has_utc_default(conn, "atom_entity_links")? {
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM atom_entity_links", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE atom_entity_links RENAME TO _atom_entity_links_old_v82;
+
+             DROP INDEX IF EXISTS idx_ael_atom;
+             DROP INDEX IF EXISTS idx_ael_entity;
+
+             CREATE TABLE atom_entity_links (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 atom_id     TEXT NOT NULL,
+                 entity_id   INTEGER NOT NULL,
+                 user_id     INTEGER NOT NULL,
+                 linked_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                 UNIQUE(atom_id, entity_id, user_id)
+             );
+
+             INSERT INTO atom_entity_links (id, atom_id, entity_id, user_id, linked_at)
+             SELECT id, atom_id, entity_id, user_id,
+                    COALESCE(datetime(linked_at, 'localtime'), linked_at)
+             FROM _atom_entity_links_old_v82;
+
+             DROP TABLE _atom_entity_links_old_v82;
+
+             CREATE INDEX idx_ael_atom ON atom_entity_links(atom_id);
+             CREATE INDEX idx_ael_entity ON atom_entity_links(entity_id);",
+        )?;
+        info!(
+            rows,
+            "tenant migration 82: atom_entity_links rebuilt, linked_at backfilled"
+        );
+    } else {
+        info!("tenant migration 82: atom_entity_links default already correct, skipping rebuild");
+    }
+
+    if crate::db::migrations::table_has_utc_default(conn, "frameshift_growth")? {
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM frameshift_growth", [], |r| r.get(0))?;
+        conn.execute_batch(
+            "ALTER TABLE frameshift_growth RENAME TO _frameshift_growth_old_v82;
+
+             DROP INDEX IF EXISTS idx_fsgrowth_user_cursor;
+             DROP INDEX IF EXISTS idx_fsgrowth_persona;
+             DROP INDEX IF EXISTS idx_fsgrowth_project;
+             DROP INDEX IF EXISTS idx_fsgrowth_scope;
+
+             CREATE TABLE frameshift_growth (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 persona TEXT,
+                 project_id TEXT,
+                 scope TEXT,
+                 content TEXT NOT NULL,
+                 metadata TEXT,
+                 host TEXT,
+                 content_hash TEXT NOT NULL,
+                 UNIQUE(user_id, content_hash)
+             );
+
+             INSERT INTO frameshift_growth
+                 (id, user_id, created_at, persona, project_id, scope, content,
+                  metadata, host, content_hash)
+             SELECT id, user_id,
+                    COALESCE(datetime(created_at, 'localtime'), created_at),
+                    persona, project_id, scope, content, metadata, host, content_hash
+             FROM _frameshift_growth_old_v82;
+
+             DROP TABLE _frameshift_growth_old_v82;
+
+             CREATE INDEX idx_fsgrowth_user_cursor ON frameshift_growth(user_id, id);
+             CREATE INDEX idx_fsgrowth_persona ON frameshift_growth(user_id, persona, created_at DESC);
+             CREATE INDEX idx_fsgrowth_project ON frameshift_growth(user_id, project_id, created_at DESC);
+             CREATE INDEX idx_fsgrowth_scope ON frameshift_growth(user_id, scope, created_at DESC);",
+        )?;
+        info!(
+            rows,
+            "tenant migration 82: frameshift_growth rebuilt, created_at backfilled"
+        );
+    } else {
+        info!("tenant migration 82: frameshift_growth default already correct, skipping rebuild");
+    }
+
+    conn.execute_batch("PRAGMA legacy_alter_table = 0; PRAGMA foreign_keys = ON;")?;
+    info!("tenant migration 82 complete: tz defaults corrected and skewed timestamps backfilled");
+    Ok(())
+}
 tenant_migration_sql!(
     apply_schema_v58_soma_agents_readd,
     "v58",
@@ -781,6 +1241,11 @@ tenant_migration_sql!(
     apply_schema_v74_forge,
     "v74",
     "../tenant/schema_v74_forge_tables.sql"
+);
+tenant_migration_sql!(
+    apply_schema_v75_scratchpad_user_id_readd,
+    "v75",
+    "../tenant/schema_v75_scratchpad_user_id_readd.sql"
 );
 
 /// Tenant v37: drops user_id from portability tables including conversations.
@@ -1168,6 +1633,79 @@ fn drop_column_if_exists(conn: &Connection, table: &str, column: &str, version: 
     Ok(())
 }
 
+/// Apply a `notx` migration atomically.
+///
+/// A `notx` migration's up fn toggles `PRAGMA foreign_keys` for a SQLite table
+/// rebuild, and that pragma is a silent no-op inside a SAVEPOINT/transaction --
+/// which is why these migrations cannot use the savepoint path. Running the
+/// rebuild as bare autocommitting statements, however, is not crash-safe: a
+/// power loss or kill between the `RENAME`/`CREATE`/`INSERT`/`DROP` steps leaves
+/// the shard with a half-rebuilt schema, and any early self-recorded version
+/// marks the migration complete so it is never retried.
+///
+/// This wrapper follows SQLite's own ALTER TABLE procedure: it disables foreign
+/// keys OUTSIDE any transaction (the only place the pragma takes effect), then
+/// wraps the entire apply -- rebuild, owner backfill, and `schema_migrations`
+/// record -- in a single `BEGIN..COMMIT`. A crash or error mid-rebuild rolls the
+/// whole transaction back, so the version stays unrecorded and the migration
+/// retries cleanly on the next tenant load. Foreign keys are re-enabled after
+/// the transaction closes -- every notx migration's own SQL ends with
+/// `PRAGMA foreign_keys = ON` (now a no-op inside the transaction), so leaving
+/// enforcement ON is the chain's long-standing postcondition, which a later
+/// migration and the loaded shard rely on (e.g. ON DELETE CASCADE). The up fn's
+/// own `PRAGMA foreign_keys` toggles become harmless no-ops inside the wrapper.
+fn apply_notx(conn: &Connection, apply: &dyn Fn(&Connection) -> Result<()>) -> Result<()> {
+    // Disable FK enforcement before opening the transaction (the rebuild renames
+    // and drops FK-referenced tables), then begin the atomic wrapper. If BEGIN
+    // itself fails, foreign keys were already toggled OFF (that half of the batch
+    // autocommitted, no transaction was open yet), so re-enable them before
+    // returning rather than leaking an FK-disabled connection back to the caller.
+    if let Err(e) = conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN;") {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        return Err(EngError::from(e));
+    }
+    let outcome = match apply(conn) {
+        Ok(()) => match conn.execute_batch("COMMIT;") {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A failed COMMIT leaves the rebuild uncommitted; roll it back so
+                // the shard is not left half-migrated. If the recovery ROLLBACK
+                // also fails the connection is unusable -- surface that distinctly
+                // (it is a fresh per-load connection open_tenant will drop).
+                if let Err(re) = conn.execute_batch("ROLLBACK;") {
+                    tracing::error!(
+                        commit_error = %e,
+                        rollback_error = %re,
+                        "notx migration COMMIT failed and recovery ROLLBACK also failed; connection unusable"
+                    );
+                }
+                Err(EngError::from(e))
+            }
+        },
+        Err(e) => {
+            // Roll back the partial rebuild so a crash/error never leaves the
+            // shard half-migrated with the version falsely recorded. Log a failed
+            // ROLLBACK distinctly so an operator can tell a poisoned connection
+            // apart from a plain migration error.
+            if let Err(re) = conn.execute_batch("ROLLBACK;") {
+                tracing::error!(
+                    apply_error = %e,
+                    rollback_error = %re,
+                    "notx migration failed and recovery ROLLBACK also failed; connection unusable"
+                );
+            }
+            Err(e)
+        }
+    };
+    // Re-enable foreign keys outside the now-closed transaction, reproducing the
+    // postcondition every notx migration's trailing `PRAGMA foreign_keys = ON`
+    // used to establish in autocommit. Unconditional (not "restore prior state"):
+    // a fresh SQLite connection defaults foreign_keys OFF, and later migrations /
+    // the loaded shard depend on enforcement being ON.
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    outcome
+}
+
 /// Run all pending tenant migrations against `conn`.
 ///
 /// Idempotent: safe to call on every tenant load. A freshly created tenant
@@ -1260,8 +1798,12 @@ pub fn run_tenant_migrations_to(
                 }
             }
         } else {
-            // PRAGMA-foreign_keys-toggling rebuild: must run outside a SAVEPOINT.
-            apply(conn)?;
+            // notx: the up fn toggles PRAGMA foreign_keys for a table rebuild,
+            // a no-op inside a SAVEPOINT. apply_notx disables foreign keys
+            // outside any transaction and wraps the whole apply in one
+            // BEGIN..COMMIT, so a crash mid-rebuild rolls back atomically and the
+            // migration is retried -- never falsely marked complete -- next load.
+            apply_notx(conn, &apply)?;
         }
     }
 
@@ -1285,8 +1827,8 @@ fn apply_schema_v54_handoff_atoms(conn: &Connection) -> Result<()> {
             salience        REAL NOT NULL DEFAULT 1.0,
             confidence      REAL NOT NULL DEFAULT 0.5,
             status          TEXT NOT NULL DEFAULT 'active',
-            created_at      TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
-            last_seen_at    TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
             seen_count      INTEGER NOT NULL DEFAULT 1,
             decay_immune    INTEGER NOT NULL DEFAULT 0,
             superseded_by   TEXT,
@@ -1305,7 +1847,7 @@ fn apply_schema_v54_handoff_atoms(conn: &Connection) -> Result<()> {
             atom_id     TEXT NOT NULL,
             entity_id   INTEGER NOT NULL,
             user_id     INTEGER NOT NULL,
-            linked_at   TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+            linked_at   TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(atom_id, entity_id, user_id)
         );
         CREATE INDEX IF NOT EXISTS idx_ael_atom ON atom_entity_links(atom_id);
@@ -1360,6 +1902,9 @@ fn backfill_owner_tables_for_version(conn: &Connection, version: i64, owner: i64
         TENANT_MIGRATION_READD_USER_ID_USER_PREFERENCES => &["user_preferences"],
         TENANT_MIGRATION_READD_USER_ID_SKILLS => &["skill_records"],
         TENANT_MIGRATION_READD_USER_ID_SESSIONS => &["sessions"],
+        TENANT_MIGRATION_READD_USER_ID_SCRATCHPAD => &["scratchpad"],
+        TENANT_MIGRATION_READD_USER_ID_AXON_SUBSCRIPTIONS => &["axon_subscriptions"],
+        TENANT_MIGRATION_READD_USER_ID_AXON_CURSORS => &["axon_cursors"],
         _ => &[],
     };
     for table in tables {
@@ -1443,6 +1988,61 @@ pub fn latest_version() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tenant migration v77: rebuilding the shard FTS tables with the
+    /// unicode61+diacritics tokenizer must preserve row parity, fold diacritics
+    /// for keyword match, and leave the base-table sync triggers firing. Migrates
+    /// to v76 (pre-change), seeds non-English rows, then applies v77.
+    #[test]
+    fn tenant_migration_77_rebuild_parity_folds_diacritics_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_tenant_migrations_to(&conn, None, 76).unwrap();
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('Häuser stehen am Fluss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('La forêt française est dense')",
+            [],
+        )
+        .unwrap();
+
+        // Apply v77 (the FTS tokenizer rebuild).
+        run_tenant_migrations_to(&conn, None, 77).unwrap();
+
+        let base: i64 = conn
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        let fts: i64 = conn
+            .query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, base, "tenant FTS row parity after v77 rebuild");
+
+        let de: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'hauser'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(de, 1, "'hauser' folds to match 'Häuser' after v77");
+
+        // Trigger still fires after the rebuild.
+        conn.execute(
+            "INSERT INTO memories (content) VALUES ('Müller wohnt in München')",
+            [],
+        )
+        .unwrap();
+        let trig: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'munchen'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trig, 1, "tenant trigger fires post-v77 and folds 'München'");
+    }
 
     /// Verifies that a fresh in-memory database lands at the latest migration version.
     #[test]
@@ -1560,12 +2160,13 @@ mod tests {
         assert_eq!(value, "v2");
     }
 
-    /// v23: scratchpad must NOT have a user_id column after the full
-    /// migration chain completes.
+    /// v23: scratchpad has no user_id column at the v23 boundary. v75 later
+    /// re-adds it (see `scratchpad_user_id_readded_after_v75`), so this test
+    /// pins to exactly v23 to keep covering the v23 drop in isolation.
     #[test]
     fn user_id_absent_from_scratchpad_after_v23() {
         let conn = Connection::open_in_memory().unwrap();
-        run_tenant_migrations(&conn, None).unwrap();
+        run_tenant_migrations_to(&conn, None, 23).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -1577,12 +2178,14 @@ mod tests {
         assert_eq!(count, 0, "scratchpad still has user_id column after v23");
     }
 
-    /// v23: the new UNIQUE(session, agent, entry_key) supports per-agent
+    /// v23: the UNIQUE(session, agent, entry_key) constraint supports per-agent
     /// upsert within a session, and collisions on that triple still collapse.
+    /// Pinned to exactly v23 because v75 tightens the constraint to include
+    /// user_id (see `scratchpad_user_id_readded_after_v75`).
     #[test]
     fn scratchpad_constraint_reshaped_after_v23() {
         let conn = Connection::open_in_memory().unwrap();
-        run_tenant_migrations(&conn, None).unwrap();
+        run_tenant_migrations_to(&conn, None, 23).unwrap();
 
         // Two different agents in the same (session, entry_key) coexist.
         conn.execute(
@@ -1621,6 +2224,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value_a, "vA2");
+    }
+
+    /// v75: re-adds user_id to scratchpad, backfills existing rows to the shard
+    /// owner, and tightens UNIQUE to include user_id so two tenants sharing a
+    /// (session, agent, entry_key) get distinct rows instead of clobbering.
+    #[test]
+    fn scratchpad_user_id_readded_after_v75() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Migrate to v74 (pre-readd) and seed a row the old, unscoped way.
+        run_tenant_migrations_to(&conn, None, 74).unwrap();
+        conn.execute(
+            "INSERT INTO scratchpad (session, agent, model, entry_key, value, expires_at) \
+             VALUES ('s1', 'agentA', 'm', 'k1', 'vold', datetime('now', '+5 minutes'))",
+            [],
+        )
+        .unwrap();
+
+        // Apply v75 as shard owner 7; the runner backfills existing rows to 7.
+        run_tenant_migrations_to(&conn, Some(7), 75).unwrap();
+
+        // user_id column is back.
+        let has_uid: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('scratchpad') WHERE name='user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_uid, 1, "scratchpad must have user_id after v75");
+
+        // The pre-existing row backfilled to the shard owner, not the default.
+        let owner: i64 = conn
+            .query_row(
+                "SELECT user_id FROM scratchpad WHERE session='s1' AND entry_key='k1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            owner, 7,
+            "existing scratchpad row backfilled to shard owner"
+        );
+
+        // The tightened UNIQUE(user_id, session, agent, entry_key) lets the same
+        // (session, agent, entry_key) under a different user coexist.
+        conn.execute(
+            "INSERT INTO scratchpad (user_id, session, agent, model, entry_key, value, expires_at) \
+             VALUES (8, 's1', 'agentA', 'm', 'k1', 'vuser8', datetime('now', '+5 minutes')) \
+             ON CONFLICT(user_id, session, agent, entry_key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scratchpad WHERE session='s1' AND agent='agentA' AND entry_key='k1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "same (session, agent, key) under two users coexist"
+        );
     }
 
     /// v23: rows inserted under the v2 shim shape survive the rebuild intact.
@@ -1718,7 +2384,8 @@ mod tests {
             .unwrap();
         assert_eq!(pre, 0);
 
-        // Run the chain; v2 adds user_id, v23 later drops it. End state: absent.
+        // Run the chain; v2 adds user_id, v23 drops it, v75 re-adds it.
+        // End state: present (tenant isolation restored).
         run_tenant_migrations(&conn, None).unwrap();
 
         let post: i64 = conn
@@ -1728,7 +2395,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(post, 0);
+        assert_eq!(post, 1, "v75 re-adds user_id to scratchpad");
     }
 
     /// Verifies sessions tables have user_id after applying v3.
@@ -5397,13 +6064,32 @@ mod tests {
         assert_eq!(col, 0, "webhooks still has user_id after v30");
     }
 
-    /// v31: axon_subscriptions and axon_cursors must NOT have a user_id column
-    /// after the full migration chain.
+    /// Axon user_id lifecycle: dropped at v31, re-added at v80/v81. Migration 31
+    /// removed the column under the per-shard-only isolation assumption; v80/v81
+    /// restore it (with a widened UNIQUE/PK) so shared-monolith mode isolates
+    /// subscriptions and cursors per tenant. Assert both ends of that lifecycle.
     #[test]
-    fn user_id_absent_from_axon_after_v31() {
+    fn axon_user_id_dropped_at_v31_then_readded_at_v80() {
+        // At v31 the column is gone on both tables.
+        let mid = Connection::open_in_memory().unwrap();
+        run_tenant_migrations_to(&mid, None, 31).unwrap();
+        for table in &["axon_subscriptions", "axon_cursors"] {
+            let count: i64 = mid
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name='user_id'",
+                        table
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            assert_eq!(count, 0, "table '{}' should have no user_id at v31", table);
+        }
+
+        // After the full chain the column is back on both tables.
         let conn = Connection::open_in_memory().unwrap();
         run_tenant_migrations(&conn, None).unwrap();
-
         for table in &["axon_subscriptions", "axon_cursors"] {
             let count: i64 = conn
                 .query_row(
@@ -5416,13 +6102,13 @@ mod tests {
                 )
                 .unwrap_or(0);
             assert_eq!(
-                count, 0,
-                "table '{}' still has user_id column after v31",
+                count, 1,
+                "table '{}' should have user_id re-added by v80/v81",
                 table
             );
         }
 
-        // UNIQUE(agent, channel) and PRIMARY KEY(agent, channel) survive.
+        // idx_axon_subs_channel survives the v80 rebuild.
         let idx: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_axon_subs_channel'",
@@ -5430,11 +6116,26 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(idx, 1, "idx_axon_subs_channel must survive v31");
+        assert_eq!(idx, 1, "idx_axon_subs_channel must survive the v80 rebuild");
+
+        // The widened UNIQUE(agent, channel, user_id) lets two tenants subscribe
+        // the same (agent, channel); the old UNIQUE(agent, channel) would reject
+        // the second insert.
+        conn.execute(
+            "INSERT INTO axon_subscriptions (agent, channel, user_id) VALUES ('a', 'c', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO axon_subscriptions (agent, channel, user_id) VALUES ('a', 'c', 2)",
+            [],
+        )
+        .expect("widened UNIQUE must allow a second tenant on the same agent/channel");
     }
 
-    /// v31: axon_subscriptions and axon_cursors support the SQL shape
-    /// services/axon.rs now uses (no user_id on INSERT or SELECT).
+    /// After the full chain (user_id re-added at v80/v81), a columnless INSERT
+    /// that omits user_id still works via the DEFAULT 1, so the legacy axon SQL
+    /// shape stays backward-compatible.
     #[test]
     fn axon_tables_usable_after_v31() {
         let conn = Connection::open_in_memory().unwrap();
@@ -7482,5 +8183,234 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_tenant_migrations(&conn, None).unwrap();
         apply_schema_v70_tenant_state(&conn).unwrap();
+    }
+
+    /// A `notx` migration that crashes mid-rebuild must roll back atomically:
+    /// the original table and its rows survive, no half-rebuilt artifacts
+    /// remain, any prematurely self-recorded version is undone so the migration
+    /// retries on the next load, and the caller's foreign_keys setting is
+    /// restored. This is the crash-mid-rebuild scenario the happy-path chain
+    /// tests do not exercise -- the whole reason finding [6] was filed.
+    #[test]
+    fn apply_notx_rolls_back_partial_rebuild_on_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL);
+             INSERT INTO t (id, x) VALUES (1, 'orig');
+             CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+
+        // An up fn that renames + recreates the table (partial rebuild) and
+        // self-records its version, then dies before copying rows / dropping the
+        // old table -- exactly the window that used to brick a shard.
+        let partial_then_fail = |c: &Connection| -> Result<()> {
+            c.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 ALTER TABLE t RENAME TO _t_old;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL, y TEXT);
+                 INSERT OR IGNORE INTO schema_migrations (version) VALUES (999);",
+            )?;
+            Err(EngError::DatabaseMessage(
+                "simulated crash mid-rebuild".into(),
+            ))
+        };
+
+        let res = apply_notx(&conn, &partial_then_fail);
+        assert!(res.is_err(), "apply_notx must surface the up fn error");
+
+        // The original table and row survive the rollback.
+        let orig: String = conn
+            .query_row("SELECT x FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orig, "orig", "original table + row survive rollback");
+
+        // The renamed-away table is gone (CREATE/RENAME rolled back).
+        let old_exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_t_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_exists, 0, "renamed-away table must not survive");
+
+        // The rebuilt schema (added 'y' column) is rolled back.
+        let has_y: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('t') WHERE name='y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_y, 0, "rebuilt schema must be rolled back");
+
+        // The premature version record is undone -> migration retries next load.
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 999",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 0, "premature version record must be rolled back");
+
+        // foreign_keys restored to the caller's ON setting.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys restored to ON after apply_notx");
+    }
+
+    /// A `notx` migration that completes must commit atomically and restore the
+    /// caller's foreign_keys setting. Also asserts foreign keys are actually
+    /// disabled inside the wrapper -- proof the pragma took effect before BEGIN
+    /// (it is a no-op inside a transaction).
+    #[test]
+    fn apply_notx_commits_completed_rebuild_and_restores_fk() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL);
+             INSERT INTO t (id, x) VALUES (1, 'orig');
+             CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+
+        let full_rebuild = |c: &Connection| -> Result<()> {
+            let fk_inside: i64 = c
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(fk_inside, 0, "apply_notx disables FK before the rebuild");
+            c.execute_batch(
+                "ALTER TABLE t RENAME TO _t_old;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT NOT NULL, y TEXT DEFAULT 'new');
+                 INSERT INTO t (id, x) SELECT id, x FROM _t_old;
+                 DROP TABLE _t_old;
+                 INSERT OR IGNORE INTO schema_migrations (version) VALUES (999);",
+            )?;
+            Ok(())
+        };
+
+        apply_notx(&conn, &full_rebuild).unwrap();
+
+        let (x, y): (String, String) = conn
+            .query_row("SELECT x, y FROM t WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(x, "orig", "original row preserved through rebuild");
+        assert_eq!(y, "new", "added column present after committed rebuild");
+
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 999",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "version recorded on success");
+
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys restored to ON after success");
+    }
+
+    /// A notx table-rebuild driven through the REAL runner (so through
+    /// `apply_notx`'s BEGIN..COMMIT wrapper) must preserve populated rows AND
+    /// their FK-child relationships, leave no dangling references, run the owner
+    /// backfill atomically, and keep ON DELETE CASCADE enforcement live
+    /// afterward. v58 rebuilds `soma_agents` (preserving ids) while
+    /// `soma_agent_logs.agent_id` references it ON DELETE CASCADE. The direct-up
+    /// chain tests seed rows but bypass the runner wrapper; this closes that gap
+    /// on real seeded data with a real FK child.
+    #[test]
+    fn soma_agents_v58_rebuild_preserves_fk_children_through_runner() {
+        const OWNER: i64 = 7;
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Build the shard up to just before the v58 soma_agents rebuild.
+        run_tenant_migrations_to(&conn, Some(OWNER), 57).unwrap();
+
+        // Seed a parent agent and a child log referencing it ON DELETE CASCADE.
+        conn.execute(
+            "INSERT INTO soma_agents (name, type) VALUES ('agent-1', 'worker')",
+            [],
+        )
+        .unwrap();
+        let agent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO soma_agent_logs (agent_id, message) VALUES (?1, 'hello')",
+            rusqlite::params![agent_id],
+        )
+        .unwrap();
+
+        // Apply v58 through the real runner (apply_notx wraps rebuild + backfill).
+        run_tenant_migrations_to(&conn, Some(OWNER), 58).unwrap();
+
+        // Parent survived, id preserved, and the owner backfill ran inside the wrap.
+        let (name, uid): (String, i64) = conn
+            .query_row(
+                "SELECT name, user_id FROM soma_agents WHERE id = ?1",
+                rusqlite::params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "agent-1", "parent row survives the v58 rebuild");
+        assert_eq!(
+            uid, OWNER,
+            "v58 owner backfill ran atomically with the rebuild"
+        );
+
+        // Child survived and still references the preserved parent id.
+        let child_agent: i64 = conn
+            .query_row(
+                "SELECT agent_id FROM soma_agent_logs WHERE message = 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            child_agent, agent_id,
+            "child FK still references the parent id"
+        );
+
+        // No dangling foreign keys anywhere after the rebuild.
+        let dangling: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0, "no dangling FK references after v58 rebuild");
+
+        // Enforcement is live: deleting the parent cascades to the child.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys ON after the notx rebuild");
+        conn.execute(
+            "DELETE FROM soma_agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM soma_agent_logs WHERE agent_id = ?1",
+                rusqlite::params![agent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "ON DELETE CASCADE still enforced after v58 rebuild"
+        );
     }
 }

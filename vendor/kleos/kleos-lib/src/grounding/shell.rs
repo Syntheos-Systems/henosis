@@ -108,6 +108,30 @@ fn split_argv(cmd: &str) -> Result<Vec<String>, &'static str> {
     Ok(out)
 }
 
+/// Return true if `arg` should be rejected as the banned inline-exec flag `flag`.
+///
+/// An exact match or `flag=value` is obvious, but short single-dash flags can be
+/// bundled with other short flags (`-ec` = `-e -c`) or carry attached inline code
+/// (`-e'code'`, `-mmodule`), all of which slip past an exact-string check. For a
+/// single-letter flag like `-c`, reject any single-dash bundle whose letters
+/// contain that letter. Long flags (`--eval`) only match exactly or with `=`.
+fn arg_matches_banned_flag(arg: &str, flag: &str) -> bool {
+    if arg == flag || arg.starts_with(&format!("{flag}=")) {
+        return true;
+    }
+    // Single-dash, single-letter short flag: catch bundled/attached forms.
+    if let Some(letter) = flag.strip_prefix('-') {
+        if !flag.starts_with("--") && letter.chars().count() == 1 {
+            if let Some(rest) = arg.strip_prefix('-') {
+                if !arg.starts_with("--") && rest.contains(letter) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Resolve `path` against the configured base directory. The final
 /// canonicalized absolute path must start with the base. Returns an
 /// error on traversal, missing base dir, or unresolvable path.
@@ -290,10 +314,7 @@ impl ShellProvider {
             .unwrap_or(&argv[0]);
         if let Some((_, banned)) = HIGH_RISK_FLAGS.iter().find(|(b, _)| *b == exec_basename) {
             for arg in argv.iter().skip(1) {
-                if banned
-                    .iter()
-                    .any(|f| arg == f || arg.starts_with(&format!("{f}=")))
-                {
+                if banned.iter().any(|f| arg_matches_banned_flag(arg, f)) {
                     return shell_error(format!(
                         "argument {arg:?} is on the high-risk-flag denylist for {exec_basename}; \
                          these flags allow inline code execution and bypass the allowlist"
@@ -536,6 +557,28 @@ mod tests {
             split_argv("git status --porcelain").unwrap(),
             vec!["git", "status", "--porcelain"]
         );
+    }
+
+    /// The inline-exec denylist must catch bundled and attached forms of a
+    /// short flag, not only its exact spelling.
+    #[test]
+    fn banned_flag_matches_bundled_and_attached() {
+        // Exact and value forms.
+        assert!(arg_matches_banned_flag("-c", "-c"));
+        assert!(arg_matches_banned_flag("-c=echo", "-c"));
+        // Bundled short flags: bash -ec 'code', perl -ne 'code'.
+        assert!(arg_matches_banned_flag("-ec", "-c"));
+        assert!(arg_matches_banned_flag("-ne", "-e"));
+        // Attached inline code: perl -e'code', python -mmodule.
+        assert!(arg_matches_banned_flag("-e'print 1'", "-e"));
+        assert!(arg_matches_banned_flag("-mhttp.server", "-m"));
+        // Long flags match exactly or with '=' only, never as a bundle.
+        assert!(arg_matches_banned_flag("--eval", "--eval"));
+        assert!(arg_matches_banned_flag("--eval=1", "--eval"));
+        // Unrelated flags must not be rejected.
+        assert!(!arg_matches_banned_flag("-i", "-c"));
+        assert!(!arg_matches_banned_flag("-v", "-e"));
+        assert!(!arg_matches_banned_flag("--version", "--eval"));
     }
 
     /// Verifies quoted argv tokenization.

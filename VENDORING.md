@@ -1,13 +1,14 @@
 # Vendored source policy
 
 Henosis keeps selected dependencies in the repository when a clean checkout must build without
-private sibling repositories or when the workspace needs a reviewed upstream patch.
+unpublished sibling checkouts or when the workspace needs a reviewed upstream patch.
 
 Each vendored component has a `VENDOR.md` file with four fields:
 
 - `Mode`: `PRISTINE` or `OWNED`
 - `Pin`: the reviewed upstream commit or release
 - `Upstream`: the source identifier used by the drift checker
+- `Ref`: the optional upstream line used for behindness checks; defaults to the checkout's `HEAD`
 - `Mirror`: each local path and its upstream path, for pristine mirrors
 
 ## Pristine components
@@ -18,6 +19,7 @@ the imported tree, and running the full repository checks.
 
 Current pristine components:
 
+- `vendor/kleos/kleos-config`
 - `vendor/kleos/kleos-lib`
 - `vendor/frameshift/frameshift-source`
 - `vendor/frameshift/frameshift-orchestrator`

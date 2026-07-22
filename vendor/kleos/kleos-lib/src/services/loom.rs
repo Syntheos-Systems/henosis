@@ -29,6 +29,94 @@ const VALID_STEP_TYPES: &[&str] = &[
     "transform",
 ];
 
+/// Hard upper bound on a step's retry count. A workflow author can request
+/// fewer, but not more: an unbounded `max_retries` would let a single failing
+/// step (e.g. a webhook to a dead host) retry forever, a denial-of-service on
+/// the engine and the target. Applied when steps are materialized in create_run.
+const MAX_STEP_RETRIES: i32 = 10;
+
+/// Validate a workflow's step graph before it is stored or run.
+///
+/// Rejects three classes of malformed graph that would otherwise wedge a run:
+/// duplicate step names (dependency resolution is name-keyed, so a duplicate is
+/// ambiguous), a `depends_on` that names a step not present in the workflow (the
+/// dependency can never complete, so the dependent step is never ready), and a
+/// dependency cycle (every step in the cycle waits on another, so the run never
+/// finishes). Cycle detection is Kahn's algorithm: if any node still has unmet
+/// in-degree after the topological sweep, the remaining nodes form a cycle.
+fn validate_step_graph(steps: &[StepDef]) -> Result<()> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut names: HashSet<&str> = HashSet::with_capacity(steps.len());
+    for step in steps {
+        if !names.insert(step.name.as_str()) {
+            return Err(EngError::InvalidInput(format!(
+                "duplicate step name '{}'",
+                step.name
+            )));
+        }
+    }
+
+    // Every dependency must reference a real step.
+    for step in steps {
+        if let Some(deps) = &step.depends_on {
+            for dep in deps {
+                if !names.contains(dep.as_str()) {
+                    return Err(EngError::InvalidInput(format!(
+                        "step '{}' depends on unknown step '{}'",
+                        step.name, dep
+                    )));
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm: repeatedly remove zero-in-degree nodes. Anything left
+    // over is part of a cycle.
+    let mut in_degree: HashMap<&str, usize> = steps.iter().map(|s| (s.name.as_str(), 0)).collect();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for step in steps {
+        if let Some(deps) = &step.depends_on {
+            for dep in deps {
+                // edge dep -> step; step's in-degree counts its dependencies.
+                *in_degree.entry(step.name.as_str()).or_insert(0) += 1;
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(step.name.as_str());
+            }
+        }
+    }
+
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    let mut resolved = 0usize;
+    while let Some(node) = queue.pop_front() {
+        resolved += 1;
+        if let Some(children) = dependents.get(node) {
+            for &child in children {
+                if let Some(d) = in_degree.get_mut(child) {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved != steps.len() {
+        return Err(EngError::InvalidInput(
+            "workflow step graph contains a dependency cycle".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 // --- Workflow ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,24 +358,14 @@ pub fn set_dot_path(
 }
 
 /// Replace {{path}} placeholders in a template string with values from vars.
+///
+/// Delegates to the shared single-pass interpolator. The previous inline
+/// implementation re-scanned the mutated result, so a var whose value contained
+/// `{{...}}` re-expanded into another slot (cross-slot injection) and a
+/// self-referential value (`{{x}}` resolving to `{{x}}`) looped forever. The
+/// shared version emits each substitution once and never re-scans it.
 pub fn interpolate(template: &str, vars: &serde_json::Value) -> String {
-    let mut result = template.to_string();
-    // Simple iterative replacement -- find {{ and }}
-    while let Some(start) = result.find("{{") {
-        if let Some(end_offset) = result[start..].find("}}") {
-            let path = result[start + 2..start + end_offset].trim().to_string();
-            let val = resolve_dot_path(vars, &path);
-            let replacement = match &val {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            result.replace_range(start..start + end_offset + 2, &replacement);
-        } else {
-            break;
-        }
-    }
-    result
+    crate::llm::template::interpolate(template, vars)
 }
 
 // --- Logging ---
@@ -394,6 +472,9 @@ pub async fn create_workflow(db: &Database, req: CreateWorkflowRequest) -> Resul
             )));
         }
     }
+
+    // Reject dangling dependencies and cycles before the workflow can be stored.
+    validate_step_graph(&req.steps)?;
 
     let steps_json = serde_json::to_string(&req.steps)?;
     let name = req.name.clone();
@@ -507,6 +588,8 @@ pub async fn update_workflow(
                 )));
             }
         }
+        // Reject dangling dependencies and cycles on the replacement graph too.
+        validate_step_graph(steps)?;
     }
 
     // Build dynamic SET -- positional params: values first, then id at end
@@ -658,7 +741,9 @@ pub async fn create_run(db: &Database, req: CreateRunRequest) -> Result<Run> {
             )?;
             let depends_on_str =
                 serde_json::to_string(&step_def.depends_on.clone().unwrap_or_default())?;
-            let max_retries = step_def.max_retries.unwrap_or(3);
+            // Clamp to [0, MAX_STEP_RETRIES] so a workflow cannot request
+            // unbounded (or negative) retries and wedge/DoS the engine.
+            let max_retries = step_def.max_retries.unwrap_or(3).clamp(0, MAX_STEP_RETRIES);
             let timeout_ms = step_def.timeout_ms.unwrap_or(30000);
 
             conn.execute(
@@ -691,6 +776,7 @@ pub async fn create_run(db: &Database, req: CreateRunRequest) -> Result<Run> {
     )
     .await?;
 
+    let run_owner = run.user_id;
     let _ = publish_internal(
         db,
         "tasks",
@@ -701,11 +787,23 @@ pub async fn create_run(db: &Database, req: CreateRunRequest) -> Result<Run> {
             "workflow_id": run.workflow_id,
             "status": run.status,
         }),
+        run_owner,
     )
     .await;
 
+    // Drive the run: mark it running and dispatch any dep-free steps. Automated
+    // step types (transform/webhook/llm) complete inline and cascade, so a fully
+    // automated workflow reaches a terminal status here; steps awaiting external
+    // completion (action/decision/parallel/wait) are left running. A dispatch
+    // error is logged but does not fail creation -- the run exists and boot
+    // recovery / a later advance can resume it.
+    if let Err(e) = advance_run(db, run.id).await {
+        warn!("run {} created but initial advance failed: {}", run.id, e);
+    }
+
     info!("created run {} for workflow {}", run.id, req.workflow_id);
-    Ok(run)
+    // Return the advanced state, not the stale 'pending' snapshot.
+    get_run(db, run.id).await
 }
 
 /// Fetch a single run by ID.
@@ -834,6 +932,7 @@ pub async fn cancel_run(db: &Database, id: i64, _user_id: i64) -> Result<bool> {
         serde_json::json!({
             "run_id": id,
         }),
+        run.user_id,
     )
     .await;
 
@@ -942,7 +1041,17 @@ pub async fn complete_step(
 pub async fn fail_step(db: &Database, step_id: i64, error: &str, _user_id: i64) -> Result<Step> {
     let step = get_step(db, step_id).await?;
     // Verify run ownership
-    get_run(db, step.run_id).await?;
+    let run = get_run(db, step.run_id).await?;
+
+    // Only a running step can be failed. Guards against re-failing an already
+    // terminal step (double external callback, or a stale retry racing a
+    // completion), which would otherwise clobber a completed run to 'failed'.
+    if step.status != "running" {
+        return Err(EngError::InvalidInput(format!(
+            "cannot fail step {} -- current status is '{}'",
+            step_id, step.status
+        )));
+    }
 
     let error = error.to_string();
 
@@ -975,6 +1084,13 @@ pub async fn fail_step(db: &Database, step_id: i64, error: &str, _user_id: i64) 
             Some(serde_json::json!({ "error": error })),
         )
         .await?;
+
+        // Bounded exponential backoff before the retried step is re-dispatched,
+        // so a step that fails fast (e.g. a webhook to a dead host) does not
+        // hammer the target in a tight loop. 50ms, 100, 200 ... capped at 1s;
+        // the shift is bounded to avoid overflow.
+        let backoff_ms = (50u64 << (step.retry_count.max(0) as u32).min(5)).min(1000);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
 
         // Re-advance so the retried step can be picked up
         advance_run(db, step.run_id).await?;
@@ -1024,6 +1140,7 @@ pub async fn fail_step(db: &Database, step_id: i64, error: &str, _user_id: i64) 
                 "run_id": run_id,
                 "error": "retries exhausted",
             }),
+            run.user_id,
         )
         .await;
 
@@ -1064,14 +1181,16 @@ pub async fn advance_run(db: &Database, run_id: i64) -> Result<()> {
         return Ok(());
     }
 
-    // If still pending, mark as running
+    // If still pending, mark as running. The `AND status = 'pending'` guard makes
+    // this a compare-and-swap: a concurrent/re-entrant advance that already moved
+    // the run to running does not overwrite started_at a second time.
     if run.status == "pending" {
         db.write(move |conn| {
             conn.execute(
                 "UPDATE loom_runs
                  SET status = 'running', started_at = datetime('now'),
                      updated_at = datetime('now')
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'pending'",
                 rusqlite::params![run_id],
             )?;
             Ok(())
@@ -1126,6 +1245,7 @@ pub async fn advance_run(db: &Database, run_id: i64) -> Result<()> {
             serde_json::json!({
                 "run_id": run_id,
             }),
+            run.user_id,
         )
         .await;
 
@@ -1200,17 +1320,24 @@ pub async fn advance_run(db: &Database, run_id: i64) -> Result<()> {
         let input_str = serde_json::to_string(&ready.merged_input)?;
         let ready_id = ready.id;
 
-        db.write(move |conn| {
-            conn.execute(
-                "UPDATE loom_steps
-                 SET status = 'running', input = ?1,
-                     started_at = datetime('now')
-                 WHERE id = ?2",
-                rusqlite::params![input_str, ready_id],
-            )?;
-            Ok(())
-        })
-        .await?;
+        // Claim the step atomically: only the advance whose UPDATE actually flips
+        // pending -> running proceeds to execute it. A concurrent or re-entrant
+        // advance (complete_step -> advance_run cascades) that saw the same step
+        // as ready gets 0 rows affected and skips it, so no step double-executes.
+        let claimed = db
+            .write(move |conn| {
+                Ok::<usize, EngError>(conn.execute(
+                    "UPDATE loom_steps
+                     SET status = 'running', input = ?1,
+                         started_at = datetime('now')
+                     WHERE id = ?2 AND status = 'pending'",
+                    rusqlite::params![input_str, ready_id],
+                )?)
+            })
+            .await?;
+        if claimed == 0 {
+            continue;
+        }
 
         add_log(
             db,
@@ -1266,6 +1393,64 @@ pub async fn advance_run(db: &Database, run_id: i64) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resume workflow runs interrupted by a process restart.
+///
+/// A run left in `pending`/`running` after a crash does not resume on its own:
+/// an automated step (transform/webhook/llm) that was mid-execution is stuck in
+/// `running` with no live task driving it, and `advance_run` treats a `running`
+/// step as in-flight rather than re-dispatching it. This resets those orphaned
+/// automated steps back to `pending` (execution is at-least-once, so a step
+/// whose side effect fired before the crash may run again), then advances every
+/// non-terminal run. Steps awaiting an EXTERNAL completion (action/decision/
+/// parallel/wait) are deliberately left `running`: their callback is still
+/// expected, and re-dispatching them is not this engine's job.
+///
+/// Operates on a single `Database` -- call it at startup for the primary DB. In
+/// sharded mode a tenant shard's interrupted runs resume the next time that
+/// shard is advanced. Returns the number of runs advanced.
+#[tracing::instrument(skip(db))]
+pub async fn recover_inflight_runs(db: &Database) -> Result<usize> {
+    // Re-arm orphaned automated steps so the advance below re-dispatches them.
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE loom_steps
+             SET status = 'pending', started_at = NULL
+             WHERE status = 'running'
+               AND type IN ('transform', 'webhook', 'llm')
+               AND run_id IN (
+                   SELECT id FROM loom_runs WHERE status IN ('pending', 'running')
+               )",
+            [],
+        )?;
+        Ok(())
+    })
+    .await?;
+
+    let run_ids: Vec<i64> = db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM loom_runs WHERE status IN ('pending', 'running') ORDER BY id ASC",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<i64>, _>>()?;
+            Ok(ids)
+        })
+        .await?;
+
+    let mut advanced = 0usize;
+    for run_id in run_ids {
+        match advance_run(db, run_id).await {
+            Ok(()) => advanced += 1,
+            Err(e) => warn!("boot recovery: advancing run {} failed: {}", run_id, e),
+        }
+    }
+    if advanced > 0 {
+        info!("loom boot recovery advanced {} in-flight run(s)", advanced);
+    }
+    Ok(advanced)
 }
 
 // --- Transform executor ---
@@ -1337,10 +1522,19 @@ pub async fn execute_transform_step(
 
 // --- Stats ---
 
-#[tracing::instrument(skip(db), fields(user_id = ?user_id))]
-pub async fn get_stats(db: &Database, user_id: Option<i64>) -> Result<LoomStats> {
-    let (workflows, runs, active_runs, steps, runs_by_status) = if let Some(_uid) = user_id {
-        db.read(move |conn| {
+/// Aggregate Loom counts for the current database.
+///
+/// The counts are process-global for this DB, not per-user: the loom tables
+/// carry no `user_id` column (dropped in migration 37 / tenant v34 and not yet
+/// restored), so per-tenant scoping is not expressible here. In sharded mode
+/// each tenant already has its own DB, so this is naturally that tenant's stats;
+/// in shared-monolith mode the counts span all tenants. The previous signature
+/// took an unused `Option<i64>` and branched into two identical queries, which
+/// implied a per-user scoping that never existed -- removed to stop lying.
+#[tracing::instrument(skip(db))]
+pub async fn get_stats(db: &Database) -> Result<LoomStats> {
+    let (workflows, runs, active_runs, steps, runs_by_status) = db
+        .read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT
                         (SELECT COUNT(*) FROM loom_workflows),
@@ -1375,45 +1569,7 @@ pub async fn get_stats(db: &Database, user_id: Option<i64>) -> Result<LoomStats>
 
             Ok((w, ru, ar, s, runs_by_status))
         })
-        .await?
-    } else {
-        db.read(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT
-                        (SELECT COUNT(*) FROM loom_workflows),
-                        (SELECT COUNT(*) FROM loom_runs),
-                        (SELECT COUNT(*) FROM loom_runs WHERE status IN ('pending','running')),
-                        (SELECT COUNT(*) FROM loom_steps)",
-            )?;
-            let mut rows = stmt.query(())?;
-
-            let (w, ru, ar, s) = if let Some(row) = rows.next()? {
-                let w: i64 = row.get(0)?;
-                let ru: i64 = row.get(1)?;
-                let ar: i64 = row.get(2)?;
-                let s: i64 = row.get(3)?;
-                (w, ru, ar, s)
-            } else {
-                (0i64, 0i64, 0i64, 0i64)
-            };
-
-            let mut runs_by_status = Vec::new();
-            let mut stmt = conn.prepare(
-                "SELECT status, COUNT(*) as cnt FROM loom_runs \
-                     GROUP BY status ORDER BY cnt DESC",
-            )?;
-            let mut rows = stmt.query(())?;
-            while let Some(r) = rows.next()? {
-                runs_by_status.push(StatBreakdown {
-                    name: r.get(0)?,
-                    count: r.get(1)?,
-                });
-            }
-
-            Ok((w, ru, ar, s, runs_by_status))
-        })
-        .await?
-    };
+        .await?;
 
     Ok(LoomStats {
         workflows,
@@ -1438,6 +1594,22 @@ static LOOM_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyL
 /// Maximum body slice retained in error messages from non-2xx responses, in
 /// bytes. Mirrors the standalone's `text.slice(0, 500)`.
 const LOOM_ERR_BODY_CAP: usize = 500;
+
+/// SSRF guard for a Loom step's user-supplied URL. Resolves the host via DNS
+/// and rejects loopback / RFC1918 / link-local / cloud-metadata targets,
+/// including hostnames that resolve to such IPs -- closing the gap where the
+/// synchronous `validate_webhook_url` only inspects literal IPs/hostnames.
+///
+/// The validated IP is deliberately NOT pinned into the URL: Loom steps
+/// routinely target https domains (LLM providers, SaaS webhooks), and rewriting
+/// the host to a literal IP would break TLS SNI / certificate validation. The
+/// shared `LOOM_HTTP_CLIENT` (built via `net::safe_client_builder`) still
+/// revalidates every redirect hop, so a redirect to a private IP is rejected.
+async fn guard_step_url_ssrf(url: &str) -> Result<()> {
+    crate::webhooks::resolve_and_validate_url(url)
+        .await
+        .map(|_| ())
+}
 
 /// Execute a `webhook`-type step by POSTing `{ step_id, run_id, input, config }`
 /// to the configured URL, then completing the step with the parsed JSON
@@ -1466,8 +1638,10 @@ pub async fn execute_webhook_step(
         }
     };
 
-    // SECURITY: validate before issuing the request to prevent SSRF.
-    if let Err(e) = crate::webhooks::validate_webhook_url(&url) {
+    // SECURITY (SSRF): resolve + validate at request time so a hostname that
+    // resolves to a private/metadata IP is rejected, not just literal private
+    // IPs (the old validate_webhook_url check).
+    if let Err(e) = guard_step_url_ssrf(&url).await {
         let msg = format!("webhook url rejected: {}", e);
         Box::pin(fail_step(db, step_id, &msg, user_id)).await?;
         return Ok(());
@@ -1564,6 +1738,15 @@ pub async fn execute_llm_step(
             return Ok(());
         }
     };
+
+    // SECURITY (SSRF): the llm step POSTs the configured api_key to this URL, so
+    // resolve + validate it (rejecting hosts that resolve to private/metadata
+    // IPs) before any request. Previously the llm step did no URL validation.
+    if let Err(e) = guard_step_url_ssrf(&url).await {
+        let msg = format!("llm url rejected: {}", e);
+        Box::pin(fail_step(db, step_id, &msg, user_id)).await?;
+        return Ok(());
+    }
 
     let vars = serde_json::Value::Object(build_llm_vars(input, config.get("input_map")));
 
@@ -1785,4 +1968,303 @@ fn extract_json_object(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Engine tests. Loom shipped with zero coverage; these exercise the wire-up
+/// (runs actually advance) and each hardening fix (cycle/dangling rejection,
+/// retry clamp, fail-status guard, interpolate termination, boot recovery).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use serde_json::json;
+
+    /// Fresh in-memory DB with the full migration chain (loom tables included).
+    async fn setup() -> Database {
+        Database::connect_memory().await.expect("db")
+    }
+
+    /// Build a transform StepDef with the given name, dependencies, and config.
+    fn transform_step(name: &str, deps: &[&str], config: serde_json::Value) -> StepDef {
+        StepDef {
+            name: name.to_string(),
+            step_type: "transform".to_string(),
+            config: Some(config),
+            depends_on: if deps.is_empty() {
+                None
+            } else {
+                Some(deps.iter().map(|s| s.to_string()).collect())
+            },
+            max_retries: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// A fully-automated transform workflow runs to completion the moment the run
+    /// is created: create_run now drives advance_run instead of leaving the run
+    /// stuck in 'pending'. The two-step dep chain also proves output merging.
+    #[tokio::test]
+    async fn create_run_drives_transform_workflow_to_completion() {
+        let db = setup().await;
+        let wf = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "greet-flow".into(),
+                description: None,
+                steps: vec![
+                    transform_step(
+                        "greet",
+                        &[],
+                        json!({"template": {"greeting": "hello {{name}}"}}),
+                    ),
+                    transform_step(
+                        "shout",
+                        &["greet"],
+                        json!({"mapping": {"loud": "greeting"}}),
+                    ),
+                ],
+                user_id: None,
+            },
+        )
+        .await
+        .expect("create workflow");
+
+        let run = create_run(
+            &db,
+            CreateRunRequest {
+                workflow_id: wf.id,
+                workflow_name: None,
+                input: Some(json!({"name": "world"})),
+                user_id: None,
+            },
+        )
+        .await
+        .expect("create run");
+
+        assert_eq!(run.status, "completed", "run should complete inline");
+        assert_eq!(
+            run.output.get("greeting").and_then(|v| v.as_str()),
+            Some("hello world")
+        );
+        assert_eq!(
+            run.output.get("loud").and_then(|v| v.as_str()),
+            Some("hello world")
+        );
+    }
+
+    /// create_workflow rejects a dependency cycle (a -> b -> a) that would
+    /// otherwise wedge every run of the workflow forever.
+    #[tokio::test]
+    async fn create_workflow_rejects_cycle() {
+        let db = setup().await;
+        let res = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "cyclic".into(),
+                description: None,
+                steps: vec![
+                    transform_step("a", &["b"], json!({})),
+                    transform_step("b", &["a"], json!({})),
+                ],
+                user_id: None,
+            },
+        )
+        .await;
+        assert!(res.is_err(), "cyclic workflow must be rejected");
+    }
+
+    /// create_workflow rejects a depends_on naming a step not in the workflow.
+    #[tokio::test]
+    async fn create_workflow_rejects_dangling_dep() {
+        let db = setup().await;
+        let res = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "dangling".into(),
+                description: None,
+                steps: vec![transform_step("a", &["ghost"], json!({}))],
+                user_id: None,
+            },
+        )
+        .await;
+        assert!(res.is_err(), "dangling dependency must be rejected");
+    }
+
+    /// A step requesting an absurd retry count is clamped to the hard cap when
+    /// the run's steps are materialized.
+    #[tokio::test]
+    async fn max_retries_is_clamped_on_run_creation() {
+        let db = setup().await;
+        let mut step = transform_step("x", &[], json!({"template": {"k": "v"}}));
+        step.max_retries = Some(i32::MAX);
+        let wf = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "retry-cap".into(),
+                description: None,
+                steps: vec![step],
+                user_id: None,
+            },
+        )
+        .await
+        .expect("create workflow");
+        let run = create_run(
+            &db,
+            CreateRunRequest {
+                workflow_id: wf.id,
+                workflow_name: None,
+                input: None,
+                user_id: None,
+            },
+        )
+        .await
+        .expect("create run");
+        let steps = get_steps(&db, run.id, 1).await.expect("steps");
+        assert_eq!(steps[0].max_retries, MAX_STEP_RETRIES);
+    }
+
+    /// fail_step refuses to fail a step that is not currently running, so a late
+    /// or duplicate failure cannot clobber an already-completed run.
+    #[tokio::test]
+    async fn fail_step_rejects_non_running_step() {
+        let db = setup().await;
+        let wf = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "single".into(),
+                description: None,
+                steps: vec![transform_step("only", &[], json!({"template": {"k": "v"}}))],
+                user_id: None,
+            },
+        )
+        .await
+        .expect("wf");
+        let run = create_run(
+            &db,
+            CreateRunRequest {
+                workflow_id: wf.id,
+                workflow_name: None,
+                input: None,
+                user_id: None,
+            },
+        )
+        .await
+        .expect("run");
+        let steps = get_steps(&db, run.id, 1).await.expect("steps");
+        assert_eq!(steps[0].status, "completed");
+        let res = fail_step(&db, steps[0].id, "late failure", 1).await;
+        assert!(res.is_err(), "failing a completed step must be rejected");
+    }
+
+    /// interpolate terminates on a self-referential variable and does not
+    /// re-expand the substituted value (the old inline version looped forever).
+    #[test]
+    fn interpolate_self_referential_terminates() {
+        let vars = json!({ "x": "{{x}}" });
+        assert_eq!(interpolate("{{x}}", &vars), "{{x}}");
+    }
+
+    /// Boot recovery re-arms an orphaned automated step (a crash left it running)
+    /// and drives the run back to completion.
+    #[tokio::test]
+    async fn recover_reruns_orphaned_automated_step() {
+        let db = setup().await;
+        let wf = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "recover-auto".into(),
+                description: None,
+                steps: vec![transform_step("t", &[], json!({"template": {"k": "done"}}))],
+                user_id: None,
+            },
+        )
+        .await
+        .expect("wf");
+        let run = create_run(
+            &db,
+            CreateRunRequest {
+                workflow_id: wf.id,
+                workflow_name: None,
+                input: None,
+                user_id: None,
+            },
+        )
+        .await
+        .expect("run");
+        assert_eq!(run.status, "completed");
+
+        // Simulate a crash mid-execution: run + its transform step back to running.
+        let run_id = run.id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE loom_runs SET status='running', completed_at=NULL WHERE id=?1",
+                rusqlite::params![run_id],
+            )?;
+            conn.execute(
+                "UPDATE loom_steps SET status='running', completed_at=NULL, output='{}' WHERE run_id=?1",
+                rusqlite::params![run_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let advanced = recover_inflight_runs(&db).await.expect("recover");
+        assert_eq!(advanced, 1);
+        let recovered = get_run(&db, run_id).await.unwrap();
+        assert_eq!(
+            recovered.status, "completed",
+            "orphaned transform run should recover to completed"
+        );
+    }
+
+    /// Boot recovery must NOT re-dispatch a step awaiting external completion:
+    /// an action step stuck 'running' after a crash is left running, since its
+    /// callback is still expected and re-running it would double-fire.
+    #[tokio::test]
+    async fn recover_leaves_external_step_running() {
+        let db = setup().await;
+        let action = StepDef {
+            name: "manual".into(),
+            step_type: "action".into(),
+            config: None,
+            depends_on: None,
+            max_retries: None,
+            timeout_ms: None,
+        };
+        let wf = create_workflow(
+            &db,
+            CreateWorkflowRequest {
+                name: "recover-ext".into(),
+                description: None,
+                steps: vec![action],
+                user_id: None,
+            },
+        )
+        .await
+        .expect("wf");
+        let run = create_run(
+            &db,
+            CreateRunRequest {
+                workflow_id: wf.id,
+                workflow_name: None,
+                input: None,
+                user_id: None,
+            },
+        )
+        .await
+        .expect("run");
+        // The action step is dispatched to 'running' and awaits external completion.
+        assert_eq!(run.status, "running");
+        let steps_before = get_steps(&db, run.id, 1).await.unwrap();
+        assert_eq!(steps_before[0].status, "running");
+
+        let _ = recover_inflight_runs(&db).await.expect("recover");
+        let steps_after = get_steps(&db, run.id, 1).await.unwrap();
+        assert_eq!(
+            steps_after[0].status, "running",
+            "external action step must stay running"
+        );
+        assert_eq!(get_run(&db, run.id).await.unwrap().status, "running");
+    }
 }

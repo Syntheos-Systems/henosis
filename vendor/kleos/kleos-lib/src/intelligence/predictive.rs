@@ -80,10 +80,14 @@ pub async fn predictive_recall(db: &Database, user_id: i64) -> Result<Predictive
 
     let task_rows: Vec<MemRow> = db
         .read(move |conn| {
+            // status != 'pending' is the review-gate predicate: predictive_recall
+            // is an agent session-start surface, so pending task memories must
+            // not be surfaced as if they were established facts.
             let mut stmt = conn.prepare(
                 "SELECT id, content, category, importance \
                      FROM memories \
                      WHERE user_id = ?1 AND is_forgotten = 0 AND is_archived = 0 AND is_latest = 1 \
+                       AND status != 'pending' \
                        AND category = 'task' AND is_static = 0 \
                        AND created_at > datetime('now', '-3 days') \
                      ORDER BY importance DESC, created_at DESC LIMIT 5",

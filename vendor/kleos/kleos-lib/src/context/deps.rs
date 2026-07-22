@@ -5,8 +5,11 @@
 use crate::db::Database;
 use crate::memory::types::Memory;
 use crate::memory::{row_to_memory, MEMORY_COLUMNS};
+use crate::validation::MAX_STATIC_CONTEXT_MEMORIES;
 use crate::Result;
 
+/// One revision in a memory's version chain, surfaced when context assembly
+/// wants to show how a fact evolved.
 #[derive(Debug, Clone)]
 pub struct VersionChainEntry {
     pub id: i64,
@@ -17,6 +20,8 @@ pub struct VersionChainEntry {
     pub created_at: String,
 }
 
+/// A memory reached through a `memory_links` edge, with the link similarity that
+/// justified surfacing it alongside the anchor memory.
 #[derive(Debug, Clone)]
 pub struct LinkedMemory {
     pub id: i64,
@@ -28,6 +33,8 @@ pub struct LinkedMemory {
     pub source: Option<String>,
 }
 
+/// A current-state key/value pair (the agent's tracked working state), with how
+/// many times it has been updated.
 #[derive(Debug, Clone)]
 pub struct StateEntry {
     pub key: String,
@@ -35,6 +42,8 @@ pub struct StateEntry {
     pub updated_count: i32,
 }
 
+/// A learned user preference in one domain, with a strength score used to rank
+/// which preferences are worth injecting.
 #[derive(Debug, Clone)]
 pub struct PreferenceEntry {
     pub domain: String,
@@ -42,6 +51,8 @@ pub struct PreferenceEntry {
     pub strength: f64,
 }
 
+/// A subject-verb-object fact extracted from a memory, with optional quantity,
+/// unit, and validity window, for injecting precise facts rather than prose.
 #[derive(Debug, Clone)]
 pub struct StructuredFact {
     pub subject: String,
@@ -55,6 +66,8 @@ pub struct StructuredFact {
     pub invalid_at: Option<String>,
 }
 
+/// A short summary of an episode (a grouped run of related memories), used to
+/// give context assembly a temporal anchor.
 #[derive(Debug, Clone)]
 pub struct EpisodeSummary {
     pub id: i64,
@@ -62,11 +75,21 @@ pub struct EpisodeSummary {
     pub started_at: Option<String>,
 }
 
+/// Load the user's static (pinned) memories, highest-importance first, for the
+/// static-facts block of assembled context. Withholds review-gate pending rows.
 #[tracing::instrument(skip(db))]
 pub async fn get_static_memories(db: &Database, user_id: i64) -> Result<Vec<Memory>> {
+    // status != 'pending' is the review-gate predicate. Static facts are ranked
+    // by importance and injected verbatim, so without it the gate would withhold
+    // a high-importance memory from search and then inject it here anyway --
+    // defeating the gate on exactly the memories it exists to hold back.
+    // Finding [19]: bound the injection set. Static memories are injected
+    // verbatim into every context assembly, so an unbounded set lets one
+    // user's static corpus dominate assembly cost. Top-N by importance keeps
+    // the highest-value facts; the downstream token budget trims further.
     let sql = format!(
-        "SELECT {} FROM memories WHERE user_id = ?1 AND is_static = 1 AND is_forgotten = 0 AND is_latest = 1 AND is_consolidated = 0 ORDER BY importance DESC",
-        MEMORY_COLUMNS,
+        "SELECT {} FROM memories WHERE user_id = ?1 AND is_static = 1 AND is_forgotten = 0 AND is_latest = 1 AND is_consolidated = 0 AND status != 'pending' ORDER BY importance DESC LIMIT {}",
+        MEMORY_COLUMNS, MAX_STATIC_CONTEXT_MEMORIES,
     );
     db.read(move |conn| {
         let mut stmt = conn.prepare(&sql)?;
@@ -81,14 +104,19 @@ pub async fn get_static_memories(db: &Database, user_id: i64) -> Result<Vec<Memo
     .await
 }
 
+/// Hydrate a single owned memory by id (without its embedding blob) for
+/// injection. Withholds review-gate pending rows even when the id is supplied.
 #[tracing::instrument(skip(db))]
 pub async fn get_memory_without_embedding(
     db: &Database,
     id: i64,
     user_id: i64,
 ) -> Result<Option<Memory>> {
+    // status != 'pending' is the review-gate predicate: this hydrates a memory
+    // for injection, so a pending row must not surface here even when a caller
+    // hands us its id.
     let sql = format!(
-        "SELECT {} FROM memories WHERE id = ?1 AND user_id = ?2",
+        "SELECT {} FROM memories WHERE id = ?1 AND user_id = ?2 AND status != 'pending'",
         MEMORY_COLUMNS
     );
     db.read(move |conn| {
@@ -102,6 +130,8 @@ pub async fn get_memory_without_embedding(
     .await
 }
 
+/// Load the full version chain for an owned memory (all revisions sharing a
+/// root), ordered oldest-first, for showing how a fact evolved in context.
 #[tracing::instrument(skip(db))]
 pub async fn get_version_chain(
     db: &Database,
@@ -110,9 +140,12 @@ pub async fn get_version_chain(
 ) -> Result<Vec<VersionChainEntry>> {
     // The owner predicate (?2) keeps single-DB (shared) mode from returning
     // another user's version chain; a no-op in a single-owner shard.
+    // status != 'pending' is the review-gate predicate: a chain sibling can be a
+    // freshly stored, still-unapproved revision, and its content is injected.
     let sql = "SELECT id, content, category, version, is_latest, created_at \
                FROM memories \
                WHERE (root_memory_id = ?1 OR id = ?1) AND user_id = ?2 \
+                 AND status != 'pending' \
                ORDER BY version ASC";
     db.read(move |conn| {
         let mut stmt = conn.prepare(sql)?;
@@ -133,6 +166,8 @@ pub async fn get_version_chain(
     .await
 }
 
+/// Fetch the summary of one owned episode by id, for anchoring injected
+/// memories to the episode they belong to.
 #[tracing::instrument(skip(db))]
 pub async fn get_episode_summary(
     db: &Database,
@@ -155,16 +190,22 @@ pub async fn get_episode_summary(
     .await
 }
 
+/// Load the top owned memories linked to `mem_id` by similarity edges, for the
+/// associative block of context. Withholds review-gate pending neighbours.
 #[tracing::instrument(skip(db))]
 pub async fn get_links(db: &Database, mem_id: i64, user_id: i64) -> Result<Vec<LinkedMemory>> {
     // The joined memory is scoped to the owner (?2) so single-DB mode never
     // returns a link into another user's memory; a no-op in a single-owner shard.
+    // m.status != 'pending' is the review-gate predicate: the JOIN reaches a
+    // memory the caller never selected, so an unapproved neighbour would other-
+    // wise ride into the prompt on the coat-tails of an approved one.
     let sql = "SELECT m.id, m.content, m.category, ml.similarity, m.is_forgotten, m.model, m.source \
                FROM memory_links ml \
                JOIN memories m ON (m.id = CASE WHEN ml.source_id = ?1 THEN ml.target_id ELSE ml.source_id END) \
                WHERE (ml.source_id = ?1 OR ml.target_id = ?1) \
                  AND m.user_id = ?2 \
                  AND m.is_latest = 1 AND m.is_consolidated = 0 \
+                 AND m.status != 'pending' \
                ORDER BY ml.similarity DESC LIMIT 10";
     db.read(move |conn| {
         let mut stmt = conn.prepare(sql)?;
@@ -186,11 +227,17 @@ pub async fn get_links(db: &Database, mem_id: i64, user_id: i64) -> Result<Vec<L
     .await
 }
 
+/// Load the user's most recent non-static memories (newest first, capped at
+/// `limit`) for the temporal context block. Withholds review-gate pending rows.
 #[tracing::instrument(skip(db))]
 pub async fn get_recent_dynamic(db: &Database, user_id: i64, limit: usize) -> Result<Vec<Memory>> {
+    // status != 'pending' is the review-gate predicate. This is the temporal
+    // context block: a memory stored seconds ago is the most likely thing to be
+    // awaiting review, so this path is the gate's likeliest leak without it.
     let sql = format!(
         "SELECT {} FROM memories \
          WHERE user_id = ?1 AND is_static = 0 AND is_forgotten = 0 AND is_latest = 1 AND is_consolidated = 0 \
+           AND status != 'pending' \
          ORDER BY created_at DESC LIMIT ?2",
         MEMORY_COLUMNS,
     );
@@ -230,6 +277,8 @@ pub async fn get_current_state(db: &Database, user_id: i64) -> Result<Vec<StateE
     .await
 }
 
+/// Load the user's strongest learned preferences (strength >= 1.5), for the
+/// preferences block of assembled context.
 #[tracing::instrument(skip(db))]
 pub async fn get_user_preferences(db: &Database, user_id: i64) -> Result<Vec<PreferenceEntry>> {
     let sql = "SELECT domain, preference, strength FROM user_preferences \
@@ -250,6 +299,9 @@ pub async fn get_user_preferences(db: &Database, user_id: i64) -> Result<Vec<Pre
     .await
 }
 
+/// Load currently-valid structured facts extracted from the given memories, for
+/// injecting precise SVO facts. `mem_ids` must already be owner-scoped by the
+/// caller: the query filters by `memory_id`, not `user_id`.
 #[tracing::instrument(skip(db, mem_ids), fields(mem_id_count = mem_ids.len()))]
 pub async fn get_structured_facts(
     db: &Database,
@@ -291,6 +343,8 @@ pub async fn get_structured_facts(
     .await
 }
 
+/// Increment the access counter and refresh the last-accessed timestamp for each
+/// memory that was surfaced into context. Best-effort: failures are logged only.
 #[tracing::instrument(skip(db, ids), fields(id_count = ids.len()))]
 pub async fn track_access(db: &Database, ids: &[i64]) {
     for &id in ids {

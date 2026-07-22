@@ -352,10 +352,15 @@ pub async fn time_travel(
     if let Some(q) = query {
         let pattern = format!("%{}%", q);
         db.read(move |conn| {
+            // Review-gate: status != 'pending' withholds unreviewed memories and
+            // is_archived = 0 drops rejected content. is_latest is intentionally
+            // NOT filtered here so time-travel can still surface superseded
+            // versions as they existed at the requested timestamp.
             let mut stmt = conn.prepare(
                 "SELECT id, content, category, importance, created_at \
                      FROM memories \
                      WHERE created_at <= ?1 AND is_forgotten = 0 \
+                       AND is_archived = 0 AND status != 'pending' \
                        AND content LIKE ?2 AND user_id = ?4 \
                      ORDER BY created_at DESC LIMIT ?3",
             )?;
@@ -375,10 +380,14 @@ pub async fn time_travel(
         .await
     } else {
         db.read(move |conn| {
+            // Review-gate, same as the query arm above: withhold pending and
+            // rejected content; keep superseded versions for time-travel.
             let mut stmt = conn.prepare(
                 "SELECT id, content, category, importance, created_at \
                      FROM memories \
-                     WHERE created_at <= ?1 AND is_forgotten = 0 AND user_id = ?3 \
+                     WHERE created_at <= ?1 AND is_forgotten = 0 \
+                       AND is_archived = 0 AND status != 'pending' \
+                       AND user_id = ?3 \
                      ORDER BY created_at DESC LIMIT ?2",
             )?;
 

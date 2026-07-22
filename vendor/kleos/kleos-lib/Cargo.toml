@@ -1,6 +1,6 @@
 [package]
 name = "kleos-lib"
-version = "1.7.1"
+version = "1.9.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Core library for Kleos -- persistent semantic memory and cognitive infrastructure for AI agents"
@@ -13,8 +13,13 @@ readme = "../README.md"
 name = "kleos_lib"
 
 [features]
-default = ["brain_hopfield"]
-brain_hopfield = []
+default = ["brain_hopfield", "ml"]
+brain_hopfield = ["dep:ndarray"]
+# Local ML inference stack: ONNX embedder + cross-encoder reranker
+# (ort/tokenizers) and the LanceDB ANN index (lancedb/arrow). Default-on;
+# disabling it builds a lean crate that degrades to remote/HTTP embedding
+# providers, the HTTP reranker backend, and FTS + sqlite-vec retrieval.
+ml = ["dep:ort", "dep:tokenizers", "dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 test-utils = []
 # Enable per-tenant sharding (rusqlite-based). Mutually exclusive with libsql tests.
 tenant-sharding = []
@@ -32,11 +37,13 @@ bundled-sqlite = ["rusqlite/bundled"]
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
+kleos-config = { path = "../kleos-config", version = "1.9.0" }
 rusqlite = { workspace = true }
 tokio-rusqlite = { workspace = true }
 deadpool-sqlite = { workspace = true, features = ["tracing"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+csv = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
@@ -50,11 +57,14 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+unicode-normalization = { workspace = true }
+rust-stemmers = { workspace = true }
+whatlang = { workspace = true }
 url = { workspace = true }
 ipnet = { workspace = true }
-ort = { workspace = true }
-tokenizers = { workspace = true }
-ndarray = { workspace = true }
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
 reqwest = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }
@@ -62,13 +72,13 @@ zip = { workspace = true }
 pdf-extract = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
 futures = { workspace = true }
 lru = { workspace = true }
 arc-swap = { workspace = true }
 walkdir = { workspace = true }
-lancedb = { workspace = true }
+lancedb = { workspace = true, optional = true }
 flate2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
@@ -93,11 +103,14 @@ openssl = { version = "0.10", optional = true }
 protoc-bin-vendored-linux-x86_64 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# test-util enables tokio::test(start_paused) so timer-race tests (e.g. the
+# circuit-breaker cancelled-probe tests) resolve virtually with no real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
 axum = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = "3"
+serde_json = { workspace = true }
 
 # Criterion bench targets. Each must set harness = false so criterion
 # supplies its own main(). Keep these zero-cloud: ONNX embeddings run
@@ -106,7 +119,17 @@ serial_test = "3"
 [[bench]]
 name = "embeddings"
 harness = false
-required-features = ["test-utils"]
+required-features = ["test-utils", "ml"]
+
+# Dev targets that construct the concrete ONNX types directly; skipped (not
+# broken) when the ml feature is off.
+[[example]]
+name = "onnx_probe"
+required-features = ["ml"]
+
+[[test]]
+name = "lang_retrieval"
+required-features = ["ml"]
 
 [[bench]]
 name = "memory_search"

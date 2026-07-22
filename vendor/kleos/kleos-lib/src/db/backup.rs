@@ -23,15 +23,35 @@ pub async fn vacuum_into(db: &crate::db::Database, dest: &Path) -> Result<()> {
     .await
 }
 
+/// Apply the SQLCipher key to a freshly opened backup connection as its first
+/// statement. Backups produced by `VACUUM INTO` on an encrypted database are
+/// themselves encrypted with the same key, so without this the verify/restore
+/// probes open ciphertext as if it were a plain database and fail every time.
+/// A no-op on unencrypted deployments (`key` is None).
+fn apply_backup_key(conn: &rusqlite::Connection, key: Option<[u8; 32]>) -> Result<()> {
+    if let Some(k) = key {
+        let key_sql = format!(
+            "PRAGMA key = {};",
+            crate::encryption::format_pragma_key(&k).as_str()
+        );
+        conn.execute_batch(&key_sql)
+            .map_err(|e| EngError::DatabaseMessage(format!("apply backup key: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Runs PRAGMA integrity_check on the given database file.
+/// `encryption_key` must be `Some` for SQLCipher-encrypted backups, else the
+/// open sees ciphertext and reports the file as corrupt.
 /// Returns Ok(vec![]) if the database is valid, or Ok(vec![messages]) if corrupt.
-#[tracing::instrument(skip(path))]
-pub async fn integrity_check(path: &Path) -> Result<Vec<String>> {
+#[tracing::instrument(skip(path, encryption_key))]
+pub async fn integrity_check(path: &Path, encryption_key: Option<[u8; 32]>) -> Result<Vec<String>> {
     let path_str = path.to_string_lossy().to_string();
 
     // Open a direct rusqlite connection for integrity check
     let conn = rusqlite::Connection::open(&path_str)
         .map_err(|e| EngError::DatabaseMessage(format!("open for integrity check: {e}")))?;
+    apply_backup_key(&conn, encryption_key)?;
 
     let mut stmt = conn
         .prepare("PRAGMA integrity_check")
@@ -59,8 +79,8 @@ pub async fn integrity_check(path: &Path) -> Result<Vec<String>> {
 /// that the sqlite_master catalog is queryable. Here we actually execute
 /// queries against the restored file -- exactly what a disaster-recovery
 /// restore would do.
-#[tracing::instrument(skip(path))]
-pub async fn restore_test(path: &Path) -> Result<RestoreReport> {
+#[tracing::instrument(skip(path, encryption_key))]
+pub async fn restore_test(path: &Path, encryption_key: Option<[u8; 32]>) -> Result<RestoreReport> {
     let path_str = path.to_string_lossy().to_string();
     let path_for_task = path_str.clone();
     tokio::task::spawn_blocking(move || -> Result<RestoreReport> {
@@ -69,6 +89,7 @@ pub async fn restore_test(path: &Path) -> Result<RestoreReport> {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| EngError::DatabaseMessage(format!("restore_test open: {e}")))?;
+        apply_backup_key(&conn, encryption_key)?;
 
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
 
@@ -162,7 +183,7 @@ mod tests {
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []).ok();
         }
 
-        let errors = integrity_check(&path).await.expect("integrity_check");
+        let errors = integrity_check(&path, None).await.expect("integrity_check");
         assert!(
             errors.is_empty(),
             "minimal db should pass integrity check: {:?}",
@@ -200,7 +221,7 @@ mod tests {
             )
             .unwrap();
         }
-        let report = restore_test(&path).await.expect("restore_test");
+        let report = restore_test(&path, None).await.expect("restore_test");
         assert!(report.table_count >= 1);
         assert_eq!(report.memory_count, Some(3));
         let _ = std::fs::remove_file(&path);
@@ -209,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_test_errors_on_missing_file() {
         let path = std::env::temp_dir().join(format!("engram-missing-{}.db", uuid::Uuid::new_v4()));
-        let result = restore_test(&path).await;
+        let result = restore_test(&path, None).await;
         assert!(result.is_err(), "missing file should fail restore_test");
     }
 
@@ -221,7 +242,7 @@ mod tests {
             conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY);")
                 .unwrap();
         }
-        let report = restore_test(&path).await.expect("restore_test");
+        let report = restore_test(&path, None).await.expect("restore_test");
         assert!(report.table_count >= 1);
         assert_eq!(report.memory_count, None);
         let _ = std::fs::remove_file(&path);

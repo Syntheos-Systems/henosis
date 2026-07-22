@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Recognised user feedback signal values for recall quality tracking.
 pub const VALID_FEEDBACK_SIGNALS: &[&str] =
     &["used", "ignored", "corrected", "irrelevant", "helpful"];
+/// Default importance score assigned to new memories when none is specified.
 pub const DEFAULT_IMPORTANCE: i32 = 5;
 pub use crate::validation::MAX_CONTENT_SIZE;
 
+/// Classification of the question driving a memory retrieval request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionType {
@@ -16,7 +19,9 @@ pub enum QuestionType {
     Generalization,
     Temporal,
 }
+/// Serialises the variant to its snake_case string representation.
 impl std::fmt::Display for QuestionType {
+    /// Writes the snake_case label for this question type.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::FactRecall => "fact_recall",
@@ -28,8 +33,11 @@ impl std::fmt::Display for QuestionType {
         write!(f, "{}", s)
     }
 }
+/// Parses a snake_case string into a QuestionType variant.
 impl std::str::FromStr for QuestionType {
+    /// Parse error type returned when the input does not match any variant.
     type Err = crate::EngError;
+    /// Converts a lowercase string to the matching QuestionType variant.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fact_recall" => Ok(Self::FactRecall),
@@ -44,6 +52,7 @@ impl std::str::FromStr for QuestionType {
     }
 }
 
+/// High-level category labels used to classify stored memories.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryCategory {
@@ -56,7 +65,9 @@ pub enum MemoryCategory {
     General,
     Reference,
 }
+/// Serialises the variant to its lowercase string representation.
 impl std::fmt::Display for MemoryCategory {
+    /// Writes the lowercase label for this memory category.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::Task => "task",
@@ -70,8 +81,11 @@ impl std::fmt::Display for MemoryCategory {
         write!(f, "{}", s)
     }
 }
+/// Parses a lowercase string into a MemoryCategory variant.
 impl std::str::FromStr for MemoryCategory {
+    /// Parse error type returned when the input does not match any variant.
     type Err = crate::EngError;
+    /// Converts a lowercase string to the matching MemoryCategory variant.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "task" => Ok(Self::Task),
@@ -88,6 +102,7 @@ impl std::str::FromStr for MemoryCategory {
     }
 }
 
+/// Approval state for a stored memory (approved or pending review).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryStatus {
@@ -95,7 +110,9 @@ pub enum MemoryStatus {
     Approved,
     Pending,
 }
+/// Serialises the variant to its lowercase string representation.
 impl std::fmt::Display for MemoryStatus {
+    /// Writes the lowercase label for this memory status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Approved => write!(f, "approved"),
@@ -103,8 +120,11 @@ impl std::fmt::Display for MemoryStatus {
         }
     }
 }
+/// Parses a lowercase string into a MemoryStatus variant.
 impl std::str::FromStr for MemoryStatus {
+    /// Parse error type returned when the input does not match any variant.
     type Err = crate::EngError;
+    /// Converts a lowercase string to the matching MemoryStatus variant.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "approved" => Ok(Self::Approved),
@@ -116,6 +136,7 @@ impl std::str::FromStr for MemoryStatus {
     }
 }
 
+/// A single stored memory record with all metadata and scoring fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: i64,
@@ -167,8 +188,12 @@ pub struct Memory {
     pub updated_at: String,
     pub is_superseded: bool,
     pub is_consolidated: bool,
+    /// Detected ISO 639-1 content language ("en"/"fr"/"de"), or None for rows
+    /// stored before language detection landed (treated as "en" downstream).
+    pub lang: Option<String>,
 }
 
+/// Tuning parameters that control how the hybrid search pipeline is executed.
 #[derive(Debug, Clone)]
 pub struct SearchStrategy {
     pub vector_floor: f64,
@@ -186,6 +211,7 @@ pub struct SearchStrategy {
     pub personality_weight: f64,
 }
 
+/// Caller-supplied overrides applied on top of the default SearchStrategy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HybridSearchOptions {
     pub vector_floor: Option<f64>,
@@ -194,6 +220,7 @@ pub struct HybridSearchOptions {
     pub include_personality_signals: Option<bool>,
 }
 
+/// Diagnostic metadata returned alongside search results for observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalDiagnostics {
     pub question_type: QuestionType,
@@ -202,6 +229,7 @@ pub struct RetrievalDiagnostics {
     pub candidate_count: usize,
 }
 
+/// A related memory surfaced by graph expansion, with its link type and similarity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedMemory {
     pub id: i64,
@@ -212,6 +240,7 @@ pub struct LinkedMemory {
     pub link_type: String,
 }
 
+/// One entry in the version chain of a memory, tracking content across edits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionChainEntry {
     pub id: i64,
@@ -220,18 +249,21 @@ pub struct VersionChainEntry {
     pub is_latest: bool,
 }
 
+/// A tag with its total occurrence count across the user's memory corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagCount {
     pub tag: String,
     pub count: i64,
 }
 
+/// A category with its total occurrence count across the user's memory corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryCount {
     pub category: String,
     pub count: i64,
 }
 
+/// Aggregated profile for a user: personality traits, counts, and top-N facets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     pub user_id: i64,
@@ -246,6 +278,7 @@ pub struct UserProfile {
     pub top_tags: Vec<TagCount>,
 }
 
+/// High-level statistics for a user's memory space, broken down by content type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserStats {
     pub memories: i64,
@@ -268,6 +301,7 @@ pub struct InlineArtifactInput {
     pub data_base64: String,
 }
 
+/// Request body for storing a new memory, including optional metadata overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreRequest {
     pub content: String,
@@ -290,21 +324,32 @@ pub struct StoreRequest {
     /// Externally-assigned sync identifier for cross-device deduplication.
     #[serde(default)]
     pub sync_id: Option<String>,
+    /// Optional creation-timestamp override for backfill/import. When set and
+    /// parseable (RFC3339, "YYYY-MM-DD HH:MM:SS", or "YYYY-MM-DD"), the stored
+    /// row's created_at uses this value (normalized to UTC) instead of now;
+    /// when omitted the database default datetime('now') applies.
+    #[serde(default)]
+    pub created_at: Option<String>,
     /// Inline artifact attachments (max 10 per store call).
     #[serde(default)]
     pub artifacts: Option<Vec<InlineArtifactInput>>,
 }
+/// Returns the default memory category string used by serde deserialization.
 fn default_category() -> String {
     "general".to_string()
 }
+/// Returns the default source string used by serde deserialization.
 fn default_source() -> String {
     "unknown".to_string()
 }
+/// Returns the default importance score used by serde deserialization.
 fn default_importance() -> i32 {
     5
 }
 
+/// Constructs a StoreRequest with all optional fields set to None and serde defaults applied.
 impl Default for StoreRequest {
+    /// Returns a StoreRequest with all optional fields None and serde defaults applied.
     fn default() -> Self {
         Self {
             content: String::new(),
@@ -321,11 +366,14 @@ impl Default for StoreRequest {
             parent_memory_id: None,
             sync_id: None,
             artifacts: None,
+            created_at: None,
         }
     }
 }
 
+/// Constructs a SearchRequest with all optional fields unset and sensible flag defaults.
 impl Default for SearchRequest {
+    /// Returns a SearchRequest with all optional fields unset and sensible flag defaults.
     fn default() -> Self {
         Self {
             query: String::new(),
@@ -364,6 +412,7 @@ pub enum SearchBudget {
     High = 2,
 }
 
+/// Inherent methods on SearchBudget.
 impl SearchBudget {
     /// Parses a budget string, defaulting unknown values to the full pipeline.
     pub fn parse(value: &str) -> Self {
@@ -376,13 +425,22 @@ impl SearchBudget {
     }
 }
 
+/// Result returned after successfully storing a memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreResult {
     pub id: i64,
     pub created: bool,
     pub duplicate_of: Option<i64>,
+    /// True when the review gate held this newly created memory for review
+    /// (status = 'pending'). Callers use it to skip deriving facts, entity
+    /// links, and brain associations from content that has not cleared review;
+    /// that derivation is (re)run when the memory is approved. Always false for a
+    /// duplicate boost, which creates no new derivable content.
+    #[serde(default)]
+    pub pending: bool,
 }
 
+/// Request parameters for the hybrid memory search endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
@@ -411,10 +469,12 @@ pub struct SearchRequest {
     #[serde(default)]
     pub budget: Option<SearchBudget>,
 }
+/// Returns `true`, used as the serde default for boolean fields that default to on.
 fn default_true() -> bool {
     true
 }
 
+/// A single search result: the matched memory plus all scoring and diagnostic signals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub memory: Memory,
@@ -462,8 +522,20 @@ pub struct SearchResult {
     pub linked: Option<Vec<LinkedMemory>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_chain: Option<Vec<VersionChainEntry>>,
+    /// Raw cross-encoder relevance score in [0, 1], captured immediately after
+    /// reranker inference and BEFORE it is blended into `score`. Present on each
+    /// row the reranker actually cross-encoded; `None` on the no-reranker path
+    /// (FTS-only, filter path, vector-only without a reranker). This is the
+    /// uncontaminated confidence signal the ABSTAIN gate prefers over `score`,
+    /// which is entangled with decay, pagerank, and recency boosts. Normalized
+    /// to [0, 1] across backends (ONNX/Cohere are already in range; raw TEI
+    /// logits are passed through a sigmoid before storage) so a single threshold
+    /// is comparable regardless of reranker backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ce_confidence: Option<f64>,
 }
 
+/// Pagination and filtering parameters for listing memories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListOptions {
     pub limit: usize,
@@ -474,8 +546,18 @@ pub struct ListOptions {
     pub space_id: Option<i64>,
     pub include_forgotten: bool,
     pub include_archived: bool,
+    /// Inclusive lower bound on created_at (YYYY-MM-DD), or None.
+    pub from: Option<String>,
+    /// Exclusive upper bound on created_at (YYYY-MM-DD), or None.
+    pub to: Option<String>,
+    /// Include memories still pending human review (status='pending'). Default
+    /// false so the review gate withholds unreviewed memories from default
+    /// listings and recall; the Inbox path queries pending rows directly.
+    pub include_pending: bool,
 }
+/// Constructs ListOptions with a 50-item page, zero offset, and all filters unset.
 impl Default for ListOptions {
+    /// Returns ListOptions with a 50-item page, zero offset, and all filters unset.
     fn default() -> Self {
         Self {
             limit: 50,
@@ -486,10 +568,14 @@ impl Default for ListOptions {
             space_id: None,
             include_forgotten: false,
             include_archived: false,
+            from: None,
+            to: None,
+            include_pending: false,
         }
     }
 }
 
+/// Partial update payload for an existing memory; only set fields are applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateRequest {
     pub content: Option<String>,
@@ -503,6 +589,7 @@ pub struct UpdateRequest {
     pub chunk_embeddings: Option<Vec<(String, Vec<f32>)>>,
 }
 
+/// A single user feedback signal recorded against a memory for a given query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedbackItem {
     pub query: String,
@@ -512,6 +599,7 @@ pub struct FeedbackItem {
     pub agent: Option<String>,
 }
 
+/// Options for submitting a factual correction, optionally linking an existing memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrectOptions {
     pub correction: String,
@@ -523,6 +611,7 @@ pub struct CorrectOptions {
     pub tags: Option<Vec<String>>,
 }
 
+/// Parameters controlling what the memory health check considers stale or duplicate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryHealthParams {
     pub stale_days: i64,
@@ -530,6 +619,7 @@ pub struct MemoryHealthParams {
     pub limit: usize,
 }
 
+/// Options for the memory deduplication pass: similarity threshold and dry-run mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeduplicateOptions {
     pub threshold: f64,
@@ -583,6 +673,7 @@ pub struct FacetedSearchRequest {
     pub facet_limit: Option<usize>,
 }
 
+/// Returns the default result limit for faceted search requests.
 fn default_faceted_limit() -> usize {
     50
 }
@@ -638,6 +729,7 @@ pub struct FtsHit {
     pub bm25_score: f64,
 }
 
+/// Unit tests for SearchBudget parsing and ordering behaviour.
 #[cfg(test)]
 mod search_budget_tests {
     use super::{SearchBudget, SearchRequest};

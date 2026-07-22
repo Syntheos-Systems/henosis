@@ -67,6 +67,7 @@ async fn extract_and_link_entities_populates_tables() {
         chunk_embeddings: None,
         sync_id: None,
         artifacts: None,
+        created_at: None,
     };
     let stored = memory::store(&db, store_req, None, false)
         .await
@@ -155,6 +156,7 @@ async fn extract_and_link_entities_skips_lowercase_content() {
         chunk_embeddings: None,
         sync_id: None,
         artifacts: None,
+        created_at: None,
     };
     let stored = memory::store(&db, store_req, None, false)
         .await
@@ -184,4 +186,135 @@ async fn extract_and_link_entities_skips_lowercase_content() {
         .await
         .expect("link count");
     assert_eq!(link_count, 0, "expected 0 links for all-lowercase content");
+}
+
+// ---------------------------------------------------------------------------
+// DoS bound: co-occurrence pairing is capped and batched
+// ---------------------------------------------------------------------------
+
+/// A memory with more extracted entities than MAX_COOCCURRENCE_ENTITIES still
+/// creates and links every entity, but records only C(cap, 2) co-occurrence
+/// pairs -- not C(total, 2). Pre-fix, 60 entities meant 1770 sequential
+/// `db.write` calls from a single store; a 100KB memory could reach millions.
+#[tokio::test]
+async fn cooccurrence_pairing_is_capped_and_batched() {
+    use kleos_lib::graph::entities::extract_and_link_entities;
+    use kleos_lib::memory::{self, types::StoreRequest};
+    use kleos_lib::validation::MAX_COOCCURRENCE_ENTITIES;
+
+    let tenant = single_tenant().await;
+    let db = tenant.database();
+
+    // 60 distinct quoted tokens -> 60 "reference" entities via rule 2.
+    let total = MAX_COOCCURRENCE_ENTITIES + 10;
+    let content: String = (0..total)
+        .map(|i| format!("\"captok{i:02}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let store_req = StoreRequest {
+        content: content.clone(),
+        category: "general".to_string(),
+        source: "test".to_string(),
+        importance: 5,
+        tags: None,
+        embedding: None,
+        session_id: None,
+        is_static: None,
+        user_id: Some(1),
+        space_id: None,
+        parent_memory_id: None,
+        chunk_embeddings: None,
+        sync_id: None,
+        artifacts: None,
+        created_at: None,
+    };
+    let stored = memory::store(&db, store_req, None, false)
+        .await
+        .expect("store memory");
+
+    let entities = extract_and_link_entities(&db, stored.id, &content, 1)
+        .await
+        .expect("extract_and_link_entities");
+    assert_eq!(
+        entities.len(),
+        total,
+        "entity creation must NOT be capped -- only pairing is"
+    );
+
+    let memory_id = stored.id;
+    let link_count: i64 = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| kleos_lib::EngError::DatabaseMessage(e.to_string()))
+        })
+        .await
+        .expect("link count");
+    assert_eq!(link_count as usize, total, "every entity must stay linked");
+
+    let cooc_count: i64 = db
+        .read(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM entity_cooccurrences", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| kleos_lib::EngError::DatabaseMessage(e.to_string()))
+        })
+        .await
+        .expect("cooccurrence count");
+    let expected_pairs = (MAX_COOCCURRENCE_ENTITIES * (MAX_COOCCURRENCE_ENTITIES - 1) / 2) as i64;
+    assert_eq!(
+        cooc_count, expected_pairs,
+        "pairing must stop at C(cap, 2), not C(total, 2)"
+    );
+}
+
+/// The batched recorder normalizes pair order: (A, B) and (B, A) in one batch
+/// accumulate into a single canonical row with count 2, matching the
+/// single-pair `record_cooccurrence` contract.
+#[tokio::test]
+async fn batched_cooccurrences_accumulate_in_canonical_order() {
+    use kleos_lib::graph::cooccurrence::record_cooccurrences_batch;
+    use kleos_lib::graph::entities::create_entity;
+    use kleos_lib::graph::types::CreateEntityRequest;
+
+    let tenant = single_tenant().await;
+    let db = tenant.database();
+
+    let mut ids = Vec::new();
+    for name in ["Alpha Corp", "Beta Corp"] {
+        let req = CreateEntityRequest {
+            name: name.to_string(),
+            entity_type: Some("organization".to_string()),
+            description: None,
+            aliases: None,
+            user_id: Some(1),
+            space_id: None,
+        };
+        ids.push(create_entity(&db, req, 1).await.expect("create entity").id);
+    }
+    let (a, b) = (ids[0], ids[1]);
+
+    record_cooccurrences_batch(&db, vec![(a, b), (b, a)], 1)
+        .await
+        .expect("batch record");
+
+    let (rows, count, lo): (i64, i64, i64) = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*), MAX(count), MIN(entity_a_id) FROM entity_cooccurrences",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| kleos_lib::EngError::DatabaseMessage(e.to_string()))
+        })
+        .await
+        .expect("read cooccurrence row");
+
+    assert_eq!(rows, 1, "reversed pair must fold into the canonical row");
+    assert_eq!(count, 2, "both orderings must accumulate the count");
+    assert_eq!(lo, a.min(b), "entity_a_id must hold the smaller id");
 }

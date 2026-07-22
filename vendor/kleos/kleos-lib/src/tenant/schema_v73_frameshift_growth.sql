@@ -16,7 +16,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (73);
 CREATE TABLE IF NOT EXISTS frameshift_growth (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     persona TEXT,
     project_id TEXT,
     scope TEXT,

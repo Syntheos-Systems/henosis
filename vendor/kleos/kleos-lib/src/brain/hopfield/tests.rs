@@ -346,4 +346,108 @@ mod hopfield_tests {
         assert_eq!(merged[0].1, 2); // Loser
         assert_eq!(network.pattern_count(), 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-tenant isolation on the shared in-process network
+    // -----------------------------------------------------------------------
+
+    /// `decay_tick` for one user must not decay or evict another user's
+    /// patterns from the shared network. Pre-fix it iterated every pattern id,
+    /// so a decay tick mutated (and could evict) other tenants' patterns while
+    /// persisting only the caller's DB rows.
+    #[tokio::test]
+    async fn decay_tick_leaves_other_tenants_patterns_untouched() {
+        let db = crate::db::Database::connect_memory().await.expect("db");
+        let dim = 64;
+        let mut net = HopfieldNetwork::new();
+
+        // User 10 owns pattern 1 (importance 0 so it decays measurably).
+        recall::store_pattern(&db, &mut net, 1, &make_pattern(dim, 10), 10, 0, 0.5)
+            .await
+            .expect("store user10");
+        // User 20 owns pattern 2.
+        recall::store_pattern(&db, &mut net, 2, &make_pattern(dim, 90), 20, 5, 0.5)
+            .await
+            .expect("store user20");
+
+        recall::decay_tick(&db, &mut net, 10, 50)
+            .await
+            .expect("decay for user 10");
+
+        // User 20's pattern is bit-for-bit unchanged and still present.
+        assert!(net.contains(2), "user 20's pattern must not be evicted");
+        assert_eq!(
+            net.strength(2),
+            Some(0.5),
+            "user 20's strength must be untouched by user 10's decay"
+        );
+        // User 10's pattern did decay, proving the tick actually ran.
+        assert!(
+            net.strength(1).unwrap() < 0.5,
+            "user 10's own pattern should have decayed"
+        );
+    }
+
+    /// `prune_weak` for one user must not prune another user's weak patterns
+    /// from the shared network.
+    #[tokio::test]
+    async fn prune_weak_leaves_other_tenants_patterns_untouched() {
+        let db = crate::db::Database::connect_memory().await.expect("db");
+        let dim = 64;
+        let mut net = HopfieldNetwork::new();
+
+        // User 10 owns a healthy pattern; user 20 owns a sub-threshold one.
+        recall::store_pattern(&db, &mut net, 1, &make_pattern(dim, 10), 10, 5, 0.5)
+            .await
+            .expect("store user10");
+        recall::store_pattern(&db, &mut net, 2, &make_pattern(dim, 90), 20, 1, 0.01)
+            .await
+            .expect("store user20 weak");
+
+        let pruned = recall::prune_weak(&db, &mut net, 10, DEATH_THRESHOLD)
+            .await
+            .expect("prune for user 10");
+
+        assert_eq!(pruned, 0, "user 10 has no weak pattern to prune");
+        assert!(
+            net.contains(2),
+            "user 20's weak pattern must not be pruned by user 10"
+        );
+    }
+
+    /// `retrieve` with a query whose length does not match the stored dimension
+    /// must return no matches rather than panicking in the dot product.
+    #[test]
+    fn retrieve_rejects_dimension_mismatch() {
+        let mut net = HopfieldNetwork::new();
+        net.store(1, 1, &make_pattern(128, 7), 1.0);
+
+        let wrong_dim = make_pattern(64, 7);
+        let results = net.retrieve(&wrong_dim, 5, DEFAULT_BETA, None);
+        assert!(
+            results.is_empty(),
+            "a dimension-mismatched query must yield no matches, not a panic"
+        );
+    }
+
+    /// Owner-scoped `retrieve` must return only the owner's patterns after the
+    /// pre-softmax filtering change.
+    #[test]
+    fn retrieve_owner_scope_returns_only_owner_patterns() {
+        let mut net = HopfieldNetwork::new();
+        let dim = 64;
+        let p = make_pattern(dim, 3);
+        net.store(1, 10, &p, 1.0);
+        net.store(2, 20, &p, 1.0);
+
+        let results = net.retrieve(&p, 5, DEFAULT_BETA, Some(10));
+        assert!(
+            results.iter().all(|(id, _)| *id == 1),
+            "owner-scoped retrieve must exclude other tenants' patterns"
+        );
+        assert!(
+            results.iter().any(|(id, _)| *id == 1),
+            "the owner's matching pattern must be returned"
+        );
+    }
 }

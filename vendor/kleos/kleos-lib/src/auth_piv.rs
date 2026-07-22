@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{EngError, Result};
 
+/// HMAC-SHA256 keyed MAC used to mint and verify opaque session tokens.
 type HmacSha256 = Hmac<Sha256>;
 
 // --- Signature algorithm enum ---
@@ -18,7 +19,9 @@ pub enum SignatureAlgo {
     Ed25519,
 }
 
+/// Parsing and stringification helpers for `SignatureAlgo`.
 impl SignatureAlgo {
+    /// Parse the `X-Kleos-Algo` header value into a `SignatureAlgo`.
     pub fn from_header(s: &str) -> Result<Self> {
         match s {
             "ecdsa-p256" => Ok(Self::EcdsaP256),
@@ -29,6 +32,7 @@ impl SignatureAlgo {
         }
     }
 
+    /// Render this algorithm as the `X-Kleos-Algo` header value.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::EcdsaP256 => "ecdsa-p256",
@@ -47,7 +51,9 @@ pub enum AuthTier {
     Bearer,
 }
 
+/// Stringification helper for `AuthTier`.
 impl AuthTier {
+    /// Render this auth tier as its wire-format string.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Piv => "piv",
@@ -70,7 +76,10 @@ pub struct CanonicalEnvelope {
     identity_hash: String,
 }
 
+/// Construction and accessors for `CanonicalEnvelope`.
 impl CanonicalEnvelope {
+    /// Build a canonical envelope from request parts, hashing the body and
+    /// sorting query params so signing/verification are order-independent.
     pub fn new(
         method: &str,
         path: &str,
@@ -97,6 +106,7 @@ impl CanonicalEnvelope {
         }
     }
 
+    /// Serialize the envelope fields into the exact byte sequence that gets signed.
     pub fn build(&self) -> Vec<u8> {
         format!(
             "KLEOSv1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -111,14 +121,17 @@ impl CanonicalEnvelope {
         .into_bytes()
     }
 
+    /// Return the request timestamp (milliseconds since epoch) in this envelope.
     pub fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
     }
 
+    /// Return the hex-encoded nonce bound into this envelope.
     pub fn nonce_hex(&self) -> &str {
         &self.nonce
     }
 
+    /// Return the hex-encoded identity hash bound into this envelope.
     pub fn identity_hash_hex(&self) -> &str {
         &self.identity_hash
     }
@@ -141,6 +154,7 @@ pub fn verify_signature(
     }
 }
 
+/// Verify an ECDSA P-256 signature over `message` using a PEM-encoded public key.
 fn verify_p256(pubkey_pem: &str, message: &[u8], sig_bytes: &[u8]) -> Result<()> {
     use p256::ecdsa::{Signature, VerifyingKey};
     use p256::pkcs8::DecodePublicKey;
@@ -156,6 +170,7 @@ fn verify_p256(pubkey_pem: &str, message: &[u8], sig_bytes: &[u8]) -> Result<()>
         .map_err(|_| EngError::Auth("P256 signature verification failed".into()))
 }
 
+/// Verify an Ed25519 signature over `message` using a PEM-encoded public key.
 fn verify_ed25519(pubkey_pem: &str, message: &[u8], sig_bytes: &[u8]) -> Result<()> {
     use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -174,6 +189,7 @@ fn verify_ed25519(pubkey_pem: &str, message: &[u8], sig_bytes: &[u8]) -> Result<
         .map_err(|_| EngError::Auth("Ed25519 signature verification failed".into()))
 }
 
+/// Extract the raw 32-byte Ed25519 public key from a PEM-encoded SubjectPublicKeyInfo.
 fn pem_to_ed25519_pubkey(pem: &str) -> Result<[u8; 32]> {
     // Ed25519 SubjectPublicKeyInfo DER has a fixed 12-byte prefix before the
     // 32-byte key. The OID is 1.3.101.112 (id-EdDSA / Ed25519).
@@ -207,6 +223,7 @@ pub fn pem_to_ed25519_verifying_key(pem: &str) -> Result<ed25519_dalek::Verifyin
         .map_err(|e| EngError::InvalidInput(format!("invalid Ed25519 public key bytes: {}", e)))
 }
 
+/// Strip PEM armor for `expected_label` and base64-decode the enclosed DER bytes.
 fn decode_pem_der(pem: &str, expected_label: &str) -> Result<Vec<u8>> {
     let begin = format!("-----BEGIN {expected_label}-----");
     let end = format!("-----END {expected_label}-----");
@@ -235,6 +252,7 @@ pub fn derive_identity_hash(pubkey_der: &[u8], host: &str, agent: &str, model: &
     out
 }
 
+/// Convenience wrapper returning `derive_identity_hash` as a hex string.
 pub fn identity_hash_hex(pubkey_der: &[u8], host: &str, agent: &str, model: &str) -> String {
     hex::encode(derive_identity_hash(pubkey_der, host, agent, model))
 }
@@ -252,16 +270,21 @@ const REPLAY_WINDOW_MS: u64 = 60_000;
 const NONCE_TTL: Duration = Duration::from_millis(2 * REPLAY_WINDOW_MS + 5_000);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Bookkeeping record for a seen nonce: only the insertion time is kept, so
+/// entries can be aged out once they exceed `NONCE_TTL`.
 struct NonceEntry {
     inserted: Instant,
 }
 
+/// Tracks recently-seen `(identity_hash, nonce)` pairs to reject replayed requests.
 pub struct ReplayGuard {
     nonces: Arc<Mutex<HashMap<(String, String), NonceEntry>>>,
     last_gc: Arc<Mutex<Instant>>,
 }
 
+/// Construction and replay-check methods for `ReplayGuard`.
 impl ReplayGuard {
+    /// Create an empty replay guard with no seen nonces and a fresh GC clock.
     pub fn new() -> Self {
         Self {
             nonces: Arc::new(Mutex::new(HashMap::new())),
@@ -269,6 +292,9 @@ impl ReplayGuard {
         }
     }
 
+    /// Reject the request if `ts_ms` is outside the replay window or the
+    /// `(identity_hash_hex, nonce_hex)` pair has already been seen; otherwise
+    /// record it and run opportunistic garbage collection.
     pub fn check(&self, identity_hash_hex: &str, nonce_hex: &str, ts_ms: u64) -> Result<()> {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -302,6 +328,8 @@ impl ReplayGuard {
         Ok(())
     }
 
+    /// Prune expired nonce entries, but only if `GC_INTERVAL` has elapsed
+    /// since the last sweep, keeping the check hot path cheap.
     fn maybe_gc(&self, nonces: &mut HashMap<(String, String), NonceEntry>) -> Result<()> {
         let mut last = self
             .last_gc
@@ -316,7 +344,9 @@ impl ReplayGuard {
     }
 }
 
+// A default ReplayGuard is just an empty one, same as `ReplayGuard::new()`.
 impl Default for ReplayGuard {
+    // Delegates to `new` so both construction paths stay in sync.
     fn default() -> Self {
         Self::new()
     }
@@ -333,6 +363,8 @@ const DEFAULT_SESSION_TTL_SECS: u64 = 900; // 15 minutes
 /// exceeds this age. Overridable via KLEOS_SESSION_MAX_LIFETIME_SECS.
 const DEFAULT_SESSION_MAX_LIFETIME_SECS: u64 = 86_400; // 24 hours
 
+/// Mints, verifies and refreshes HMAC-backed sliding-window session tokens
+/// that let a PIV/soft-signed identity avoid re-signing every request.
 pub struct SessionManager {
     key: [u8; 32],
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
@@ -340,12 +372,14 @@ pub struct SessionManager {
     max_lifetime: Duration,
 }
 
+/// A single active session: which identity it belongs to and its timing bounds.
 struct SessionEntry {
     identity_id: i64,
     issued_at: Instant,
     expires_at: Instant,
 }
 
+/// Construction, minting, verification and refresh methods for `SessionManager`.
 impl SessionManager {
     /// Construct a SessionManager with the given HMAC key and default
     /// TTL / max-lifetime. Tests use this directly; production goes through
@@ -375,6 +409,9 @@ impl SessionManager {
         }
     }
 
+    /// Build a `SessionManager` from `KLEOS_SESSION_KEY`/`KLEOS_SESSION_TTL_SECS`/
+    /// `KLEOS_SESSION_MAX_LIFETIME_SECS` env vars, generating an ephemeral key
+    /// (with a warning) if none is configured.
     pub fn from_env_or_generate() -> Result<Self> {
         let key = if let Ok(hex_str) = std::env::var("KLEOS_SESSION_KEY") {
             let bytes = hex::decode(hex_str.trim())
@@ -474,6 +511,13 @@ impl SessionManager {
     /// session; callers wanting sliding-window behavior must also call
     /// `refresh`.
     pub fn verify(&self, token: &str) -> Result<i64> {
+        self.verify_at(token, Instant::now())
+    }
+
+    /// Clock-injected core of `verify`: checks the token against an explicit
+    /// `now` so tests can replay exact timelines without real sleeps (mirrors
+    /// the `mint` / `mint_with_issue` split).
+    fn verify_at(&self, token: &str, now: Instant) -> Result<i64> {
         let sessions = self
             .sessions
             .lock()
@@ -482,7 +526,7 @@ impl SessionManager {
             .get(token)
             .ok_or_else(|| EngError::Auth("unknown session token".into()))?;
 
-        if entry.expires_at <= Instant::now() {
+        if entry.expires_at <= now {
             return Err(EngError::Auth("session token expired".into()));
         }
 
@@ -508,7 +552,14 @@ impl SessionManager {
     /// - `Err` if the token is unknown, already expired, or has crossed
     ///   `max_lifetime` since its original mint (forcing fresh PIV re-auth).
     pub fn refresh(&self, token: &str) -> Result<String> {
-        let now = Instant::now();
+        self.refresh_at(token, Instant::now())
+    }
+
+    /// Clock-injected core of `refresh` (see `refresh` for the semantics):
+    /// every expiry / hard-cap comparison and the replacement token's
+    /// `expires_at` derive from the explicit `now`, so tests can drive whole
+    /// refresh timelines deterministically with zero wall-clock waiting.
+    fn refresh_at(&self, token: &str, now: Instant) -> Result<String> {
         let (identity_id, issued_at) = {
             let sessions = self
                 .sessions
@@ -631,6 +682,8 @@ fn piv_verify_and_sign(
     .map(|buf| buf.to_vec())
 }
 
+/// Signs outgoing requests with a PIV or software Ed25519 identity, and
+/// caches the resulting session token so subsequent requests can skip signing.
 pub struct RequestSigner {
     backend: SigningBackend,
     algo: SignatureAlgo,
@@ -644,11 +697,15 @@ pub struct RequestSigner {
     session_token: Mutex<Option<String>>,
 }
 
+/// Fixed 12-byte SubjectPublicKeyInfo prefix for Ed25519 (OID 1.3.101.112),
+/// used when building or parsing signer public keys.
 const ED25519_SPKI_PREFIX_CONST: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
+/// Construction, signing, and accessor methods for `RequestSigner`.
 impl RequestSigner {
+    /// Build a software Ed25519 `RequestSigner` from a raw 32-byte secret key.
     pub fn from_key_bytes(secret: [u8; 32], host: &str, agent: &str, model: &str) -> Self {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
         let vk = signing_key.verifying_key();
@@ -678,6 +735,8 @@ impl RequestSigner {
         }
     }
 
+    /// Build a hardware `RequestSigner` from the PIV slot 9A certificate on
+    /// an attached YubiKey.
     #[cfg(feature = "piv")]
     pub fn from_yubikey(host: &str, agent: &str, model: &str) -> Result<Self> {
         use yubikey::piv::SlotId;
@@ -734,6 +793,8 @@ impl RequestSigner {
         })
     }
 
+    /// Build a `RequestSigner` from a key file: 32 raw bytes, hex text, or a
+    /// PEM-encoded Ed25519 PKCS8 private key.
     pub fn from_file(path: &std::path::Path, host: &str, agent: &str, model: &str) -> Result<Self> {
         // The file holds raw private-key material. Every heap buffer that
         // touches the secret (file bytes, decoded DER, hex-decoded bytes) is
@@ -780,6 +841,9 @@ impl RequestSigner {
         Ok(Self::from_key_bytes(arr, host, agent, model))
     }
 
+    /// Resolve a `RequestSigner` in tier order: PIV YubiKey (unless forced
+    /// soft), then `KLEOS_IDENTITY_KEY`, then `KLEOS_IDENTITY_KEY_FILE` or the
+    /// default `~/.kleos/identity.key`. Returns `None` if nothing is configured.
     pub fn from_env_or_file(host: &str, agent: &str, model: &str) -> Result<Option<Self>> {
         // Allow a host to force the software tier (skip PIV) via
         // KLEOS_SIGNER_TIER=soft, mirroring credd's CREDD_KLEOS_SIGNER_TIER. This
@@ -828,6 +892,8 @@ impl RequestSigner {
         }
     }
 
+    /// Generate a new software Ed25519 identity key at `~/.kleos/identity.key`
+    /// (0600, owner-only), refusing to overwrite an existing key.
     pub fn generate_software_key(
         host: &str,
         agent: &str,
@@ -932,6 +998,7 @@ impl RequestSigner {
         }
     }
 
+    /// Return the YubiKey serial number if this signer's backend is PIV hardware.
     #[cfg(feature = "piv")]
     pub fn yubikey_serial(&self) -> Option<String> {
         match &self.backend {
@@ -943,10 +1010,12 @@ impl RequestSigner {
         }
     }
 
+    /// Return the signature algorithm used by this signer's backend.
     pub fn algo(&self) -> SignatureAlgo {
         self.algo
     }
 
+    /// Return the auth tier string ("soft" or "piv") for this signer's backend.
     pub fn tier(&self) -> &'static str {
         match &self.backend {
             SigningBackend::Ed25519(_) => "soft",
@@ -955,14 +1024,17 @@ impl RequestSigner {
         }
     }
 
+    /// Return the PEM-encoded public key for this signer.
     pub fn pubkey_pem(&self) -> &str {
         &self.pubkey_pem
     }
 
+    /// Return the raw DER-encoded public key (SubjectPublicKeyInfo) for this signer.
     pub fn pubkey_der(&self) -> &[u8] {
         &self.pubkey_der
     }
 
+    /// Return the SHA-256 fingerprint (hex) of this signer's public key.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -995,14 +1067,17 @@ impl RequestSigner {
         &self.identity_hash
     }
 
+    /// Return the host label this signer's identity was derived with.
     pub fn host_label(&self) -> &str {
         &self.host_label
     }
 
+    /// Return the agent label this signer's identity was derived with.
     pub fn agent_label(&self) -> &str {
         &self.agent_label
     }
 
+    /// Return the model label this signer's identity was derived with.
     pub fn model_label(&self) -> &str {
         &self.model_label
     }
@@ -1060,6 +1135,8 @@ impl RequestSigner {
         *self.session_token.lock().unwrap() = None;
     }
 
+    /// Build a canonical envelope for the given request parts, sign it with
+    /// this signer's backend, and return the resulting `SignedRequest` headers.
     pub fn sign_request(
         &self,
         method: &str,
@@ -1131,6 +1208,8 @@ impl RequestSigner {
         })
     }
 
+    /// Generate a fresh software Ed25519 keypair and return the raw secret
+    /// bytes alongside its PEM-encoded public key.
     pub fn generate_keypair() -> ([u8; 32], String) {
         let mut secret = [0u8; 32];
         use rand::rngs::OsRng;
@@ -1152,6 +1231,8 @@ impl RequestSigner {
     }
 }
 
+/// The header values produced by signing a request: signature, algorithm,
+/// identity, timestamp, nonce, and identity-labeling metadata.
 pub struct SignedRequest {
     pub sig_hex: String,
     pub algo: SignatureAlgo,
@@ -1164,7 +1245,9 @@ pub struct SignedRequest {
     pub model_label: String,
 }
 
+/// Header-application method for `SignedRequest`.
 impl SignedRequest {
+    /// Attach every `X-Kleos-*` signing header from this `SignedRequest` onto `req`.
     pub fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.header("X-Kleos-Sig", &self.sig_hex)
             .header("X-Kleos-Algo", self.algo.as_str())
@@ -1178,6 +1261,8 @@ impl SignedRequest {
     }
 }
 
+/// Resolve the user's home directory (`HOME` or `USERPROFILE`) used to locate
+/// the default identity key path.
 fn dirs_for_key_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1271,6 +1356,7 @@ mod tests {
         assert_eq!(e1.build(), e2.build());
     }
 
+    // An empty request body still hashes to the SHA-256 of the empty slice.
     #[test]
     fn envelope_empty_body() {
         let e = CanonicalEnvelope::new("GET", "/search", "q=test", b"", 1000, "aa", "bb");
@@ -1279,6 +1365,7 @@ mod tests {
         assert!(s.contains(&hex::encode(Sha256::digest(b""))));
     }
 
+    // Query params in a different order must still canonicalize identically.
     #[test]
     fn envelope_sorts_query_params() {
         let e1 = CanonicalEnvelope::new("GET", "/s", "z=1&a=2", b"", 1000, "aa", "bb");
@@ -1286,6 +1373,7 @@ mod tests {
         assert_eq!(e1.build(), e2.build());
     }
 
+    // Lower- and upper-case HTTP methods must canonicalize to the same envelope.
     #[test]
     fn envelope_method_uppercased() {
         let e1 = CanonicalEnvelope::new("post", "/x", "", b"", 1, "a", "b");
@@ -1303,6 +1391,7 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    // Different host/agent/model labels must derive different identity hashes.
     #[test]
     fn hkdf_different_labels_different_hash() {
         let pk = b"same-key";
@@ -1314,6 +1403,7 @@ mod tests {
         assert_ne!(h2, h3);
     }
 
+    // Empty labels are still valid HKDF info input and produce a distinct hash.
     #[test]
     fn hkdf_empty_labels_valid() {
         let pk = b"key";
@@ -1351,6 +1441,7 @@ mod tests {
         verify_signature(SignatureAlgo::EcdsaP256, &pubkey_pem, &msg, &sig_hex).unwrap();
     }
 
+    // A signature of all-zero bytes must be rejected, not accidentally verify.
     #[test]
     fn p256_bad_sig_rejected() {
         use p256::ecdsa::SigningKey;
@@ -1368,6 +1459,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // A manually 64-char-wrapped PEM (as produced by from_yubikey) must still verify.
     #[test]
     fn p256_manual_pem_wrapping_roundtrip() {
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -1431,6 +1523,7 @@ mod tests {
         verify_signature(SignatureAlgo::Ed25519, &pubkey_pem, &msg, &sig_hex).unwrap();
     }
 
+    // A signature of all-zero bytes must be rejected for Ed25519 too.
     #[test]
     fn ed25519_bad_sig_rejected() {
         use ed25519_dalek::SigningKey;
@@ -1452,6 +1545,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Wrap a raw 32-byte Ed25519 public key into a PEM SubjectPublicKeyInfo for tests.
     fn ed25519_pubkey_to_pem(raw: &[u8; 32]) -> String {
         // Build SubjectPublicKeyInfo DER
         let mut der = Vec::with_capacity(44);
@@ -1476,6 +1570,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("replay"));
     }
 
+    // Two distinct nonces from the same identity must both be accepted.
     #[test]
     fn replay_allows_different_nonces() {
         let guard = ReplayGuard::new();
@@ -1484,6 +1579,7 @@ mod tests {
         guard.check("id1", "nonce2", ts).unwrap();
     }
 
+    // A timestamp outside the replay window must be rejected regardless of nonce.
     #[test]
     fn replay_rejects_stale_timestamp() {
         let guard = ReplayGuard::new();
@@ -1503,6 +1599,7 @@ mod tests {
         assert_eq!(id, 7);
     }
 
+    // An unrecognized token string must fail verification.
     #[test]
     fn session_unknown_token_rejected() {
         let mgr = SessionManager::new([42u8; 32]);
@@ -1510,6 +1607,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // A token minted under one HMAC key must not verify under a different key.
     #[test]
     fn session_different_key_cannot_verify() {
         let mgr1 = SessionManager::new([1u8; 32]);
@@ -1521,9 +1619,10 @@ mod tests {
 
     // -- Sliding-window refresh tests --
     //
-    // These use short Durations + thread::sleep to exercise the timing
-    // logic. Bounds are generous enough (40ms+ between checks) to remain
-    // reliable on slow CI runners.
+    // Timing tests drive the clock-injected helpers (mint_with_issue /
+    // refresh_at / verify_at) with explicit simulated instants instead of
+    // thread::sleep, so they are deterministic under CI load and add zero
+    // wall-clock time.
 
     #[test]
     fn session_refresh_returns_new_token_and_keeps_old_valid_until_expiry() {
@@ -1546,6 +1645,8 @@ mod tests {
         );
     }
 
+    // Many threads racing to refresh the same token must never panic and
+    // every returned token, plus the original, must still verify afterward.
     #[test]
     fn session_refresh_is_concurrency_safe() {
         // N threads racing to refresh the same token: every thread should
@@ -1582,6 +1683,7 @@ mod tests {
         assert_eq!(mgr.verify(&original).expect("original still valid"), 99);
     }
 
+    // Refreshing an unrecognized token must fail with an "unknown" error.
     #[test]
     fn session_refresh_unknown_token_rejected() {
         let mgr = SessionManager::new([42u8; 32]);
@@ -1589,6 +1691,7 @@ mod tests {
         assert!(err.contains("unknown"), "unexpected err: {err}");
     }
 
+    // A token past its expires_at must be rejected by refresh, not silently renewed.
     #[test]
     fn session_refresh_expired_token_rejected() {
         let mgr = SessionManager::with_durations(
@@ -1596,12 +1699,18 @@ mod tests {
             Duration::from_millis(40),
             Duration::from_secs(60),
         );
-        let token = mgr.mint(3);
-        std::thread::sleep(Duration::from_millis(80));
-        let err = mgr.refresh(&token).unwrap_err().to_string();
+        // Simulated timeline: mint at t=0 with ttl=40ms, refresh at t=80ms.
+        let t_origin = Instant::now();
+        let token = mgr.mint_with_issue(3, t_origin, t_origin + Duration::from_millis(40));
+        let err = mgr
+            .refresh_at(&token, t_origin + Duration::from_millis(80))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("expired"), "unexpected err: {err}");
     }
 
+    // A token refreshed before its original TTL expires must remain valid
+    // past that original expiry, while the pre-refresh token must not.
     #[test]
     fn session_sliding_window_carries_past_original_ttl() {
         // ttl=60ms, cap=10s. Original token would die at t=60ms; refresh
@@ -1611,22 +1720,28 @@ mod tests {
             Duration::from_millis(60),
             Duration::from_secs(10),
         );
-        let t0 = mgr.mint(9);
-        std::thread::sleep(Duration::from_millis(30));
-        let t1 = mgr.refresh(&t0).expect("refresh while still alive");
-        std::thread::sleep(Duration::from_millis(50));
-        // t=80ms now -- t0 would have expired by 60ms, but t1 (issued at
-        // t=30, expires at t=90) is still alive.
+        // Simulated timeline: mint at t=0, refresh at t=30ms, verify at t=80ms.
+        let t_origin = Instant::now();
+        let t0 = mgr.mint_with_issue(9, t_origin, t_origin + Duration::from_millis(60));
+        let t1 = mgr
+            .refresh_at(&t0, t_origin + Duration::from_millis(30))
+            .expect("refresh while still alive");
+        // t=80ms -- t0 would have expired by 60ms, but t1 (issued at t=30,
+        // expires at t=90) is still alive.
         assert_eq!(
-            mgr.verify(&t1).expect("rolled-forward token still valid"),
+            mgr.verify_at(&t1, t_origin + Duration::from_millis(80))
+                .expect("rolled-forward token still valid"),
             9
         );
         assert!(
-            mgr.verify(&t0).is_err(),
+            mgr.verify_at(&t0, t_origin + Duration::from_millis(80))
+                .is_err(),
             "original token must not be reusable after refresh"
         );
     }
 
+    // Once the absolute lifetime cap is crossed, refresh must be blocked
+    // even though the current sliding-window token is still unexpired.
     #[test]
     fn session_hard_cap_blocks_refresh_even_when_current_token_valid() {
         // ttl=80ms, cap=100ms. After a refresh at t=40ms the current token
@@ -1638,20 +1753,30 @@ mod tests {
             Duration::from_millis(80),
             Duration::from_millis(100),
         );
-        let t0 = mgr.mint(4);
-        std::thread::sleep(Duration::from_millis(40));
-        let t1 = mgr.refresh(&t0).expect("first refresh inside cap");
-        std::thread::sleep(Duration::from_millis(70));
+        // Simulated timeline: mint at t=0, refresh at t=40ms, checks at t=110ms.
+        let t_origin = Instant::now();
+        let t0 = mgr.mint_with_issue(4, t_origin, t_origin + Duration::from_millis(80));
+        let t1 = mgr
+            .refresh_at(&t0, t_origin + Duration::from_millis(40))
+            .expect("first refresh inside cap");
         // t=110ms: t1 still verifies (issued at 40, expires at 120)
-        assert_eq!(mgr.verify(&t1).expect("current token still alive"), 4);
+        assert_eq!(
+            mgr.verify_at(&t1, t_origin + Duration::from_millis(110))
+                .expect("current token still alive"),
+            4
+        );
         // but refresh declines because issued_at=0 and now > 100ms
-        let err = mgr.refresh(&t1).unwrap_err().to_string();
+        let err = mgr
+            .refresh_at(&t1, t_origin + Duration::from_millis(110))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("absolute lifetime") || err.contains("lifetime cap"),
             "unexpected err: {err}"
         );
     }
 
+    // An incoherent max_lifetime < ttl config must be clamped to ttl, not rejected.
     #[test]
     fn session_with_durations_floors_max_lifetime_to_ttl() {
         // An incoherent config (max < ttl) is clamped, not rejected, so a

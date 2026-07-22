@@ -43,6 +43,7 @@ fn base_store(content: &str) -> StoreRequest {
         chunk_embeddings: None,
         sync_id: None,
         artifacts: None,
+        created_at: None,
     }
 }
 

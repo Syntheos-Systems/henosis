@@ -467,7 +467,7 @@ async fn storage_quota_allows_within_limit() {
     .expect("store artifact");
 
     // Adding another 5000 bytes should pass (well under 1 GiB).
-    let result = kleos_lib::quota::enforce_storage_quota(&db, 5000).await;
+    let result = kleos_lib::quota::enforce_storage_quota(&db, TEST_USER, 5000).await;
     assert!(result.is_ok(), "upload within limit should succeed");
 }
 
@@ -497,7 +497,7 @@ async fn storage_quota_rejects_over_limit() {
     .expect("insert large artifact row");
 
     // Attempting to upload 200 more bytes should exceed the limit.
-    let result = kleos_lib::quota::enforce_storage_quota(&db, 200).await;
+    let result = kleos_lib::quota::enforce_storage_quota(&db, TEST_USER, 200).await;
     assert!(result.is_err(), "upload exceeding limit should fail");
 
     let err = result.unwrap_err();
@@ -669,4 +669,167 @@ async fn artifacts_are_isolated_across_tenants_in_shared_db() {
         "owner's delete removes the row and its FTS entry"
     );
     let _ = intruder_mem; // referenced for clarity of the two-tenant setup
+}
+
+/// `blob_path` must place each tenant's blobs under a distinct directory so two
+/// tenants uploading identical (plaintext) content cannot collide on one path
+/// -- the collision that let one tenant's encrypted blob overwrite another's.
+#[test]
+fn blob_path_is_tenant_scoped() {
+    use std::path::Path;
+    let dir = Path::new("/blobs");
+    let sha = "abcd1234ef567890abcd1234ef567890abcd1234ef567890abcd1234ef567890";
+    let a = kleos_lib::artifacts::blob_path(dir, 10, sha, true);
+    let b = kleos_lib::artifacts::blob_path(dir, 20, sha, true);
+    assert_ne!(a, b, "different tenants must not share a blob path");
+    assert!(
+        a.starts_with("/blobs/10"),
+        "tenant id must be a path segment: {a:?}"
+    );
+    assert!(a.to_string_lossy().ends_with(".enc"));
+}
+
+/// `delete_artifact` must reference-count a shared disk blob: deleting one of
+/// two artifacts pointing at the same disk_path must NOT return the path for
+/// unlinking (the other still needs it); deleting the last one must.
+#[tokio::test]
+async fn delete_artifact_refcounts_shared_blob() {
+    let handle = one_tenant().await;
+    let db = handle.database();
+    let memory_id = insert_memory(&db, "host for refcount test").await;
+    let shared = "/blobs/1/ab/cd/abcd1234.enc";
+    let opts = StoreArtifactOpts::default();
+
+    let id1 = store_artifact(
+        &db,
+        TEST_USER,
+        memory_id,
+        "a.bin",
+        "a.bin",
+        "application/octet-stream",
+        2_000_000,
+        "hash1",
+        "disk",
+        None,
+        Some(shared),
+        true,
+        &opts,
+    )
+    .await
+    .expect("store artifact 1");
+    let id2 = store_artifact(
+        &db,
+        TEST_USER,
+        memory_id,
+        "b.bin",
+        "b.bin",
+        "application/octet-stream",
+        2_000_000,
+        "hash1",
+        "disk",
+        None,
+        Some(shared),
+        true,
+        &opts,
+    )
+    .await
+    .expect("store artifact 2");
+
+    // Deleting the first must NOT release the shared blob.
+    let first = kleos_lib::artifacts::delete_artifact(&db, TEST_USER, id1)
+        .await
+        .expect("delete artifact 1");
+    assert_eq!(
+        first, None,
+        "a shared blob must not be unlinked while another artifact references it"
+    );
+
+    // Deleting the last reference must release the blob for unlinking.
+    let second = kleos_lib::artifacts::delete_artifact(&db, TEST_USER, id2)
+        .await
+        .expect("delete artifact 2");
+    assert_eq!(
+        second.as_deref(),
+        Some(shared),
+        "deleting the last reference releases the blob"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Query sanitization: FTS5 operators, oversized input, stopword-only queries
+// ---------------------------------------------------------------------------
+
+/// FTS5 operators and unbalanced quotes in the query are sanitized rather
+/// than interpreted: the search matches on the surviving tokens instead of
+/// raising an FTS5 syntax error (pre-fix, the raw string was bound directly
+/// into `MATCH` and this query errored out).
+#[tokio::test]
+async fn search_artifacts_sanitizes_fts_operators() {
+    let handle = one_tenant().await;
+    let db = handle.database();
+
+    let memory_id = insert_memory(&db, "host for sanitize test").await;
+    let content = "entanglement protocol notes";
+    let data = content.as_bytes().to_vec();
+    let opts = StoreArtifactOpts {
+        artifact_type: Some("file".into()),
+        content: Some(content.to_string()),
+        ..StoreArtifactOpts::default()
+    };
+    let artifact_id = store_artifact(
+        &db,
+        TEST_USER,
+        memory_id,
+        "sanitize.txt",
+        "sanitize.txt",
+        "text/plain",
+        data.len() as i64,
+        "3333cccc",
+        "inline",
+        Some(data),
+        None,
+        false,
+        &opts,
+    )
+    .await
+    .expect("store artifact");
+
+    // Unbalanced quote + boolean keyword + parens: raw FTS5 would reject this.
+    let results =
+        kleos_lib::artifacts::search_artifacts(&db, TEST_USER, "entanglement AND (\"", 10, None)
+            .await
+            .expect("operator-laden query must be sanitized, not an FTS5 error");
+    assert_eq!(results.len(), 1, "expected the surviving token to match");
+    assert_eq!(results[0].id, artifact_id);
+}
+
+/// Queries longer than MAX_FTS_QUERY_LEN are rejected with InvalidInput
+/// before any tokenization or DB work.
+#[tokio::test]
+async fn search_artifacts_rejects_oversized_query() {
+    let handle = one_tenant().await;
+    let db = handle.database();
+
+    let long_query = "a".repeat(kleos_lib::validation::MAX_FTS_QUERY_LEN + 1);
+    let err = kleos_lib::artifacts::search_artifacts(&db, TEST_USER, &long_query, 10, None)
+        .await
+        .expect_err("oversized query must be rejected");
+    assert!(
+        matches!(err, kleos_lib::EngError::InvalidInput(_)),
+        "expected InvalidInput, got {err:?}"
+    );
+}
+
+/// A query that sanitizes to nothing (stopwords / single-char tokens only)
+/// returns an empty result set instead of hitting the FTS table, matching
+/// the fts_search / search_episodes_fts contract.
+#[tokio::test]
+async fn search_artifacts_empty_after_sanitization_returns_no_hits() {
+    let handle = one_tenant().await;
+    let db = handle.database();
+
+    let results = kleos_lib::artifacts::search_artifacts(&db, TEST_USER, "a ! ?", 10, None)
+        .await
+        .expect("stopword-only query must not error");
+    assert!(results.is_empty(), "nothing usable to match on");
 }

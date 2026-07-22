@@ -24,6 +24,7 @@ use kleos_lib::services::axon::{self, PublishEventRequest};
 use kleos_lib::services::chiasm::{self, CreateTaskRequest};
 use kleos_lib::services::soma::{self, RegisterAgentRequest};
 use kleos_lib::services::thymus::{self, CreateRubricRequest, RecordMetricRequest};
+use kleos_lib::sync::{self, SyncReceiveChange};
 use kleos_lib::webhooks;
 
 /// Build a monolith (non-tenant) in-memory database with the full monolith
@@ -51,6 +52,7 @@ fn store_req(content: &str, user_id: i64) -> StoreRequest {
         parent_memory_id: None,
         sync_id: None,
         artifacts: None,
+        created_at: None,
     }
 }
 
@@ -561,6 +563,7 @@ async fn causal_chains_isolated_between_users_single_db() {
 async fn entities_isolated_between_users_single_db() {
     let db = monolith().await;
 
+    /// Build a minimal CreateEntityRequest owned by `user_id` for this test.
     fn entity_req(name: &str, user_id: i64) -> CreateEntityRequest {
         CreateEntityRequest {
             name: name.to_string(),
@@ -999,4 +1002,198 @@ async fn brain_edges_isolated_between_users_single_db() {
         .await
         .expect("count_edges user 20");
     assert_eq!(count_20, 1, "user 20 must see exactly their own edge");
+}
+
+/// The admin backfill helpers must return each memory's real owner user_id, not
+/// a hardcoded 1. Attributing derived facts/entities to user 1 in shared mode
+/// mislabels every other tenant's data.
+#[tokio::test]
+async fn backfill_helpers_return_real_user_id() {
+    let db = monolith().await;
+    let alice = memory::store(
+        &db,
+        store_req("alice rocket propulsion notes", 10),
+        None,
+        false,
+    )
+    .await
+    .expect("store alice")
+    .id;
+    let bob = memory::store(
+        &db,
+        store_req("bob heirloom tomato journal", 20),
+        None,
+        false,
+    )
+    .await
+    .expect("store bob")
+    .id;
+
+    let facts = kleos_lib::admin::get_memories_without_facts(&db, 500)
+        .await
+        .expect("facts backfill list");
+    assert_eq!(
+        facts
+            .iter()
+            .find(|(id, _, _)| *id == alice)
+            .map(|(_, _, u)| *u),
+        Some(10),
+        "fact backfill must carry alice's real user_id"
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .find(|(id, _, _)| *id == bob)
+            .map(|(_, _, u)| *u),
+        Some(20),
+        "fact backfill must carry bob's real user_id"
+    );
+
+    let ents = kleos_lib::admin::get_memories_without_entity_links(&db, 500)
+        .await
+        .expect("entity backfill list");
+    assert_eq!(
+        ents.iter()
+            .find(|(id, _, _)| *id == alice)
+            .map(|(_, _, u)| *u),
+        Some(10),
+        "entity backfill must carry alice's real user_id"
+    );
+    assert_eq!(
+        ents.iter()
+            .find(|(id, _, _)| *id == bob)
+            .map(|(_, _, u)| *u),
+        Some(20),
+        "entity backfill must carry bob's real user_id"
+    );
+}
+
+/// A "delete" sync change replayed by another tenant must not forget the
+/// owner's memory. Before the fix, receive_sync soft-deleted by sync_id with no
+/// user_id predicate, so any tenant could forget another tenant's memory by
+/// guessing or replaying its sync_id.
+#[tokio::test]
+async fn sync_delete_cannot_forget_another_users_memory() {
+    let db = monolith().await;
+
+    let alice_id = memory::store(
+        &db,
+        StoreRequest {
+            sync_id: Some("shared-sync-del".to_string()),
+            ..store_req("alice syncable", 10)
+        },
+        None,
+        false,
+    )
+    .await
+    .expect("store alice")
+    .id;
+
+    // Bob (user 20) replays a delete for alice's sync_id.
+    let result = sync::receive_sync(
+        &db,
+        20,
+        vec![SyncReceiveChange {
+            sync_id: "shared-sync-del".to_string(),
+            change_type: "delete".to_string(),
+            content: None,
+            category: None,
+            importance: None,
+            timestamp: None,
+        }],
+    )
+    .await
+    .expect("receive_sync");
+
+    assert_eq!(
+        result.applied, 0,
+        "bob's delete must not apply to alice's row"
+    );
+    assert_eq!(result.skipped, 1, "the cross-tenant delete must be skipped");
+
+    // Alice's row survives: is_forgotten stays 0.
+    let forgotten: i64 = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT is_forgotten FROM memories WHERE id = ?1 AND user_id = ?2",
+                rusqlite::params![alice_id, 10i64],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .expect("read alice row");
+    assert_eq!(
+        forgotten, 0,
+        "alice's memory must not be forgotten by bob's sync delete"
+    );
+}
+
+/// receive_sync dedups inserts by sync_id, but the probe must be per-tenant.
+/// Before the fix the probe was global, so when another tenant already held the
+/// same sync_id this tenant's own insert was silently swallowed.
+#[tokio::test]
+async fn sync_insert_dedup_is_per_tenant() {
+    let db = monolith().await;
+
+    memory::store(
+        &db,
+        StoreRequest {
+            sync_id: Some("shared-sync-dup".to_string()),
+            ..store_req("alice original", 10)
+        },
+        None,
+        false,
+    )
+    .await
+    .expect("store alice");
+
+    // Bob syncs an insert carrying the same sync_id. He must get his own copy.
+    let result = sync::receive_sync(
+        &db,
+        20,
+        vec![SyncReceiveChange {
+            sync_id: "shared-sync-dup".to_string(),
+            change_type: "insert".to_string(),
+            content: Some("bob copy".to_string()),
+            category: Some("general".to_string()),
+            importance: Some(5),
+            timestamp: None,
+        }],
+    )
+    .await
+    .expect("receive_sync");
+
+    assert_eq!(
+        result.applied, 1,
+        "bob's insert must apply despite alice holding the same sync_id"
+    );
+
+    // Bob can see his own copy; alice keeps hers.
+    let list_bob = memory::list(
+        &db,
+        ListOptions {
+            user_id: Some(20),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list bob");
+    assert!(
+        list_bob.iter().any(|m| m.content == "bob copy"),
+        "bob must have his own synced copy"
+    );
+
+    let list_alice = memory::list(
+        &db,
+        ListOptions {
+            user_id: Some(10),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list alice");
+    assert!(
+        list_alice.iter().any(|m| m.content == "alice original"),
+        "alice keeps her original"
+    );
 }

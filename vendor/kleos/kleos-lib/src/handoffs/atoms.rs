@@ -173,26 +173,91 @@ pub fn make_atom_id(atom_type: AtomType, canonical_form: &str) -> String {
 
 // --- Compiled regexes (lazy) ---
 
-static RE_DECISION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(we\s+will|we\s+should|decided\s+to|chose\s+to|went\s+with|using)\b.{1,120}")
-        .expect("RE_DECISION is a valid regex")
-});
+// The 4 atom-extraction regexes become per-language
+// templates fed by the lexicon (atom_<kind>_markers classes). The static
+// RE_ENTITY_PATH and RE_ENTITY_LABEL below stay language-agnostic because
+// they encode structural patterns (path prefixes, `file:` / `service:`
+// label syntax) that do not vary across human languages.
 
-static RE_CONSTRAINT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(must\s+not|cannot|never|always|required|forbidden|do\s+not)\b.{1,120}")
-        .expect("RE_CONSTRAINT is a valid regex")
-});
+fn build_atom_regex(lang: &str, class: &str) -> Option<Regex> {
+    // Wildcard-after-stem: stem each marker (one-shot at
+    // load) and append `\w*` so inflected forms (`decided` -> `decide`
+    // matches `decides`, `decideront`) catch without TOML duplication.
+    // Multi-word markers ("we will") keep the inner-whitespace `\s+`
+    // collapse so the regex still matches normalised source text.
+    let markers = crate::lexicon::word_class(lang, class);
+    if markers.is_empty() {
+        return None;
+    }
+    let with_stem = crate::lexicon::class_stem_enabled(lang, class);
+    let alternation = markers
+        .iter()
+        .map(|m| {
+            // Stem each whitespace-separated token of the marker, then
+            // escape and re-glue with `\s+` to keep the multi-word
+            // tolerance.
+            m.split_whitespace()
+                .map(|tok| {
+                    let folded = crate::lexicon::fold_for_matching(tok, lang, with_stem);
+                    regex::escape(&folded)
+                })
+                .collect::<Vec<_>>()
+                .join(r"\s+")
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    // `\b` already anchors at a word boundary (including string start), so a
+    // lookbehind is unnecessary. The standard `regex` crate has no lookbehind
+    // support, so the previous `(?<=^|\s)` made this pattern fail to compile,
+    // and `.ok()` silently turned that into `None` (no markers ever matched).
+    Regex::new(&format!(r"(?i)\b(?:{alternation})\w*.{{0,120}}")).ok()
+}
 
-static RE_TASK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(?:TODO:|need\s+to|going\s+to\s+(?:implement|fix|add|build)|\[\s*\]\s+).{1,120}",
-    )
-    .expect("RE_TASK is a valid regex")
-});
+fn atom_decision_regex_for(lang: &str) -> Option<Regex> {
+    build_atom_regex(lang, "atom_decision_markers")
+}
 
-static RE_QUESTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(not\s+sure|unclear|open\s+question|need\s+to\s+figure\s+out)\b.{0,120}")
-        .expect("RE_QUESTION is a valid regex")
+fn atom_constraint_regex_for(lang: &str) -> Option<Regex> {
+    build_atom_regex(lang, "atom_constraint_markers")
+}
+
+fn atom_task_regex_for(lang: &str) -> Option<Regex> {
+    build_atom_regex(lang, "atom_task_markers")
+}
+
+fn atom_question_regex_for(lang: &str) -> Option<Regex> {
+    build_atom_regex(lang, "atom_question_markers")
+}
+
+struct AtomRegexCache {
+    decision: std::collections::HashMap<String, Regex>,
+    constraint: std::collections::HashMap<String, Regex>,
+    task: std::collections::HashMap<String, Regex>,
+    question: std::collections::HashMap<String, Regex>,
+}
+
+static ATOM_REGEX: LazyLock<AtomRegexCache> = LazyLock::new(|| {
+    let mut cache = AtomRegexCache {
+        decision: std::collections::HashMap::new(),
+        constraint: std::collections::HashMap::new(),
+        task: std::collections::HashMap::new(),
+        question: std::collections::HashMap::new(),
+    };
+    for lang in crate::lexicon::supported_languages() {
+        if let Some(r) = atom_decision_regex_for(&lang) {
+            cache.decision.insert(lang.clone(), r);
+        }
+        if let Some(r) = atom_constraint_regex_for(&lang) {
+            cache.constraint.insert(lang.clone(), r);
+        }
+        if let Some(r) = atom_task_regex_for(&lang) {
+            cache.task.insert(lang.clone(), r);
+        }
+        if let Some(r) = atom_question_regex_for(&lang) {
+            cache.question.insert(lang.clone(), r);
+        }
+    }
+    cache
 });
 
 /// Matches Unix-style paths with at least two segments (e.g. /foo/bar.rs or
@@ -236,31 +301,38 @@ pub fn extract_heuristic(text: &str) -> Vec<ExtractedAtom> {
         }};
     }
 
-    // Decisions
-    for cap in RE_DECISION.captures_iter(text) {
-        if let Some(m) = cap.get(0) {
-            push!(AtomType::Decision, m.as_str(), 0.7);
+    // Iterate over every supported language and apply
+    // that language's atom regex. The push! macro already deduplicates by
+    // canonical lowercase form, so bilingual source text producing two
+    // overlapping matches collapses to a single atom.
+    for lang in crate::lexicon::supported_languages() {
+        if let Some(re) = ATOM_REGEX.decision.get(&lang) {
+            for cap in re.captures_iter(text) {
+                if let Some(m) = cap.get(0) {
+                    push!(AtomType::Decision, m.as_str(), 0.7);
+                }
+            }
         }
-    }
-
-    // Constraints
-    for cap in RE_CONSTRAINT.captures_iter(text) {
-        if let Some(m) = cap.get(0) {
-            push!(AtomType::Constraint, m.as_str(), 0.8);
+        if let Some(re) = ATOM_REGEX.constraint.get(&lang) {
+            for cap in re.captures_iter(text) {
+                if let Some(m) = cap.get(0) {
+                    push!(AtomType::Constraint, m.as_str(), 0.8);
+                }
+            }
         }
-    }
-
-    // Tasks
-    for cap in RE_TASK.captures_iter(text) {
-        if let Some(m) = cap.get(0) {
-            push!(AtomType::Task, m.as_str(), 0.75);
+        if let Some(re) = ATOM_REGEX.task.get(&lang) {
+            for cap in re.captures_iter(text) {
+                if let Some(m) = cap.get(0) {
+                    push!(AtomType::Task, m.as_str(), 0.75);
+                }
+            }
         }
-    }
-
-    // Questions
-    for cap in RE_QUESTION.captures_iter(text) {
-        if let Some(m) = cap.get(0) {
-            push!(AtomType::Question, m.as_str(), 0.65);
+        if let Some(re) = ATOM_REGEX.question.get(&lang) {
+            for cap in re.captures_iter(text) {
+                if let Some(m) = cap.get(0) {
+                    push!(AtomType::Question, m.as_str(), 0.65);
+                }
+            }
         }
     }
 
@@ -315,19 +387,24 @@ struct LlmAtomItem {
     confidence: Option<f64>,
 }
 
+/// Embedded default for the atom-extraction system prompt, overridable at
+/// runtime via the prompt repository under `extraction/atoms/system.txt`.
+const ATOMS_SYSTEM_PROMPT_DEFAULT: &str = include_str!("../../prompts/extraction/atoms/system.txt");
+
+/// Resolves the atom-extraction system prompt through the prompt repository,
+/// falling back to the embedded default.
+fn atoms_system_prompt() -> std::borrow::Cow<'static, str> {
+    crate::llm::prompts::load_prompt("extraction/atoms/system", ATOMS_SYSTEM_PROMPT_DEFAULT)
+}
+
 /// Attempts to extract atoms from `text` via an Ollama-compatible LLM endpoint.
 ///
 /// On any failure (network, parse, timeout) this function logs a warning and
 /// returns an empty vector -- callers should fall back to [`extract_heuristic`].
 pub async fn extract_llm(text: &str, sidecar_url: &str) -> Vec<ExtractedAtom> {
-    let system_prompt = "You are a semantic extraction engine. \
-        Given text, extract key atoms as JSON. \
-        Return ONLY a JSON object with an \"atoms\" array. \
-        Each atom has: atom_type (decision|constraint|task|entity|question|belief|relation), \
-        content (string), confidence (0.0-1.0). \
-        Extract only atoms clearly present in the text. Be concise.";
+    let system_prompt = atoms_system_prompt();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "llama3",
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -336,6 +413,9 @@ pub async fn extract_llm(text: &str, sidecar_url: &str) -> Vec<ExtractedAtom> {
         "response_format": {"type": "json_object"},
         "temperature": 0.1
     });
+    // Optionally inject the operator-controlled thinking-mode flag (KLEOS_LLM_THINK).
+    // No-op when the env var is unset, so the body is unchanged by default.
+    crate::llm::inject_openai_compat_reasoning(&mut body);
 
     let client = reqwest::Client::new();
     let url = format!("{}/v1/chat/completions", sidecar_url.trim_end_matches('/'));

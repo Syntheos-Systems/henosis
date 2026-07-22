@@ -68,7 +68,7 @@ pub struct Subscription {
     pub channel: String,
     pub filter_type: Option<String>,
     pub webhook_url: Option<String>,
-    pub user_id: i64, // populated from caller context; not stored after v31
+    pub user_id: i64, // owning tenant; re-added to the table by migration 97
     pub created_at: String,
 }
 
@@ -79,7 +79,7 @@ pub struct Cursor {
     pub channel: String,
     pub last_event_id: i64,
     pub updated_at: String,
-    pub user_id: i64, // populated from caller context; not stored after v31
+    pub user_id: i64, // owning tenant; re-added to the table by migration 98
 }
 
 /// Request payload for subscribing to a channel.
@@ -273,9 +273,11 @@ pub async fn upsert_subscription(
     req: SubscribeRequest,
     user_id: i64,
 ) -> Result<Subscription> {
-    let sql = "INSERT INTO axon_subscriptions (agent, channel, filter_type, webhook_url)
-               VALUES (?1, ?2, ?3, ?4)
-               ON CONFLICT(agent, channel) DO UPDATE SET
+    // user_id is bound and included in the ON CONFLICT target so subscriptions
+    // isolate per tenant on a shared axon table (see migration 97).
+    let sql = "INSERT INTO axon_subscriptions (agent, channel, filter_type, webhook_url, user_id)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(agent, channel, user_id) DO UPDATE SET
                    filter_type = excluded.filter_type,
                    webhook_url = excluded.webhook_url";
 
@@ -284,7 +286,7 @@ pub async fn upsert_subscription(
     let ft = req.filter_type.clone();
     let wh = req.webhook_url.clone();
     db.write(move |conn| {
-        conn.execute(sql, rusqlite::params![a, c, ft, wh])?;
+        conn.execute(sql, rusqlite::params![a, c, ft, wh, user_id])?;
         Ok(())
     })
     .await?;
@@ -301,13 +303,13 @@ pub async fn get_subscription(
 ) -> Result<Subscription> {
     let sql = "SELECT id, agent, channel, filter_type, webhook_url, created_at
                FROM axon_subscriptions
-               WHERE agent = ?1 AND channel = ?2";
+               WHERE agent = ?1 AND channel = ?2 AND user_id = ?3";
     let agent_s = agent.to_string();
     let channel_s = channel.to_string();
 
     db.read(move |conn| {
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(rusqlite::params![agent_s, channel_s])?;
+        let mut rows = stmt.query(rusqlite::params![agent_s, channel_s, user_id])?;
         let row = rows
             .next()?
             .ok_or_else(|| EngError::NotFound("subscription".into()))?;
@@ -324,15 +326,22 @@ pub async fn get_subscription(
     .await
 }
 
-/// Removes a subscription.
-#[tracing::instrument(skip(db), fields(agent = %agent, channel = %channel))]
-pub async fn delete_subscription(db: &Database, agent: &str, channel: &str) -> Result<bool> {
-    let sql = "DELETE FROM axon_subscriptions WHERE agent = ?1 AND channel = ?2";
+/// Removes a subscription owned by `user_id`.
+#[tracing::instrument(skip(db), fields(agent = %agent, channel = %channel, user_id))]
+pub async fn delete_subscription(
+    db: &Database,
+    agent: &str,
+    channel: &str,
+    user_id: i64,
+) -> Result<bool> {
+    // Scope by user_id so one tenant cannot delete another's subscription on a
+    // shared axon table.
+    let sql = "DELETE FROM axon_subscriptions WHERE agent = ?1 AND channel = ?2 AND user_id = ?3";
     let a = agent.to_string();
     let c = channel.to_string();
 
     let n = db
-        .write(move |conn| Ok(conn.execute(sql, rusqlite::params![a, c])?))
+        .write(move |conn| Ok(conn.execute(sql, rusqlite::params![a, c, user_id])?))
         .await?;
     Ok(n > 0)
 }
@@ -346,13 +355,13 @@ pub async fn list_subscriptions_for_agent(
 ) -> Result<Vec<Subscription>> {
     let sql = "SELECT id, agent, channel, filter_type, webhook_url, created_at
                FROM axon_subscriptions
-               WHERE agent = ?1
+               WHERE agent = ?1 AND user_id = ?2
                ORDER BY channel ASC";
     let a = agent.to_string();
 
     db.read(move |conn| {
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(rusqlite::params![a])?;
+        let mut rows = stmt.query(rusqlite::params![a, user_id])?;
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
             results.push(Subscription {
@@ -373,15 +382,18 @@ pub async fn list_subscriptions_for_agent(
 /// Retrieves the cursor position for an agent on a channel.
 #[tracing::instrument(skip(db), fields(agent = %agent, channel = %channel, user_id))]
 pub async fn get_cursor(db: &Database, agent: &str, channel: &str, user_id: i64) -> Result<Cursor> {
+    // Scope the cursor read by user_id: the (agent, channel) cursor is shared
+    // across tenants on a shared axon table, so without this one tenant's
+    // consume would advance a position another tenant then skips past.
     let sql = "SELECT agent, channel, last_event_id, updated_at
                FROM axon_cursors
-               WHERE agent = ?1 AND channel = ?2";
+               WHERE agent = ?1 AND channel = ?2 AND user_id = ?3";
     let a = agent.to_string();
     let c = channel.to_string();
 
     db.read(move |conn| {
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(rusqlite::params![a.clone(), c.clone()])?;
+        let mut rows = stmt.query(rusqlite::params![a.clone(), c.clone(), user_id])?;
         match rows.next()? {
             Some(row) => Ok(Cursor {
                 agent: row.get(0)?,
@@ -408,17 +420,19 @@ async fn upsert_cursor(
     agent: &str,
     channel: &str,
     last_event_id: i64,
+    user_id: i64,
 ) -> Result<()> {
-    let sql = "INSERT INTO axon_cursors (agent, channel, last_event_id, updated_at)
-               VALUES (?1, ?2, ?3, datetime('now'))
-               ON CONFLICT(agent, channel) DO UPDATE SET
+    // user_id is part of the cursor key so each tenant advances its own cursor.
+    let sql = "INSERT INTO axon_cursors (agent, channel, last_event_id, updated_at, user_id)
+               VALUES (?1, ?2, ?3, datetime('now'), ?4)
+               ON CONFLICT(agent, channel, user_id) DO UPDATE SET
                    last_event_id = excluded.last_event_id,
                    updated_at = excluded.updated_at";
     let a = agent.to_string();
     let c = channel.to_string();
 
     db.write(move |conn| {
-        conn.execute(sql, rusqlite::params![a, c, last_event_id])?;
+        conn.execute(sql, rusqlite::params![a, c, last_event_id, user_id])?;
         Ok(())
     })
     .await
@@ -454,7 +468,7 @@ pub async fn consume(
         })
         .await?;
     if let Some(max_id) = events.iter().map(|e| e.id).max() {
-        upsert_cursor(db, agent, channel, max_id).await?;
+        upsert_cursor(db, agent, channel, max_id, user_id).await?;
     }
     Ok(events)
 }
@@ -505,13 +519,20 @@ pub async fn get_stats(db: &Database, user_id: i64) -> Result<AxonStats> {
 
 /// Publishes an event internally (no HTTP). Used by other services (Loom, Soma, etc.)
 /// to emit lifecycle events into the Axon bus.
-#[tracing::instrument(skip(db, payload), fields(%channel, %action))]
+///
+/// `user_id` is the owning tenant of the event. It must be threaded from the
+/// caller's context: in shared-monolith mode axon_events is one table across all
+/// tenants, so a hardcoded id (the previous behavior) filed every service's
+/// lifecycle events under user 1 and leaked one tenant's activity into another
+/// tenant's event feed.
+#[tracing::instrument(skip(db, payload), fields(%channel, %action, user_id))]
 pub async fn publish_internal(
     db: &Database,
     channel: &str,
     source: &str,
     action: &str,
     payload: serde_json::Value,
+    user_id: i64,
 ) -> Result<i64> {
     let req = PublishEventRequest {
         channel: channel.to_string(),
@@ -519,7 +540,7 @@ pub async fn publish_internal(
         payload: Some(payload),
         source: Some(source.to_string()),
         agent: None,
-        user_id: Some(1), // system user for internal events
+        user_id: Some(user_id),
     };
     let event = publish_event(db, req).await?;
     Ok(event.id)
@@ -648,5 +669,98 @@ mod tests {
         let db = setup().await;
         let channels = list_channels(&db, 1).await.unwrap();
         assert!(channels.iter().any(|c| c.name == "system"));
+    }
+
+    /// Two tenants may hold a subscription on the same (agent, channel) after the
+    /// UNIQUE key widened to include user_id (migration 97), and every read/write
+    /// helper is scoped so one tenant cannot see, overwrite, or delete another's
+    /// subscription row on the shared table.
+    #[tokio::test]
+    async fn subscription_isolated_across_users() {
+        let db = setup().await;
+        // Same agent + channel, two different owners, distinct webhook URLs.
+        upsert_subscription(
+            &db,
+            SubscribeRequest {
+                agent: "shared".into(),
+                channel: "chan".into(),
+                filter_type: None,
+                webhook_url: Some("http://localhost:7001/a".into()),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        upsert_subscription(
+            &db,
+            SubscribeRequest {
+                agent: "shared".into(),
+                channel: "chan".into(),
+                filter_type: None,
+                webhook_url: Some("http://localhost:7002/b".into()),
+            },
+            2,
+        )
+        .await
+        .expect("second tenant can subscribe the same agent/channel");
+
+        // Each tenant reads only its own row.
+        let s1 = get_subscription(&db, "shared", "chan", 1).await.unwrap();
+        let s2 = get_subscription(&db, "shared", "chan", 2).await.unwrap();
+        assert_eq!(s1.webhook_url.as_deref(), Some("http://localhost:7001/a"));
+        assert_eq!(s2.webhook_url.as_deref(), Some("http://localhost:7002/b"));
+
+        // Listing is scoped: tenant 1 sees exactly one row.
+        let listed = list_subscriptions_for_agent(&db, "shared", 1)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+
+        // Deleting tenant 1's row leaves tenant 2's intact.
+        assert!(delete_subscription(&db, "shared", "chan", 1).await.unwrap());
+        assert!(get_subscription(&db, "shared", "chan", 1).await.is_err());
+        assert!(get_subscription(&db, "shared", "chan", 2).await.is_ok());
+    }
+
+    /// Each tenant's consume cursor is keyed by user_id (migration 98), so one
+    /// tenant advancing its read position on a shared (agent, channel) does not
+    /// cause another tenant to skip its own unread events.
+    #[tokio::test]
+    async fn cursor_isolated_across_users() {
+        let db = setup().await;
+        // Two events per tenant on the same channel.
+        for owner in [1_i64, 2_i64] {
+            for i in 0..2 {
+                publish_event(
+                    &db,
+                    PublishEventRequest {
+                        channel: "cc".into(),
+                        action: format!("a-{owner}-{i}"),
+                        payload: None,
+                        source: Some("src".into()),
+                        agent: None,
+                        user_id: Some(owner),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // Tenant 1 consumes its two events and advances only its own cursor.
+        let first = consume(&db, "reader", "cc", 10, 1).await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Tenant 2's cursor is untouched, so it still sees its own two events
+        // rather than being skipped past by tenant 1's advance.
+        let other = consume(&db, "reader", "cc", 10, 2).await.unwrap();
+        assert_eq!(other.len(), 2);
+
+        // Cursors are independent rows.
+        let c1 = get_cursor(&db, "reader", "cc", 1).await.unwrap();
+        let c2 = get_cursor(&db, "reader", "cc", 2).await.unwrap();
+        assert!(c1.last_event_id > 0);
+        assert!(c2.last_event_id > 0);
+        assert_ne!(c1.last_event_id, c2.last_event_id);
     }
 }

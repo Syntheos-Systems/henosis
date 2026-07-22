@@ -58,6 +58,8 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Build the POST request to the configured `/v1/embeddings` endpoint,
+    /// attaching the model name when set and the Bearer token when present.
     fn build_request(&self, input: serde_json::Value) -> reqwest::RequestBuilder {
         let mut body = serde_json::json!({ "input": input });
         if let Some(ref model) = self.model {
@@ -70,6 +72,8 @@ impl OpenAiProvider {
         req
     }
 
+    /// Parse one response item's `embedding` array into a `Vec<f32>`, erroring
+    /// when its length does not match the configured `dim`.
     fn parse_embedding(item: &serde_json::Value, dim: usize, ctx: &str) -> Result<Vec<f32>> {
         let embedding: Vec<f32> = item["embedding"]
             .as_array()
@@ -89,7 +93,10 @@ impl OpenAiProvider {
     }
 }
 
+/// Embed text through an OpenAI-compatible `/v1/embeddings` endpoint, both the
+/// single-text and batched paths.
 impl EmbeddingProvider for OpenAiProvider {
+    /// Embed a single text and return its dimension-checked vector.
     fn embed<'a>(
         &'a self,
         text: &'a str,
@@ -126,6 +133,8 @@ impl EmbeddingProvider for OpenAiProvider {
         )
     }
 
+    /// Embed a batch of texts in one request, returning vectors aligned to the
+    /// input order (the response is reordered by each item's `index`).
     fn embed_batch<'a>(
         &'a self,
         texts: &'a [String],
@@ -173,8 +182,28 @@ impl EmbeddingProvider for OpenAiProvider {
                     EngError::Internal("embed_batch: missing data array".to_string())
                 })?;
 
-                data.iter()
-                    .map(|item| Self::parse_embedding(item, self.dim, "embed_batch"))
+                // The embeddings API returns one object per input, each carrying an
+                // explicit `index`, and does not guarantee they arrive in request
+                // order. Mapping by array position would silently pair an embedding
+                // with the wrong text, so require exactly one item per input and
+                // sort by `index` before parsing. Absent `index` falls back to array
+                // position so a stricter-order provider still yields a stable result.
+                if data.len() != texts.len() {
+                    return Err(EngError::Internal(format!(
+                        "embed_batch: expected {} embeddings, got {}",
+                        texts.len(),
+                        data.len()
+                    )));
+                }
+                let mut indexed: Vec<(u64, &serde_json::Value)> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, item)| (item["index"].as_u64().unwrap_or(pos as u64), item))
+                    .collect();
+                indexed.sort_by_key(|(idx, _)| *idx);
+                indexed
+                    .into_iter()
+                    .map(|(_, item)| Self::parse_embedding(item, self.dim, "embed_batch"))
                     .collect()
             }
             .instrument(span),

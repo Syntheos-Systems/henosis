@@ -276,20 +276,25 @@ pub fn enforce_quota_in_tx(
 
 /// Gate an artifact upload on the tenant's storage byte limit.
 ///
-/// Queries the artifact table in the tenant shard for current usage, then
-/// checks against `DEFAULT_STORAGE_BYTES_LIMIT` (tenant shards lack the
-/// `tenant_quotas` table -- the limit is admin-configurable in the main DB
-/// but the default applies uniformly here).
+/// Sums the caller's own artifact bytes and checks against
+/// `DEFAULT_STORAGE_BYTES_LIMIT` (tenant shards lack the `tenant_quotas`
+/// table -- the limit is admin-configurable in the main DB but the default
+/// applies uniformly here).
+///
+/// The `user_id` predicate is essential in shared-monolith mode: without it
+/// the SUM spans every tenant's artifacts, so one tenant's uploads exhaust
+/// the storage quota of all tenants. In a per-tenant shard it is a harmless
+/// no-op (every row already belongs to the shard owner).
 ///
 /// Returns `Err(EngError::Forbidden)` if `current_usage + upload_bytes`
 /// would exceed the limit.
-#[tracing::instrument(skip(db), fields(upload_bytes))]
-pub async fn enforce_storage_quota(db: &Database, upload_bytes: i64) -> Result<()> {
+#[tracing::instrument(skip(db), fields(user_id, upload_bytes))]
+pub async fn enforce_storage_quota(db: &Database, user_id: i64, upload_bytes: i64) -> Result<()> {
     let current_usage: i64 = db
         .read(move |conn| {
             Ok(conn.query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts",
-                params![],
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts WHERE user_id = ?1",
+                params![user_id],
                 |row| row.get(0),
             )?)
         })

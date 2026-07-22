@@ -79,6 +79,14 @@ pub async fn detect_contradictions(db: &Database, memory: &Memory) -> Result<Vec
             .await?;
 
         for (_old_fact_id, old_object, old_memory_id, old_confidence) in existing {
+            // Guard the RAW stored confidence before any arithmetic:
+            // structured_facts.confidence has no write-side validation, and
+            // f32::min laundering (NAN.min(1.0) == 1.0, INFINITY.min(1.0)
+            // == 1.0) would otherwise turn a degenerate stored value into a
+            // full-confidence contradiction downstream.
+            if !old_confidence.is_finite() || old_confidence <= 0.0 {
+                continue;
+            }
             // Compare objects -- if they differ, it's a contradiction
             if !objects_match(new_object, &old_object) {
                 let conf = old_confidence as f32 * 0.8; // Scale by old fact confidence
@@ -104,11 +112,14 @@ pub async fn detect_contradictions(db: &Database, memory: &Memory) -> Result<Vec
             "contradictions_detected"
         );
 
-        // Record contradiction links in memory_links
+        // Record contradiction links in memory_links. Skip degenerate
+        // confidence (<= 0 or NaN, both fail the `> 0.0` test): this write
+        // bypasses insert_link, and a non-positive similarity row would feed
+        // the PageRank edge weights that insert_link now guards against.
         for c in &contradictions {
             let mem_b_id: i64 = c.memory_b.parse().unwrap_or(0);
-            if mem_b_id > 0 {
-                let conf_f64 = c.confidence as f64;
+            let conf_f64 = c.confidence as f64;
+            if mem_b_id > 0 && conf_f64 > 0.0 {
                 if let Err(e) = db
                     .write(move |conn| {
                         conn.execute(

@@ -171,6 +171,7 @@ pub async fn register_agent(db: &Database, req: RegisterAgentRequest) -> Result<
             "name": &agent.name,
             "type": &agent.type_,
         }),
+        agent.user_id,
     )
     .await;
 
@@ -357,6 +358,7 @@ pub async fn delete_agent(db: &Database, id: i64, user_id: i64) -> Result<()> {
         serde_json::json!({
             "agent_id": id,
         }),
+        user_id,
     )
     .await;
 

@@ -18,15 +18,31 @@ pub const DEFAULT_MAX_MEMORY_TOKENS: usize = 2500;
 /// Default cosine similarity deduplication threshold.
 pub const DEFAULT_DEDUP_THRESHOLD: f64 = 0.88;
 
-/// Default minimum relevance score for semantic results.
+/// Default minimum relevance floor for semantic results that were NOT
+/// reranked: compared against the vector-cosine `semantic_score`, a scale
+/// where bge-m3 cosines run high (clearly irrelevant content commonly lands
+/// around 0.6-0.7, on-topic content 0.8+).
 pub const DEFAULT_MIN_RELEVANCE: f64 = 0.55;
+
+/// Default minimum relevance floor for RERANKED results, whose `score` is the
+/// cross-encoder blend `ce*w + fusion_norm*(1-w)` (w=0.7 by default) -- a
+/// scale that runs far lower than raw cosines. Evidence (locomo-abstain,
+/// reranker-in-the-loop dataset eval + the harness context canary): the top
+/// blended score of answerable queries averages 0.56 with a quartile below
+/// 0.35, unanswerable junk tops average 0.30, and known-good context blocks
+/// land at 0.28-0.34. Sharing the cosine-scale 0.55 floor stripped the best
+/// result from half of answerable queries; 0.25 sits below every observed
+/// wanted block while still cutting the pure-junk end of the blend.
+pub const DEFAULT_RERANKED_MIN_RELEVANCE: f64 = 0.25;
 
 /// Default semantic ceiling (fraction of total budget) per strategy.
 pub const DEFAULT_SEMANTIC_CEILING_BALANCED: f64 = 0.80;
 pub const DEFAULT_SEMANTIC_CEILING_PRECISION: f64 = 0.82;
 pub const DEFAULT_SEMANTIC_CEILING_BREADTH: f64 = 0.90;
 
-/// Recency boost window: memories within this age (ms) get +10% score.
+/// Recency boost window (ms). No longer applied in context assembly (recency
+/// is scored exactly once, inside hybrid_search's compound score); kept for
+/// API compatibility with external callers of this public module.
 pub const RECENCY_BOOST_MS: i64 = 48 * 60 * 60 * 1000;
 
 /// Static fact budget fractions per strategy.

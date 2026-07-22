@@ -269,7 +269,7 @@ pub async fn get_usage(db: &Database) -> Result<Vec<UsageRow>> {
         let mut stmt = conn.prepare(
             "SELECT u.id, u.username, COALESCE(m.cnt, 0), COALESCE(c.cnt, 0), COALESCE(k.cnt, 0) \
              FROM users u \
-             LEFT JOIN (SELECT 1 AS user_id, COUNT(*) as cnt FROM memories) m ON u.id = m.user_id \
+             LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM memories GROUP BY user_id) m ON u.id = m.user_id \
              LEFT JOIN (SELECT 0 as user_id, COUNT(*) as cnt FROM conversations) c ON u.id = c.user_id \
              LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM api_keys WHERE is_active = 1 GROUP BY user_id) k ON u.id = k.user_id \
              ORDER BY u.id",
@@ -300,7 +300,7 @@ pub async fn get_tenants(db: &Database) -> Result<Vec<TenantRow>> {
         let mut stmt = conn.prepare(
             "SELECT u.id, u.username, u.role, COALESCE(m.cnt, 0), COALESCE(k.cnt, 0), u.created_at \
              FROM users u \
-             LEFT JOIN (SELECT 1 AS user_id, COUNT(*) as cnt FROM memories) m ON u.id = m.user_id \
+             LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM memories GROUP BY user_id) m ON u.id = m.user_id \
              LEFT JOIN (SELECT user_id, COUNT(*) as cnt FROM api_keys WHERE is_active = 1 GROUP BY user_id) k ON u.id = k.user_id \
              ORDER BY u.id",
         )
@@ -379,6 +379,13 @@ pub async fn provision_tenant(
 /// when tenant_registry is None.
 #[tracing::instrument(skip(db))]
 pub async fn deprovision_tenant(db: &Database, user_id: i64) -> Result<bool> {
+    // F28 (defense-in-depth): never delete the reserved owner account, even if a
+    // caller reaches this layer directly without the route-level guard.
+    if user_id == 1 {
+        return Err(crate::EngError::Forbidden(
+            "cannot deprovision the owner account (user_id=1)".into(),
+        ));
+    }
     db.write(move |conn| {
         conn.execute(
             "UPDATE api_keys SET is_active = 0 WHERE user_id = ?1",
@@ -660,9 +667,14 @@ pub async fn get_memories_without_facts(
     limit: i64,
 ) -> Result<Vec<(i64, String, i64)>> {
     db.read(move |conn| {
+        // Review-gate predicate: facts must never be derived from a memory that
+        // has not cleared review. status != 'pending' excludes unreviewed rows;
+        // is_archived = 0 excludes rejected rows (reject sets is_archived = 1),
+        // which the user explicitly refused and must not become derived facts.
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.content, 1 FROM memories m \
+            "SELECT m.id, m.content, m.user_id FROM memories m \
                  WHERE m.is_forgotten = 0 \
+                 AND m.status != 'pending' AND m.is_archived = 0 \
                  AND NOT EXISTS (SELECT 1 FROM structured_facts f WHERE f.memory_id = m.id) \
                  LIMIT ?1",
         )?;
@@ -689,17 +701,24 @@ pub async fn get_memories_without_facts(
 pub async fn get_memories_without_entity_links(
     db: &Database,
     limit: i64,
-) -> Result<Vec<(i64, String)>> {
+) -> Result<Vec<(i64, String, i64)>> {
     db.read(move |conn| {
+        // Review-gate predicate: entity links must never be derived from a memory
+        // that has not cleared review. status != 'pending' excludes unreviewed
+        // rows; is_archived = 0 excludes rejected rows (reject sets is_archived = 1),
+        // which the user explicitly refused and must not become derived links.
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.content FROM memories m \
+            "SELECT m.id, m.content, m.user_id FROM memories m \
                  WHERE m.is_forgotten = 0 \
+                 AND m.status != 'pending' AND m.is_archived = 0 \
                  AND NOT EXISTS (SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id) \
                  ORDER BY m.id ASC \
                  LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
@@ -1017,6 +1036,62 @@ mod tests {
         assert!(
             obj.get("session_id").map(|v| v.is_null()).unwrap_or(false),
             "null column must serialize to json null",
+        );
+    }
+
+    /// F28: deprovisioning the reserved owner account (user_id=1) must be refused
+    /// with Forbidden, while a normal tenant is still deleted. Pins the guard that
+    /// prevents an admin call from tearing down the primary store.
+    #[tokio::test]
+    async fn deprovision_refuses_owner_but_allows_normal_tenant() {
+        let db = Database::connect_memory().await.expect("memory db");
+
+        // connect_memory() already seeds the owner (id=1); add only a non-owner
+        // tenant (id=2) so its deprovision can succeed.
+        db.write(|conn| {
+            conn.execute("INSERT INTO users (id, username) VALUES (2, 'tenant2')", [])?;
+            Ok(())
+        })
+        .await
+        .expect("seed non-owner user");
+
+        // Pin the assumption that connect_memory() seeds the owner, so the
+        // owner-survives assertion below is meaningful and the test fails loudly
+        // if that seeding ever changes.
+        let owner_before: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM users WHERE id = 1", [], |r| r.get(0))?)
+            })
+            .await
+            .expect("count owner rows before");
+        assert_eq!(
+            owner_before, 1,
+            "connect_memory() is expected to seed user id=1"
+        );
+
+        // The owner account is protected: deprovisioning user_id=1 is Forbidden.
+        let owner = deprovision_tenant(&db, 1).await;
+        assert!(
+            matches!(owner, Err(crate::EngError::Forbidden(_))),
+            "deprovisioning user_id=1 must return Forbidden, got {owner:?}",
+        );
+
+        // A normal tenant is unaffected by the guard and is removed.
+        let removed = deprovision_tenant(&db, 2)
+            .await
+            .expect("deprovision tenant 2");
+        assert!(removed, "a non-owner tenant must be deprovisioned");
+
+        // The owner row must still exist after the refused call.
+        let owner_rows: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM users WHERE id = 1", [], |r| r.get(0))?)
+            })
+            .await
+            .expect("count owner rows");
+        assert_eq!(
+            owner_rows, 1,
+            "owner account must survive the refused deprovision"
         );
     }
 }

@@ -387,20 +387,26 @@ pub async fn list_sessions(
     .await
 }
 
-#[tracing::instrument(skip(db, line), fields(session_id = %session_id, line_len = line.len()))]
-pub async fn append_output(db: &Database, session_id: &str, line: &str) -> Result<()> {
+#[tracing::instrument(skip(db, line), fields(session_id = %session_id, user_id, line_len = line.len()))]
+pub async fn append_output(
+    db: &Database,
+    session_id: &str,
+    user_id: i64,
+    line: &str,
+) -> Result<()> {
     let session_id_owned = session_id.to_string();
     let line_owned = line.to_string();
 
-    // Verify session exists (tenant isolation is enforced by the shard,
-    // so the user_id predicate is no longer needed here).
+    // Verify the session exists AND belongs to the caller. In shared-monolith
+    // mode a bare-id check let any tenant append output (and bump updated_at) on
+    // another tenant's session; the user_id predicate closes that write leak.
     let sid_check = session_id_owned.clone();
     let exists = db
         .read(move |conn| {
             let result = conn
                 .query_row(
-                    "SELECT id FROM sessions WHERE id = ?1",
-                    params![sid_check],
+                    "SELECT id FROM sessions WHERE id = ?1 AND user_id = ?2",
+                    params![sid_check, user_id],
                     |_| Ok(()),
                 )
                 .optional()?;
@@ -415,6 +421,8 @@ pub async fn append_output(db: &Database, session_id: &str, line: &str) -> Resul
         )));
     }
 
+    // The session is owner-verified above, so keying the output insert by
+    // session_id alone is safe.
     let sid_insert = session_id_owned.clone();
     db.write(move |conn| {
         conn.execute(
@@ -425,12 +433,12 @@ pub async fn append_output(db: &Database, session_id: &str, line: &str) -> Resul
     })
     .await?;
 
-    // Update session updated_at
+    // Update session updated_at, again scoped to the owner.
     let sid_update = session_id_owned.clone();
     db.write(move |conn| {
         conn.execute(
-            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1",
-            params![sid_update],
+            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1 AND user_id = ?2",
+            params![sid_update, user_id],
         )?;
         Ok(())
     })
@@ -562,10 +570,10 @@ mod tests {
         };
         let session = create_session(&db, &req, 1).await.expect("create");
 
-        append_output(&db, &session.id, "line 1")
+        append_output(&db, &session.id, 1, "line 1")
             .await
             .expect("append");
-        append_output(&db, &session.id, "line 2")
+        append_output(&db, &session.id, 1, "line 2")
             .await
             .expect("append");
 
@@ -579,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_to_nonexistent_session() {
         let db = crate::db::Database::connect_memory().await.expect("db");
-        let result = append_output(&db, "nonexistent-id", "line").await;
+        let result = append_output(&db, "nonexistent-id", 1, "line").await;
         assert!(result.is_err());
     }
 }
