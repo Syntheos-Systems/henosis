@@ -271,7 +271,10 @@ mod tests {
         let t = now().timestamp() - 1_000;
         let header = sign(TEST_SECRET, t, body);
         let err = verify_stripe_signature(TEST_SECRET, &header, body, now()).unwrap_err();
-        assert!(matches!(err, SignatureError::TimestampOutOfTolerance { .. }));
+        assert!(matches!(
+            err,
+            SignatureError::TimestampOutOfTolerance { .. }
+        ));
     }
 
     /// A timestamp more than the tolerance window in the future is rejected too -- the
@@ -282,7 +285,10 @@ mod tests {
         let t = now().timestamp() + 1_000;
         let header = sign(TEST_SECRET, t, body);
         let err = verify_stripe_signature(TEST_SECRET, &header, body, now()).unwrap_err();
-        assert!(matches!(err, SignatureError::TimestampOutOfTolerance { .. }));
+        assert!(matches!(
+            err,
+            SignatureError::TimestampOutOfTolerance { .. }
+        ));
     }
 
     /// A skew of exactly `DEFAULT_TOLERANCE_SECS` is accepted (inclusive boundary).
@@ -453,8 +459,7 @@ mod tests {
         let body: &[u8] = b"payload";
         let t = now().timestamp();
         let header = sign(TEST_SECRET, t, body);
-        let err =
-            verify_stripe_signature("whsec_wrong_secret", &header, body, now()).unwrap_err();
+        let err = verify_stripe_signature("whsec_wrong_secret", &header, body, now()).unwrap_err();
         assert!(matches!(err, SignatureError::NoMatchingSignature));
     }
 

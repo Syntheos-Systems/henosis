@@ -37,6 +37,7 @@ pub struct OperatorClaims {
     pub exp: i64,
 }
 
+/// Constructs deterministic operator JWT claims.
 impl OperatorClaims {
     /// Construct a new set of claims with an explicitly injected issue time.
     ///
@@ -79,6 +80,7 @@ pub enum OperatorError {
     Backend(String),
 }
 
+/// Maps operator API errors to HTTP responses.
 impl IntoResponse for OperatorError {
     /// Convert an [`OperatorError`] into an HTTP response with the appropriate
     /// status code and the error message as the plain-text body.
@@ -211,7 +213,11 @@ pub async fn resolve_login(
         .map_err(|e| OperatorError::Backend(e.to_string()))?
         .ok_or_else(|| OperatorError::Forbidden("no role in org".into()))?;
 
-    Ok(SessionGrant { principal, org, role })
+    Ok(SessionGrant {
+        principal,
+        org,
+        role,
+    })
 }
 
 /// Extract a Bearer token from the `Authorization` header.
@@ -236,8 +242,7 @@ pub async fn login(
     State(state): State<OperatorState>,
     Json(body): Json<LoginBody>,
 ) -> Result<Json<LoginResponse>, OperatorError> {
-    let grant =
-        resolve_login(&state.accounts, &*state.plutus, &body.email, &body.password).await?;
+    let grant = resolve_login(&state.accounts, &*state.plutus, &body.email, &body.password).await?;
 
     // Wall-clock iat is acceptable here; the unit tests for resolve_login are clock-free.
     let iat = std::time::SystemTime::now()
@@ -362,7 +367,10 @@ mod tests {
             .await
             .expect("resolve_login must succeed for valid credentials + active org member");
 
-        assert_eq!(grant.principal, principal, "principal must match the enrolled account");
+        assert_eq!(
+            grant.principal, principal,
+            "principal must match the enrolled account"
+        );
         assert_eq!(grant.org, expected_tenant, "org must match the mock tenant");
         assert_eq!(
             grant.role.as_str(),

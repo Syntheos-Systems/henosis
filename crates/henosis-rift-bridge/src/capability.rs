@@ -163,7 +163,10 @@ impl CapabilityOracle for PistisOracle {
         let response = self
             .client
             .post(url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.auth_token))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.auth_token),
+            )
             .json(&request)
             .send()
             .await?;

@@ -219,20 +219,16 @@ impl Gateway {
             self.connection_counts.remove(&user_id);
             self.online_users.remove(&user_id);
             if let Some(sender) = self.user_senders.get(&user_id)
-                && sender.receiver_count() == 0 {
-                    drop(sender);
-                    self.user_senders.remove(&user_id);
-                }
+                && sender.receiver_count() == 0
+            {
+                drop(sender);
+                self.user_senders.remove(&user_id);
+            }
         }
     }
 
     /// Handle a new WebSocket connection
-    pub async fn handle_connection(
-        &self,
-        socket: WebSocket,
-        jwt_secret: String,
-        pool: PgPool,
-    ) {
+    pub async fn handle_connection(&self, socket: WebSocket, jwt_secret: String, pool: PgPool) {
         let (mut ws_tx, mut ws_rx) = socket.split();
         let gateway = self.clone();
 
@@ -264,7 +260,9 @@ impl Gateway {
             username: session.username.clone(),
         };
         let _ = ws_tx
-            .send(WsMessage::Text(serde_json::to_string(&ready).unwrap().into()))
+            .send(WsMessage::Text(
+                serde_json::to_string(&ready).unwrap().into(),
+            ))
             .await;
 
         // Subscribe to user-specific events
@@ -423,7 +421,11 @@ impl Gateway {
     }
 
     /// Subscribe a connection to receive events for a specific channel
-    pub fn subscribe_connection_to_channel(&self, channel_id: Uuid, tx: tokio::sync::mpsc::Sender<GatewayEvent>) {
+    pub fn subscribe_connection_to_channel(
+        &self,
+        channel_id: Uuid,
+        tx: tokio::sync::mpsc::Sender<GatewayEvent>,
+    ) {
         let mut rx = self.subscribe_channel(channel_id);
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {

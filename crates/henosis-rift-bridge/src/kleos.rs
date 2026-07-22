@@ -524,7 +524,11 @@ impl KleosClient for HttpKleosClient {
             .send()
             .await?;
         let events: KleosAxonEventsResponse = self.parse_json("/axon/events", response).await?;
-        Ok(events.events.into_iter().map(AxonEventBrief::from).collect())
+        Ok(events
+            .events
+            .into_iter()
+            .map(AxonEventBrief::from)
+            .collect())
     }
 
     /// List recent Loom workflow runs via `GET /loom/runs`.
@@ -1134,8 +1138,14 @@ mod in_process_tests {
             .create_draft_task("proj", "architect", "Maybe later", "needs human ok")
             .await
             .expect("create draft task");
-        let summary = kleos.active_tasks_summary("proj", 10).await.expect("summary");
-        assert!(summary.is_none(), "blocked_on_human task must not be active");
+        let summary = kleos
+            .active_tasks_summary("proj", 10)
+            .await
+            .expect("summary");
+        assert!(
+            summary.is_none(),
+            "blocked_on_human task must not be active"
+        );
     }
 
     /// Updating an execution task to completed removes it from the active list.
@@ -1150,7 +1160,10 @@ mod in_process_tests {
             .update_task_status(&id, "completed", "done and verified")
             .await
             .expect("update status");
-        let summary = kleos.active_tasks_summary("proj", 10).await.expect("summary");
+        let summary = kleos
+            .active_tasks_summary("proj", 10)
+            .await
+            .expect("summary");
         assert!(summary.is_none(), "completed task must not be active");
     }
 

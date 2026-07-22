@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -26,6 +26,7 @@ pub struct AgentForgeClient {
     pub timeout: Duration,
 }
 
+/// Implements Agent-Forge task registration, verification, and subprocess transport.
 impl AgentForgeClient {
     /// Construct a client pointing at the given binary. Uses a 5s default
     /// timeout which is sufficient for all current subcommands.
@@ -39,12 +40,7 @@ impl AgentForgeClient {
 
     /// Register a Hephaestus task in agent-forge's spec store. Returns the
     /// spec id (e.g. `spec_abc123`) on success, or None on any failure.
-    pub async fn spec_task(
-        &self,
-        task_id: &str,
-        title: &str,
-        description: &str,
-    ) -> Option<String> {
+    pub async fn spec_task(&self, task_id: &str, title: &str, description: &str) -> Option<String> {
         let input = json!({
             "task_description": format!("hephaestus task {task_id} -- {title}: {description}"),
             "task_type": "feature",
@@ -73,7 +69,9 @@ impl AgentForgeClient {
         let Some(out) = self.run("verify", &input).await else {
             return false;
         };
-        out.get("success").and_then(|s| s.as_bool()).unwrap_or(false)
+        out.get("success")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
     }
 
     /// Write `input` to a tempfile, invoke `agent-forge <subcommand>`, read

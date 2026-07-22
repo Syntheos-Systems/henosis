@@ -18,7 +18,10 @@ use tokio::sync::mpsc;
 ///
 /// Each test uses a distinct port so they can run concurrently under the
 /// default test harness without racing for a bind address.
-async fn serve_control(port: u16, registry: ApprovalRegistry) -> (String, mpsc::Receiver<PendingProposal>) {
+async fn serve_control(
+    port: u16,
+    registry: ApprovalRegistry,
+) -> (String, mpsc::Receiver<PendingProposal>) {
     let (tx, rx) = mpsc::channel::<PendingProposal>(8);
     let config = ControlConfig {
         bind_addr: format!("127.0.0.1:{port}"),
@@ -91,7 +94,10 @@ async fn held_approval_is_visible_and_cancellable_while_paused() {
     // Operator approves while the bridge is paused.
     assert_eq!(act(&client, &base, id, "approve").await, 200);
 
-    let proposal = approved_rx.recv().await.expect("proposal reaches the drain");
+    let proposal = approved_rx
+        .recv()
+        .await
+        .expect("proposal reaches the drain");
     assert_eq!(
         decide_drain_action(true, &registry, proposal.id),
         DrainAction::Hold,
@@ -112,7 +118,10 @@ async fn held_approval_is_visible_and_cancellable_while_paused() {
 
     let body = list(&client, &base).await;
     assert!(
-        body["pending"].as_array().expect("pending array").is_empty(),
+        body["pending"]
+            .as_array()
+            .expect("pending array")
+            .is_empty(),
         "rejected approval must be gone"
     );
 
@@ -136,7 +145,10 @@ async fn unpause_dispatches_the_held_approval_exactly_once() {
     assert_eq!(body["pending"][0]["state"].as_str(), Some("pending"));
 
     assert_eq!(act(&client, &base, id, "approve").await, 200);
-    let proposal = approved_rx.recv().await.expect("proposal reaches the drain");
+    let proposal = approved_rx
+        .recv()
+        .await
+        .expect("proposal reaches the drain");
     assert_eq!(
         decide_drain_action(true, &registry, proposal.id),
         DrainAction::Hold
@@ -156,7 +168,10 @@ async fn unpause_dispatches_the_held_approval_exactly_once() {
     );
 
     let body = list(&client, &base).await;
-    assert!(body["pending"].as_array().expect("pending array").is_empty());
+    assert!(body["pending"]
+        .as_array()
+        .expect("pending array")
+        .is_empty());
 }
 
 /// Approving twice cannot queue two executions of the same task.

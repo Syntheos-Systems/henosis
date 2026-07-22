@@ -52,8 +52,8 @@ use super::OperatorState;
 /// emitters are added -- no fabricated events reach clients.
 const SUBSCRIBED_CHANNELS: &[&str] = &[
     "narration", // henosis-broca: ActionLogged events
-    "agent",     // henosis-soma: AgentRegistered/Deregistered/Heartbeat/StatusChanged/QualityUpdated
-    "workflow",  // henosis-loom: RunCreated/Completed/Failed/Cancelled, StepStarted/Completed/Failed
+    "agent", // henosis-soma: AgentRegistered/Deregistered/Heartbeat/StatusChanged/QualityUpdated
+    "workflow", // henosis-loom: RunCreated/Completed/Failed/Cancelled, StepStarted/Completed/Failed
 ];
 
 /// Periodic heartbeat interval. The server sends a heartbeat frame every
@@ -303,9 +303,7 @@ mod tests {
     fn make_state() -> (OperatorState, TenantId, Arc<Vec<u8>>, Arc<AxonBus>) {
         let bus = Arc::new(AxonBus::new());
         let dir = Arc::new(InMemoryDirectory::new());
-        let soma = Arc::new(
-            SomaStore::open_in_memory(bus.clone(), dir.clone()).expect("soma"),
-        );
+        let soma = Arc::new(SomaStore::open_in_memory(bus.clone(), dir.clone()).expect("soma"));
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm"));
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca"));
         let loom = Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom"));
@@ -314,8 +312,7 @@ mod tests {
             Arc::new(syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts"));
         let plutus: Arc<dyn henosis_plutus::PolicyBackend> =
             Arc::new(MockPolicyBackend::allow_all());
-        let jwt_secret: Arc<Vec<u8>> =
-            Arc::new(b"ws-test-secret-32bytes-padded!!!".to_vec());
+        let jwt_secret: Arc<Vec<u8>> = Arc::new(b"ws-test-secret-32bytes-padded!!!".to_vec());
 
         let org = TenantId::new();
         let state = OperatorState {
@@ -388,7 +385,10 @@ mod tests {
 
         // Different tenant: None (org-isolation filter drops it).
         let result_other = envelope_to_event(&env, other_org);
-        assert!(result_other.is_none(), "cross-tenant envelope must produce None");
+        assert!(
+            result_other.is_none(),
+            "cross-tenant envelope must produce None"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -468,8 +468,14 @@ mod tests {
         let text = frame.into_text().expect("expected text frame");
         let json: serde_json::Value =
             serde_json::from_str(&text).expect("frame must be valid JSON");
-        assert_eq!(json["type"], "narration.action_logged", "type must match env.kind");
-        assert_eq!(json["payload"]["channel"], "narration", "payload.channel must be forwarded");
+        assert_eq!(
+            json["type"], "narration.action_logged",
+            "type must match env.kind"
+        );
+        assert_eq!(
+            json["payload"]["channel"], "narration",
+            "payload.channel must be forwarded"
+        );
 
         // -- Publish a cross-tenant envelope; it must NOT arrive (org-isolation). --
         let other_org = TenantId::new();

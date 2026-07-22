@@ -181,6 +181,7 @@ pub struct QuotaOutcome {
     pub limit: i64,
 }
 
+/// Unit tests for quota accounting and enforcement.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +220,12 @@ mod tests {
     /// Tier round-trips through its text form.
     #[test]
     fn tier_roundtrip() {
-        for tier in [QuotaTier::Free, QuotaTier::Pro, QuotaTier::Team, QuotaTier::Enterprise] {
+        for tier in [
+            QuotaTier::Free,
+            QuotaTier::Pro,
+            QuotaTier::Team,
+            QuotaTier::Enterprise,
+        ] {
             let s = tier.to_string();
             let back: QuotaTier = s.parse().expect("valid tier");
             assert_eq!(tier, back);

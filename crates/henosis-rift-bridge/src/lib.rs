@@ -26,26 +26,26 @@ pub mod execution;
 pub mod executor;
 /// Executor implementations (Claude Code, Synapse).
 pub mod executors;
-/// Kleos client seam (HTTP and in-process backends).
-pub mod kleos;
-/// Turn budgets, consensus signals, thread ceiling.
-pub mod loop_prevention;
-/// Rift REST and WebSocket clients.
-pub mod rift_client;
-/// Room state machine driving the conversation cascade.
-pub mod room;
-/// Stimulus injection (reflection, task, and git signals).
-pub mod stimulus;
 /// Per-agent growth file store.
 pub mod growth;
 /// Bridge tenant and principal identity helpers.
 pub mod identity;
+/// Kleos client seam (HTTP and in-process backends).
+pub mod kleos;
+/// Turn budgets, consensus signals, thread ceiling.
+pub mod loop_prevention;
 /// Frameshift persona allocation across the roster.
 pub mod persona_alloc;
 /// Message-to-persona relevance scoring.
 pub mod relevance;
+/// Rift REST and WebSocket clients.
+pub mod rift_client;
+/// Room state machine driving the conversation cascade.
+pub mod room;
 /// Agent roster provisioning and runtime state.
 pub mod roster;
+/// Stimulus injection (reflection, task, and git signals).
+pub mod stimulus;
 /// Turn interleaving, compose slots, and the compose floor.
 pub mod turn_manager;
 /// Shared bridge types (agents, messages, states).

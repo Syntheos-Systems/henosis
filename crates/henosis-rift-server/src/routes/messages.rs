@@ -1,11 +1,12 @@
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
+use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::models::attachment::Attachment;
@@ -13,8 +14,7 @@ use crate::models::message::{
     EditMessageRequest, MessageQuery, MessageResponse, SendMessageRequest,
 };
 use crate::models::permissions::perms;
-use crate::config::Config;
-use crate::routes::upload::{delete_pending_upload_file, PendingUploads};
+use crate::routes::upload::{PendingUploads, delete_pending_upload_file};
 use crate::ws::gateway::{Gateway, GatewayEvent};
 
 /// GET /api/channels/:channel_id/messages
@@ -126,10 +126,11 @@ pub async fn send_message(
             .await?;
 
             if let Some((_, stored_upload)) = pending.remove(&upload_id)
-                && stored_upload.uploader_id != auth.user_id {
-                    delete_pending_upload_file(&config, &stored_upload).await;
-                    continue;
-                }
+                && stored_upload.uploader_id != auth.user_id
+            {
+                delete_pending_upload_file(&config, &stored_upload).await;
+                continue;
+            }
 
             attachments.push(attachment);
         }
@@ -222,7 +223,13 @@ pub async fn delete_message(
 
     // Author can delete own messages, or user with MANAGE_MESSAGES
     if existing.author_id != auth.user_id {
-        require_permission(&pool, channel.server_id, auth.user_id, perms::MANAGE_MESSAGES).await?;
+        require_permission(
+            &pool,
+            channel.server_id,
+            auth.user_id,
+            perms::MANAGE_MESSAGES,
+        )
+        .await?;
     }
 
     // Attachments cascade-deleted by DB foreign key
@@ -242,7 +249,10 @@ pub async fn delete_message(
 // ─── Helpers ───
 
 /// Reject a message identifier that does not belong to the channel in the route path.
-fn require_message_channel(message_channel_id: Uuid, path_channel_id: Uuid) -> Result<(), AppError> {
+fn require_message_channel(
+    message_channel_id: Uuid,
+    path_channel_id: Uuid,
+) -> Result<(), AppError> {
     if message_channel_id != path_channel_id {
         return Err(AppError::NotFound("Message not found".into()));
     }
@@ -256,10 +266,7 @@ fn require_message_channel(message_channel_id: Uuid, path_channel_id: Uuid) -> R
 /// is_agent flag, so a human cannot forge bridge machinery ('stimulus',
 /// 'system') and an agent cannot pass itself off as a human ('user').
 /// Whitelisting also guarantees the value fits the VARCHAR(16) column.
-fn resolve_message_type(
-    requested: Option<&str>,
-    author_is_agent: bool,
-) -> Result<&str, AppError> {
+fn resolve_message_type(requested: Option<&str>, author_is_agent: bool) -> Result<&str, AppError> {
     let Some(requested) = requested else {
         return Ok(if author_is_agent { "agent" } else { "user" });
     };
@@ -269,7 +276,7 @@ fn resolve_message_type(
         other => {
             return Err(AppError::BadRequest(format!(
                 "Unknown message_type '{other}'"
-            )))
+            )));
         }
     };
     if allowed {

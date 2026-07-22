@@ -110,7 +110,9 @@ impl EchoDetector {
             match self.max_semantic(candidate, recent_peer_texts).await {
                 Ok(max) => return max >= self.semantic_threshold,
                 Err(e) => {
-                    tracing::warn!("semantic echo check failed, falling back to token overlap: {e}");
+                    tracing::warn!(
+                        "semantic echo check failed, falling back to token overlap: {e}"
+                    );
                 }
             }
         }
@@ -226,7 +228,8 @@ mod tests {
     /// Verifies case and punctuation differences do not defeat detection.
     #[test]
     fn test_normalization_is_case_and_punctuation_insensitive() {
-        let shouty = "THE DEPLOYMENT REVIEW identified TWO unsafe defaults, and required BOTH fixes!!";
+        let shouty =
+            "THE DEPLOYMENT REVIEW identified TWO unsafe defaults, and required BOTH fixes!!";
         assert!(similarity(ORIGINAL_LINE, shouty) >= 0.7);
     }
 
@@ -288,7 +291,7 @@ mod tests {
                 "Schema transitions require reversible migration procedures",
                 &[ORIGINAL_LINE]
             )
-                .await
+            .await
         );
     }
 
@@ -304,7 +307,7 @@ mod tests {
                 "Schema transitions require reversible migration procedures",
                 &[ORIGINAL_LINE]
             )
-                .await
+            .await
         );
     }
 

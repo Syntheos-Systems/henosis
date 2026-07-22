@@ -1,10 +1,11 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
 
+/// Claims carried by Rift access tokens.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid, // user id
@@ -13,6 +14,7 @@ pub struct Claims {
     pub iat: i64,
 }
 
+/// Creates a signed 24-hour access token for a Rift user.
 pub fn create_access_token(
     user_id: Uuid,
     username: &str,
@@ -33,6 +35,7 @@ pub fn create_access_token(
     .map_err(|e| AppError::Internal(format!("JWT encode error: {e}")))
 }
 
+/// Generates a cryptographically random refresh token.
 pub fn create_refresh_token() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -42,11 +45,13 @@ pub fn create_refresh_token() -> String {
 
 // We don't have hex crate, use a manual approach
 mod hex {
+    /// Encodes bytes as lowercase hexadecimal text.
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
+/// Validates a signed access token and returns its claims.
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, AppError> {
     let data = decode::<Claims>(
         token,
@@ -57,6 +62,7 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, AppError> {
     Ok(data.claims)
 }
 
+/// Unit tests for access-token signing and validation.
 #[cfg(test)]
 mod tests {
     use super::*;

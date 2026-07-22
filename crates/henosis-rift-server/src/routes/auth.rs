@@ -1,4 +1,4 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -93,6 +93,7 @@ pub async fn login(
     }))
 }
 
+/// Request body containing a refresh token to rotate.
 #[derive(Deserialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
@@ -143,8 +144,8 @@ pub async fn logout(
 /// password so agent accounts have no usable login.
 pub(crate) fn hash_password(password: &str) -> Result<String, AppError> {
     use argon2::{
-        password_hash::{rand_core::OsRng, SaltString},
         Argon2, PasswordHasher,
+        password_hash::{SaltString, rand_core::OsRng},
     };
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -154,17 +155,17 @@ pub(crate) fn hash_password(password: &str) -> Result<String, AppError> {
         .map_err(|e| AppError::Internal(format!("Password hash error: {e}")))
 }
 
+/// Verifies a password against an Argon2 PHC hash.
 fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
-    use argon2::{
-        password_hash::PasswordHash, Argon2, PasswordVerifier,
-    };
-    let parsed = PasswordHash::new(hash)
-        .map_err(|e| AppError::Internal(format!("Invalid hash: {e}")))?;
+    use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
+    let parsed =
+        PasswordHash::new(hash).map_err(|e| AppError::Internal(format!("Invalid hash: {e}")))?;
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| AppError::Unauthorized)
 }
 
+/// Hashes a refresh token into its lowercase SHA-256 storage representation.
 fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     format!("{digest:x}")

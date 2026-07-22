@@ -34,7 +34,7 @@ use std::process::Command;
 
 use frameshift_orchestrator::feedback::Preferences;
 use frameshift_orchestrator::policy::{PolicyWeights, Scored};
-use frameshift_orchestrator::run::{select, SelectionInputs};
+use frameshift_orchestrator::run::{SelectionInputs, select};
 
 /// Result of a single persona ranking. `name` is the persona's canonical name
 /// (matches `persona::load_by_name`). Score and margin are surfaced so the CLI

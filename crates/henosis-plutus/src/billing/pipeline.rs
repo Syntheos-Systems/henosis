@@ -852,11 +852,18 @@ mod tests {
         )
         .await;
         let pro_quota: QuotaConfig = QuotaTier::Pro.defaults();
-        assert_eq!(store.quota_config(tenant).await.unwrap(), Some(pro_quota.clone()));
+        assert_eq!(
+            store.quota_config(tenant).await.unwrap(),
+            Some(pro_quota.clone())
+        );
 
         let outcome = run(
             &store,
-            &invoice_failed_event(&format!("evt_f_{}", tenant.as_uuid()), &customer, Some(&sub)),
+            &invoice_failed_event(
+                &format!("evt_f_{}", tenant.as_uuid()),
+                &customer,
+                Some(&sub),
+            ),
         )
         .await;
 
@@ -895,7 +902,11 @@ mod tests {
         assert_eq!(run(&store, &event).await, BillingOutcome::UnmappedPrice);
         assert_eq!(store.org_tier(tenant).await.unwrap(), Some(QuotaTier::Free));
         assert!(
-            store.entitlement_for_subscription(&sub).await.unwrap().is_none(),
+            store
+                .entitlement_for_subscription(&sub)
+                .await
+                .unwrap()
+                .is_none(),
             "an unmapped price must not write an entitlement"
         );
     }
@@ -918,7 +929,11 @@ mod tests {
         );
 
         assert_eq!(run(&store, &event).await, BillingOutcome::UnknownCustomer);
-        assert!(store.entitlement_for_subscription(&sub).await.unwrap().is_none());
+        assert!(store
+            .entitlement_for_subscription(&sub)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Live: replaying the same event id applies nothing a second time.
@@ -970,7 +985,10 @@ mod tests {
             .await
             .expect("insert_price_mapping");
         // Put the org on Pro so a spurious downgrade would be visible.
-        store.apply_tier(tenant, QuotaTier::Pro).await.expect("apply_tier");
+        store
+            .apply_tier(tenant, QuotaTier::Pro)
+            .await
+            .expect("apply_tier");
 
         let event = subscription_event(
             &format!("evt_us_{}", tenant.as_uuid()),
@@ -981,7 +999,10 @@ mod tests {
             &price,
         );
 
-        assert_eq!(run(&store, &event).await, BillingOutcome::UnknownSubscription);
+        assert_eq!(
+            run(&store, &event).await,
+            BillingOutcome::UnknownSubscription
+        );
         assert_eq!(
             store.org_tier(tenant).await.unwrap(),
             Some(QuotaTier::Pro),

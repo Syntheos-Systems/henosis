@@ -1379,10 +1379,8 @@ mod tests {
         let roster = AgentRoster::from_agents(vec![agent]);
 
         // Port 9 on localhost: nothing listens there, connections fail fast.
-        let auth = AgentAuthManager::new(
-            "test-secret".to_string(),
-            "test-bridge-secret".to_string(),
-        );
+        let auth =
+            AgentAuthManager::new("test-secret".to_string(), "test-bridge-secret".to_string());
         let rift = Arc::new(RiftRestClient::new("http://127.0.0.1:9".to_string(), auth));
         let kleos: Arc<dyn KleosClient> = Arc::new(NullKleos);
         let channel_id = Uuid::new_v4();

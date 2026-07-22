@@ -44,8 +44,14 @@ fn test_recency_decay_reduces_probability() {
     let p0 = engine.compute_probability(inputs(0.3, false, Some(0)));
     let p2 = engine.compute_probability(inputs(0.3, false, Some(2)));
     let p4 = engine.compute_probability(inputs(0.3, false, Some(4)));
-    assert!(p0 < p2, "probability should recover from decay: {p0} < {p2}");
-    assert!(p2 < p4, "probability should continue recovering: {p2} < {p4}");
+    assert!(
+        p0 < p2,
+        "probability should recover from decay: {p0} < {p2}"
+    );
+    assert!(
+        p2 < p4,
+        "probability should continue recovering: {p2} < {p4}"
+    );
 }
 
 /// Verifies very recent low-probability agents stay below the auto-skip threshold.

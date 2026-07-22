@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 /// Result of an Eidolon gate check. Gate is best-effort -- errors always
@@ -29,6 +29,7 @@ pub struct GateClient {
     pub http: Client,
 }
 
+/// Constructs the gate client and evaluates actions through Eidolon.
 impl GateClient {
     /// Construct a gate client pointing at `base_url`.
     pub fn new(base_url: &str, http: Client) -> Self {
@@ -93,7 +94,10 @@ impl GateClient {
                 GateVerdict::Deny(reason)
             }
             None => {
-                warn!(action, "gate check response missing 'allow' field -- allowing");
+                warn!(
+                    action,
+                    "gate check response missing 'allow' field -- allowing"
+                );
                 GateVerdict::Allow
             }
         }

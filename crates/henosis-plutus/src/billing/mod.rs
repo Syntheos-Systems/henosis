@@ -15,9 +15,9 @@ pub mod signature;
 pub use pipeline::{
     apply_decision, decide, parse_event, BillingDecision, BillingOutcome, DecideError, StripeEvent,
 };
-pub use signature::{verify_stripe_signature, SignatureError, DEFAULT_TOLERANCE_SECS};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use signature::sign_stripe_payload;
+pub use signature::{verify_stripe_signature, SignatureError, DEFAULT_TOLERANCE_SECS};
 
 use std::fmt;
 use std::str::FromStr;

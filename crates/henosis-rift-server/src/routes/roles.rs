@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use crate::models::permissions::perms;
 use crate::models::role::{CreateRoleRequest, Role, UpdateRoleRequest};
 use crate::ws::gateway::{Gateway, GatewayEvent};
 
+/// Requires the user to belong to the specified server.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
     if !db::is_member(pool, server_id, user_id).await? {
         return Err(AppError::Forbidden);
@@ -19,6 +20,7 @@ async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result
     Ok(())
 }
 
+/// Requires server membership and the specified role-management permission.
 async fn require_permission(
     pool: &PgPool,
     server_id: Uuid,
@@ -71,7 +73,9 @@ pub async fn create_role(
 
     let name = req.name.trim();
     if name.is_empty() || name.len() > 100 {
-        return Err(AppError::BadRequest("Role name must be 1-100 characters".into()));
+        return Err(AppError::BadRequest(
+            "Role name must be 1-100 characters".into(),
+        ));
     }
 
     let color = req.color.unwrap_or(0);
@@ -105,7 +109,9 @@ pub async fn update_role(
 
     // Don't allow renaming the @everyone role
     if existing.is_default && req.name.is_some() {
-        return Err(AppError::BadRequest("Cannot rename the @everyone role".into()));
+        return Err(AppError::BadRequest(
+            "Cannot rename the @everyone role".into(),
+        ));
     }
 
     let role = db::update_role(
@@ -141,18 +147,14 @@ pub async fn delete_role(
     let role = get_role_in_server(&pool, server_id, role_id).await?;
 
     if role.is_default {
-        return Err(AppError::BadRequest("Cannot delete the @everyone role".into()));
+        return Err(AppError::BadRequest(
+            "Cannot delete the @everyone role".into(),
+        ));
     }
 
     db::delete_role(&pool, role_id).await?;
 
-    gateway.broadcast_to_server(
-        server_id,
-        GatewayEvent::RoleDelete {
-            server_id,
-            role_id,
-        },
-    );
+    gateway.broadcast_to_server(server_id, GatewayEvent::RoleDelete { server_id, role_id });
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -181,7 +183,9 @@ pub async fn assign_role(
     let role = get_role_in_server(&pool, server_id, role_id).await?;
 
     if role.is_default {
-        return Err(AppError::BadRequest("Cannot manually assign the @everyone role".into()));
+        return Err(AppError::BadRequest(
+            "Cannot manually assign the @everyone role".into(),
+        ));
     }
 
     // Verify target user is a member
@@ -204,7 +208,9 @@ pub async fn remove_role(
     let role = get_role_in_server(&pool, server_id, role_id).await?;
 
     if role.is_default {
-        return Err(AppError::BadRequest("Cannot remove the @everyone role from a member".into()));
+        return Err(AppError::BadRequest(
+            "Cannot remove the @everyone role from a member".into(),
+        ));
     }
 
     db::remove_role_from_member(&pool, server_id, user_id, role_id).await?;

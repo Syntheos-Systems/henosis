@@ -213,19 +213,18 @@ impl PlutusStore {
                 "SYNTHEOS_PLUTUS_OPERATOR_TENANT is required when Plutus is enabled".into(),
             )
         })?;
-        let principal_str =
-            std::env::var("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL").map_err(|_| {
-                PlutusError::Config(
-                    "SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL is required when Plutus is enabled".into(),
-                )
-            })?;
+        let principal_str = std::env::var("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL").map_err(|_| {
+            PlutusError::Config(
+                "SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL is required when Plutus is enabled".into(),
+            )
+        })?;
 
         let tenant: TenantId = tenant_str
             .parse()
             .map_err(|e| PlutusError::Config(format!("SYNTHEOS_PLUTUS_OPERATOR_TENANT: {e}")))?;
-        let principal: PrincipalId = principal_str.parse().map_err(|e| {
-            PlutusError::Config(format!("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL: {e}"))
-        })?;
+        let principal: PrincipalId = principal_str
+            .parse()
+            .map_err(|e| PlutusError::Config(format!("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL: {e}")))?;
 
         // Check whether the org already exists.
         let existing: Option<(String,)> =
@@ -445,11 +444,7 @@ impl PlutusStore {
     }
 
     /// Insert or update the tier that `stripe_price_id` maps to.
-    pub async fn insert_price_mapping(
-        &self,
-        stripe_price_id: &str,
-        tier: QuotaTier,
-    ) -> Result<()> {
+    pub async fn insert_price_mapping(&self, stripe_price_id: &str, tier: QuotaTier) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO billing_price_map (stripe_price_id, tier)
                VALUES ($1, $2)
@@ -564,10 +559,11 @@ impl PlutusStore {
     ///
     /// Returns `Ok(None)` when no `org` row exists for the tenant.
     pub async fn org_tier(&self, tenant: TenantId) -> Result<Option<QuotaTier>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT plan_tier FROM org WHERE tenant_id = $1")
-            .bind(tenant.as_uuid())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT plan_tier FROM org WHERE tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             None => Ok(None),
             Some((s,)) => {
@@ -594,13 +590,15 @@ impl PlutusStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(tasks, tokens, tool_calls, memory_stores, rpm)| QuotaConfig {
-            max_tasks_per_day: tasks,
-            max_tokens_per_day: tokens,
-            max_tool_calls_per_day: tool_calls,
-            max_memory_stores_per_day: memory_stores,
-            rate_limit_rpm: rpm,
-        }))
+        Ok(row.map(
+            |(tasks, tokens, tool_calls, memory_stores, rpm)| QuotaConfig {
+                max_tasks_per_day: tasks,
+                max_tokens_per_day: tokens,
+                max_tool_calls_per_day: tool_calls,
+                max_memory_stores_per_day: memory_stores,
+                rate_limit_rpm: rpm,
+            },
+        ))
     }
 
     /// Look up the entitlement row for a given Stripe `subscription_id`.
@@ -611,16 +609,15 @@ impl PlutusStore {
         &self,
         subscription_id: &str,
     ) -> Result<Option<Entitlement>> {
-        let row: Option<EntitlementRow> =
-            sqlx::query_as(
-                r#"SELECT id, tenant_id, tier, source, stripe_subscription_id, status,
+        let row: Option<EntitlementRow> = sqlx::query_as(
+            r#"SELECT id, tenant_id, tier, source, stripe_subscription_id, status,
                           current_period_end
                    FROM entitlement
                    WHERE stripe_subscription_id = $1"#,
-            )
-            .bind(subscription_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        )
+        .bind(subscription_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         match row {
             None => Ok(None),
@@ -658,11 +655,10 @@ impl PolicyBackend for PlutusStore {
     /// Returns `Ok(None)` when no row exists (unknown tenant). An sqlx error is
     /// surfaced as `Err(PlutusError::Store)` -- the gate treats that as a denial.
     async fn org_status(&self, tenant: TenantId) -> Result<Option<OrgStatus>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM org WHERE tenant_id = $1")
-                .bind(tenant.as_uuid())
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM org WHERE tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
         match row {
             None => Ok(None),
             Some((s,)) => {
@@ -675,11 +671,7 @@ impl PolicyBackend for PlutusStore {
     /// Look up the member role of `principal` within `tenant`'s org.
     ///
     /// Returns `Ok(None)` when the principal is not a member.
-    async fn member_role(
-        &self,
-        tenant: TenantId,
-        principal: PrincipalId,
-    ) -> Result<Option<Role>> {
+    async fn member_role(&self, tenant: TenantId, principal: PrincipalId) -> Result<Option<Role>> {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT role FROM org_member WHERE tenant_id = $1 AND principal_id = $2",
         )
@@ -705,12 +697,11 @@ impl PolicyBackend for PlutusStore {
     /// the principal has no org membership. Used by the operator login flow to map
     /// a verified principal to its org before checking org status and role.
     async fn tenant_for_principal(&self, principal: PrincipalId) -> Result<Option<TenantId>> {
-        let row: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT tenant_id FROM org_member WHERE principal_id = $1 LIMIT 1",
-        )
-        .bind(principal.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT tenant_id FROM org_member WHERE principal_id = $1 LIMIT 1")
+                .bind(principal.as_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             None => Ok(None),
             Some((uuid,)) => TenantId::from_uuid(uuid)
@@ -1013,7 +1004,10 @@ mod tests {
 
         // Advance now by 60 seconds: should refill rpm=2 tokens.
         let t1 = t0 + chrono::Duration::seconds(60);
-        let r4 = store.rate_limit_ok(tenant, t1).await.expect("rate 4 after 60s");
+        let r4 = store
+            .rate_limit_ok(tenant, t1)
+            .await
+            .expect("rate 4 after 60s");
         assert!(r4, "request allowed after 60s refill");
     }
 
@@ -1087,7 +1081,11 @@ mod tests {
             .await
             .expect("query entitlement")
             .expect("entitlement exists");
-        assert_eq!(entitlement.tier, QuotaTier::Team, "second upsert's tier wins");
+        assert_eq!(
+            entitlement.tier,
+            QuotaTier::Team,
+            "second upsert's tier wins"
+        );
         assert_eq!(
             entitlement.current_period_end.as_deref(),
             Some("2026-09-01T00:00:00Z"),
@@ -1178,7 +1176,10 @@ mod tests {
             .billing_event_seen(&event_id)
             .await
             .expect("billing_event_seen before recording");
-        assert!(!seen_before, "unseen event id reports false before recording");
+        assert!(
+            !seen_before,
+            "unseen event id reports false before recording"
+        );
 
         store
             .record_billing_event(
@@ -1302,7 +1303,10 @@ mod tests {
         };
         let unknown = format!("sub_never_seen_{}", TenantId::new().as_uuid());
         assert!(
-            !store.cancel_entitlement(&unknown).await.expect("cancel query succeeds"),
+            !store
+                .cancel_entitlement(&unknown)
+                .await
+                .expect("cancel query succeeds"),
             "canceling an unknown subscription must report no row updated"
         );
         assert!(

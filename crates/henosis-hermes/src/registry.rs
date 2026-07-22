@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tool::{Tool, ToolSchema};
 use crate::adapters;
+use crate::tool::{Tool, ToolSchema};
 
 /// The central registry mapping tool IDs to their adapter implementations.
 /// Populated once at startup by [`build_registry`] and shared read-only across
@@ -15,6 +15,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
 
+/// Provides tool registration, lookup, and provider inventory operations.
 impl ToolRegistry {
     /// Construct an empty registry with no registered tools.
     pub fn new() -> Self {
@@ -52,13 +53,17 @@ impl ToolRegistry {
     /// All (tool_id, provider) pairs, sorted by tool_id. Used to assemble the
     /// adapter health report grouped by provider.
     pub fn tool_providers(&self) -> Vec<(String, &'static str)> {
-        let mut pairs: Vec<(String, &'static str)> =
-            self.tools.iter().map(|(id, t)| (id.clone(), t.provider())).collect();
+        let mut pairs: Vec<(String, &'static str)> = self
+            .tools
+            .iter()
+            .map(|(id, t)| (id.clone(), t.provider()))
+            .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs
     }
 }
 
+/// Creates an empty tool registry by default.
 impl Default for ToolRegistry {
     /// Delegate to [`ToolRegistry::new`] so the registry can be
     /// default-constructed in tests.

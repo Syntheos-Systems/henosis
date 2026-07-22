@@ -225,11 +225,8 @@ mod tests {
         };
 
         // Insert in an order deliberately unrelated to slot order.
-        let roster = AgentRoster::from_agents(vec![
-            build(2, "rook"),
-            build(0, "vera"),
-            build(1, "pip"),
-        ]);
+        let roster =
+            AgentRoster::from_agents(vec![build(2, "rook"), build(0, "vera"), build(1, "pip")]);
 
         let ordered: Vec<&str> = roster
             .all_by_slot()

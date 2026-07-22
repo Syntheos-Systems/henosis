@@ -1,10 +1,11 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 
+/// Errors returned by the Rift HTTP API.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Authentication required")]
@@ -29,7 +30,9 @@ pub enum AppError {
     Database(#[from] sqlx::Error),
 }
 
+/// Maps Rift application errors to safe HTTP responses.
 impl IntoResponse for AppError {
+    /// Converts an application error into its status and JSON error body.
     fn into_response(self) -> Response {
         let (status, message) = match &self {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),

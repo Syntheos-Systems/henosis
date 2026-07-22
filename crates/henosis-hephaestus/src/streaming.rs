@@ -21,8 +21,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 
 /// Single SSE event emitted to subscribers. The wire shape is the JSON

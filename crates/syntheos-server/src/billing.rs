@@ -114,12 +114,9 @@ async fn stripe_webhook(
 
     // 2. Authenticate the RAW bytes before anything interprets them. Nothing below this line
     //    runs for an unsigned, tampered, or replayed-outside-the-window delivery.
-    if let Err(e) = verify_stripe_signature(
-        &state.webhook_secret,
-        signature,
-        &body,
-        chrono::Utc::now(),
-    ) {
+    if let Err(e) =
+        verify_stripe_signature(&state.webhook_secret, signature, &body, chrono::Utc::now())
+    {
         tracing::warn!(error = %e, "stripe webhook: signature verification failed");
         return (StatusCode::BAD_REQUEST, REJECTED).into_response();
     }
@@ -374,7 +371,12 @@ mod tests {
         };
         let tenant = TenantId::new();
         store
-            .create_org(tenant, "webhook-replay", PrincipalId::new(), QuotaTier::Free)
+            .create_org(
+                tenant,
+                "webhook-replay",
+                PrincipalId::new(),
+                QuotaTier::Free,
+            )
             .await
             .expect("create_org");
         let customer = format!("cus_{}", tenant.as_uuid());
@@ -415,7 +417,12 @@ mod tests {
         };
         let tenant = TenantId::new();
         store
-            .create_org(tenant, "webhook-unmapped", PrincipalId::new(), QuotaTier::Free)
+            .create_org(
+                tenant,
+                "webhook-unmapped",
+                PrincipalId::new(),
+                QuotaTier::Free,
+            )
             .await
             .expect("create_org");
         let customer = format!("cus_{}", tenant.as_uuid());

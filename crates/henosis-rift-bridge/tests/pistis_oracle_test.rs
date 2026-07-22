@@ -83,6 +83,7 @@ struct FakeServerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Provides assertions over requests captured by the fake Pistis server.
 impl FakeServerHandle {
     /// Return the single recorded call for a test that expects exactly one request.
     async fn one_call(&self) -> RecordedCall {
@@ -92,6 +93,7 @@ impl FakeServerHandle {
     }
 }
 
+/// Ensures the fake Pistis server task stops when its handle is dropped.
 impl Drop for FakeServerHandle {
     /// Stop the background fake server when the test handle goes out of scope.
     fn drop(&mut self) {
@@ -101,6 +103,7 @@ impl Drop for FakeServerHandle {
 
 /// Start a local fake Pistis server with the supplied static response.
 async fn start_fake_server(response: FakeResponse) -> FakeServerHandle {
+    /// Captures one capability-check request and returns the configured decision.
     async fn capability_check(
         State(state): State<FakeServerState>,
         Path(room): Path<String>,
@@ -125,7 +128,10 @@ async fn start_fake_server(response: FakeResponse) -> FakeServerHandle {
         response,
     };
     let app = Router::new()
-        .route("/api/v1/rooms/{room}/capabilities/check", post(capability_check))
+        .route(
+            "/api/v1/rooms/{room}/capabilities/check",
+            post(capability_check),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -295,9 +301,7 @@ async fn test_pistis_oracle_reports_server_errors() {
         .expect_err("server error should bubble up");
 
     assert!(
-        error
-            .to_string()
-            .contains("Pistis check rejected"),
+        error.to_string().contains("Pistis check rejected"),
         "unexpected error: {error}"
     );
 }

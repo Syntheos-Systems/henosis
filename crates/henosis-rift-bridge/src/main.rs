@@ -302,13 +302,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !workspace_paths.is_empty() {
             sources.push(Box::new(GitHeadSource::new(workspace_paths)));
         }
-        let injector = StimulusInjector::new(
-            &settings,
-            sources,
-            stim_tx,
-            activity_rx,
-            pause_rx.clone(),
-        );
+        let injector =
+            StimulusInjector::new(&settings, sources, stim_tx, activity_rx, pause_rx.clone());
         tokio::spawn(injector.run());
         tracing::info!("stimulus injector running");
     }
@@ -579,9 +574,9 @@ async fn build_memory_backend(
         .or_else(|_| std::env::var("KLEOS_KEY"))
         .ok();
     tracing::info!("kleos memory backend: upstream Kleos over HTTP (cognition feature off)");
-    Ok(Arc::new(HttpMemoryBackend::new(Arc::new(MemoryClient::new(
-        kleos_url, api_key, None,
-    )))))
+    Ok(Arc::new(HttpMemoryBackend::new(Arc::new(
+        MemoryClient::new(kleos_url, api_key, None),
+    ))))
 }
 
 /// Resolve a `namespace/key` cred reference into the bearer token string it stores.

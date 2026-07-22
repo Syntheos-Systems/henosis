@@ -6,13 +6,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use synapse_core::executors::SynapseExecutor;
 use synapse_core::hooks::HookConfig;
 use synapse_core::types::AgentConfig as SynapseAgentConfig;
-use synapse_provider::{ProviderConfig, ToolExecutor, create_provider};
-use synapse_tools::{ToolRegistryExecutor, default_tools};
+use synapse_provider::{create_provider, ProviderConfig, ToolExecutor};
+use synapse_tools::{default_tools, ToolRegistryExecutor};
 
 /// Build a `SynapseExecutor` from bridge-level configuration values.
 ///

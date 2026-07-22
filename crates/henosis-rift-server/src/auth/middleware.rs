@@ -1,12 +1,9 @@
-use axum::{
-    extract::FromRequestParts,
-    http::request::Parts,
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 use uuid::Uuid;
 
+use super::jwt;
 use crate::config::Config;
 use crate::error::AppError;
-use super::jwt;
 
 /// Extractor that validates the Authorization header and provides the authenticated user's ID and username.
 #[derive(Debug, Clone)]
@@ -15,12 +12,15 @@ pub struct AuthUser {
     pub username: String,
 }
 
+/// Extracts authenticated Rift user identity from bearer access tokens.
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
 {
+    /// Authentication failures returned by the extractor.
     type Rejection = AppError;
 
+    /// Validates the request bearer token against the configured JWT secret.
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let config = parts
             .extensions

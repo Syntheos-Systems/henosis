@@ -302,9 +302,7 @@ impl StimulusSource for GitHeadSource {
                     );
                     self.dead.insert(name.clone());
                 } else {
-                    tracing::debug!(
-                        "git probe failed for workspace {name} ({count} consecutive)"
-                    );
+                    tracing::debug!("git probe failed for workspace {name} ({count} consecutive)");
                 }
                 continue;
             };
@@ -729,10 +727,7 @@ mod tests {
         inj.record_fire(StimulusKind::GitCommit, t0 + Duration::from_secs(1));
         assert!(!inj.may_fire(StimulusKind::Reflection, t0 + Duration::from_secs(2)));
         // Past the window, capacity returns.
-        assert!(inj.may_fire(
-            StimulusKind::Reflection,
-            t0 + Duration::from_secs(3601 + 1)
-        ));
+        assert!(inj.may_fire(StimulusKind::Reflection, t0 + Duration::from_secs(3601 + 1)));
     }
 
     /// Verifies reflection fires only after the inactivity window.
@@ -1055,6 +1050,8 @@ mod tests {
         assert!(src.poll(&ctx).await.is_empty());
         let fired = src.poll(&ctx).await;
         assert_eq!(fired.len(), 1);
-        assert!(fired[0].text.contains("running -> failed (step 2 exploded)"));
+        assert!(fired[0]
+            .text
+            .contains("running -> failed (step 2 exploded)"));
     }
 }

@@ -79,6 +79,7 @@ fn verify_password(phc: &str, password: &str) -> Result<bool, DirectoryError> {
         .is_ok())
 }
 
+/// Provides persistent operator-account creation, verification, and lookup.
 impl SqliteDirectory {
     /// Create an operator account bound to `principal`.
     ///
@@ -103,9 +104,7 @@ impl SqliteDirectory {
             rusqlite::Error::SqliteFailure(f, _)
                 if f.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                DirectoryError::Backend(format!(
-                    "operator account already exists: {email_lc}"
-                ))
+                DirectoryError::Backend(format!("operator account already exists: {email_lc}"))
             }
             _ => DirectoryError::Backend(e.to_string()),
         })?;
@@ -196,9 +195,9 @@ impl SqliteDirectory {
         match row {
             None => Ok(None),
             Some((email, principal_str, disabled, created_at)) => {
-                let principal = principal_str.parse::<PrincipalId>().map_err(|e| {
-                    DirectoryError::Backend(format!("corrupt principal_id: {e}"))
-                })?;
+                let principal = principal_str
+                    .parse::<PrincipalId>()
+                    .map_err(|e| DirectoryError::Backend(format!("corrupt principal_id: {e}")))?;
                 Ok(Some(OperatorAccount {
                     email,
                     principal,
@@ -210,6 +209,7 @@ impl SqliteDirectory {
     }
 }
 
+/// Unit tests for operator account authentication and lifecycle behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,11 +220,23 @@ mod tests {
     fn operator_account_create_and_verify() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
         let p = PrincipalId::new();
-        dir.create_account("Op@example.com", "hunter2", p).expect("create");
+        dir.create_account("Op@example.com", "hunter2", p)
+            .expect("create");
         // Email is case-insensitive; password must match.
-        assert_eq!(dir.verify_login("op@example.com", "hunter2").expect("verify"), Some(p));
-        assert_eq!(dir.verify_login("op@example.com", "wrong").expect("verify"), None);
-        assert_eq!(dir.verify_login("nobody@example.com", "hunter2").expect("verify"), None);
+        assert_eq!(
+            dir.verify_login("op@example.com", "hunter2")
+                .expect("verify"),
+            Some(p)
+        );
+        assert_eq!(
+            dir.verify_login("op@example.com", "wrong").expect("verify"),
+            None
+        );
+        assert_eq!(
+            dir.verify_login("nobody@example.com", "hunter2")
+                .expect("verify"),
+            None
+        );
     }
 
     /// A disabled account always returns None from verify_login, even with the correct password.
@@ -232,7 +244,8 @@ mod tests {
     fn disabled_account_cannot_verify() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
         let p = PrincipalId::new();
-        dir.create_account("admin@example.com", "secret", p).expect("create");
+        dir.create_account("admin@example.com", "secret", p)
+            .expect("create");
         // Disable the account directly via SQL.
         {
             let conn = dir.conn.lock().unwrap();
@@ -243,7 +256,8 @@ mod tests {
             .expect("disable");
         }
         assert_eq!(
-            dir.verify_login("admin@example.com", "secret").expect("verify"),
+            dir.verify_login("admin@example.com", "secret")
+                .expect("verify"),
             None,
             "disabled account must not verify"
         );
@@ -254,11 +268,18 @@ mod tests {
     fn get_account_round_trip() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
         let p = PrincipalId::new();
-        dir.create_account("user@example.com", "pw", p).expect("create");
-        let acct = dir.get_account("user@example.com").expect("get").expect("present");
+        dir.create_account("user@example.com", "pw", p)
+            .expect("create");
+        let acct = dir
+            .get_account("user@example.com")
+            .expect("get")
+            .expect("present");
         assert_eq!(acct.email, "user@example.com");
         assert_eq!(acct.principal, p);
         assert!(!acct.disabled);
-        assert!(dir.get_account("nobody@example.com").expect("get").is_none());
+        assert!(dir
+            .get_account("nobody@example.com")
+            .expect("get")
+            .is_none());
     }
 }

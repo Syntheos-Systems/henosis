@@ -103,8 +103,8 @@ pub fn parse_cors_origins(value: &str) -> Result<Vec<HeaderValue>, String> {
 /// Exercises fail-closed parsing for Rift origins and trust-boundary secrets.
 mod tests {
     use super::{
-        DEFAULT_MAX_UPLOAD_BYTES, MAX_UPLOAD_BYTES_CEILING, parse_cors_origins,
-        parse_upload_limit, validate_secrets,
+        DEFAULT_MAX_UPLOAD_BYTES, MAX_UPLOAD_BYTES_CEILING, parse_cors_origins, parse_upload_limit,
+        validate_secrets,
     };
 
     /// The parser trims and retains each explicitly allowed origin.
@@ -143,8 +143,6 @@ mod tests {
         );
         assert!(parse_upload_limit(Some("0")).is_err());
         assert!(parse_upload_limit(Some("not-a-number")).is_err());
-        assert!(
-            parse_upload_limit(Some(&(MAX_UPLOAD_BYTES_CEILING + 1).to_string())).is_err()
-        );
+        assert!(parse_upload_limit(Some(&(MAX_UPLOAD_BYTES_CEILING + 1).to_string())).is_err());
     }
 }

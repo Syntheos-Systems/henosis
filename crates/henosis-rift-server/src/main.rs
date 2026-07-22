@@ -1,21 +1,17 @@
 //! Standalone Rift HTTP and WebSocket server entry point.
 
 use axum::{
-    extract::{
-        DefaultBodyLimit,
-        ws::WebSocketUpgrade,
-        State,
-    },
-    http::{header, HeaderValue, Method},
+    Router,
+    extract::{DefaultBodyLimit, State, ws::WebSocketUpgrade},
+    http::{HeaderValue, Method, header},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
-    Router,
 };
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 // Use the library target rather than re-declaring the module tree. Declaring
@@ -158,14 +154,22 @@ async fn main() {
         .route("/api/auth/refresh", post(routes::auth::refresh))
         .route("/api/auth/logout", post(routes::auth::logout))
         // Users
-        .route("/api/users/@me", get(routes::users::get_me).patch(routes::users::update_me))
+        .route(
+            "/api/users/@me",
+            get(routes::users::get_me).patch(routes::users::update_me),
+        )
         .route(
             "/api/users/@me/avatar",
-            post(routes::users::upload_avatar)
-                .layer(DefaultBodyLimit::max(avatar_body_limit)),
+            post(routes::users::upload_avatar).layer(DefaultBodyLimit::max(avatar_body_limit)),
         )
-        .route("/api/users/@me/password", post(routes::users::change_password))
-        .route("/api/users/@me/dms", get(routes::users::list_dms).post(routes::users::create_dm))
+        .route(
+            "/api/users/@me/password",
+            post(routes::users::change_password),
+        )
+        .route(
+            "/api/users/@me/dms",
+            get(routes::users::list_dms).post(routes::users::create_dm),
+        )
         .route("/api/users/{user_id}", get(routes::users::get_user))
         // Servers
         .route(
@@ -194,7 +198,10 @@ async fn main() {
             "/api/servers/{server_id}/invites/{code}",
             delete(routes::servers::delete_invite),
         )
-        .route("/api/invites/{code}/join", post(routes::servers::join_via_invite))
+        .route(
+            "/api/invites/{code}/join",
+            post(routes::servers::join_via_invite),
+        )
         // Roles
         .route(
             "/api/servers/{server_id}/roles",
@@ -233,8 +240,7 @@ async fn main() {
         // File uploads
         .route(
             "/api/upload",
-            post(routes::upload::upload_files)
-                .layer(DefaultBodyLimit::max(attachment_body_limit)),
+            post(routes::upload::upload_files).layer(DefaultBodyLimit::max(attachment_body_limit)),
         )
         // Bridge internal
         .route("/api/bridge/notify", post(routes::bridge::notify_message))
@@ -242,9 +248,18 @@ async fn main() {
             "/api/bridge/provision",
             post(routes::bridge::provision_agents),
         )
-        .route("/api/bridge/pause", post(routes::bridge_control::pause_bridge))
-        .route("/api/bridge/resume", post(routes::bridge_control::resume_bridge))
-        .route("/api/bridge/status", get(routes::bridge_control::bridge_status))
+        .route(
+            "/api/bridge/pause",
+            post(routes::bridge_control::pause_bridge),
+        )
+        .route(
+            "/api/bridge/resume",
+            post(routes::bridge_control::resume_bridge),
+        )
+        .route(
+            "/api/bridge/status",
+            get(routes::bridge_control::bridge_status),
+        )
         // DMs
         .route(
             "/api/dms/{dm_channel_id}/messages",
@@ -269,10 +284,7 @@ async fn main() {
 }
 
 /// Upgrade an authenticated Rift WebSocket connection into the shared gateway.
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     let jwt_secret = state.config.jwt_secret.clone();
     let gateway = state.gateway.clone();
     let pool = state.pool.clone();

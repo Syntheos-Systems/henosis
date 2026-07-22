@@ -15,8 +15,7 @@ use crate::config::{Config, DeployEnv};
 
 /// First system block required by the Anthropic OAuth contract. Missing it
 /// returns 429 with a "claude code" identity complaint. Not negotiable.
-pub const CLAUDE_CODE_IDENTITY: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+pub const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Errors that can occur while resolving an Anthropic bearer token.
 #[derive(Debug, Error)]
@@ -67,6 +66,7 @@ pub struct PlutusTokenProvider {
 }
 
 #[async_trait]
+/// Provides the placeholder Plutus token lookup used by the provider chain.
 impl AnthropicTokenProvider for PlutusTokenProvider {
     /// Always returns `PlutusUnavailable` -- Phase 4 stub not yet implemented.
     async fn token(&self, _tenant_id: Option<&str>) -> Result<String, AuthError> {
@@ -102,16 +102,17 @@ struct ClaudeAiOauth {
 }
 
 #[async_trait]
+/// Loads Anthropic OAuth tokens from the configured local credentials file.
 impl AnthropicTokenProvider for CredentialsFileProvider {
     /// Load and parse the credentials file, returning the embedded access
     /// token. Returns an `AuthError` if the file is missing or malformed.
     async fn token(&self, _tenant_id: Option<&str>) -> Result<String, AuthError> {
-        let bytes = tokio::fs::read(&self.path)
-            .await
-            .map_err(|e| AuthError::CredentialsFileUnreadable {
+        let bytes = tokio::fs::read(&self.path).await.map_err(|e| {
+            AuthError::CredentialsFileUnreadable {
                 path: self.path.clone(),
                 source: e,
-            })?;
+            }
+        })?;
         let parsed: CredentialsFile =
             serde_json::from_slice(&bytes).map_err(|e| AuthError::CredentialsFileMalformed {
                 path: self.path.clone(),
@@ -138,6 +139,7 @@ pub struct ProviderChain {
     env: DeployEnv,
 }
 
+/// Builds and resolves the ordered Anthropic token provider chain.
 impl ProviderChain {
     /// Construct a chain from a loaded `Config`. Enables Plutus when
     /// `PLUTUS_URL` is set; enables the credentials-file path when

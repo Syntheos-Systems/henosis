@@ -48,9 +48,7 @@ pub async fn resume_bridge(
 }
 
 /// Get bridge status. Used by bridge to check if paused.
-pub async fn bridge_status(
-    State(pool): State<PgPool>,
-) -> Result<Json<BridgeStatus>, AppError> {
+pub async fn bridge_status(State(pool): State<PgPool>) -> Result<Json<BridgeStatus>, AppError> {
     let paused = db::is_bridge_paused(&pool).await?;
     Ok(Json(BridgeStatus { paused }))
 }

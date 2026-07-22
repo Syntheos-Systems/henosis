@@ -1844,8 +1844,7 @@ mod tests {
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
         // MockPolicyBackend::allow_all(): active org, Member role, quota OK, rate OK.
-        let plutus_backend: Arc<dyn PolicyBackend> =
-            Arc::new(MockPolicyBackend::allow_all());
+        let plutus_backend: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::allow_all());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
@@ -1871,8 +1870,7 @@ mod tests {
         // The plutus slot (chain[1]) is the REAL PlutusGate and allows an enrolled-member request.
         // Re-build the chain for the gate-level test (the dispatcher consumed it above).
         let bus2 = Arc::new(AxonBus::new());
-        let thymus2 =
-            Arc::new(ThymusStore::open_in_memory(bus2.clone()).expect("thymus store 2"));
+        let thymus2 = Arc::new(ThymusStore::open_in_memory(bus2.clone()).expect("thymus store 2"));
         let plutus_allow: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::allow_all());
         let chain2 = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
@@ -2984,7 +2982,10 @@ mod tests {
                     .uri("/api/auth/login")
                     .header("origin", allowed_origin)
                     .header("access-control-request-method", "POST")
-                    .header("access-control-request-headers", "content-type,authorization")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,authorization",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3028,8 +3029,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let stored: serde_json::Value =
-            serde_json::from_str(&body_string(response).await).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(stored["created"], true, "first store creates a memory");
         let stored_id = stored["id"].as_i64().expect("memory id");
 
@@ -3045,8 +3045,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let hits: serde_json::Value =
-            serde_json::from_str(&body_string(response).await).unwrap();
+        let hits: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         let hits = hits.as_array().expect("hit array");
         assert!(
             hits.iter().any(|h| h["id"].as_i64() == Some(stored_id)),

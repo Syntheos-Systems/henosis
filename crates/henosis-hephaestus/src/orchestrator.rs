@@ -325,11 +325,7 @@ async fn loop_inner(
                     .get("language")
                     .and_then(|l| l.as_str())
                     .unwrap_or("bash");
-                let code = tu
-                    .input
-                    .get("code")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                let code = tu.input.get("code").and_then(|c| c.as_str()).unwrap_or("");
                 match crate::sandbox::run_code(
                     language,
                     code,

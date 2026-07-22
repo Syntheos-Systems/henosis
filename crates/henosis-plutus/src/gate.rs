@@ -203,6 +203,7 @@ impl Gate for PlutusGate {
     }
 }
 
+/// Unit tests for Plutus gate policy and denial behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +253,10 @@ mod tests {
     async fn allow_active_org_member_role_memory_search() {
         let g = gate(MockPolicyBackend::allow_all());
         let req = make_req("kleos", "memory_search");
-        assert_eq!(g.check(&req).await.expect("gate decides"), GateDecision::Allow);
+        assert_eq!(
+            g.check(&req).await.expect("gate decides"),
+            GateDecision::Allow
+        );
     }
 
     /// Active org + Member role + memory_store (has quota dim, quota OK) => Allow.
@@ -260,7 +264,10 @@ mod tests {
     async fn allow_active_org_member_role_memory_store_with_quota() {
         let g = gate(MockPolicyBackend::allow_all());
         let req = make_req("kleos", "memory_store");
-        assert_eq!(g.check(&req).await.expect("gate decides"), GateDecision::Allow);
+        assert_eq!(
+            g.check(&req).await.expect("gate decides"),
+            GateDecision::Allow
+        );
     }
 
     // ---- Deny: step 1 (org check) ----

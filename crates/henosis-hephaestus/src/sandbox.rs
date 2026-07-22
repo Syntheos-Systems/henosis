@@ -9,20 +9,21 @@ use tokio::process::Command;
 /// Execute `code` in an isolated Podman container.
 /// Returns combined stdout + stderr on success or an error string on failure.
 /// Timeout and memory are taken from config.
-pub async fn run_code(language: &str, code: &str, timeout_secs: u64, memory: &str) -> Result<String, String> {
+pub async fn run_code(
+    language: &str,
+    code: &str,
+    timeout_secs: u64,
+    memory: &str,
+) -> Result<String, String> {
     let (image, cmd_args): (&str, Vec<&str>) = match language {
         "python" => (
             "docker.io/library/python:3.12-slim",
             vec!["python3", "-c", code],
         ),
-        "bash" => (
-            "docker.io/library/alpine:latest",
-            vec!["sh", "-c", code],
-        ),
-        "javascript" | "js" | "node" => (
-            "docker.io/library/node:22-slim",
-            vec!["node", "-e", code],
-        ),
+        "bash" => ("docker.io/library/alpine:latest", vec!["sh", "-c", code]),
+        "javascript" | "js" | "node" => {
+            ("docker.io/library/node:22-slim", vec!["node", "-e", code])
+        }
         other => return Err(format!("unsupported language: {other}")),
     };
 

@@ -1,8 +1,8 @@
 //! Authenticated attachment ingestion and pending-upload cleanup for Rift.
 
 use axum::{
-    extract::{Multipart, State},
     Json,
+    extract::{Multipart, State},
 };
 use chrono::{Duration, Utc};
 use serde::Serialize;
@@ -133,9 +133,13 @@ pub async fn upload_files(
 pub async fn delete_pending_upload_file(config: &Config, pending_upload: &PendingUpload) {
     let file_path = std::path::Path::new(&config.upload_dir).join(&pending_upload.stored_filename);
     if let Err(err) = tokio::fs::remove_file(file_path).await
-        && err.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Failed to delete stale upload {}: {err}", pending_upload.stored_filename);
-        }
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "Failed to delete stale upload {}: {err}",
+            pending_upload.stored_filename
+        );
+    }
 }
 
 /// Remove staged uploads that have remained unlinked for more than 24 hours.
@@ -167,8 +171,8 @@ mod tests {
     /// Hostile original extensions cannot appear because storage names depend only on UUIDs.
     #[test]
     fn stored_attachment_names_are_extension_free() {
-        let upload_id = Uuid::parse_str("00000000-0000-0000-0000-000000000123")
-            .expect("static UUID is valid");
+        let upload_id =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000123").expect("static UUID is valid");
         let stored = stored_attachment_filename(upload_id);
         assert_eq!(stored, "00000000-0000-0000-0000-000000000123");
         assert!(!stored.contains('.'));

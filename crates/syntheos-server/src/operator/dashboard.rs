@@ -165,14 +165,26 @@ pub async fn compose_dashboard(
     // -- Soma: agent presence aggregate, scoped by org/tenant. --
     let (soma_health, agents) = match soma.stats(org).await {
         Ok(stats) => (
-            ServiceHealth { name: "soma".into(), status: "ok".into() },
-            AgentStats { total: stats.total, online: stats.online },
+            ServiceHealth {
+                name: "soma".into(),
+                status: "ok".into(),
+            },
+            AgentStats {
+                total: stats.total,
+                online: stats.online,
+            },
         ),
         Err(e) => {
             tracing::warn!("dashboard: soma.stats failed: {e}");
             (
-                ServiceHealth { name: "soma".into(), status: "error".into() },
-                AgentStats { total: 0, online: 0 },
+                ServiceHealth {
+                    name: "soma".into(),
+                    status: "error".into(),
+                },
+                AgentStats {
+                    total: 0,
+                    online: 0,
+                },
             )
         }
     };
@@ -185,15 +197,27 @@ pub async fn compose_dashboard(
             let completed = stats.by_status.get("completed").copied().unwrap_or(0);
             let active = stats.total - completed;
             (
-                ServiceHealth { name: "chiasm".into(), status: "ok".into() },
-                TaskStats { active, by_status: stats.by_status },
+                ServiceHealth {
+                    name: "chiasm".into(),
+                    status: "ok".into(),
+                },
+                TaskStats {
+                    active,
+                    by_status: stats.by_status,
+                },
             )
         }
         Err(e) => {
             tracing::warn!("dashboard: chiasm.stats failed: {e}");
             (
-                ServiceHealth { name: "chiasm".into(), status: "error".into() },
-                TaskStats { active: 0, by_status: BTreeMap::new() },
+                ServiceHealth {
+                    name: "chiasm".into(),
+                    status: "error".into(),
+                },
+                TaskStats {
+                    active: 0,
+                    by_status: BTreeMap::new(),
+                },
             )
         }
     };
@@ -201,13 +225,21 @@ pub async fn compose_dashboard(
     // -- Loom: workflow/run aggregate, scoped by principal. --
     let (loom_health, workflows) = match loom.stats(principal).await {
         Ok(stats) => (
-            ServiceHealth { name: "loom".into(), status: "ok".into() },
-            WorkflowStats { runs_active: stats.active_runs },
+            ServiceHealth {
+                name: "loom".into(),
+                status: "ok".into(),
+            },
+            WorkflowStats {
+                runs_active: stats.active_runs,
+            },
         ),
         Err(e) => {
             tracing::warn!("dashboard: loom.stats failed: {e}");
             (
-                ServiceHealth { name: "loom".into(), status: "error".into() },
+                ServiceHealth {
+                    name: "loom".into(),
+                    status: "error".into(),
+                },
                 WorkflowStats { runs_active: 0 },
             )
         }
@@ -216,13 +248,21 @@ pub async fn compose_dashboard(
     // -- Thymus: quality aggregate, scoped by principal. --
     let (thymus_health, quality) = match thymus.stats(principal).await {
         Ok(stats) => (
-            ServiceHealth { name: "thymus".into(), status: "ok".into() },
-            QualityStats { evaluations: stats.evaluations },
+            ServiceHealth {
+                name: "thymus".into(),
+                status: "ok".into(),
+            },
+            QualityStats {
+                evaluations: stats.evaluations,
+            },
         ),
         Err(e) => {
             tracing::warn!("dashboard: thymus.stats failed: {e}");
             (
-                ServiceHealth { name: "thymus".into(), status: "error".into() },
+                ServiceHealth {
+                    name: "thymus".into(),
+                    status: "error".into(),
+                },
                 QualityStats { evaluations: 0 },
             )
         }
@@ -230,7 +270,13 @@ pub async fn compose_dashboard(
 
     // -- Broca: newest 20 action entries, scoped by org/tenant. --
     let (broca_health, activity) = match broca
-        .query(org, ActionFilter { limit: Some(20), ..Default::default() })
+        .query(
+            org,
+            ActionFilter {
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(entries) => {
@@ -245,12 +291,21 @@ pub async fn compose_dashboard(
                     created_at: e.created_at,
                 })
                 .collect();
-            (ServiceHealth { name: "broca".into(), status: "ok".into() }, activity)
+            (
+                ServiceHealth {
+                    name: "broca".into(),
+                    status: "ok".into(),
+                },
+                activity,
+            )
         }
         Err(e) => {
             tracing::warn!("dashboard: broca.query failed: {e}");
             (
-                ServiceHealth { name: "broca".into(), status: "error".into() },
+                ServiceHealth {
+                    name: "broca".into(),
+                    status: "error".into(),
+                },
                 Vec::new(),
             )
         }
@@ -264,7 +319,13 @@ pub async fn compose_dashboard(
     };
 
     Ok(DashboardResponse {
-        services: vec![soma_health, chiasm_health, loom_health, thymus_health, broca_health],
+        services: vec![
+            soma_health,
+            chiasm_health,
+            loom_health,
+            thymus_health,
+            broca_health,
+        ],
         agents,
         tasks,
         workflows,
@@ -346,10 +407,8 @@ mod tests {
         );
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm store"));
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca store"));
-        let loom =
-            Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom store"));
-        let thymus =
-            Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
+        let loom = Arc::new(LoomStore::open_in_memory(bus.clone()).expect("loom store"));
+        let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
 
         // Pick fixed identifiers for deterministic assertions.
         let org = TenantId::new();
@@ -404,14 +463,12 @@ mod tests {
             .expect("broca log");
 
         // Operator accounts store (the login flow; not tested here, just required by OperatorState).
-        let accounts = Arc::new(
-            syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts store"),
-        );
+        let accounts =
+            Arc::new(syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts store"));
         // MockPolicyBackend::allow_all() covers OrgRead permission for a Viewer role JWT.
         let plutus: Arc<dyn henosis_plutus::PolicyBackend> =
             Arc::new(MockPolicyBackend::allow_all());
-        let jwt_secret: Arc<Vec<u8>> =
-            Arc::new(b"test-secret-32bytes-for-dashboard!".to_vec());
+        let jwt_secret: Arc<Vec<u8>> = Arc::new(b"test-secret-32bytes-for-dashboard!".to_vec());
 
         let state = OperatorState {
             accounts,
@@ -475,9 +532,15 @@ mod tests {
             .await
             .expect("oneshot");
 
-        assert_eq!(response.status(), StatusCode::OK, "authenticated GET /api/dashboard must be 200");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "authenticated GET /api/dashboard must be 200"
+        );
 
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body bytes");
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body bytes");
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body json");
 
         // Agent counts from Soma.
@@ -496,7 +559,10 @@ mod tests {
 
         // Activity from Broca (one logged action).
         assert_eq!(
-            body["activity"].as_array().expect("activity is an array").len(),
+            body["activity"]
+                .as_array()
+                .expect("activity is an array")
+                .len(),
             1,
             "activity must contain the one seeded broca action: body = {body}"
         );

@@ -323,10 +323,7 @@ impl AgentExecutor for SynapseExecutor {
                 AgentEvent::ToolResult { id, is_error, .. } => {
                     // Recover the tool name from the matching ToolStart; fall back to a
                     // placeholder only if the start was never seen.
-                    let tool_name = tool_names
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| "tool".into());
+                    let tool_name = tool_names.get(id).cloned().unwrap_or_else(|| "tool".into());
                     let _ = progress_tx
                         .send(ProgressUpdate::ToolCompleted {
                             tool_name,
@@ -399,8 +396,8 @@ mod tests {
     use crate::hooks::HookConfig;
     use crate::types::AgentConfig;
     use serde_json::Value;
-    use synapse_tools::{GateDecision, PermissiveGate, ToolGate, ToolResult};
     use std::path::PathBuf;
+    use synapse_tools::{GateDecision, PermissiveGate, ToolGate, ToolResult};
 
     /// Stub provider that satisfies `Provider + Send + Sync` without network calls.
     struct StubProvider;
@@ -595,7 +592,8 @@ mod tests {
         };
         let executor = SynapseExecutor::new(provider, tools, hooks, None, config);
 
-        let config = executor.execution_config(&make_task(vec![Capability::new(Capability::FS_READ)]));
+        let config =
+            executor.execution_config(&make_task(vec![Capability::new(Capability::FS_READ)]));
         let decision = config
             .tool_gate
             .expect("execution config should install a task-local gate")
@@ -630,7 +628,8 @@ mod tests {
         };
         let executor = SynapseExecutor::new(provider, tools, hooks, None, config);
 
-        let config = executor.execution_config(&make_task(vec![Capability::new(Capability::FS_READ)]));
+        let config =
+            executor.execution_config(&make_task(vec![Capability::new(Capability::FS_READ)]));
         let decision = config
             .tool_gate
             .expect("execution config should install a task-local gate")

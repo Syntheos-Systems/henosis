@@ -1,7 +1,7 @@
 //! Web tools -- fetch URLs and search the web.
 
 use crate::tool::{AgentTool, ToolResult};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

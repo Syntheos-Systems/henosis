@@ -7,17 +7,14 @@
 
 /// English stopwords excluded from both message and interest tokenization.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "but", "not", "you", "all", "can",
-    "had", "her", "was", "one", "our", "out", "day", "get", "has",
-    "him", "his", "how", "its", "may", "now", "old", "see", "two",
-    "who", "did", "she", "use", "way", "will", "with", "this", "that",
-    "from", "have", "been", "they", "were", "said", "each", "which",
-    "their", "when", "what", "your", "make", "like", "into", "time",
-    "look", "more", "write", "than", "been", "call", "first", "long",
-    "down", "side", "been", "now", "come", "made", "over", "such",
-    "also", "here", "just", "know", "take", "some", "only", "both",
-    "then", "very", "even", "much", "back", "well", "must", "about",
-    "good", "after", "those", "tell", "does", "gave", "give",
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one",
+    "our", "out", "day", "get", "has", "him", "his", "how", "its", "may", "now", "old", "see",
+    "two", "who", "did", "she", "use", "way", "will", "with", "this", "that", "from", "have",
+    "been", "they", "were", "said", "each", "which", "their", "when", "what", "your", "make",
+    "like", "into", "time", "look", "more", "write", "than", "been", "call", "first", "long",
+    "down", "side", "been", "now", "come", "made", "over", "such", "also", "here", "just", "know",
+    "take", "some", "only", "both", "then", "very", "even", "much", "back", "well", "must",
+    "about", "good", "after", "those", "tell", "does", "gave", "give",
 ];
 
 /// Tokenize `text`: lowercase, split on non-alphanumeric chars, drop tokens
@@ -114,6 +111,7 @@ pub fn score(message: &str, persona_interests: &[String]) -> f64 {
     raw.clamp(0.0, 1.0)
 }
 
+/// Unit tests for message-to-persona relevance scoring.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,8 +162,14 @@ mod tests {
     fn result_bounded() {
         let cases: &[(&str, &[&str])] = &[
             ("hello world", &["hello", "world"]),
-            ("completely unrelated text here", &["rust", "async", "tokio"]),
-            ("rust async tokio runtime executor spawn", &["rust", "async", "tokio"]),
+            (
+                "completely unrelated text here",
+                &["rust", "async", "tokio"],
+            ),
+            (
+                "rust async tokio runtime executor spawn",
+                &["rust", "async", "tokio"],
+            ),
             ("", &["anything"]),
             ("something", &[]),
         ];

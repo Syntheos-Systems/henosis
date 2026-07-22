@@ -1,8 +1,8 @@
 //! Authenticated Rift user-profile, password, avatar, and direct-message routes.
 
 use axum::{
-    extract::{Multipart, Path, State},
     Json,
+    extract::{Multipart, Path, State},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -57,9 +57,10 @@ pub async fn update_me(
             return Err(AppError::BadRequest("Invalid email".into()));
         }
         if let Some(existing) = db::get_user_by_email(&pool, email).await?
-            && existing.id != auth.user_id {
-                return Err(AppError::Conflict("Email already registered".into()));
-            }
+            && existing.id != auth.user_id
+        {
+            return Err(AppError::Conflict("Email already registered".into()));
+        }
         db::update_user_email(&pool, auth.user_id, email).await?;
     }
 
@@ -95,9 +96,10 @@ pub async fn upload_avatar(
 
     // Validate it's an image
     if let Some(ref ct) = content_type
-        && !ct.starts_with("image/") {
-            return Err(AppError::BadRequest("File must be an image".into()));
-        }
+        && !ct.starts_with("image/")
+    {
+        return Err(AppError::BadRequest("File must be an image".into()));
+    }
 
     let data = field
         .bytes()
@@ -183,8 +185,8 @@ pub async fn change_password(
 
 fn hash_password(password: &str) -> Result<String, AppError> {
     use argon2::{
-        password_hash::{rand_core::OsRng, SaltString},
         Argon2, PasswordHasher,
+        password_hash::{SaltString, rand_core::OsRng},
     };
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -196,7 +198,7 @@ fn hash_password(password: &str) -> Result<String, AppError> {
 
 /// Verify a password against its stored Argon2 hash.
 fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
-    use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+    use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
     let parsed =
         PasswordHash::new(hash).map_err(|e| AppError::Internal(format!("Invalid hash: {e}")))?;
     Argon2::default()
@@ -240,17 +242,19 @@ pub async fn list_dms(
     let result: Vec<DmChannelInfo> = channels
         .into_iter()
         .map(
-            |(dm_id, user_id, username, display_name, avatar_url, status, is_agent)| DmChannelInfo {
-                id: dm_id,
-                recipient: PublicUser {
-                    id: user_id,
-                    username,
-                    display_name,
-                    avatar_url,
-                    status,
-                    about: None,
-                    is_agent,
-                },
+            |(dm_id, user_id, username, display_name, avatar_url, status, is_agent)| {
+                DmChannelInfo {
+                    id: dm_id,
+                    recipient: PublicUser {
+                        id: user_id,
+                        username,
+                        display_name,
+                        avatar_url,
+                        status,
+                        about: None,
+                        is_agent,
+                    },
+                }
             },
         )
         .collect();
@@ -299,8 +303,13 @@ pub async fn list_dm_messages(
         return Err(AppError::Forbidden);
     }
 
-    let messages =
-        db::get_dm_messages(&pool, dm_channel_id, query.limit.unwrap_or(50), query.before).await?;
+    let messages = db::get_dm_messages(
+        &pool,
+        dm_channel_id,
+        query.limit.unwrap_or(50),
+        query.before,
+    )
+    .await?;
     Ok(Json(messages))
 }
 

@@ -37,6 +37,7 @@ pub fn bridge_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v8(v5.into_bytes())).expect("new_v8 always yields a v8 UUID")
 }
 
+/// Unit tests for deterministic bridge identities.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,13 +45,19 @@ mod tests {
     /// The same username resolves to the same principal every time.
     #[test]
     fn deterministic() {
-        assert_eq!(principal_for_agent("architect"), principal_for_agent("architect"));
+        assert_eq!(
+            principal_for_agent("architect"),
+            principal_for_agent("architect")
+        );
     }
 
     /// Different usernames resolve to different principals.
     #[test]
     fn distinct_agents_distinct_principals() {
-        assert_ne!(principal_for_agent("architect"), principal_for_agent("scribe"));
+        assert_ne!(
+            principal_for_agent("architect"),
+            principal_for_agent("scribe")
+        );
     }
 
     /// The bridge tenant is deterministic across calls.

@@ -181,7 +181,7 @@ pub async fn serve(
 /// Covers control-server request authorization and body parsing.
 #[cfg(test)]
 mod tests {
-    use super::{ControlAction, authorize};
+    use super::{authorize, ControlAction};
 
     /// Verifies a matching bearer token authorizes the request.
     #[test]

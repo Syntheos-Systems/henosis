@@ -40,6 +40,7 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// Converts the circuit state between its typed and atomic representations.
 impl CircuitState {
     /// Parse the atomic `u8` constant back into a `CircuitState`.
     fn from_u8(v: u8) -> Self {
@@ -71,11 +72,22 @@ pub struct CircuitConfig {
     pub half_open_max: u32,
 }
 
+/// Loads circuit-breaker defaults with optional environment overrides.
 impl Default for CircuitConfig {
     /// Read tunables from environment variables, falling back to plan defaults.
     fn default() -> Self {
-        let env_u32 = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let env_u32 = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let env_u64 = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         Self {
             failure_threshold: env_u32("HERMES_CIRCUIT_FAILURE_THRESHOLD", 5),
             recovery_timeout_ms: env_u64("HERMES_CIRCUIT_RECOVERY_MS", 60_000),
@@ -108,6 +120,7 @@ enum Transition {
     HalfOpen,
 }
 
+/// Exposes stable labels for circuit state transitions.
 impl Transition {
     /// Axon action string for this transition.
     fn action(self) -> &'static str {
@@ -141,6 +154,7 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+/// Implements circuit admission decisions and success or failure transitions.
 impl CircuitBreaker {
     /// Construct a new breaker in the Closed state with the given config.
     fn new(cfg: CircuitConfig) -> Self {
@@ -166,7 +180,12 @@ impl CircuitBreaker {
                     // First caller past the window flips Open -> HalfOpen.
                     if self
                         .state
-                        .compare_exchange(STATE_OPEN, STATE_HALF_OPEN, Ordering::SeqCst, Ordering::SeqCst)
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
                         .is_ok()
                     {
                         self.half_open_calls.store(0, Ordering::SeqCst);
@@ -176,7 +195,12 @@ impl CircuitBreaker {
                     }
                 } else {
                     let eta = (self.cfg.recovery_timeout_ms as i64 - elapsed).max(0) as u64;
-                    (CircuitDecision::Rejected { recovery_eta_ms: eta }, None)
+                    (
+                        CircuitDecision::Rejected {
+                            recovery_eta_ms: eta,
+                        },
+                        None,
+                    )
                 }
             }
         }
@@ -270,6 +294,7 @@ pub struct CircuitRegistry {
     http: reqwest::Client,
 }
 
+/// Manages provider-scoped circuit breakers and their aggregate status.
 impl CircuitRegistry {
     /// Construct a new registry reading config and `AXON_URL` from the
     /// environment.
@@ -331,9 +356,7 @@ impl CircuitRegistry {
             .lock()
             .expect("circuit map poisoned")
             .values()
-            .filter(|b| {
-                CircuitState::from_u8(b.state.load(Ordering::SeqCst)) == CircuitState::Open
-            })
+            .filter(|b| CircuitState::from_u8(b.state.load(Ordering::SeqCst)) == CircuitState::Open)
             .count()
     }
 
@@ -367,6 +390,7 @@ impl CircuitRegistry {
     }
 }
 
+/// Creates a registry using the default circuit configuration.
 impl Default for CircuitRegistry {
     /// Delegates to [`CircuitRegistry::new`].
     fn default() -> Self {
@@ -456,7 +480,11 @@ fn validation_error_response(
 }
 
 /// Structured fast-fail response when a provider's circuit is open.
-pub fn circuit_open_response(tool_id: &str, provider: &str, recovery_eta_ms: u64) -> InvokeResponse {
+pub fn circuit_open_response(
+    tool_id: &str,
+    provider: &str,
+    recovery_eta_ms: u64,
+) -> InvokeResponse {
     InvokeResponse {
         tool_id: tool_id.to_string(),
         success: false,
@@ -471,10 +499,12 @@ pub fn circuit_open_response(tool_id: &str, provider: &str, recovery_eta_ms: u64
     }
 }
 
+/// Unit tests for circuit transitions, recovery, and failure classification.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Builds a circuit breaker with concise test-specific thresholds.
     fn breaker(threshold: u32, recovery_ms: u64) -> CircuitBreaker {
         CircuitBreaker::new(CircuitConfig {
             failure_threshold: threshold,
@@ -483,6 +513,7 @@ mod tests {
         })
     }
 
+    /// Verifies a closed circuit trips only at its failure threshold.
     #[test]
     fn closed_allows_until_threshold() {
         let b = breaker(3, 60_000);
@@ -494,6 +525,7 @@ mod tests {
         assert!(matches!(b.decide().0, CircuitDecision::Rejected { .. }));
     }
 
+    /// Verifies a successful request clears accumulated failures.
     #[test]
     fn success_resets_failures() {
         let b = breaker(2, 60_000);
@@ -504,6 +536,7 @@ mod tests {
         assert_eq!(b.decide().0, CircuitDecision::Allowed);
     }
 
+    /// Verifies an open circuit enters half-open after its recovery window.
     #[test]
     fn open_transitions_to_half_open_after_recovery() {
         let b = breaker(1, 0); // trip on first failure, instant recovery window
@@ -517,6 +550,7 @@ mod tests {
         assert!(matches!(b.decide().0, CircuitDecision::Rejected { .. }));
     }
 
+    /// Verifies a failed half-open probe reopens the circuit.
     #[test]
     fn half_open_failure_reopens() {
         let b = breaker(1, 0);
@@ -526,6 +560,7 @@ mod tests {
         assert!(matches!(t, Some(Transition::Opened)));
     }
 
+    /// Verifies a successful half-open probe closes the circuit.
     #[test]
     fn half_open_success_closes() {
         let b = breaker(1, 0);
@@ -536,6 +571,7 @@ mod tests {
         assert_eq!(b.decide().0, CircuitDecision::Allowed);
     }
 
+    /// Verifies transport and upstream server failures count against circuits.
     #[test]
     fn classifies_provider_failures() {
         let unreachable = InvokeResponse {

@@ -129,9 +129,7 @@ impl ApprovalRegistry {
     pub fn approve_and_take(&self, id: ProposalId) -> Option<PendingProposal> {
         let mut guard = self.inner.lock().expect("approval registry mutex poisoned");
         match guard.get(&id) {
-            Some(e) if e.state == ProposalState::Pending => {
-                guard.remove(&id).map(|e| e.proposal)
-            }
+            Some(e) if e.state == ProposalState::Pending => guard.remove(&id).map(|e| e.proposal),
             _ => None,
         }
     }
@@ -370,7 +368,10 @@ mod tests {
         let _ = reg.insert_for_test(proposal(13));
         let _ = reg.approve(ProposalId(13));
 
-        assert!(reg.reject(ProposalId(13)), "held approval must be rejectable");
+        assert!(
+            reg.reject(ProposalId(13)),
+            "held approval must be rejectable"
+        );
         assert!(reg.list().is_empty());
         // Nothing left to flush on unpause -- the rejection stuck.
         assert!(reg.take_approved().is_empty());
@@ -503,7 +504,10 @@ mod tests {
         let _ = reg.insert_for_test(proposal(32));
         let _ = reg.approve(ProposalId(32));
 
-        assert_eq!(decide_drain_action(true, &reg, ProposalId(32)), DrainAction::Hold);
+        assert_eq!(
+            decide_drain_action(true, &reg, ProposalId(32)),
+            DrainAction::Hold
+        );
         assert_eq!(reg.take_approved().len(), 1, "unpause flush claims it");
 
         assert_eq!(

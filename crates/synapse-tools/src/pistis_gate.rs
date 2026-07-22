@@ -387,13 +387,13 @@ pub mod henosis {
     use std::sync::Arc;
 
     use henosis_pistis::authority::{
-        authorize_capabilities, CapabilityCheckRequest, CapabilityRequirement,
+        CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities,
     };
     use henosis_pistis::model::ActionKind;
     use henosis_pistis::{Clock, RoomStateSource, SystemClock};
     use syntheos_contracts::PrincipalId;
 
-    use super::{capability_map, AuthorizationOutcome, Capability, PistisAuthority};
+    use super::{AuthorizationOutcome, Capability, PistisAuthority, capability_map};
 
     /// Capability authority backed by in-process henosis-pistis room state.
     ///

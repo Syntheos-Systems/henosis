@@ -145,14 +145,12 @@ pub async fn store_refresh_token(
     token_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(user_id)
-    .bind(token_hash)
-    .bind(expires_at)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)")
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -387,13 +385,11 @@ pub async fn get_member(
     server_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<Member>, sqlx::Error> {
-    sqlx::query_as::<_, Member>(
-        "SELECT * FROM members WHERE server_id = $1 AND user_id = $2",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, Member>("SELECT * FROM members WHERE server_id = $1 AND user_id = $2")
+        .bind(server_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// List a server's members joined with their user rows (emails scrubbed).
@@ -465,18 +461,13 @@ struct MemberWithUser {
 }
 
 /// True when the user has a membership row in the server.
-pub async fn is_member(
-    pool: &PgPool,
-    server_id: Uuid,
-    user_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM members WHERE server_id = $1 AND user_id = $2",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn is_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT COUNT(*) FROM members WHERE server_id = $1 AND user_id = $2")
+            .bind(server_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|r| r.0 > 0).unwrap_or(false))
 }
 
@@ -491,12 +482,11 @@ pub async fn create_channel(
     channel_type: &str,
 ) -> Result<Channel, sqlx::Error> {
     // Get next position
-    let pos: Option<(i32,)> = sqlx::query_as(
-        "SELECT COALESCE(MAX(position), -1) FROM channels WHERE server_id = $1",
-    )
-    .bind(server_id)
-    .fetch_optional(pool)
-    .await?;
+    let pos: Option<(i32,)> =
+        sqlx::query_as("SELECT COALESCE(MAX(position), -1) FROM channels WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await?;
     let position = pos.map(|r| r.0 + 1).unwrap_or(0);
 
     sqlx::query_as::<_, Channel>(
@@ -526,12 +516,10 @@ pub async fn get_server_channels(
     pool: &PgPool,
     server_id: Uuid,
 ) -> Result<Vec<Channel>, sqlx::Error> {
-    sqlx::query_as::<_, Channel>(
-        "SELECT * FROM channels WHERE server_id = $1 ORDER BY position",
-    )
-    .bind(server_id)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE server_id = $1 ORDER BY position")
+        .bind(server_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// Patch channel name, topic, and position; absent fields keep their values.
@@ -811,10 +799,7 @@ pub async fn create_role(
 }
 
 /// Insert the @everyone default role with baseline permissions.
-pub async fn create_default_role(
-    pool: &PgPool,
-    server_id: Uuid,
-) -> Result<Role, sqlx::Error> {
+pub async fn create_default_role(pool: &PgPool, server_id: Uuid) -> Result<Role, sqlx::Error> {
     use crate::models::permissions::perms;
     sqlx::query_as::<_, Role>(
         r#"INSERT INTO roles (server_id, name, color, permissions, position, is_default)
@@ -837,12 +822,10 @@ pub async fn get_role_by_id(pool: &PgPool, role_id: Uuid) -> Result<Option<Role>
 
 /// List a server's roles in position order.
 pub async fn get_server_roles(pool: &PgPool, server_id: Uuid) -> Result<Vec<Role>, sqlx::Error> {
-    sqlx::query_as::<_, Role>(
-        "SELECT * FROM roles WHERE server_id = $1 ORDER BY position",
-    )
-    .bind(server_id)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Role>("SELECT * FROM roles WHERE server_id = $1 ORDER BY position")
+        .bind(server_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// Patch role name, color, permissions, and position; absent fields keep their values.
@@ -905,13 +888,12 @@ pub async fn get_member_role_ids(
     server_id: Uuid,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT role_id FROM member_roles WHERE server_id = $1 AND user_id = $2",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT role_id FROM member_roles WHERE server_id = $1 AND user_id = $2")
+            .bind(server_id)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
@@ -922,14 +904,12 @@ pub async fn remove_role_from_member(
     user_id: Uuid,
     role_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .bind(role_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3")
+        .bind(server_id)
+        .bind(user_id)
+        .bind(role_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -942,9 +922,10 @@ pub async fn get_member_permissions(
     // Owner has all permissions
     let server = get_server_by_id(pool, server_id).await?;
     if let Some(s) = &server
-        && s.owner_id == user_id {
-            return Ok(i64::MAX); // all bits set
-        }
+        && s.owner_id == user_id
+    {
+        return Ok(i64::MAX); // all bits set
+    }
 
     // Union of: default role permissions + all assigned role permissions
     let row: Option<(i64,)> = sqlx::query_as(
@@ -1058,10 +1039,9 @@ pub async fn get_or_create_dm_channel(
     }
 
     // Create new DM channel
-    let row: (Uuid,) =
-        sqlx::query_as("INSERT INTO dm_channels DEFAULT VALUES RETURNING id")
-            .fetch_one(pool)
-            .await?;
+    let row: (Uuid,) = sqlx::query_as("INSERT INTO dm_channels DEFAULT VALUES RETURNING id")
+        .fetch_one(pool)
+        .await?;
 
     sqlx::query("INSERT INTO dm_participants (dm_channel_id, user_id) VALUES ($1, $2), ($1, $3)")
         .bind(row.0)
@@ -1077,7 +1057,18 @@ pub async fn get_or_create_dm_channel(
 pub async fn get_user_dm_channels(
     pool: &PgPool,
     user_id: Uuid,
-) -> Result<Vec<(Uuid, Uuid, String, Option<String>, Option<String>, String, bool)>, sqlx::Error> {
+) -> Result<
+    Vec<(
+        Uuid,
+        Uuid,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        bool,
+    )>,
+    sqlx::Error,
+> {
     // Returns: (dm_channel_id, other_user_id, username, display_name, avatar_url, status, is_agent)
     sqlx::query_as(
         r#"SELECT dp1.dm_channel_id, dp2.user_id, u.username, u.display_name, u.avatar_url,
@@ -1196,21 +1187,18 @@ pub async fn is_dm_participant(
 
 /// Set the bridge paused state in the bridge_state table.
 pub async fn set_bridge_paused(pool: &PgPool, paused: bool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE bridge_state SET value = $1, updated_at = NOW() WHERE key = 'paused'"
-    )
-    .bind(paused.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE bridge_state SET value = $1, updated_at = NOW() WHERE key = 'paused'")
+        .bind(paused.to_string())
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 /// Check if the bridge is currently paused.
 pub async fn is_bridge_paused(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT value FROM bridge_state WHERE key = 'paused'"
-    )
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM bridge_state WHERE key = 'paused'")
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|r| r.0 == "true").unwrap_or(false))
 }

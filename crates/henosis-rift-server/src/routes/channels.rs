@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -24,7 +24,9 @@ pub async fn create_channel(
 
     let name = req.name.trim();
     if name.is_empty() || name.len() > 100 {
-        return Err(AppError::BadRequest("Channel name must be 1-100 characters".into()));
+        return Err(AppError::BadRequest(
+            "Channel name must be 1-100 characters".into(),
+        ));
     }
 
     let channel_type = req.channel_type.as_deref().unwrap_or("text");
@@ -67,7 +69,13 @@ pub async fn update_channel(
         .await?
         .ok_or(AppError::NotFound("Channel not found".into()))?;
 
-    require_permission(&pool, channel.server_id, auth.user_id, perms::MANAGE_CHANNELS).await?;
+    require_permission(
+        &pool,
+        channel.server_id,
+        auth.user_id,
+        perms::MANAGE_CHANNELS,
+    )
+    .await?;
 
     let updated = db::update_channel(
         &pool,
@@ -92,7 +100,13 @@ pub async fn delete_channel(
         .await?
         .ok_or(AppError::NotFound("Channel not found".into()))?;
 
-    require_permission(&pool, channel.server_id, auth.user_id, perms::MANAGE_CHANNELS).await?;
+    require_permission(
+        &pool,
+        channel.server_id,
+        auth.user_id,
+        perms::MANAGE_CHANNELS,
+    )
+    .await?;
 
     let server_id = channel.server_id;
     db::delete_channel(&pool, channel_id).await?;
@@ -117,6 +131,7 @@ async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result
     Ok(())
 }
 
+/// Requires channel access membership and the specified server permission.
 async fn require_permission(
     pool: &PgPool,
     server_id: Uuid,

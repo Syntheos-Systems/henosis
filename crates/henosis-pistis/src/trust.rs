@@ -234,13 +234,10 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let mut s = admitted_state(&[target]);
         // Bypass record_outcome's drop to prove compute_trust also skips it.
-        s.outcomes_by_target.entry(target).or_default().push(outcome(
-            target,
-            target,
-            Outcome::Success,
-            10,
-            now,
-        ));
+        s.outcomes_by_target
+            .entry(target)
+            .or_default()
+            .push(outcome(target, target, Outcome::Success, 10, now));
         assert!((compute_trust(&s, &target, now) - NEUTRAL_TRUST).abs() < 1e-9);
     }
 

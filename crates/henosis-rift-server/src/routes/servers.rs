@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -12,7 +12,9 @@ use crate::error::AppError;
 use crate::models::channel::Channel;
 use crate::models::permissions::perms;
 use crate::models::role::Role;
-use crate::models::server::{CreateInviteRequest, CreateServerRequest, Invite, Server, UpdateServerRequest};
+use crate::models::server::{
+    CreateInviteRequest, CreateServerRequest, Invite, Server, UpdateServerRequest,
+};
 use crate::models::user::PublicUser;
 
 /// Server response enriched with its visible channels and roles.
@@ -40,7 +42,9 @@ pub async fn create_server(
 ) -> Result<Json<ServerWithChannels>, AppError> {
     let name = req.name.trim();
     if name.is_empty() || name.len() > 100 {
-        return Err(AppError::BadRequest("Server name must be 1-100 characters".into()));
+        return Err(AppError::BadRequest(
+            "Server name must be 1-100 characters".into(),
+        ));
     }
 
     let server = db::create_server(&pool, name, req.description.as_deref(), auth.user_id).await?;
@@ -185,9 +189,15 @@ pub async fn create_invite(
         .expires_in_hours
         .map(|h| chrono::Utc::now() + chrono::Duration::hours(h));
 
-    let invite =
-        db::create_invite(&pool, server_id, auth.user_id, &code, req.max_uses, expires_at)
-            .await?;
+    let invite = db::create_invite(
+        &pool,
+        server_id,
+        auth.user_id,
+        &code,
+        req.max_uses,
+        expires_at,
+    )
+    .await?;
 
     Ok(Json(invite))
 }
@@ -204,15 +214,17 @@ pub async fn join_via_invite(
 
     // Check expiry
     if let Some(expires) = invite.expires_at
-        && expires < chrono::Utc::now() {
-            return Err(AppError::BadRequest("Invite expired".into()));
-        }
+        && expires < chrono::Utc::now()
+    {
+        return Err(AppError::BadRequest("Invite expired".into()));
+    }
 
     // Check max uses
     if let Some(max) = invite.max_uses
-        && invite.uses >= max {
-            return Err(AppError::BadRequest("Invite has reached max uses".into()));
-        }
+        && invite.uses >= max
+    {
+        return Err(AppError::BadRequest("Invite has reached max uses".into()));
+    }
 
     // Check if already a member
     if db::is_member(&pool, invite.server_id, auth.user_id).await? {

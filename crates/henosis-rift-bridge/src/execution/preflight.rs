@@ -46,7 +46,10 @@ pub fn health_preflight(status: HealthStatus) -> Preflight {
 /// (already on `sandbox`) and the executor's declared `max_runtime_secs`, so an
 /// executor may self-limit but never exceed the operator ceiling. A policy of
 /// `0` (no executor-declared limit) leaves the operator value untouched.
-pub fn apply_runtime_policy(mut sandbox: ExecutionSandbox, policy: &ExecutionSandbox) -> ExecutionSandbox {
+pub fn apply_runtime_policy(
+    mut sandbox: ExecutionSandbox,
+    policy: &ExecutionSandbox,
+) -> ExecutionSandbox {
     if policy.max_runtime_secs > 0 {
         sandbox.max_runtime_secs = if sandbox.max_runtime_secs == 0 {
             // Operator set no limit; adopt the executor's declared ceiling.
@@ -58,6 +61,7 @@ pub fn apply_runtime_policy(mut sandbox: ExecutionSandbox, policy: &ExecutionSan
     sandbox
 }
 
+/// Unit tests for execution readiness and concurrency policy.
 #[cfg(test)]
 mod tests {
     use super::*;

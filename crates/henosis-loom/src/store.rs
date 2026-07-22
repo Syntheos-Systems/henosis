@@ -2024,10 +2024,7 @@ mod tests {
         );
 
         // Create a run: the engine starts the step (no executor claims it, so it stays Running).
-        let run = store
-            .create_run(principal, wf.id, None)
-            .await
-            .expect("run");
+        let run = store.create_run(principal, wf.id, None).await.expect("run");
         assert_eq!(run.status, RunStatus::Running, "waiting on unclaimed step");
 
         // Verify the step instance row carries the hephaestus token.

@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::WorkspaceConfig;
+use crate::execution::approval::ApprovalRegistry;
 use crate::execution::preflight::{apply_runtime_policy, health_preflight, Preflight};
 use crate::execution::sandbox::{resolve_workspace, SandboxManager};
 use crate::execution::supervisor::{ExecutionSupervisor, SupervisedTask};
-use crate::execution::approval::ApprovalRegistry;
 use crate::execution::PendingProposal;
 use crate::executor::AgentExecutor;
 use crate::kleos::KleosClient;

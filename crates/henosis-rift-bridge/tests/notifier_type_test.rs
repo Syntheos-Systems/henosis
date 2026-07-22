@@ -58,10 +58,7 @@ async fn serve_recorder(port: u16) -> Recorded {
 async fn notifier_posts_system_typed_messages() {
     let rec = serve_recorder(39221).await;
 
-    let auth = AgentAuthManager::new(
-        "test-secret".to_string(),
-        "test-bridge-secret".to_string(),
-    );
+    let auth = AgentAuthManager::new("test-secret".to_string(), "test-bridge-secret".to_string());
     let rift = Arc::new(RiftRestClient::new(
         "http://127.0.0.1:39221".to_string(),
         auth,
@@ -80,7 +77,10 @@ async fn notifier_posts_system_typed_messages() {
 
     let bodies = rec.lock().unwrap();
     assert_eq!(bodies.len(), 1, "exactly one message must be posted");
-    assert_eq!(bodies[0]["content"], "[EXEC] proposal approved, starting task");
+    assert_eq!(
+        bodies[0]["content"],
+        "[EXEC] proposal approved, starting task"
+    );
     assert_eq!(
         bodies[0]["message_type"], "system",
         "execution notices must be stamped 'system' on the wire"

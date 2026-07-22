@@ -39,7 +39,6 @@ use tokio::sync::Semaphore;
 // embedding applications (syntheos-server, henosis-rift-bridge) can construct
 // requests and read results through `henosis_cognition::*` without taking a
 // direct dependency on the vendored `kleos-lib`.
-pub use kleos_lib::Result as KleosResult;
 pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
 pub use kleos_lib::context::types::{ContextOptions, ContextResult};
 pub use kleos_lib::embeddings::EmbeddingProvider;
@@ -66,6 +65,7 @@ pub use kleos_lib::skills::{
     CreateSkillRequest, EvolutionFeedRow, ExecutionRecord, Skill, SkillJudgment, SkillKind,
     ToolQuality, UpdateSkillRequest,
 };
+pub use kleos_lib::Result as KleosResult;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -1006,12 +1006,10 @@ mod tests {
             .forge_session_learn("db key must use uuid not name".into(), None, None, None)
             .await
             .expect("forge_session_learn");
-        assert!(
-            learned["id"]
-                .as_str()
-                .expect("learn id")
-                .starts_with("learn_")
-        );
+        assert!(learned["id"]
+            .as_str()
+            .expect("learn id")
+            .starts_with("learn_"));
     }
 
     /// Intelligence pass-throughs smoke test: memory_health and contradiction scan succeed on empty DB.
@@ -1247,13 +1245,11 @@ mod tests {
             .scratchpad_delete_session("shared-session")
             .await
             .expect("first user delete");
-        assert!(
-            first
-                .scratchpad_list(None, None, Some("shared-session"))
-                .await
-                .expect("first user list")
-                .is_empty()
-        );
+        assert!(first
+            .scratchpad_list(None, None, Some("shared-session"))
+            .await
+            .expect("first user list")
+            .is_empty());
         assert_eq!(
             second
                 .scratchpad_list(None, None, Some("shared-session"))

@@ -83,6 +83,7 @@ pub struct HumanApprovalRequested {
     pub prompt: String,
 }
 
+/// Declares the Axon routing metadata for human approval requests.
 impl TypedEvent for HumanApprovalRequested {
     const CHANNEL: &'static str = HUMAN_CHANNEL;
     const KIND: &'static str = "human.approval.requested";
@@ -96,6 +97,7 @@ pub struct HumanGate {
     bus: Arc<AxonBus>,
 }
 
+/// Builds the human gate and derives approval prompts from invocations.
 impl HumanGate {
     /// Build the gate over an approval channel and the Axon bus.
     pub fn new(approver: Arc<dyn Approver>, bus: Arc<AxonBus>) -> Self {
@@ -132,6 +134,7 @@ impl HumanGate {
 }
 
 #[async_trait]
+/// Enforces declared human approval requirements in the dispatcher gate chain.
 impl Gate for HumanGate {
     /// The canonical authority name for this slot.
     fn name(&self) -> &str {
@@ -183,6 +186,7 @@ impl Gate for HumanGate {
     }
 }
 
+/// Unit tests for human approval requirements and decisions.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +195,9 @@ mod tests {
     /// An approver that always returns a fixed decision.
     struct FixedApprover(ApprovalDecision);
     #[async_trait]
+    /// Returns the fixed decision configured by each test.
     impl Approver for FixedApprover {
+        /// Supplies the configured approval decision without external input.
         async fn await_decision(&self, _request: &ApprovalRequest) -> ApprovalDecision {
             self.0.clone()
         }
@@ -310,7 +316,10 @@ mod tests {
             Box::new(StubGate::new("pistis")),
             Box::new(StubGate::new("plutus")),
             Box::new(StubGate::new("eidolon")),
-            Box::new(HumanGate::new(Arc::new(FixedApprover(decision)), bus.clone())),
+            Box::new(HumanGate::new(
+                Arc::new(FixedApprover(decision)),
+                bus.clone(),
+            )),
             Box::new(StubGate::new("phylax")),
         ];
         Dispatcher::new(gates, Box::new(EchoExecutor), bus).expect("canonical chain")

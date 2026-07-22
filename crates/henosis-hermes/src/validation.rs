@@ -20,6 +20,7 @@ pub struct FieldError {
     pub message: String,
 }
 
+/// Constructs field-level validation errors.
 impl FieldError {
     /// Construct a new field error.
     fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
@@ -43,7 +44,10 @@ pub fn validate(schema: &Value, instance: &Value) -> Result<(), Vec<FieldError>>
         Value::Object(m) => m,
         Value::Null => &empty,
         _ => {
-            return Err(vec![FieldError::new("(root)", "args must be a JSON object")]);
+            return Err(vec![FieldError::new(
+                "(root)",
+                "args must be a JSON object",
+            )]);
         }
     };
 
@@ -94,7 +98,10 @@ fn check_property(name: &str, subschema: &Value, value: &Value, errors: &mut Vec
         if expected == "array" {
             if let (Some(arr), Some(item_ty)) = (
                 value.as_array(),
-                subschema.get("items").and_then(|i| i.get("type")).and_then(|t| t.as_str()),
+                subschema
+                    .get("items")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str()),
             ) {
                 for (idx, el) in arr.iter().enumerate() {
                     if !type_matches(item_ty, el) {
@@ -112,7 +119,11 @@ fn check_property(name: &str, subschema: &Value, value: &Value, errors: &mut Vec
         if !allowed.iter().any(|a| a == value) {
             let opts: Vec<String> = allowed
                 .iter()
-                .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))
+                .map(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string())
+                })
                 .collect();
             errors.push(FieldError::new(
                 name,
@@ -138,11 +149,13 @@ fn type_matches(expected: &str, value: &Value) -> bool {
     }
 }
 
+/// Unit tests for the supported JSON Schema validation subset.
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Builds the shared object schema used by validation tests.
     fn schema() -> Value {
         json!({
             "type": "object",
@@ -156,12 +169,14 @@ mod tests {
         })
     }
 
+    /// Verifies a fully valid object is accepted.
     #[test]
     fn accepts_valid() {
         let ok = json!({ "name": "x", "count": 3, "mode": "a", "tags": ["p", "q"] });
         assert!(validate(&schema(), &ok).is_ok());
     }
 
+    /// Verifies absent required fields are reported.
     #[test]
     fn reports_missing_required() {
         let bad = json!({ "name": "x" });
@@ -169,6 +184,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "count"));
     }
 
+    /// Verifies null does not satisfy a required field.
     #[test]
     fn null_required_is_missing() {
         let bad = json!({ "name": "x", "count": null });
@@ -176,6 +192,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "count"));
     }
 
+    /// Verifies properties with the wrong JSON type are rejected.
     #[test]
     fn rejects_wrong_type() {
         let bad = json!({ "name": 5, "count": 3 });
@@ -183,6 +200,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "name"));
     }
 
+    /// Verifies fractional numbers do not satisfy integer fields.
     #[test]
     fn integer_rejects_float() {
         let bad = json!({ "name": "x", "count": 1.5 });
@@ -190,6 +208,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "count"));
     }
 
+    /// Verifies string enum constraints are enforced.
     #[test]
     fn enforces_enum() {
         let bad = json!({ "name": "x", "count": 1, "mode": "z" });
@@ -197,6 +216,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "mode"));
     }
 
+    /// Verifies array elements are checked against the declared item type.
     #[test]
     fn checks_array_item_types() {
         let bad = json!({ "name": "x", "count": 1, "tags": ["ok", 7] });
@@ -204,12 +224,14 @@ mod tests {
         assert!(errs.iter().any(|e| e.field == "tags[1]"));
     }
 
+    /// Verifies null input behaves like an empty object when no fields are required.
     #[test]
     fn null_instance_is_empty_object() {
         let no_required = json!({ "type": "object", "properties": { "q": { "type": "string" } } });
         assert!(validate(&no_required, &Value::Null).is_ok());
     }
 
+    /// Verifies unsupported top-level schema types pass through unchanged.
     #[test]
     fn non_object_schema_passes() {
         assert!(validate(&json!({ "type": "string" }), &json!("anything")).is_ok());

@@ -579,11 +579,9 @@ mod tests {
             auth_token: "control-token-that-is-at-least-32-bytes".to_string(),
             allow_insecure_remote: false,
         };
-        assert!(
-            control
-                .validate(&["another-strong-secret-value-here"])
-                .is_ok()
-        );
+        assert!(control
+            .validate(&["another-strong-secret-value-here"])
+            .is_ok());
     }
 
     /// Verifies remote listeners and unsafe tokens fail closed.

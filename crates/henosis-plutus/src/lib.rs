@@ -23,19 +23,19 @@ pub mod rbac;
 pub mod store;
 
 pub use action_map::{map_invocation, ActionClass};
-pub use backend::{OrgStatus, PolicyBackend};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use backend::MockPolicyBackend;
+pub use backend::{OrgStatus, PolicyBackend};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use billing::sign_stripe_payload;
 pub use billing::{
     apply_decision, decide, parse_event, verify_stripe_signature, BillingDecision,
     BillingEventRecord, BillingOutcome, DecideError, Entitlement, EntitlementSource,
     EntitlementStatus, SignatureError, StripeEvent, DEFAULT_TOLERANCE_SECS,
 };
 #[cfg(any(test, feature = "test-helpers"))]
-pub use billing::sign_stripe_payload;
-pub use gate::{Clock, PlutusGate, WallClock};
-#[cfg(any(test, feature = "test-helpers"))]
 pub use gate::FrozenClock;
+pub use gate::{Clock, PlutusGate, WallClock};
 pub use quota::{QuotaConfig, QuotaDimension, QuotaOutcome, QuotaTier};
 pub use rbac::{can, Permission, Role};
 pub use store::PlutusStore;
@@ -73,6 +73,7 @@ impl From<sqlx::migrate::MigrateError> for PlutusError {
 /// The crate-level result type.
 pub type Result<T> = std::result::Result<T, PlutusError>;
 
+/// Unit tests for Plutus policy backend composition.
 #[cfg(test)]
 mod tests {
     /// The crate is wired into the workspace and its error type constructs correctly.

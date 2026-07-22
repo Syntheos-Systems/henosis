@@ -141,6 +141,7 @@ pub fn can(role: Role, perm: Permission) -> bool {
     }
 }
 
+/// Unit tests for role permissions and access checks.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +184,13 @@ mod tests {
     /// Role round-trips through its text form.
     #[test]
     fn role_roundtrip() {
-        for role in [Role::Owner, Role::Admin, Role::Member, Role::Viewer, Role::Billing] {
+        for role in [
+            Role::Owner,
+            Role::Admin,
+            Role::Member,
+            Role::Viewer,
+            Role::Billing,
+        ] {
             let s = role.to_string();
             let back: Role = s.parse().expect("valid role");
             assert_eq!(role, back);

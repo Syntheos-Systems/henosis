@@ -4,15 +4,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -117,6 +117,7 @@ pub struct TaskStore {
     resume_senders: RwLock<HashMap<String, oneshot::Sender<Option<String>>>>,
 }
 
+/// Provides concurrent task record and resume-sender operations.
 impl TaskStore {
     /// Insert or replace a task record.
     pub async fn insert(&self, rec: TaskRecord) {
@@ -228,6 +229,7 @@ async fn setup_task(
     let _ = state.streams.sink(id).await;
 }
 
+/// Drives one prepared task through the orchestrator and records its terminal state.
 async fn execute_task(
     state: AppState,
     id: String,
@@ -237,7 +239,16 @@ async fn execute_task(
     body: CreateTaskBody,
 ) {
     setup_task(&state, &id, agent, &project, &title, &body).await;
-    run_task(state, id, project, title, body.tenant_id, body.system, body.input).await;
+    run_task(
+        state,
+        id,
+        project,
+        title,
+        body.tenant_id,
+        body.system,
+        body.input,
+    )
+    .await;
 }
 
 /// Submit a task and run it to a terminal state in-process, returning the final [`TaskRecord`].
@@ -270,7 +281,10 @@ pub async fn run_task_to_completion(
 
     let cfg = state.clients.config();
     let id = Uuid::new_v4().to_string();
-    let agent = body.agent.clone().unwrap_or_else(|| cfg.chiasm_agent.clone());
+    let agent = body
+        .agent
+        .clone()
+        .unwrap_or_else(|| cfg.chiasm_agent.clone());
     let project = body
         .project
         .clone()
@@ -323,7 +337,10 @@ pub async fn create_task(
 
     let cfg = state.clients.config();
     let id = Uuid::new_v4().to_string();
-    let agent = body.agent.clone().unwrap_or_else(|| cfg.chiasm_agent.clone());
+    let agent = body
+        .agent
+        .clone()
+        .unwrap_or_else(|| cfg.chiasm_agent.clone());
     let project = body
         .project
         .clone()
@@ -395,14 +412,10 @@ pub async fn resume_task(
         ));
     }
 
-    let sender = state
-        .store
-        .take_sender(&id)
-        .await
-        .ok_or((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "no pending pause for this task" })),
-        ))?;
+    let sender = state.store.take_sender(&id).await.ok_or((
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "no pending pause for this task" })),
+    ))?;
 
     let human_input = body.and_then(|b| b.0.input);
     // If send fails the task has already moved on; ignore the error.
@@ -410,7 +423,10 @@ pub async fn resume_task(
 
     // Return the current record (status will flip to running asynchronously).
     let updated = state.store.get(&id).await.unwrap_or(rec);
-    Ok((StatusCode::OK, Json(json!({ "task_id": id, "status": updated.status }))))
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "task_id": id, "status": updated.status })),
+    ))
 }
 
 /// Spawn a fresh executor loop for a newly-created task. Creates the Chiasm
@@ -461,16 +477,7 @@ async fn run_task(
         .await;
 
     run_task_loop(
-        state,
-        id,
-        project,
-        chiasm_id,
-        tenant_id,
-        system,
-        input,
-        tools,
-        max_turns,
-        llm_result,
+        state, id, project, chiasm_id, tenant_id, system, input, tools, max_turns, llm_result,
         false,
     )
     .await;
@@ -565,9 +572,7 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
         .await;
     } else {
         info!(task_id = %id, "resuming Running task from checkpoint");
-        store
-            .update(&id, |r| r.status = TaskStatus::Running)
-            .await;
+        store.update(&id, |r| r.status = TaskStatus::Running).await;
         let sink = state.streams.sink(&id).await;
         let llm_result = clients
             .anthropic_resume(
@@ -627,10 +632,7 @@ async fn run_task_loop(
 
                 // Run the optional agent-forge `verify` gate before marking
                 // Complete. If verify fails the task is Failed, not Completed.
-                let verify_command = store
-                    .get(&id)
-                    .await
-                    .and_then(|r| r.verify_command.clone());
+                let verify_command = store.get(&id).await.and_then(|r| r.verify_command.clone());
                 let verify_passed = match verify_command.as_deref() {
                     Some(cmd) if clients.config().agent_forge_enabled => {
                         let ok = clients.agent_forge().verify(cmd).await;

@@ -2,9 +2,9 @@
 //! Secured via a dedicated bridge secret passed as a Bearer token.
 
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -301,12 +301,9 @@ mod tests {
     #[test]
     fn human_jwt_is_rejected() {
         let config = config_with_secret("super-secret");
-        let token = crate::auth::jwt::create_access_token(
-            uuid::Uuid::new_v4(),
-            "alice",
-            "super-secret",
-        )
-        .expect("encode");
+        let token =
+            crate::auth::jwt::create_access_token(uuid::Uuid::new_v4(), "alice", "super-secret")
+                .expect("encode");
         let headers = headers_with_auth(&format!("Bearer {token}"));
         assert!(!bridge_authorized(&headers, &config));
     }
@@ -316,8 +313,14 @@ mod tests {
     fn missing_and_malformed_headers_are_rejected() {
         let config = config_with_secret("super-secret");
         assert!(!bridge_authorized(&HeaderMap::new(), &config));
-        assert!(!bridge_authorized(&headers_with_auth("super-secret"), &config));
-        assert!(!bridge_authorized(&headers_with_auth("Basic super-secret"), &config));
+        assert!(!bridge_authorized(
+            &headers_with_auth("super-secret"),
+            &config
+        ));
+        assert!(!bridge_authorized(
+            &headers_with_auth("Basic super-secret"),
+            &config
+        ));
     }
 
     /// Agent emails are stamped with the agent domain, which is the marker that

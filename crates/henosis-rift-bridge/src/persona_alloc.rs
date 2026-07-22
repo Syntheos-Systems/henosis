@@ -183,7 +183,10 @@ fn allocate_from_ranked(
     challenger_slot: bool,
     seed: u64,
 ) -> Vec<ChosenPersona> {
-    debug_assert!(!ranked.is_empty(), "ranked candidate list must be non-empty");
+    debug_assert!(
+        !ranked.is_empty(),
+        "ranked candidate list must be non-empty"
+    );
 
     // Per-candidate assignment counts, parallel to `ranked`.
     let mut counts = vec![0usize; ranked.len()];
@@ -210,8 +213,7 @@ fn allocate_from_ranked(
 
     // --- Challenger: highest-ranked persona not in the consensus set. ---
     if challenger_slot {
-        let consensus_names: HashSet<&str> =
-            chosen.iter().map(|c| c.name.as_str()).collect();
+        let consensus_names: HashSet<&str> = chosen.iter().map(|c| c.name.as_str()).collect();
         let idx = ranked
             .iter()
             .position(|p| !consensus_names.contains(p.name.as_str()))
@@ -328,16 +330,67 @@ fn is_stopword(token: &str) -> bool {
     // Small, fixed stopword set covering frequent English filler plus rationale
     // boilerplate ("score", "persona", "match") that carries no interest signal.
     const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "with", "this", "that", "from", "into", "than", "then",
-        "are", "was", "were", "has", "have", "had", "not", "but", "its", "his", "her",
-        "you", "your", "our", "out", "all", "any", "can", "will", "would", "should",
-        "which", "while", "when", "where", "what", "who", "how", "why", "via", "per",
-        "score", "scored", "scores", "persona", "personas", "match", "matched",
-        "matches", "matching", "rank", "ranked", "task", "rationale", "best", "top",
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "from",
+        "into",
+        "than",
+        "then",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "had",
+        "not",
+        "but",
+        "its",
+        "his",
+        "her",
+        "you",
+        "your",
+        "our",
+        "out",
+        "all",
+        "any",
+        "can",
+        "will",
+        "would",
+        "should",
+        "which",
+        "while",
+        "when",
+        "where",
+        "what",
+        "who",
+        "how",
+        "why",
+        "via",
+        "per",
+        "score",
+        "scored",
+        "scores",
+        "persona",
+        "personas",
+        "match",
+        "matched",
+        "matches",
+        "matching",
+        "rank",
+        "ranked",
+        "task",
+        "rationale",
+        "best",
+        "top",
     ];
     STOPWORDS.contains(&token)
 }
 
+/// Unit tests for deterministic persona allocation and collision limits.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +446,10 @@ mod tests {
         let a = out.iter().filter(|c| c.name == "alpha").count();
         let b = out.iter().filter(|c| c.name == "beta").count();
         assert_eq!(a + b, 5);
-        assert!((a as i64 - b as i64).abs() <= 1, "fallback should balance load");
+        assert!(
+            (a as i64 - b as i64).abs() <= 1,
+            "fallback should balance load"
+        );
     }
 
     /// The challenger slot is the last agent and takes the top-ranked persona not
@@ -410,8 +466,7 @@ mod tests {
         // Exactly one challenger.
         assert_eq!(out.iter().filter(|c| c.is_challenger).count(), 1);
         // Challenger persona differs from the consensus persona.
-        let consensus: HashSet<&str> =
-            out[..2].iter().map(|c| c.name.as_str()).collect();
+        let consensus: HashSet<&str> = out[..2].iter().map(|c| c.name.as_str()).collect();
         assert!(
             !consensus.contains(out[2].name.as_str()),
             "challenger must differ from consensus"

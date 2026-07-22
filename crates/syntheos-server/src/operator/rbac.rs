@@ -34,6 +34,7 @@ pub struct OperatorAuth {
     pub role: Role,
 }
 
+/// Enforces endpoint permissions for an authenticated operator.
 impl OperatorAuth {
     /// Assert that the authenticated operator holds `perm`.
     ///
@@ -53,6 +54,7 @@ impl OperatorAuth {
     }
 }
 
+/// Extracts and validates operator identity and role claims from bearer tokens.
 impl FromRequestParts<OperatorState> for OperatorAuth {
     /// Authentication or authorization failures become [`OperatorError`] responses
     /// (401 for auth failures, 403 for permission denials).
@@ -88,7 +90,11 @@ impl FromRequestParts<OperatorState> for OperatorAuth {
         let role = Role::from_str(&claims.role)
             .map_err(|e| OperatorError::Auth(format!("invalid role in JWT: {e}")))?;
 
-        Ok(OperatorAuth { principal, org, role })
+        Ok(OperatorAuth {
+            principal,
+            org,
+            role,
+        })
     }
 }
 
