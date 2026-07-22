@@ -102,17 +102,23 @@ pub async fn update_user_email(
     Ok(())
 }
 
-/// Replace a user's password hash.
+/// Replace a user's password hash and revoke every refresh token atomically.
 pub async fn update_user_password(
     pool: &PgPool,
     user_id: Uuid,
     password_hash: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
         .bind(user_id)
         .bind(password_hash)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

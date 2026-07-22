@@ -1,3 +1,5 @@
+//! Authenticated Rift user-profile, password, avatar, and direct-message routes.
+
 use axum::{
     extract::{Multipart, Path, State},
     Json,
@@ -13,6 +15,7 @@ use crate::error::AppError;
 use crate::models::user::PublicUser;
 
 #[derive(Deserialize)]
+/// Fields an authenticated user may change on their own profile.
 pub struct UpdateProfileRequest {
     pub display_name: Option<String>,
     pub about: Option<String>,
@@ -20,6 +23,7 @@ pub struct UpdateProfileRequest {
 }
 
 #[derive(Serialize)]
+/// A public user record with private fields included for its owner.
 pub struct UserProfile {
     #[serde(flatten)]
     pub user: PublicUser,
@@ -74,7 +78,7 @@ pub async fn update_me(
     }))
 }
 
-/// POST /api/users/@me/avatar — upload a new avatar image
+/// Upload a new avatar image for the authenticated user.
 pub async fn upload_avatar(
     State(pool): State<PgPool>,
     State(config): State<Config>,
@@ -143,12 +147,13 @@ pub async fn upload_avatar(
 }
 
 #[derive(Deserialize)]
+/// Current and replacement credentials for a password change.
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
 }
 
-/// POST /api/users/@me/password — change password
+/// Change the authenticated user's password and revoke all refresh tokens.
 pub async fn change_password(
     State(pool): State<PgPool>,
     auth: AuthUser,
@@ -189,6 +194,7 @@ fn hash_password(password: &str) -> Result<String, AppError> {
         .map_err(|e| AppError::Internal(format!("Password hash error: {e}")))
 }
 
+/// Verify a password against its stored Argon2 hash.
 fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
     use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
     let parsed =
@@ -220,6 +226,7 @@ pub struct DmChannelInfo {
 }
 
 #[derive(Deserialize)]
+/// Identifies the recipient for a new direct-message channel.
 pub struct CreateDmRequest {
     pub recipient_id: Uuid,
 }
@@ -318,6 +325,7 @@ pub async fn send_dm_message(
 }
 
 #[derive(Deserialize)]
+/// Pagination parameters for direct-message history.
 pub struct DmMessageQuery {
     pub before: Option<Uuid>,
     pub limit: Option<i64>,
