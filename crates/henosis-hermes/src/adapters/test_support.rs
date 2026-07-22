@@ -4,8 +4,6 @@
 //! The macro covers the common adapter shape -- one upstream call returning a
 //! canned body. Multi-call or special-case adapters write manual wiremock
 //! tests (see `notion::tests::get_page_merges_page_and_blocks`).
-#![cfg(test)]
-
 use std::sync::Arc;
 
 use crate::phylaxd_client::PhylaxdClient;
