@@ -1,6 +1,12 @@
 use axum::http::HeaderValue;
 use std::env;
 
+/// Default attachment request ceiling: 25 MiB.
+pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Hard attachment request ceiling: 100 MiB.
+pub const MAX_UPLOAD_BYTES_CEILING: usize = 100 * 1024 * 1024;
+
 /// Runtime settings for the standalone Rift HTTP and WebSocket server.
 #[derive(Clone)]
 pub struct Config {
@@ -38,12 +44,26 @@ impl Config {
             }))
             .expect("RIFT_CORS_ORIGINS must contain valid HTTP header values"),
             upload_dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".into()),
-            max_upload_bytes: env::var("MAX_UPLOAD_BYTES")
-                .unwrap_or_else(|_| "26214400".into())
-                .parse()
-                .unwrap_or(26214400),
+            max_upload_bytes: parse_upload_limit(env::var("MAX_UPLOAD_BYTES").ok().as_deref())
+                .expect("MAX_UPLOAD_BYTES must be between 1 and 104857600"),
         }
     }
+}
+
+/// Parse an optional attachment limit and enforce the server's allocation ceiling.
+pub fn parse_upload_limit(value: Option<&str>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_UPLOAD_BYTES);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid MAX_UPLOAD_BYTES: {error}"))?;
+    if parsed == 0 || parsed > MAX_UPLOAD_BYTES_CEILING {
+        return Err(format!(
+            "MAX_UPLOAD_BYTES must be between 1 and {MAX_UPLOAD_BYTES_CEILING}"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Reject short or reused secrets before the server exposes either trust boundary.
@@ -82,7 +102,10 @@ pub fn parse_cors_origins(value: &str) -> Result<Vec<HeaderValue>, String> {
 #[cfg(test)]
 /// Exercises fail-closed parsing for Rift origins and trust-boundary secrets.
 mod tests {
-    use super::{parse_cors_origins, validate_secrets};
+    use super::{
+        DEFAULT_MAX_UPLOAD_BYTES, MAX_UPLOAD_BYTES_CEILING, parse_cors_origins,
+        parse_upload_limit, validate_secrets,
+    };
 
     /// The parser trims and retains each explicitly allowed origin.
     #[test]
@@ -108,5 +131,20 @@ mod tests {
         assert!(validate_secrets(&jwt, &bridge).is_ok());
         assert!(validate_secrets("short", &bridge).is_err());
         assert!(validate_secrets(&jwt, &jwt).is_err());
+    }
+
+    /// Upload limits default safely and reject malformed or excessive allocations.
+    #[test]
+    fn upload_limit_is_bounded() {
+        assert_eq!(parse_upload_limit(None).unwrap(), DEFAULT_MAX_UPLOAD_BYTES);
+        assert_eq!(
+            parse_upload_limit(Some(&MAX_UPLOAD_BYTES_CEILING.to_string())).unwrap(),
+            MAX_UPLOAD_BYTES_CEILING
+        );
+        assert!(parse_upload_limit(Some("0")).is_err());
+        assert!(parse_upload_limit(Some("not-a-number")).is_err());
+        assert!(
+            parse_upload_limit(Some(&(MAX_UPLOAD_BYTES_CEILING + 1).to_string())).is_err()
+        );
     }
 }

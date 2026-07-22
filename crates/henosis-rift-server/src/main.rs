@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{
+        DefaultBodyLimit,
         ws::WebSocketUpgrade,
         State,
     },
@@ -29,6 +30,12 @@ use ws::gateway::Gateway;
 
 /// Maximum accepted WebSocket message and frame size.
 const MAX_WEBSOCKET_BYTES: usize = 64 * 1024;
+
+/// Multipart envelope allowance above the accepted file payload.
+const MULTIPART_OVERHEAD_BYTES: usize = 64 * 1024;
+
+/// Maximum avatar payload accepted by the avatar route.
+const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
 
 /// Shared application state
 #[derive(Clone)]
@@ -114,6 +121,10 @@ async fn main() {
     let pending_uploads: PendingUploads = std::sync::Arc::new(dashmap::DashMap::new());
 
     let upload_dir = config.upload_dir.clone();
+    let attachment_body_limit = config
+        .max_upload_bytes
+        .saturating_add(MULTIPART_OVERHEAD_BYTES);
+    let avatar_body_limit = MAX_AVATAR_BYTES + MULTIPART_OVERHEAD_BYTES;
 
     let state = AppState {
         pool,
@@ -148,7 +159,11 @@ async fn main() {
         .route("/api/auth/logout", post(routes::auth::logout))
         // Users
         .route("/api/users/@me", get(routes::users::get_me).patch(routes::users::update_me))
-        .route("/api/users/@me/avatar", post(routes::users::upload_avatar))
+        .route(
+            "/api/users/@me/avatar",
+            post(routes::users::upload_avatar)
+                .layer(DefaultBodyLimit::max(avatar_body_limit)),
+        )
         .route("/api/users/@me/password", post(routes::users::change_password))
         .route("/api/users/@me/dms", get(routes::users::list_dms).post(routes::users::create_dm))
         .route("/api/users/{user_id}", get(routes::users::get_user))
@@ -216,7 +231,11 @@ async fn main() {
             patch(routes::messages::edit_message).delete(routes::messages::delete_message),
         )
         // File uploads
-        .route("/api/upload", post(routes::upload::upload_files))
+        .route(
+            "/api/upload",
+            post(routes::upload::upload_files)
+                .layer(DefaultBodyLimit::max(attachment_body_limit)),
+        )
         // Bridge internal
         .route("/api/bridge/notify", post(routes::bridge::notify_message))
         .route(
