@@ -39,6 +39,7 @@ struct Mocks {
     _tmp: TempDir,
 }
 
+/// Builds and configures the mock services shared by acceptance tests.
 impl Mocks {
     /// Spin up all mock servers and pre-populate standard 200 responses for
     /// the coordination services. The Anthropic mock is configured per-test.
@@ -487,11 +488,11 @@ async fn crash_recovery_resumes_from_checkpoint() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut final_status = None;
     while std::time::Instant::now() < deadline {
-        if let Some(rec) = state.store.get(&task_id).await {
-            if matches!(rec.status, TaskStatus::Completed | TaskStatus::Failed) {
-                final_status = Some(rec.status);
-                break;
-            }
+        if let Some(rec) = state.store.get(&task_id).await
+            && matches!(rec.status, TaskStatus::Completed | TaskStatus::Failed)
+        {
+            final_status = Some(rec.status);
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
