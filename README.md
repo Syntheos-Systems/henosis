@@ -1,92 +1,73 @@
 # Henosis
 
-Henosis is an agent runtime built around one identity model, one authorization path, and one event-driven coordination plane. The repository is under active development. APIs, storage schemas, and deployment requirements may change before the first stable release.
+Henosis is an operating system for persistent autonomous agents. It keeps identity, memory,
+trust, coordination, execution, policy, and credentials in one runtime so an agent can retain
+continuity across model calls, process restarts, and work sessions.
 
-The Cargo workspace combines the Syntheos kernel authorities with agent execution, chat, memory, tools, workflows, and operator services. Each subsystem owns its state and communicates through typed Rust contracts and Axon events.
+Each agent has one principal identity. Soma records its presence, Pistis evaluates its trust and
+capabilities, Phylax controls its credentials, Kleos holds its memory, and Axon carries its actions
+to the rest of the system. The agent does not need a separate identity for each subsystem.
 
-## Architecture
+> **Status:** Henosis is under active development. The integrated server runs, the source installer
+> produces a persistent user service, and the core authorities fail closed. APIs, database schemas,
+> configuration, and deployment requirements may change before the first stable release.
 
-```text
-External surfaces
-  HTTP APIs, MCP, CLI, TUI, Rift chat, operator API
-        |
-Runtime services
-  Synapse, Hephaestus, Hermes, Rift
-        |
-Syntheos kernel
-  Identity, Axon, Chiasm, Soma, Broca, Loom, Thymus
-  Pistis, Plutus, Eidolon, Human approval, Phylax
-        |
-Storage and cognition
-  SQLite, Postgres, Kleos, optional in-process Cognition
-```
+## Operating model
 
-The `syntheos-server` binary composes the kernel and its canonical action dispatcher. Rift, its agent bridge, Synapse clients, and compatibility gateways also ship as workspace binaries.
-
-## Action authorization
-
-Henosis sends tool and system actions through one ordered gate chain:
+Henosis combines the agent lifecycle in one Rust workspace:
 
 ```text
-invocation
-  -> Pistis capability and trust policy
-  -> Plutus tenant, role, quota, and rate policy
-  -> Eidolon input policy
-  -> human approval when required
-  -> Phylax credential policy
-  -> Hermes, Phylax, or internal execution
-  -> Eidolon output filtering
-  -> Axon event publication and service projections
+Human, agent, CLI, TUI, HTTP, MCP, or Rift
+                    |
+             Synapse / Hephaestus
+          model calls, tools, checkpoints
+                    |
+          canonical action dispatcher
+                    |
+    Pistis -> Plutus -> Eidolon -> Human -> Phylax
+                    |
+         Hermes or internal execution
+                    |
+      Axon events update Chiasm, Soma, Broca,
+      Loom, Thymus, Rift, and durable storage
+                    |
+        Kleos memory and Cognition services
 ```
 
-The server rejects a gate chain with a different order. Production startup also requires the Plutus and Phylax authorities; it does not replace missing authorities with allow or deny placeholders.
+The dispatcher applies the gate chain in that order. The server rejects a different order and
+refuses to start without the required Plutus and Phylax authorities. An allowed action executes
+through Hermes, Phylax, or an internal handler, then publishes typed lifecycle events through
+Axon.
 
-## Subsystems
+This structure gives one agent a continuous record of who it is, what it has done, which
+capabilities it has earned, and which work remains after a restart.
 
-| Subsystem | Responsibility |
-|-----------|----------------|
-| Axon | Typed event publication, subscriptions, retention, and replay |
-| Chiasm | Task state, claims, dependencies, activity, and queues |
-| Soma | Agent presence, health, and capability advertisement |
-| Broca | Human-readable action narration |
-| Loom | Durable workflow DAGs and step execution |
-| Thymus | Evaluations, quality history, and drift signals |
-| Pistis | Capability grants, trust, admission, and room authority |
-| Plutus | Organizations, roles, quotas, rate limits, and billing entitlements |
-| Eidolon | Input policy, supervision, output filtering, and redaction |
-| Phylax | Encrypted credentials, grants, leases, and use-without-holding execution |
-| Rift | Rooms, messages, membership, WebSockets, and human approval |
-| Synapse | Provider-neutral chat requests, tool loops, sessions, and clients |
-| Hephaestus | Stateful agent execution, checkpoints, cancellation, and resume |
-| Hermes | External SaaS adapters, OAuth refresh, rate limits, circuits, and MCP |
-| Cognition | Optional in-process access to the vendored Kleos cognitive core |
-| Agent-Forge | Task specifications, hypotheses, review gates, and verification records |
+## What is in the workspace
 
-## Provider and backend boundaries
+| Area | Components | Responsibility |
+|------|------------|----------------|
+| Integrated runtime | `syntheos-server`, contracts, identity, dispatch | Boots the authorities, kernel services, execution path, HTTP API, and optional operator surface |
+| Coordination | Axon, Chiasm, Soma, Broca, Loom, Thymus | Events, tasks, presence, narration, workflows, evaluations, and drift signals |
+| Authorities | Pistis, Plutus, Eidolon, Human approval, Phylax | Capability policy, tenant policy, input and output policy, escalation, and credential use |
+| Agent execution | Synapse, Hephaestus, Hermes | Model providers, sessions, checkpoints, tool loops, SaaS adapters, rate limits, and audit events |
+| Agent space | Rift server and bridge | Rooms, messages, WebSockets, agent participation, and approval requests |
+| Memory | Kleos bridge and optional Cognition facade | Persistent memory, context, handoffs, graph, personality, skills, and intelligence services |
+| Development gates | Agent-Forge | Task specifications, hypotheses, review checks, and verification records |
 
-Henosis separates configurable providers from product authorities.
+The default `syntheos-server` build excludes the vendored Kleos machine-learning stack. The
+`cognition` feature embeds that stack and exposes the Cognition routes in the same process.
 
-| Area | Available substitutions | Boundary |
-|------|-------------------------|----------|
-| Synapse LLM | Anthropic, OpenAI-compatible endpoints, Ollama, Azure OpenAI, OpenCode Zen, OpenAI Codex, Palantir Foundry, Claude Max | Runtime provider configuration |
-| Hephaestus LLM | Anthropic or an OpenAI-compatible endpoint such as OpenAI, Ollama, Azure, or OpenRouter | Runtime environment configuration |
-| Rift embeddings | OpenAI-compatible HTTP endpoint, shared in-process Kleos bge-m3, or token-overlap mode | Runtime configuration plus the optional `cognition` feature |
-| Rift memory | External Kleos HTTP service or in-process Cognition | Compile-time `cognition` feature and bridge configuration |
-| Hermes tools | Tool implementations register through a common trait and registry | New adapters require Rust code; bundled OAuth adapters resolve credentials through `credd` |
-| Pistis room state | `RoomStateSource` trait | The server still uses an in-memory source pending live room materialization |
-| Plutus policy reads | `PolicyBackend` trait | The production server uses Postgres |
-| Human approval | `Approver` trait | The production server uses the Rift approval registry |
+## Quick start
 
-The Syntheos authority roles and their gate order define the product security model. Replacing a data source behind an authority does not remove that authority from the dispatcher.
+The installer supports Linux and installs `syntheos-server` as a systemd user service. A source
+install needs:
 
-Kleos remains the native memory and cognition system. The Rift bridge uses the Kleos HTTP API in its default build. Enabling `cognition` embeds the vendored `kleos-lib` facade and its optional local bge-m3 provider in the process.
+- Git, a Rust toolchain, Cargo, and OpenSSL
+- A reachable PostgreSQL database for the Plutus authority
+- `curl` or `wget` for the startup health check
+- A systemd user manager, unless you pass `--no-service`
 
-## Install
-
-The Linux installer turns a checkout into a persistent user service. It validates Postgres,
-builds the integrated server, generates the required UUIDv8 authority identities and Phylax
-master key, writes an owner-only environment file, installs a hardened systemd user unit, starts
-the service, and verifies the real health endpoint:
+Clone the repository and run the installer:
 
 ```sh
 git clone https://github.com/Syntheos-Systems/henosis.git
@@ -94,86 +75,146 @@ cd henosis
 ./install.sh
 ```
 
-The fresh-install prompt reads the Postgres URL without echo, keeping database credentials out of
-shell history. Automation can set `SYNTHEOS_PLUTUS_DB` or pass `--postgres-url` directly.
+On a new installation, the script requests the PostgreSQL URL without echoing it. It generates the
+operator tenant, operator principal, and Phylax master key; creates private SQLite storage; builds
+the locked release binary; installs a hardened user service; and checks `/health` after startup.
+If `psql` is installed, the script tests the database before the build. The server performs its own
+database check at boot in either case.
 
-Postgres is an explicit external boundary because Plutus is a required production authority. The
-installer does not silently start a privileged database container or invent database credentials.
-It currently builds `syntheos-server` from the checkout, so a Rust toolchain and OpenSSL are
-required. A prebuilt executable can bypass the build with `--binary /path/to/syntheos-server`.
+Automation can supply the database URL through the environment:
 
-Configuration is stored at `~/.config/henosis/henosis.env`, persistent SQLite state at
-`~/.local/share/henosis/`, and the binary at `~/.local/bin/syntheos-server`. Re-running the same
-command, or simply `./install.sh` after the first install, updates the binary and service definition
-while preserving the environment file byte for byte, so authority identities and encryption keys
-do not rotate. Prior binaries and changed service definitions receive uniquely named timestamped
-backups.
+```sh
+SYNTHEOS_PLUTUS_DB="$DATABASE_URL" ./install.sh
+```
 
-Useful service commands:
+The installer stores files in these locations by default:
+
+| Path | Contents |
+|------|----------|
+| `~/.config/henosis/henosis.env` | Owner-only runtime configuration and generated authority secrets |
+| `~/.local/share/henosis/` | Persistent SQLite databases |
+| `~/.local/bin/syntheos-server` | Installed server binary |
+| `~/.config/systemd/user/henosis.service` | Hardened systemd user unit |
+
+Run the same command after pulling changes to update the binary and service definition. The
+installer preserves the environment file byte for byte, so upgrades do not rotate identities or
+keys.
+
+Useful commands:
 
 ```sh
 systemctl --user status henosis
 journalctl --user -u henosis -f
 systemctl --user restart henosis
+curl http://127.0.0.1:8088/health
 ```
 
-For a foreground or non-systemd installation, pass `--no-service`. Run `./install.sh --help` for
-path overrides, a custom listen address, service-only installation without startup, and prebuilt
-binary support. The installer is Linux-first while Henosis remains in active development.
+Use `./install.sh --no-service` for a foreground or non-systemd installation. Pass `--binary` to
+install a prebuilt `syntheos-server` without compiling the workspace. Run `./install.sh --help` for
+all path and bind-address options.
 
-## Build
+The installer configures the integrated server. Rift, Synapse CLI/TUI, and standalone compatibility
+binaries have separate configuration and launch paths.
 
-Install a Rust toolchain compatible with the workspace lockfile, then run:
+## API surfaces
+
+The integrated server binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` selects another address. Its
+base routes include:
+
+- `/health`, `/version`, `/enroll`, and `/dispatch`
+- Chiasm task, Soma agent, Broca action, Loom workflow, and Thymus quality APIs
+- Optional `/cognition/*` routes in a build with `--features cognition`
+- Optional operator authentication, dashboard, and WebSocket routes when an operator JWT secret is configured
+- Optional Stripe entitlement webhook when its signing secret is configured
+
+The standalone Rift server supplies room, message, membership, upload, bridge-control, and
+WebSocket APIs. Synapse ships CLI and TUI clients for provider-backed agent sessions.
+
+## Providers and product boundaries
+
+Henosis makes model and storage integrations replaceable where substitution serves users. The
+authority chain remains part of the product security model.
+
+| Area | Choices or interface | Status |
+|------|----------------------|--------|
+| Synapse models | Anthropic, OpenAI-compatible endpoints, Ollama, Azure OpenAI, OpenCode Zen, OpenAI Codex, Palantir Foundry, and Claude Max | Selected at runtime |
+| Hephaestus models | Anthropic or an OpenAI-compatible endpoint such as OpenAI, Ollama, Azure, or OpenRouter | Selected through environment configuration |
+| Rift embeddings | OpenAI-compatible HTTP, shared in-process Kleos bge-m3, or token overlap | Runtime and feature configuration |
+| Rift memory | External Kleos HTTP or in-process Cognition | External by default; embedded with the `cognition` feature |
+| Pistis room state | `RoomStateSource` trait | Integrated server uses an empty in-memory source pending live room materialization |
+| Plutus policy data | `PolicyBackend` trait | Integrated server uses PostgreSQL |
+| Human approval | `Approver` trait | Integrated server uses the Rift approval registry |
+| Tool adapters | Hermes tool trait and registry | Adding a provider requires a Rust adapter and registry entry |
+| Credentials | Phylax authority | Canonical store for encrypted secrets and use-without-holding operations |
+
+Kleos is the native memory and cognition system. PostgreSQL is the production Plutus backend.
+Phylax and the ordered authority chain are intentional Henosis components, while traits isolate
+their data sources and callers.
+
+### Legacy `credd` dependency
+
+Hermes entered the workspace with an HTTP client for `credd`, the credential daemon used by the
+older service architecture. The bundled Gmail, Google Calendar, Google Drive, GitHub, Linear,
+Notion, and similar adapters still use that client to fetch tenant OAuth tokens and webhook
+secrets.
+
+Henosis does not ship or install `credd`. The server can boot without it, but an adapter that needs
+OAuth returns a credential error unless a compatible endpoint and token are configured. Phylax is
+the canonical Henosis credential authority, so the remaining work is to route Hermes credential
+requests through Phylax and remove the legacy `CREDD_URL` and `HERMES_CREDD_TOKEN` configuration.
+
+## Build and test
+
+Build the workspace with the lockfile:
 
 ```sh
-cargo build --workspace
+cargo build --locked --workspace
 ```
 
 Build the integrated server without the local cognitive core:
 
 ```sh
-cargo build -p syntheos-server
+cargo build --locked -p syntheos-server
 ```
 
 Build it with in-process Cognition:
 
 ```sh
-cargo build -p syntheos-server --features cognition
+cargo build --locked -p syntheos-server --features cognition
 ```
 
-The `cognition` feature compiles the vendored Kleos machine-learning dependencies. Default builds leave that stack out.
+The Cognition build compiles the vendored Kleos machine-learning and vector-search dependencies.
+Run the repository checks with:
 
-## Running the server
+```sh
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+./tests/install.sh
+./scripts/stub-scan.sh
+```
 
-`syntheos-server` binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` overrides it. A production-shaped boot requires at least:
+## Active-development limits
 
-- `SYNTHEOS_PLUTUS_DB`, a Postgres connection URL
-- `SYNTHEOS_PLUTUS_OPERATOR_TENANT`, a tenant UUID used for first-boot organization setup
-- `SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL`, a principal UUID used for first-boot organization setup
-- `SYNTHEOS_PHYLAX_KEY`, a 64-character hexadecimal master key
+- The integrated Pistis gate uses an empty in-memory room-state source. Requests that require room capabilities fail closed until live room state is connected.
+- Hephaestus has a placeholder production Plutus token provider for tenant-scoped Anthropic authentication. Development credentials and OpenAI-compatible providers use separate paths.
+- Hermes OAuth-backed adapters retain the legacy `credd` dependency described above.
+- The default Rift bridge expects a reachable Kleos HTTP service. An embedded memory path requires the `cognition` feature.
+- The source installer configures `syntheos-server`; it does not provision PostgreSQL or install every workspace binary.
+- Public APIs and persistence formats have no stable compatibility guarantee yet.
 
-SQLite-backed services write under `data/` unless their `SYNTHEOS_*_DB` variables select other paths. Optional surfaces use their own environment variables, including the operator JWT, Stripe webhook, Eidolon supervisor, Hephaestus provider, and Cognition database settings.
+The repository keeps test-only allow gates behind the non-default `stubs` feature. Production
+startup uses the five authority implementations and fails when required authority configuration is
+missing.
 
-Do not use development keys in a deployed instance. Keep secrets outside the repository and inject them through the deployment environment or credential service.
+## Security reports
 
-## Development status
-
-The core workspace builds and contains working implementations for the dispatcher, kernel stores, authorization gates, Hermes execution, task and narration projections, agent execution, Rift, Synapse, and optional Cognition.
-
-The following work remains open:
-
-- Hephaestus production tenant-scoped Anthropic authentication has a placeholder Plutus token provider. Development mode can use local Claude credentials, and OpenAI-compatible providers use their configured key path.
-- The integrated server constructs an empty in-memory Pistis room-state source. Capability-bearing requests fail closed until a live source supplies signed room state.
-- The default Rift bridge memory path requires a reachable Kleos HTTP service. In-process memory requires a build with `--features cognition`.
-- Hermes bundles adapters for several SaaS providers, but adding a different service requires a Rust adapter and registry entry.
-- Public APIs and persistence formats have not reached a stable compatibility guarantee.
-
-See [`scripts/known-incomplete.md`](scripts/known-incomplete.md) for the maintained wiring ledger and dependency advisory status.
-
-## Security and issue reports
-
-Open a GitHub issue for reproducible bugs that do not expose sensitive data. Send security reports through a private maintainer channel until the project publishes a security policy and disclosure address.
+Open a GitHub issue for reproducible bugs that contain no credentials, private data, or exploit
+details. Use GitHub private vulnerability reporting for sensitive reports after that channel is
+enabled for this repository. Do not publish secrets in an issue.
 
 ## License
 
-Henosis uses the Elastic License 2.0. See [`LICENSE`](LICENSE).
+Henosis is source-available under the [Elastic License 2.0](LICENSE). Elastic License 2.0 is not an
+OSI-approved open-source license and restricts offering the software as a hosted or managed
+service.
