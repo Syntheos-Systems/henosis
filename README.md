@@ -81,6 +81,46 @@ The Syntheos authority roles and their gate order define the product security mo
 
 Kleos remains the native memory and cognition system. The Rift bridge uses the Kleos HTTP API in its default build. Enabling `cognition` embeds the vendored `kleos-lib` facade and its optional local bge-m3 provider in the process.
 
+## Install
+
+The Linux installer turns a checkout into a persistent user service. It validates Postgres,
+builds the integrated server, generates the required UUIDv8 authority identities and Phylax
+master key, writes an owner-only environment file, installs a hardened systemd user unit, starts
+the service, and verifies the real health endpoint:
+
+```sh
+git clone https://github.com/Syntheos-Systems/henosis.git
+cd henosis
+./install.sh
+```
+
+The fresh-install prompt reads the Postgres URL without echo, keeping database credentials out of
+shell history. Automation can set `SYNTHEOS_PLUTUS_DB` or pass `--postgres-url` directly.
+
+Postgres is an explicit external boundary because Plutus is a required production authority. The
+installer does not silently start a privileged database container or invent database credentials.
+It currently builds `syntheos-server` from the checkout, so a Rust toolchain and OpenSSL are
+required. A prebuilt executable can bypass the build with `--binary /path/to/syntheos-server`.
+
+Configuration is stored at `~/.config/henosis/henosis.env`, persistent SQLite state at
+`~/.local/share/henosis/`, and the binary at `~/.local/bin/syntheos-server`. Re-running the same
+command, or simply `./install.sh` after the first install, updates the binary and service definition
+while preserving the environment file byte for byte, so authority identities and encryption keys
+do not rotate. Prior binaries and changed service definitions receive uniquely named timestamped
+backups.
+
+Useful service commands:
+
+```sh
+systemctl --user status henosis
+journalctl --user -u henosis -f
+systemctl --user restart henosis
+```
+
+For a foreground or non-systemd installation, pass `--no-service`. Run `./install.sh --help` for
+path overrides, a custom listen address, service-only installation without startup, and prebuilt
+binary support. The installer is Linux-first while Henosis remains in active development.
+
 ## Build
 
 Install a Rust toolchain compatible with the workspace lockfile, then run:
