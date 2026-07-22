@@ -1,8 +1,7 @@
 //! Optional text-embedding capability for semantic echo and loop detection.
 //!
-//! The 2026-07-17 design spec (P4) recorded embedding-based echo/loop
-//! detection as future work behind the `echo::similarity` seam; this module
-//! is that capability landing. The default build implements a thin
+//! This module adds embedding-based echo and loop detection behind the
+//! `echo::similarity` seam. The default build implements a thin
 //! OpenAI-compatible `/v1/embeddings` client instead of pulling in the vendored
 //! kleos-lib ML stack. The optional `cognition` feature adds an adapter around
 //! Henosis's in-process provider, letting memory and room semantics share one
@@ -22,8 +21,8 @@ use crate::error::BridgeError;
 
 /// Ceiling on one embeddings request. Embed calls run inside the compose
 /// floor and topic seeding; an unbounded call against a stalled endpoint
-/// would freeze the whole room, not just this check (adversarial review
-/// finding). A timeout surfaces as an error, and every caller degrades to
+/// would freeze the whole room, not just this check. A timeout surfaces as
+/// an error, and every caller degrades to
 /// non-semantic behavior on error.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(10);
 

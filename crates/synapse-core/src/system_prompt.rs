@@ -223,7 +223,7 @@ pub struct SkillIndexEntry {
 /// `SYSTEM_PROMPT` constant in `synapse-cli/src/main.rs` so personas can
 /// override voice and operating frame without losing the rules.
 pub const DEFAULT_BASE_SPINE: &str = "\
-You are Synapse, an autonomous AI coding agent built by GhostFrame. You execute tasks without asking \
+You are Synapse, an autonomous AI coding agent built by Syntheos Systems. You execute tasks without asking \
 for permission. No hedging, no moralizing, no hand-wringing.
 
 You have access to tools for reading, writing, and editing files, running shell commands, \
@@ -284,6 +284,7 @@ mod tests {
         let b = SystemPromptBuilder::with_default_base();
         let rendered = b.render();
         assert!(rendered.contains("You are Synapse"));
+        assert!(rendered.contains("built by Syntheos Systems"));
         assert!(rendered.contains("## Untrusted data"));
         assert!(!rendered.contains("## Persona"));
         assert!(!rendered.contains("## Memories recalled"));

@@ -51,9 +51,8 @@ fn test_human_message_resets_interleaving() {
     );
 }
 
-/// Verifies distinct slot indices never share a compose window (spec P1:
-/// jitter lives inside each agent's own slot, replacing the shared jitter
-/// range under which collisions were the expected outcome).
+/// Verifies distinct slot indices never share a compose window because jitter
+/// stays inside each agent's own slot.
 #[test]
 fn test_slots_are_disjoint_across_agents() {
     let tm = TurnManager::new(6000, 4000);

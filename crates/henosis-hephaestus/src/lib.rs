@@ -2,9 +2,7 @@
 //! modules via the `henosis_hephaestus` crate name; integration tests under
 //! `tests/` also import from here.
 //!
-//! Absorbed from ~/projects/hephaestus (Phase 5 / Story 5.3, copy-and-own).
-//! Upstream hephaestus stays standalone; this is a snapshot wired into the
-//! henosis workspace.
+//! Maintained in-tree as an owned Henosis component.
 
 pub mod agent_forge;
 pub mod anthropic_auth;

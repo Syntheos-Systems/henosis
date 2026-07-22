@@ -1,5 +1,4 @@
-# Absorbed from ~/projects/rift/server (Story 4.4, copy-and-own). Upstream rift
-# stays standalone; this is a snapshot wired into the henosis workspace.
+# Maintained in-tree as an owned Henosis component.
 [package]
 name = "henosis-rift-server"
 version = "0.1.0"

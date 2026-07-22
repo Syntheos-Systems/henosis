@@ -1,18 +1,17 @@
 //! Stimulus injection: wakes the room with real project signals.
 //!
-//! The parent Rift Team Room design (memory 27272) lists the stimulus
-//! injector as a core bridge component: rooms otherwise only wake when a
-//! human posts, so an idle team never reflects, never notices a new commit,
-//! and never revisits stale tasks. Sources implemented here: scheduled
+//! Rooms otherwise only wake when a human posts, so an idle team cannot
+//! reflect, notice a new commit, or revisit stale tasks. Sources implemented
+//! here include scheduled
 //! reflection, Chiasm task-state changes, git HEAD movement in declared
 //! workspaces, Axon activity events (alerts/tasks channels, self-reports
 //! excluded), and Loom workflow-run transitions -- the latter two via the
 //! KleosClient HTTP surface only (the in-process AxonBus is pure pub/sub
 //! with nothing to query, and there is no in-process Loom store). The
-//! parent spec's test-result source still needs a CI surface the bridge
-//! does not have and remains future work.
+//! A test-result source requires a CI surface the bridge does not currently
+//! expose.
 //!
-//! Parent-spec safety requirements implemented here: per-source cooldowns, a
+//! Safety controls include per-source cooldowns, a
 //! global hourly rate cap, and content sanitization of everything read from
 //! external state (commit subjects, task summaries). Structural distinction
 //! is end-to-end: stimuli enter the cascade in-process and their room
@@ -213,8 +212,8 @@ impl StimulusSource for ChiasmTaskSource {
 }
 
 /// Consecutive probe failures before a workspace is disabled. A single
-/// transient failure (index.lock contention, momentary IO error) must not
-/// permanently silence a workspace (adversarial review finding).
+/// transient failure such as index.lock contention or a momentary IO error
+/// must not permanently silence a workspace.
 const GIT_FAILURES_BEFORE_DISABLE: u32 = 3;
 
 /// Ceiling on one git HEAD probe; a hung git (dead NFS mount, lock storm)
@@ -284,9 +283,8 @@ impl StimulusSource for GitHeadSource {
 
     /// Probe each live workspace and emit at most ONE stimulus listing all
     /// moved HEADs. Batching matters: baselines advance during the poll, so
-    /// per-workspace stimuli beyond the first would be eaten by the
-    /// injector's per-kind cooldown and the changes silently lost
-    /// (adversarial review finding).
+    /// per-workspace stimuli beyond the first would be consumed by the
+    /// injector's per-kind cooldown and the changes silently lost.
     async fn poll(&mut self, _ctx: &StimulusContext) -> Vec<Stimulus> {
         let mut moved_lines = Vec::new();
         for (name, path) in &self.workspaces {
@@ -520,7 +518,7 @@ impl StimulusSource for LoomRunSource {
 /// Strip control characters (newline survives), collapse leading/trailing
 /// whitespace, and truncate to `max_chars` on a char boundary. Everything a
 /// source read from external state (commit subjects, task titles) is
-/// untrusted input per the parent spec and passes through here.
+/// untrusted input and passes through here.
 pub fn sanitize(text: &str, max_chars: usize) -> String {
     let cleaned: String = text
         .chars()

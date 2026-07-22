@@ -1,22 +1,20 @@
 //! Turn discipline: identity-derived compose slots and a single compose floor.
 //!
-//! Two mechanisms with two distinct jobs (2026-07-17 design spec, P1):
+//! Two mechanisms have distinct jobs:
 //!
 //! - **Compose slots** pace responders into deterministic, non-overlapping
 //!   windows derived from each agent's stable roster slot index. Jitter is
 //!   drawn *inside* the agent's own window, never from a range shared with
-//!   other agents. This is the shape that fixed the botcore fleet in
-//!   production (distinct cascading windows), replacing the shared jitter
-//!   range under which collisions were the expected outcome (spec F2).
-//! - **The compose floor** is a single-permit semaphore enforcing the spec
+//!   other agents. Distinct cascading windows replace shared jitter ranges,
+//!   under which collisions are expected.
+//! - **The compose floor** is a single-permit semaphore enforcing the
 //!   invariant "no two agents compose against the same room state". Today the
 //!   room drives generation sequentially, so the floor is uncontended; it
 //!   exists so the invariant survives any future refactor that spawns
-//!   generation concurrently (spec F1).
+//!   generation concurrently.
 //!
 //! There is intentionally no queue here. A strict speaking-token queue is
-//! deferred until execution mode needs strict ordering (spec P1 recommends
-//! slots first; both open questions recorded in the design doc).
+//! deferred until execution mode needs strict ordering.
 
 use rand::Rng;
 use std::sync::Arc;

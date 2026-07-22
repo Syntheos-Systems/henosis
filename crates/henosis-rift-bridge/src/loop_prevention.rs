@@ -8,10 +8,9 @@
 //! consumed budget through [`LoopBudget`] when an exhausted topic reignites.
 //! Echo detection stays in [`crate::echo`].
 //!
-//! Consensus markers are LINE-ANCHORED (spec P5): a signal counts only when
+//! Consensus markers are line-anchored: a signal counts only when
 //! a line starts with it, so an agent *discussing* the protocol ("should I
-//! emit [AGREE] here?") does not trip it (spec F6, same bug class as
-//! botcore's isNoReply incident).
+//! emit [AGREE] here?") does not trip it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -182,8 +181,7 @@ mod tests {
     }
 
     /// Verifies reset restores budgets and clears agreements so a room can
-    /// host a new topic (regression test for finding N2: reset had no
-    /// callers and the room died permanently at the ceiling).
+    /// host a new topic after the previous topic reaches its ceiling.
     #[test]
     fn test_reset_restores_topic_energy() {
         let a = agent();
@@ -269,7 +267,7 @@ mod tests {
     }
 
     /// Verifies pass detection is anchored to the first non-empty line
-    /// (spec P5) and prose mentions do not trip it (spec F6).
+    /// and prose mentions do not trip it.
     #[test]
     fn test_is_pass_is_first_line_anchored() {
         let guard = LoopGuard::new(5, 30);

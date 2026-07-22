@@ -347,8 +347,8 @@ pub async fn mark_user_as_agent(pool: &PgPool, user_id: Uuid) -> Result<User, sq
 /// Mirrors migration 004's classification exactly. The migration runs once
 /// at boot, strictly before provisioning can promote a legacy account
 /// (is_agent = FALSE) or a pre-stamping server build stops writing 'user'
-/// rows -- so provisioning must converge each agent's history itself or
-/// those rows stay mislabeled forever (adversarial review finding).
+/// rows, so provisioning must converge each agent's history itself or those
+/// rows remain mislabeled.
 pub async fn retype_agent_messages(pool: &PgPool, user_id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         r#"UPDATE messages

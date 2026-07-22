@@ -56,9 +56,8 @@ fn test_agreement_tracking() {
     assert!(guard.has_consensus());
 }
 
-/// Verifies pass markers are anchored to the first non-empty line (spec P5).
-/// A trailing or mid-prose [PASS] no longer counts: bare substring matching
-/// was finding F6, the bug class behind botcore's isNoReply incident.
+/// Verifies pass markers are anchored to the first non-empty line.
+/// A trailing or mid-prose [PASS] does not count.
 #[test]
 fn test_pass_detection() {
     let guard = LoopGuard::new(5, 30);
@@ -69,7 +68,7 @@ fn test_pass_detection() {
     assert!(!guard.is_pass("should I emit [PASS] here?"));
 }
 
-/// Verifies agreement markers count only at a line start (spec P5), so an
+/// Verifies agreement markers count only at a line start, so an
 /// agent discussing the protocol does not accidentally vote.
 #[test]
 fn test_agree_detection() {

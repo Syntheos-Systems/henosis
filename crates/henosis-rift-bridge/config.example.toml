@@ -16,7 +16,7 @@ cooldown_secs = 30        # min seconds between two posts by the SAME agent
 turn_budget = 5           # max turns per agent per topic
 thread_ceiling = 30       # hard cap on total agent posts per topic
 context_window = 50
-# Compose slots (spec P1): each agent composes inside its own window
+# Compose slots: each agent composes inside its own window
 # [slot_index * slot_width_ms, + slot_jitter_ms]. Jitter must stay below the
 # width or it is clamped -- overlapping windows are the bug this replaces.
 slot_width_ms = 6000

@@ -7,7 +7,7 @@
 //! An inbound human (or stimulus) message seeds a bounded conversation
 //! cascade: engaged agents reply in their compose slots, and each agent post
 //! becomes the trigger for the next evaluation round, so agents answer each
-//! other (2026-07-17 design spec; parent Rift Team Room success criterion 1).
+//! other.
 //! The cascade is bounded by per-agent turn budgets, the thread ceiling, a
 //! round cap, per-agent cooldown, engagement decay, and consensus. Fresh
 //! topics reset their energy; semantic re-ignitions restore the exhausted
@@ -85,13 +85,13 @@ pub struct Room {
     /// Per-agent growth file store (None when personas disabled).
     growth: Option<GrowthStore>,
     /// Monotonic count of messages posted in the room (human and agent).
-    /// Feeds true turns-since-last-post recency (fixes finding N1).
+    /// Feeds true turns-since-last-post recency.
     room_turn: u64,
     /// Ring buffer of recent AGENT posts, compared against candidate
-    /// responses for cross-agent echo suppression (spec P3). Human/stimulus
+    /// responses for cross-agent echo suppression. Human/stimulus
     /// messages are deliberately absent: comparing a reply against the
     /// question it answers suppresses legitimate confirming answers
-    /// (adversarial review finding, 2026-07-17).
+    /// because doing so would suppress legitimate confirming answers.
     recent_posts: VecDeque<(AgentId, String)>,
     /// Two-tier echo detector (embedding when configured, token overlap
     /// otherwise) applied to candidates before posting.
@@ -416,10 +416,10 @@ impl Room {
 
         // The inbound message is a room turn for recency purposes. It is NOT
         // remembered for echo comparison: echo suppression is scoped to
-        // cross-agent repetition (spec P3/F4).
+        // cross-agent repetition.
         self.room_turn += 1;
 
-        // Topic reignition (parent design: topic exhaustion memory): a
+        // Topic reignition: a
         // trigger semantically matching a recently exhausted topic restores
         // its consumed budget and damps the cascade. An unmatched or failed
         // embedding leaves the reset budget fresh.
@@ -445,7 +445,7 @@ impl Room {
 
     /// Drive the bounded conversation cascade. The trigger seeds round 0;
     /// each subsequent round is triggered by the last agent post of the
-    /// previous round, so agents can answer each other (finding N3). Bounds:
+    /// previous round, so agents can answer each other. Bounds include
     /// per-agent turn budgets, the thread ceiling, the round cap, engagement
     /// decay, per-agent cooldown, and consensus. Slot waits are
     /// event-responsive: approvals dispatch at slot boundaries, a fresh
@@ -478,14 +478,14 @@ impl Room {
             let mut last_post: Option<(AgentId, String)> = None;
 
             for (agent_id, slot_index) in plan {
-                // Pace into this agent's own compose window (spec P1): the
+                // Pace into this agent's own compose window: the
                 // window is derived from the agent's stable slot index, with
                 // jitter inside the window, never shared across agents.
                 let target = round_start + self.turn_manager.slot_delay(slot_index);
                 match self.wait_for_slot(target, events, pause).await {
                     SlotOutcome::Proceed => {}
                     SlotOutcome::Interrupted(new_msg) => {
-                        // Human priority (parent design): the fresh message
+                        // Human priority: the fresh message
                         // becomes the topic. Reset energy and restart the
                         // cascade against it -- iteratively, never recursively.
                         tracing::info!("cascade interrupted by fresh message, re-seeding topic");
@@ -504,8 +504,8 @@ impl Room {
                 }
 
                 // Peers may have answered while this agent waited for its
-                // slot: re-evaluate at the damped probability (spec P2, the
-                // fourth-voice rule) and re-check turn gates.
+                // slot: re-evaluate at the damped probability using the
+                // peer-coverage rule and re-check turn gates.
                 if peers_posted > 0
                     && !self.reroll_engagement(agent_id, &trigger_content, peers_posted)
                 {
@@ -549,7 +549,7 @@ impl Room {
             }
         }
 
-        // Hitting the hard ceiling exhausts the topic (parent design):
+        // Hitting the hard ceiling exhausts the topic:
         // remember it so a reignition gets damped instead of burning another
         // full thread on the same ground.
         if self.loop_guard.total_turns() >= self.config.thread_ceiling {
@@ -568,7 +568,7 @@ impl Room {
     /// `pause.changed()` arm can lose the select race to an already-queued
     /// event, and processing that event -- especially an `!approve` --
     /// while the operator has paused the bridge would bypass the pause the
-    /// approvals drain task honors (adversarial review finding). While
+    /// approvals drain task honors. While
     /// paused, inbound room messages are dropped, matching the main event
     /// loop's paused behavior.
     async fn wait_for_slot(
@@ -612,7 +612,7 @@ impl Room {
                             // and foreign 'system' notices never interrupt.
                             // Gating only the idle path would let another
                             // bridge's status line re-seed a running cascade
-                            // (adversarial review finding), and would apply a
+                            // and apply a
                             // foreign control command mid-cascade that the
                             // idle path ignores.
                             let own = self.roster.by_rift_user_id(m.author_id).is_some();
@@ -813,7 +813,7 @@ impl Room {
 
     /// Compute the engagement probability for one agent against one message,
     /// assembling direct-address, true recency (room turns since this agent
-    /// last posted -- fixes finding N1), peer-coverage, and relevance inputs.
+    /// last posted), peer-coverage, and relevance inputs.
     fn probability_for(&self, agent_id: AgentId, content: &str, peer_responses: u32) -> f64 {
         let agent = match self.roster.all().find(|a| a.id == agent_id) {
             Some(a) => a,
@@ -847,7 +847,7 @@ impl Room {
             relevance,
         });
 
-        // Reignited-topic damping (parent design: topic exhaustion memory).
+        // Apply configured damping to a re-ignited exhausted topic.
         // Directly addressed agents stay immune, matching the peer-damp
         // immunity: a human naming an agent deserves an answer even on
         // exhausted ground.
@@ -880,7 +880,7 @@ impl Room {
 
     /// Return an agent to Idle. Called on every compose exit path so a failed
     /// context build, generation, or send cannot wedge the agent in Thinking
-    /// forever (finding N4).
+    /// indefinitely.
     fn set_agent_idle(&mut self, agent_id: AgentId) {
         if let Some(agent) = self.roster.get_mut(&agent_id) {
             agent.state = AgentState::Idle;
@@ -905,8 +905,8 @@ impl Room {
 
     /// Generate a response from an agent and post it to the room. Holds the
     /// compose floor for the whole sequence (context build, generation,
-    /// post) so no other agent composes against the same room state (spec P1
-    /// invariant). Returns the posted text, or None when the agent passed,
+    /// post) so no other agent composes against the same room state. Returns
+    /// the posted text, or None when the agent passed,
     /// returned nothing, or was suppressed as a cross-agent echo.
     async fn generate_and_post(
         &mut self,
@@ -929,8 +929,7 @@ impl Room {
 
         // Build context for the executor. Every failure exit must return the
         // agent to Idle: the old code used `?` here and a single failed
-        // context build or generation wedged the agent in Thinking forever
-        // (finding N4).
+        // context build or generation wedged the agent in Thinking indefinitely.
         let context = match self.build_context(agent_id).await {
             Ok(context) => context,
             Err(e) => {
@@ -966,24 +965,24 @@ impl Room {
             }
         };
 
-        // A pass declines the turn (line-anchored marker, spec P5).
+        // A pass declines the turn using a line-anchored marker.
         if self.loop_guard.is_pass(&agent_resp.text) {
             tracing::info!("{display_name} passed");
             self.set_agent_idle(agent_id);
             return Ok(None);
         }
 
-        // Check for agreement signal (line-anchored marker, spec P5).
+        // Check for a line-anchored agreement signal.
         let is_agreement = self.loop_guard.contains_agreement(&agent_resp.text);
 
-        // Cross-agent echo suppression (spec P3): drop candidates that
+        // Cross-agent echo suppression drops candidates that
         // substantially reproduce a recent PEER AGENT post. The buffer holds
         // only agent posts, so a reply restating the human question it
         // answers is never suppressed. Consensus votes are exempt because
         // [AGREE] messages are legitimately similar to each other. This check
         // deliberately applies even to directly addressed agents: a verbatim
         // repeat of a peer is an echo no matter who was named. Detection is
-        // two-tier (spec P4 closing): embedding cosine when configured,
+        // Detection is two-tier: embedding cosine when configured,
         // token overlap otherwise or on embed failure.
         if !is_agreement {
             let peer_texts: Vec<String> = self
@@ -1022,14 +1021,14 @@ impl Room {
 
         // Record the agreement only after the message actually reached the
         // room: recording before a failed send would poison consensus with a
-        // vote nobody saw (adversarial review finding).
+        // vote nobody saw.
         if is_agreement {
             self.loop_guard.record_agreement(agent_id);
         }
 
         // Update tracking state: the post is a room turn and this agent's
         // new recency anchor (the old code instead incremented a posts-made
-        // counter that fed the recency decay inverted -- finding N1).
+        // counter that inverted recency decay).
         self.record_topic_contribution(agent_id);
         self.turn_manager.record_post(agent_id);
         self.room_turn += 1;
@@ -1449,8 +1448,8 @@ mod tests {
         (room, agent_id)
     }
 
-    /// Regression test for finding N4: a failed context build (unreachable
-    /// Rift) must return the agent to Idle instead of wedging it in
+    /// Verifies a failed context build against unreachable Rift returns the
+    /// agent to Idle instead of wedging it in
     /// Thinking, and must release the compose floor.
     #[tokio::test]
     async fn test_failed_compose_returns_agent_to_idle() {
@@ -1481,8 +1480,8 @@ mod tests {
         );
     }
 
-    /// Verifies per-agent cooldown floor semantics (review finding:
-    /// previously untested): never-posted agents are exempt, a fresh post
+    /// Verifies per-agent cooldown floor semantics: never-posted agents are
+    /// exempt, a fresh post
     /// blocks, and cooldown zero never blocks.
     #[test]
     fn test_cooldown_active_semantics() {
@@ -1543,7 +1542,7 @@ mod tests {
     }
 
     /// Verifies a fresh human message interrupts the slot wait and comes
-    /// back as the new topic seed (human priority, parent design).
+    /// back as the new topic seed.
     #[tokio::test]
     async fn test_wait_for_slot_interrupts_on_fresh_human_message() {
         let (mut room, _agent) = offline_room();
@@ -1601,8 +1600,8 @@ mod tests {
 
     /// Verifies an in-room `!approve` queued while the bridge is paused is
     /// NOT applied mid-cascade: the wait aborts on the pause level check and
-    /// the proposal stays in the registry (adversarial review finding: the
-    /// mid-cascade path must not bypass the pause the drain task honors).
+    /// the proposal stays in the registry. The mid-cascade path must not
+    /// bypass the pause the drain task honors.
     #[tokio::test]
     async fn test_wait_for_slot_does_not_apply_control_command_while_paused() {
         let (mut room, _agent) = offline_room();
@@ -1694,8 +1693,7 @@ mod tests {
     }
 
     /// Verifies a trigger matching a recorded exhausted topic returns the
-    /// configured damp and an unrelated trigger returns 1.0 (parent design:
-    /// topic exhaustion memory).
+    /// configured damp and an unrelated trigger returns 1.0.
     #[tokio::test]
     async fn test_reignition_factor_matches_exhausted_topic() {
         let (mut room, _agent) = offline_room();
@@ -1967,8 +1965,7 @@ mod tests {
 
     /// Verifies a foreign 'system' notice mid-wait neither interrupts nor
     /// re-seeds the cascade: another bridge's machinery announcement must
-    /// not steer this room (adversarial review finding: the inbound gate
-    /// must cover BOTH paths, not just the idle one).
+    /// not steer this room. The inbound gate must cover both paths.
     #[tokio::test]
     async fn test_wait_for_slot_ignores_foreign_system_notice() {
         let (mut room, _agent) = offline_room();

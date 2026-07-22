@@ -26,9 +26,7 @@ fn test_directly_addressed_has_high_probability() {
 }
 
 /// Verifies a directly addressed agent that never posted gets the full
-/// boost (regression test for finding N1: the inverted recency counter used
-/// to damp fresh agents to 0.25x, so a named agent ignored the mention 80%
-/// of the time).
+/// boost instead of applying recency damping to an agent with no history.
 #[test]
 fn test_directly_addressed_fresh_agent_gets_full_boost() {
     let engine = EngagementEngine::default();
@@ -62,8 +60,8 @@ fn test_auto_skip_threshold() {
     );
 }
 
-/// Verifies peers answering the message damp an unaddressed agent (spec P2:
-/// the fourth voice on a covered point should be rare).
+/// Verifies peers answering the message damp an unaddressed agent so
+/// additional voices on an already covered point become increasingly rare.
 #[test]
 fn test_peer_responses_damp_probability() {
     let engine = EngagementEngine::default();

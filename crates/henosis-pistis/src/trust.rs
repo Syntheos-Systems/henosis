@@ -106,6 +106,7 @@ fn apply_decay(score: &mut f64, from: OffsetDateTime, to: OffsetDateTime) {
     *score -= distance * DECAY_RATE_PER_DAY * days_elapsed;
 }
 
+/// Unit tests for trust scoring, decay, and contribution caps.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,57 +149,57 @@ mod tests {
     /// No history yields the neutral score.
     #[test]
     fn empty_history_returns_neutral() {
-        let gir = PrincipalId::new();
-        let s = admitted_state(&[gir]);
-        let score = compute_trust(&s, &gir, OffsetDateTime::now_utc());
+        let target = PrincipalId::new();
+        let s = admitted_state(&[target]);
+        let score = compute_trust(&s, &target, OffsetDateTime::now_utc());
         assert!((score - NEUTRAL_TRUST).abs() < 1e-9);
     }
 
     /// A single success raises the score above neutral.
     #[test]
     fn one_success_increases_score() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[gir, sec]);
-        s.record_outcome(outcome(gir, sec, Outcome::Success, 5, now));
-        assert!(compute_trust(&s, &gir, now) > NEUTRAL_TRUST);
+        let mut s = admitted_state(&[target, attestor]);
+        s.record_outcome(outcome(target, attestor, Outcome::Success, 5, now));
+        assert!(compute_trust(&s, &target, now) > NEUTRAL_TRUST);
     }
 
     /// A single failure lowers the score below neutral.
     #[test]
     fn one_failure_decreases_score() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[gir, sec]);
-        s.record_outcome(outcome(gir, sec, Outcome::Failure, 5, now));
-        assert!(compute_trust(&s, &gir, now) < NEUTRAL_TRUST);
+        let mut s = admitted_state(&[target, attestor]);
+        s.record_outcome(outcome(target, attestor, Outcome::Failure, 5, now));
+        assert!(compute_trust(&s, &target, now) < NEUTRAL_TRUST);
     }
 
     /// Failures hurt more than equal-weight successes help (FAILURE_RATE >
     /// SUCCESS_RATE).
     #[test]
     fn failures_hurt_more_than_successes_help() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut succ = admitted_state(&[gir, sec]);
-        succ.record_outcome(outcome(gir, sec, Outcome::Success, 5, now));
-        let mut fail = admitted_state(&[gir, sec]);
-        fail.record_outcome(outcome(gir, sec, Outcome::Failure, 5, now));
-        let success_delta = compute_trust(&succ, &gir, now) - NEUTRAL_TRUST;
-        let failure_delta = NEUTRAL_TRUST - compute_trust(&fail, &gir, now);
+        let mut succ = admitted_state(&[target, attestor]);
+        succ.record_outcome(outcome(target, attestor, Outcome::Success, 5, now));
+        let mut fail = admitted_state(&[target, attestor]);
+        fail.record_outcome(outcome(target, attestor, Outcome::Failure, 5, now));
+        let success_delta = compute_trust(&succ, &target, now) - NEUTRAL_TRUST;
+        let failure_delta = NEUTRAL_TRUST - compute_trust(&fail, &target, now);
         assert!(failure_delta > success_delta);
     }
 
     /// Score decays toward neutral as query time advances past the event.
     #[test]
     fn score_decays_toward_neutral_over_time() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
         let then = now - Duration::days(60);
-        let mut s = admitted_state(&[gir, sec]);
-        s.record_outcome(outcome(gir, sec, Outcome::Success, 10, then));
-        let at_event = compute_trust(&s, &gir, then);
-        let at_now = compute_trust(&s, &gir, now);
+        let mut s = admitted_state(&[target, attestor]);
+        s.record_outcome(outcome(target, attestor, Outcome::Success, 10, then));
+        let at_event = compute_trust(&s, &target, then);
+        let at_now = compute_trust(&s, &target, now);
         assert!((at_now - NEUTRAL_TRUST).abs() < (at_event - NEUTRAL_TRUST).abs());
     }
 
@@ -206,21 +207,21 @@ mod tests {
     /// successes exceed a single one but stay strictly below 1.0.
     #[test]
     fn per_attestor_cap_limits_contribution() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let query = base + Duration::milliseconds(25);
 
-        let mut capped = admitted_state(&[gir, sec]);
+        let mut capped = admitted_state(&[target, attestor]);
         let mut t = base;
         for _ in 0..20 {
-            capped.record_outcome(outcome(gir, sec, Outcome::Success, 10, t));
+            capped.record_outcome(outcome(target, attestor, Outcome::Success, 10, t));
             t += Duration::milliseconds(1);
         }
-        let capped_score = compute_trust(&capped, &gir, query);
+        let capped_score = compute_trust(&capped, &target, query);
 
-        let mut single = admitted_state(&[gir, sec]);
-        single.record_outcome(outcome(gir, sec, Outcome::Success, 10, base));
-        let single_score = compute_trust(&single, &gir, query);
+        let mut single = admitted_state(&[target, attestor]);
+        single.record_outcome(outcome(target, attestor, Outcome::Success, 10, base));
+        let single_score = compute_trust(&single, &target, query);
 
         assert!(capped_score > single_score);
         assert!(capped_score < 1.0);
@@ -229,29 +230,29 @@ mod tests {
     /// A self-attestation pushed directly into storage still moves nothing.
     #[test]
     fn self_attestation_contributes_zero() {
-        let gir = PrincipalId::new();
+        let target = PrincipalId::new();
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[gir]);
+        let mut s = admitted_state(&[target]);
         // Bypass record_outcome's drop to prove compute_trust also skips it.
-        s.outcomes_by_target.entry(gir).or_default().push(outcome(
-            gir,
-            gir,
+        s.outcomes_by_target.entry(target).or_default().push(outcome(
+            target,
+            target,
             Outcome::Success,
             10,
             now,
         ));
-        assert!((compute_trust(&s, &gir, now) - NEUTRAL_TRUST).abs() < 1e-9);
+        assert!((compute_trust(&s, &target, now) - NEUTRAL_TRUST).abs() < 1e-9);
     }
 
     /// The computation is deterministic across repeated runs.
     #[test]
     fn deterministic_across_runs() {
-        let (gir, sec) = (PrincipalId::new(), PrincipalId::new());
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let t = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[gir, sec]);
-        s.record_outcome(outcome(gir, sec, Outcome::Success, 5, t));
-        let a = compute_trust(&s, &gir, t);
-        let b = compute_trust(&s, &gir, t);
+        let mut s = admitted_state(&[target, attestor]);
+        s.record_outcome(outcome(target, attestor, Outcome::Success, 5, t));
+        let a = compute_trust(&s, &target, t);
+        let b = compute_trust(&s, &target, t);
         assert!((a - b).abs() < f64::EPSILON);
     }
 }

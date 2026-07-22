@@ -1,15 +1,13 @@
-//! Cross-agent echo suppression (2026-07-17 design spec, P3 / F4).
+//! Cross-agent echo suppression.
 //!
-//! Nothing in botcore compared an agent's candidate output against what its
-//! *peers* just said, so Zim reproduced GIR's line near-verbatim unnoticed.
-//! For working agents the failure mode is two agents independently producing
-//! the same proposal and both believing they contributed.
+//! The bridge compares an agent's candidate output with recent peer messages.
+//! This prevents two agents from independently presenting the same proposal
+//! while each appears to have contributed a distinct response.
 //!
 //! Two detection tiers live here:
 //!
-//! - The token-overlap (Jaccard) pass the spec called the cheap first cut.
-//! - [`EchoDetector`]: the embedding-based tier (memory 27272, spec P4)
-//!   filling the `echo::similarity` seam the design doc addendum named.
+//! - A token-overlap (Jaccard) first pass.
+//! - [`EchoDetector`], an optional embedding-based tier.
 //!   When an embedder is configured, candidates are compared to recent peer
 //!   posts by cosine similarity, which catches paraphrased echoes token
 //!   overlap cannot. Without one -- or when an embed call fails -- detection
@@ -71,8 +69,7 @@ pub fn is_echo(candidate: &str, recent_peer_texts: &[&str], threshold: f64) -> b
 pub struct EchoDetector {
     /// Optional semantic tier. `None` means token-overlap only.
     embedder: Option<Arc<dyn Embedder>>,
-    /// Cosine similarity at or above which a candidate is an echo
-    /// (parent design: 0.85).
+    /// Cosine similarity at or above which a candidate is an echo.
     semantic_threshold: f64,
     /// Jaccard similarity threshold for the fallback tier.
     token_threshold: f64,
@@ -139,8 +136,8 @@ impl EchoDetector {
 
         // Prune BEFORE embedding, not after: pruning on the exit path is
         // skipped whenever an embed call errors out mid-loop, letting stale
-        // entries outlive the ring-buffer bound (adversarial review
-        // finding). Entry-side pruning holds the invariant on every path.
+        // entries outlive the ring-buffer bound. Entry-side pruning holds
+        // the invariant on every path.
         let live: HashSet<&str> = recent_peer_texts.iter().copied().collect();
         self.cache.retain(|text, _| live.contains(text.as_str()));
 
@@ -172,44 +169,49 @@ impl EchoDetector {
     }
 }
 
-/// Unit tests using the production echo strings from the 2026-07-16 botcore
-/// incident plus boundary cases.
+/// Unit tests using synthetic echo strings and boundary cases.
 #[cfg(test)]
 mod tests {
     use super::{is_echo, similarity};
 
-    /// The line GIR posted at 12:54:04 in the measured incident.
-    const GIR_LINE: &str = "Selection pressure weeded out the weak bots and kept the best ones running strong";
-    /// The near-verbatim reproduction Zim posted 35 seconds later.
-    const ZIM_LINE: &str = "Selection pressure weeded out the weak bots and kept the best";
+    /// A synthetic peer message used as the echo baseline.
+    const ORIGINAL_LINE: &str =
+        "The deployment review identified two unsafe defaults and required both fixes before release";
+    /// A synthetic near-verbatim candidate response.
+    const NEAR_DUPLICATE_LINE: &str =
+        "The deployment review identified two unsafe defaults and required both fixes";
 
-    /// Verifies the measured production echo pair scores well above the
-    /// default threshold and gets suppressed.
+    /// Verifies a near-duplicate pair exceeds the default threshold and is suppressed.
     #[test]
-    fn test_production_echo_pair_is_suppressed() {
-        assert!(similarity(GIR_LINE, ZIM_LINE) >= 0.7);
-        assert!(is_echo(ZIM_LINE, &[GIR_LINE], 0.5));
+    fn test_near_duplicate_echo_pair_is_suppressed() {
+        assert!(similarity(ORIGINAL_LINE, NEAR_DUPLICATE_LINE) >= 0.7);
+        assert!(is_echo(NEAR_DUPLICATE_LINE, &[ORIGINAL_LINE], 0.5));
     }
 
-    /// Verifies a genuine engagement with the same topic (Eidolon's reply,
-    /// which named peers instead of echoing) is not suppressed.
+    /// Verifies a distinct response on the same topic is not suppressed.
     #[test]
     fn test_engaged_reply_on_same_topic_passes() {
-        let eidolon = "Selection pressure kept you, GIR, and Sam because you each answer differently";
-        assert!(!is_echo(eidolon, &[GIR_LINE], 0.5));
+        let response =
+            "The release owner should document how each correction changes deployment safety";
+        assert!(!is_echo(response, &[ORIGINAL_LINE], 0.5));
     }
 
     /// Verifies unrelated content scores near zero.
     #[test]
     fn test_unrelated_content_scores_near_zero() {
-        assert!(similarity(GIR_LINE, "The deploy pipeline needs a rollback path before Friday") < 0.1);
+        assert!(
+            similarity(
+                ORIGINAL_LINE,
+                "Schema transitions require reversible migration procedures"
+            ) < 0.1
+        );
     }
 
     /// Verifies short acknowledgments are never suppressed even when their
     /// few tokens all appear in a longer peer message.
     #[test]
     fn test_short_acknowledgment_is_never_suppressed() {
-        assert!(!is_echo("the best ones", &[GIR_LINE], 0.3));
+        assert!(!is_echo("both fixes", &[ORIGINAL_LINE], 0.3));
     }
 
     /// Verifies empty and token-free inputs are handled without panicking.
@@ -217,15 +219,15 @@ mod tests {
     fn test_degenerate_inputs() {
         assert_eq!(similarity("", ""), 0.0);
         assert_eq!(similarity("!!", "??"), 0.0);
-        assert!(!is_echo("", &[GIR_LINE], 0.5));
-        assert!(!is_echo(GIR_LINE, &[], 0.5));
+        assert!(!is_echo("", &[ORIGINAL_LINE], 0.5));
+        assert!(!is_echo(ORIGINAL_LINE, &[], 0.5));
     }
 
     /// Verifies case and punctuation differences do not defeat detection.
     #[test]
     fn test_normalization_is_case_and_punctuation_insensitive() {
-        let shouty = "SELECTION PRESSURE weeded-out the WEAK bots, and kept the BEST!!";
-        assert!(similarity(GIR_LINE, shouty) >= 0.7);
+        let shouty = "THE DEPLOYMENT REVIEW identified TWO unsafe defaults, and required BOTH fixes!!";
+        assert!(similarity(ORIGINAL_LINE, shouty) >= 0.7);
     }
 
     use super::EchoDetector;
@@ -244,7 +246,7 @@ mod tests {
         /// Returns canned vectors: the two paraphrase texts point the same
         /// way, unrelated text is orthogonal.
         async fn embed(&self, text: &str) -> Result<Vec<f32>, BridgeError> {
-            if text.contains("weeded") || text.contains("filtered out the weak") {
+            if text.contains("identified two unsafe") || text.contains("flagged both risky") {
                 Ok(vec![1.0, 0.05])
             } else {
                 Ok(vec![0.0, 1.0])
@@ -268,12 +270,13 @@ mod tests {
     /// overlap misses -- the exact gap embeddings were specified to close.
     #[tokio::test]
     async fn test_semantic_tier_catches_paraphrase_jaccard_misses() {
-        let paraphrase = "Natural selection filtered out the weak machines while retaining top performers";
+        let paraphrase =
+            "The release audit flagged both risky defaults and required corrections before shipping";
         // Token overlap alone does NOT flag this pair at the default threshold.
-        assert!(!is_echo(paraphrase, &[GIR_LINE], 0.5));
+        assert!(!is_echo(paraphrase, &[ORIGINAL_LINE], 0.5));
 
         let mut det = EchoDetector::new(Some(Arc::new(StubEmbedder)), 0.85, 0.5);
-        assert!(det.is_echo(paraphrase, &[GIR_LINE]).await);
+        assert!(det.is_echo(paraphrase, &[ORIGINAL_LINE]).await);
     }
 
     /// Verifies unrelated content passes the semantic tier.
@@ -281,20 +284,26 @@ mod tests {
     async fn test_semantic_tier_passes_unrelated_content() {
         let mut det = EchoDetector::new(Some(Arc::new(StubEmbedder)), 0.85, 0.5);
         assert!(
-            !det.is_echo("The deploy pipeline needs a rollback path before Friday", &[GIR_LINE])
+            !det.is_echo(
+                "Schema transitions require reversible migration procedures",
+                &[ORIGINAL_LINE]
+            )
                 .await
         );
     }
 
     /// Verifies an embed failure degrades to the token-overlap tier instead
-    /// of suppressing or panicking: the verbatim production echo is still
-    /// caught, unrelated content still passes.
+    /// of suppressing or panicking: the near-duplicate echo is still caught,
+    /// and unrelated content still passes.
     #[tokio::test]
     async fn test_embed_failure_falls_back_to_token_overlap() {
         let mut det = EchoDetector::new(Some(Arc::new(FailingEmbedder)), 0.85, 0.5);
-        assert!(det.is_echo(ZIM_LINE, &[GIR_LINE]).await);
+        assert!(det.is_echo(NEAR_DUPLICATE_LINE, &[ORIGINAL_LINE]).await);
         assert!(
-            !det.is_echo("The deploy pipeline needs a rollback path before Friday", &[GIR_LINE])
+            !det.is_echo(
+                "Schema transitions require reversible migration procedures",
+                &[ORIGINAL_LINE]
+            )
                 .await
         );
     }
@@ -303,9 +312,10 @@ mod tests {
     #[tokio::test]
     async fn test_no_embedder_is_token_overlap_only() {
         let mut det = EchoDetector::new(None, 0.85, 0.5);
-        assert!(det.is_echo(ZIM_LINE, &[GIR_LINE]).await);
-        let paraphrase = "Natural selection filtered out the weak machines while retaining top performers";
-        assert!(!det.is_echo(paraphrase, &[GIR_LINE]).await);
+        assert!(det.is_echo(NEAR_DUPLICATE_LINE, &[ORIGINAL_LINE]).await);
+        let paraphrase =
+            "The release audit flagged both risky defaults and required corrections before shipping";
+        assert!(!det.is_echo(paraphrase, &[ORIGINAL_LINE]).await);
     }
 
     /// Verifies the short-message guard applies before the semantic tier.
@@ -314,6 +324,6 @@ mod tests {
         let mut det = EchoDetector::new(Some(Arc::new(FailingEmbedder)), 0.85, 0.5);
         // Five tokens or fewer: never suppressed, embedder never consulted
         // (FailingEmbedder would otherwise log a fallback).
-        assert!(!det.is_echo("the best ones", &[GIR_LINE]).await);
+        assert!(!det.is_echo("both fixes", &[ORIGINAL_LINE]).await);
     }
 }

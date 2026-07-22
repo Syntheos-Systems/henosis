@@ -4,11 +4,9 @@
 //! probability, direct addressing, recency decay, peer coverage, and persona
 //! relevance.
 //!
-//! PEER PARITY INVARIANT (2026-07-17 design spec, "already right -- protect
-//! it"): [`EngagementInputs`] carries no human-vs-agent distinction and none
-//! may be added. Gating agent speakers harder than humans is the structural
-//! mistake that made botcore's bot-to-bot conversation unable to sustain
-//! itself; this engine treats every message author identically.
+//! [`EngagementInputs`] carries no human-vs-agent distinction. The engine
+//! treats every message author identically so peer conversations can sustain
+//! themselves without favoring human-authored messages.
 
 use rand::Rng;
 
@@ -21,11 +19,11 @@ pub struct EngagementInputs {
     pub directly_addressed: bool,
     /// Room turns since this agent last posted. `None` means the agent has
     /// never posted and evaluates fully recovered. Feeding a
-    /// posts-made counter here is the inverted-recency bug (finding N1,
-    /// memory 35112) -- callers must pass actual quiet time.
+    /// posts-made counter here would invert the intended recency behavior;
+    /// callers must pass actual quiet time.
     pub turns_since_last_post: Option<u32>,
     /// How many peers have already responded to the message under
-    /// consideration (spec P2). Zero when this agent evaluates first.
+    /// consideration. Zero when this agent evaluates first.
     pub peer_responses: u32,
     /// Message-to-persona relevance in [0.0, 1.0]; 1.0 is neutral (no
     /// persona signal). Callers pass 1.0 when the agent is directly addressed.
@@ -41,8 +39,8 @@ pub struct EngagementEngine {
     /// Recency decay half-life in turns.
     pub decay_halflife: f64,
     /// Multiplier applied once per peer that already answered the message
-    /// (spec P2: an agent should be markedly less eager to be the fourth
-    /// voice on a point already covered). Direct addressing is immune: a
+    /// so an agent is markedly less eager to add another voice to a point
+    /// already covered. Direct addressing is immune: a
     /// named agent should answer even as the fourth voice.
     pub peer_response_damp: f64,
 }
@@ -75,7 +73,7 @@ impl EngagementEngine {
         // Recency decay: an agent that just posted is damped so it cannot
         // dominate; a quiet agent recovers toward full probability; an agent
         // that has never posted starts fully recovered (the old code damped
-        // fresh agents to 0.25 forever -- finding N1).
+        // fresh agents to 0.25 indefinitely).
         let recency = match inputs.turns_since_last_post {
             None => 1.0,
             Some(0) => 0.25,
@@ -85,10 +83,10 @@ impl EngagementEngine {
             }
         };
 
-        // Peer-coverage damping (spec P2): each peer that already answered
+        // Peer-coverage damping: each peer that already answered
         // multiplies the probability down, so herds cannot pile onto one
         // message. This is the anti-synchronisation term the recency decay
-        // alone cannot provide (spec F3).
+        // alone cannot provide.
         let peer_damp = if inputs.directly_addressed {
             1.0
         } else {
@@ -136,7 +134,7 @@ mod tests {
     }
 
     /// Verifies a never-posted agent evaluates at full base probability
-    /// (regression test for finding N1: it was damped to 0.25x forever).
+    /// instead of remaining damped to 0.25x indefinitely.
     #[test]
     fn test_never_posted_agent_is_fully_recovered() {
         let engine = EngagementEngine::default();
@@ -178,7 +176,7 @@ mod tests {
     }
 
     /// Verifies each peer response multiplies probability down for
-    /// unaddressed agents (spec P2: the fourth voice should be rare).
+    /// unaddressed agents so repeated responses become increasingly rare.
     #[test]
     fn test_peer_responses_damp_unaddressed_agents() {
         let engine = EngagementEngine::default();

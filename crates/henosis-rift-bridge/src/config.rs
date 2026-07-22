@@ -63,7 +63,7 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub api_key_env: Option<String>,
     /// Cosine similarity at or above which a candidate response is an echo
-    /// of a recent peer post (parent design: 0.85).
+    /// of a recent peer post.
     #[serde(default = "default_semantic_threshold")]
     pub semantic_threshold: f64,
     /// Cosine similarity at or above which a fresh trigger counts as
@@ -117,8 +117,8 @@ fn default_reignition_ttl_secs() -> u64 {
     21600
 }
 
-/// Stimulus injector settings (parent design memory 27272: scheduled
-/// reflection, project signals, per-type cooldowns, rate limiting).
+/// Stimulus injector settings for scheduled reflection, project signals,
+/// per-type cooldowns, and rate limiting.
 #[derive(Debug, Deserialize, Clone)]
 pub struct StimulusSettings {
     /// Master switch; false keeps the injector fully absent.
@@ -128,7 +128,7 @@ pub struct StimulusSettings {
     #[serde(default = "default_stimulus_poll_secs")]
     pub poll_secs: u64,
     /// Room inactivity in seconds before a reflection prompt fires; also the
-    /// reflection refire cooldown (parent design: 4 hours).
+    /// reflection refire cooldown.
     #[serde(default = "default_reflection_after_secs")]
     pub reflection_after_secs: u64,
     /// Minimum seconds between two Chiasm task-change stimuli.
@@ -153,7 +153,7 @@ fn default_stimulus_poll_secs() -> u64 {
     60
 }
 
-/// Default reflection inactivity window (4 hours, parent design).
+/// Default reflection inactivity window of four hours.
 fn default_reflection_after_secs() -> u64 {
     14400
 }
@@ -248,12 +248,12 @@ pub struct BridgeDaemonConfig {
     pub thread_ceiling: u32,
     /// Number of recent messages to include in context.
     pub context_window: usize,
-    /// DEPRECATED (spec F2): the shared jitter range guaranteed compose
-    /// collisions. Parsed for config compatibility, no longer used; slot
+    /// Deprecated shared jitter range. Parsed for config compatibility but
+    /// no longer used because slot
     /// geometry below replaces it.
     #[serde(default = "default_jitter_range_ms")]
     pub jitter_range_ms: (u64, u64),
-    /// Width of each agent's compose slot in milliseconds (spec P1).
+    /// Width of each agent's compose slot in milliseconds.
     #[serde(default = "default_slot_width_ms")]
     pub slot_width_ms: u64,
     /// Jitter drawn inside an agent's own slot, in milliseconds. Must stay
@@ -265,11 +265,11 @@ pub struct BridgeDaemonConfig {
     #[serde(default = "default_max_cascade_rounds")]
     pub max_cascade_rounds: u32,
     /// Token-overlap similarity at or above which a candidate response is
-    /// suppressed as a cross-agent echo (spec P3).
+    /// suppressed as a cross-agent echo.
     #[serde(default = "default_echo_similarity_threshold")]
     pub echo_similarity_threshold: f64,
     /// Per-peer-response probability multiplier for agents not directly
-    /// addressed (spec P2).
+    /// addressed.
     #[serde(default = "default_peer_response_damp")]
     pub peer_response_damp: f64,
 }
@@ -279,8 +279,7 @@ fn default_jitter_range_ms() -> (u64, u64) {
     (2000, 8000)
 }
 
-/// Default compose slot width: mirrors the botcore production fix
-/// (6-second cascading windows).
+/// Default compose slot width for six-second cascading windows.
 fn default_slot_width_ms() -> u64 {
     6000
 }

@@ -29,10 +29,10 @@ pub struct RegisteredAgent {
     /// Current runtime state.
     pub state: AgentState,
     /// Stable position in the config roster; derives this agent's compose
-    /// slot so its timing window never overlaps another agent's (spec P1).
+    /// slot so its timing window never overlaps another agent's.
     pub slot_index: usize,
     /// Room turn at which this agent last posted (None = never posted).
-    /// Feeds true turns-since-last-post recency (fixes finding N1).
+    /// Feeds true turns-since-last-post recency.
     pub last_posted_turn: Option<u64>,
     /// Wall-clock instant of this agent's last post, for cooldown pacing.
     pub last_post_at: Option<Instant>,

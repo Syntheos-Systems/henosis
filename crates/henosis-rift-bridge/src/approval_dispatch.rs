@@ -83,9 +83,7 @@ impl ApprovalDispatcher {
     /// The full dispatch pipeline: health preflight, workspace resolution,
     /// sandbox creation, then a supervised run. The concurrency permit is
     /// acquired FIRST so `max_concurrent_executions` bounds the whole
-    /// pipeline including worktree creation -- the pre-extraction code got
-    /// this bound implicitly from running preflight inline in the single
-    /// event loop (adversarial review finding).
+    /// pipeline including worktree creation.
     async fn dispatch_inner(&self, proposal: PendingProposal) {
         let _permit = match self.exec_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
