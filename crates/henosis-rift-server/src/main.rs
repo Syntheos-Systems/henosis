@@ -3,13 +3,15 @@ use axum::{
         ws::WebSocketUpgrade,
         State,
     },
-    http::Method,
+    http::{header, HeaderValue, Method},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Router,
 };
 use sqlx::postgres::PgPoolOptions;
+use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -126,6 +128,13 @@ async fn main() {
         ])
         .allow_headers(Any);
 
+    let uploads = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .service(ServeDir::new(upload_dir));
+
     let app = Router::new()
         // Auth
         .route("/api/auth/register", post(routes::auth::register))
@@ -218,7 +227,7 @@ async fn main() {
             get(routes::users::list_dm_messages).post(routes::users::send_dm_message),
         )
         // Static file serving for uploads
-        .nest_service("/uploads", ServeDir::new(upload_dir))
+        .nest_service("/uploads", uploads)
         // WebSocket
         .route("/ws", get(ws_handler))
         // Middleware

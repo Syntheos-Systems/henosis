@@ -14,7 +14,7 @@ description = "Rift room, message, membership, WebSocket, and approval server."
 axum = { version = "0.8", features = ["ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }
 tokio = { version = "1", features = ["full"] }
 
 # Database
