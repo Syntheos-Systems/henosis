@@ -1409,7 +1409,7 @@ async fn main() -> anyhow::Result<()> {
     let session_store = match SessionStore::open_default() {
         Ok(store) => {
             let count = store.session_count().unwrap_or(0);
-            eprintln!("{DIM}Session store: {} sessions{RESET}", count);
+            eprintln!("{DIM}Session store: {count} sessions{RESET}");
             Some(Arc::new(store))
         }
         Err(e) => {
