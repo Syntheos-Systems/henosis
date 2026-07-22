@@ -1,5 +1,10 @@
 # Vendored Kleos `kleos-lib`
 
+Mode: PRISTINE
+Pin: 18e507677aa325cb2d7e164b4aa52a066b3a9a17
+Upstream: kleos
+Mirror: kleos-lib=kleos-lib
+
 This directory vendors the Kleos cognitive-core library `kleos-lib` into Henosis as a
 NESTED Cargo workspace that is EXCLUDED from the Henosis root workspace. It builds against
 its own vendored workspace root (`vendor/kleos/Cargo.toml`), so landing it forces zero

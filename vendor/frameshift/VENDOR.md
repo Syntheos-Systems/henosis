@@ -3,6 +3,8 @@
 Mode: PRISTINE
 Pin: f2a5315efb2d04f11ebdae71c09dc894e7eb22f0
 Upstream: frameshift
+Mirror: frameshift-source=crates/frameshift-source
+Mirror: frameshift-orchestrator=crates/frameshift-orchestrator
 
 Henosis vendors `frameshift-source` and `frameshift-orchestrator` so a checkout can build
 without a sibling FrameShift repository. The two crate directories match the upstream file trees

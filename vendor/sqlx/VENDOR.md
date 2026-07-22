@@ -1,5 +1,9 @@
 # Vendored `sqlx` facade (Postgres-only)
 
+Mode: OWNED
+Pin: 0.8.6
+Upstream: crates.io:sqlx
+
 This is a vendored, minimally-patched copy of the **sqlx 0.8.6 facade crate** wired into the
 workspace via `[patch.crates-io]` in the root `Cargo.toml`.
 
