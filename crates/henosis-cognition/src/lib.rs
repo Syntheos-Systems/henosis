@@ -164,9 +164,11 @@ impl Cognition {
     /// Migrations run on open, so a fresh file lands at the current monolith
     /// schema and an existing file is upgraded in place.
     pub async fn open_path(db_path: &str) -> Result<Self> {
-        let mut config = Config::default();
-        config.db_path = db_path.to_string();
-        config.use_lance_index = false;
+        let config = Config {
+            db_path: db_path.to_string(),
+            use_lance_index: false,
+            ..Config::default()
+        };
         Self::connect(&config).await
     }
 
