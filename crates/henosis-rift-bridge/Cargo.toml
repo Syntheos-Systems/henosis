@@ -52,8 +52,8 @@ synapse-tools = { path = "../synapse-tools" }
 # anyhow (synapse-core's error type at the AgentExecutor boundary)
 anyhow = "1"
 
-# Frameshift persona selection engine (local development path dependency)
-frameshift-orchestrator = { path = "../../../frameshift/crates/frameshift-orchestrator" }
+# Pinned FrameShift persona selection engine in the excluded vendor workspace.
+frameshift-orchestrator = { path = "../../vendor/frameshift/frameshift-orchestrator" }
 
 # In-process Kleos seam (Story 4.4 step 3): InProcessKleosClient backs the
 # KleosClient trait with the henosis kernel stores instead of HTTP-to-Kleos.

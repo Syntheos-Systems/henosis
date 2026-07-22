@@ -1,0 +1,19 @@
+[package]
+name = "frameshift-orchestrator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Persona-orchestration subsystem: ranking, drift-controlled switching, and audit for automate mode."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+frameshift-source = { path = "../frameshift-source" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -36,10 +36,12 @@ members = [
 # Kleos `kleos-lib` is vendored at vendor/kleos/ as a NESTED, EXCLUDED workspace. It resolves
 # against its own root (vendor/kleos/Cargo.toml), so excluding it keeps zero blast radius on
 # existing Henosis crates. See vendor/kleos/VENDOR.md.
+# vendor/frameshift is a pinned, excluded workspace containing the two persona-selection crates
+# Henosis consumes. See vendor/frameshift/VENDOR.md.
 # vendor/sqlx is a [patch.crates-io] Postgres-only fork of the sqlx facade -- excluded so it is
 # not treated as a workspace member; it is pulled in only through the patch below. See
 # vendor/sqlx/VENDOR.md.
-exclude = ["vendor/kleos", "vendor/sqlx", "vendor/sqlx-macros-core"]
+exclude = ["vendor/kleos", "vendor/frameshift", "vendor/sqlx", "vendor/sqlx-macros-core"]
 
 [workspace.package]
 edition = "2021"
