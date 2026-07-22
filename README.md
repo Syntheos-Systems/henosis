@@ -216,9 +216,10 @@ missing.
 
 ## Security reports
 
-Open a GitHub issue for reproducible bugs that contain no credentials, private data, or exploit
-details. Use GitHub private vulnerability reporting for sensitive reports after that channel is
-enabled for this repository. Do not publish secrets in an issue.
+Send vulnerabilities through [GitHub Private Vulnerability Reporting](https://github.com/Syntheos-Systems/henosis/security/advisories/new)
+or `security@syntheos.dev`. Send non-security bugs to `support@syntheos.dev` or open a GitHub
+issue that contains no credentials, private data, or exploit details. Read [SECURITY.md](SECURITY.md)
+before sending sensitive material.
 
 ## License
 
