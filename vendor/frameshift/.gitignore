@@ -1,0 +1,3 @@
+# The repository root Cargo.lock governs Henosis builds. This excluded helper
+# workspace resolves its own temporary lockfile only for focused vendor tests.
+/Cargo.lock

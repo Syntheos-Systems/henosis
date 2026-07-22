@@ -30,4 +30,12 @@ git -C "$FRAMESHIFT_UPSTREAM" archive "$pin" \
 ```
 
 Update the pin above, compare both trees with the upstream commit, run
-`./scripts/vendor-drift.sh`, and complete the repository test suite before committing.
+`./scripts/vendor-drift.sh`, then run the focused mirror tests offline:
+
+```sh
+cargo test --offline --manifest-path vendor/frameshift/Cargo.toml --workspace
+```
+
+The excluded helper workspace generates a local ignored `Cargo.lock`; the repository root
+`Cargo.lock` remains authoritative for Henosis builds. Complete the repository test suite before
+committing an updated mirror.
