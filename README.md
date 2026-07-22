@@ -5,8 +5,8 @@ trust, coordination, execution, policy, and credentials in one runtime so an age
 continuity across model calls, process restarts, and work sessions.
 
 Each agent has one principal identity. Soma records its presence, Pistis evaluates its trust and
-capabilities, Phylax controls its credentials, Kleos holds its memory, and Axon carries its actions
-to the rest of the system. The agent does not need a separate identity for each subsystem.
+capabilities, `phylaxd` brokers its credentials, Kleos holds its memory, and Axon carries its
+actions to the rest of the system. The agent does not need a separate identity for each subsystem.
 
 > **Status:** Henosis is under active development. The integrated server runs, the source installer
 > produces a persistent user service, and the core authorities fail closed. APIs, database schemas,
@@ -24,7 +24,7 @@ Human, agent, CLI, TUI, HTTP, MCP, or Rift
                     |
           canonical action dispatcher
                     |
-    Pistis -> Plutus -> Eidolon -> Human -> Phylax
+    Pistis -> Plutus -> Eidolon -> Human -> credential policy
                     |
          Hermes or internal execution
                     |
@@ -34,10 +34,11 @@ Human, agent, CLI, TUI, HTTP, MCP, or Rift
         Kleos memory and Cognition services
 ```
 
-The dispatcher applies the gate chain in that order. The server rejects a different order and
-refuses to start without the required Plutus and Phylax authorities. An allowed action executes
-through Hermes, Phylax, or an internal handler, then publishes typed lifecycle events through
-Axon.
+The dispatcher applies the gate chain in that order. The current source calls the last internal
+slot `phylax`, a stale name retained by the in-process implementation. The server rejects a
+different order and refuses to start without the required Plutus and credential-policy
+authorities. An allowed action executes through Hermes or an internal handler, then publishes
+typed lifecycle events through Axon.
 
 This structure gives one agent a continuous record of who it is, what it has done, which
 capabilities it has earned, and which work remains after a restart.
@@ -48,7 +49,7 @@ capabilities it has earned, and which work remains after a restart.
 |------|------------|----------------|
 | Integrated runtime | `syntheos-server`, contracts, identity, dispatch | Boots the authorities, kernel services, execution path, HTTP API, and optional operator surface |
 | Coordination | Axon, Chiasm, Soma, Broca, Loom, Thymus | Events, tasks, presence, narration, workflows, evaluations, and drift signals |
-| Authorities | Pistis, Plutus, Eidolon, Human approval, Phylax | Capability policy, tenant policy, input and output policy, escalation, and credential use |
+| Authorities | Pistis, Plutus, Eidolon, Human approval, credential policy | Capability policy, tenant policy, input and output policy, escalation, and credential use |
 | Agent execution | Synapse, Hephaestus, Hermes | Model providers, sessions, checkpoints, tool loops, SaaS adapters, rate limits, and audit events |
 | Agent space | Rift server and bridge | Rooms, messages, WebSockets, agent participation, and approval requests |
 | Memory | Kleos bridge and optional Cognition facade | Persistent memory, context, handoffs, graph, personality, skills, and intelligence services |
@@ -76,8 +77,9 @@ cd henosis
 ```
 
 On a new installation, the script requests the PostgreSQL URL without echoing it. It generates the
-operator tenant, operator principal, and Phylax master key; creates private SQLite storage; builds
-the locked release binary; installs a hardened user service; and checks `/health` after startup.
+operator tenant, operator principal, and a key for the current in-process credential path; creates
+private SQLite storage; builds the locked release binary; installs a hardened user service; and
+checks `/health` after startup.
 If `psql` is installed, the script tests the database before the build. The server performs its own
 database check at boot in either case.
 
@@ -145,23 +147,27 @@ authority chain remains part of the product security model.
 | Plutus policy data | `PolicyBackend` trait | Integrated server uses PostgreSQL |
 | Human approval | `Approver` trait | Integrated server uses the Rift approval registry |
 | Tool adapters | Hermes tool trait and registry | Adding a provider requires a Rust adapter and registry entry |
-| Credentials | Phylax authority | Canonical store for encrypted secrets and use-without-holding operations |
+| Credentials | `cred`, brokered by `phylaxd` | Canonical external credential path; Henosis integration is incomplete |
 
 Kleos is the native memory and cognition system. PostgreSQL is the production Plutus backend.
-Phylax and the ordered authority chain are intentional Henosis components, while traits isolate
-their data sources and callers.
+The ordered policy chain is intentional Henosis architecture, while traits isolate its data
+sources and callers.
 
-### Legacy `credd` dependency
+### Credential migration gap
 
-Hermes entered the workspace with an HTTP client for `credd`, the credential daemon used by the
-older service architecture. The bundled Gmail, Google Calendar, Google Drive, GitHub, Linear,
-Notion, and similar adapters still use that client to fetch tenant OAuth tokens and webhook
-secrets.
+`phylaxd` is the credential broker behind `cred`. It superseded `credd` and retains a
+credd-compatible API, which is why some client types, environment variables, socket names, and
+error messages still contain the old name.
 
-Henosis does not ship or install `credd`. The server can boot without it, but an adapter that needs
-OAuth returns a credential error unless a compatible endpoint and token are configured. Phylax is
-the canonical Henosis credential authority, so the remaining work is to route Hermes credential
-requests through Phylax and remove the legacy `CREDD_URL` and `HERMES_CREDD_TOKEN` configuration.
+Hermes uses that compatibility API for OAuth tokens and webhook secrets needed by Gmail, Google
+Calendar, Google Drive, GitHub, Linear, Notion, and similar adapters. Its client and configuration
+still use the legacy `CreddClient`, `CREDD_URL`, and `HERMES_CREDD_TOKEN` names.
+
+The repository also contains an absorbed `henosis-phylax` crate and currently wires it into the
+integrated server as the fifth policy gate and an in-process credential store. It came from a
+separate credential experiment and is not the intended credential architecture. Before the
+credential integration is complete, Henosis must replace that path with `phylaxd` and retire its
+`SYNTHEOS_PHYLAX_KEY` and `SYNTHEOS_PHYLAX_DB` configuration.
 
 ## Build and test
 
@@ -198,7 +204,8 @@ cargo test --locked --workspace
 
 - The integrated Pistis gate uses an empty in-memory room-state source. Requests that require room capabilities fail closed until live room state is connected.
 - Hephaestus has a placeholder production Plutus token provider for tenant-scoped Anthropic authentication. Development credentials and OpenAI-compatible providers use separate paths.
-- Hermes OAuth-backed adapters retain the legacy `credd` dependency described above.
+- Credential handling is split between the canonical `phylaxd` broker, legacy credd-named Hermes
+  compatibility code, and the stale in-process `henosis-phylax` path described above.
 - The default Rift bridge expects a reachable Kleos HTTP service. An embedded memory path requires the `cognition` feature.
 - The source installer configures `syntheos-server`; it does not provision PostgreSQL or install every workspace binary.
 - Public APIs and persistence formats have no stable compatibility guarantee yet.
