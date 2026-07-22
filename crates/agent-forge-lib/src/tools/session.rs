@@ -50,7 +50,7 @@ pub fn checkpoint(db: &Database, input: CheckpointInput) -> ToolResult {
 
     Ok(Output::ok_with_id(
         id,
-        format!("Checkpoint '{}' created", name),
+        format!("Checkpoint '{name}' created"),
     ))
 }
 
@@ -75,7 +75,7 @@ pub fn rollback(db: &Database, input: RollbackInput) -> ToolResult {
             rusqlite::params![name],
             |row| row.get(0),
         )
-        .map_err(|_| ToolError::InvalidValue(format!("Checkpoint not found: {}", name)))?;
+        .map_err(|_| ToolError::InvalidValue(format!("Checkpoint not found: {name}")))?;
 
     if let Some(ref git_hash) = git_ref {
         let status = Command::new("git")
@@ -88,7 +88,7 @@ pub fn rollback(db: &Database, input: RollbackInput) -> ToolResult {
         }
     }
 
-    Ok(Output::ok(format!("Rolled back to checkpoint '{}'", name)))
+    Ok(Output::ok(format!("Rolled back to checkpoint '{name}'")))
 }
 
 /// Input for `session_learn`: the insight to record plus optional context,
@@ -151,7 +151,7 @@ pub fn session_learn(
                 }
                 Err(e) => {
                     // Best-effort: log but don't fail the session_learn
-                    eprintln!("warning: skill capture failed: {}", e);
+                    eprintln!("warning: skill capture failed: {e}");
                 }
             }
         }
@@ -195,7 +195,7 @@ pub fn session_recall(db: &Database, input: SessionRecallInput) -> ToolResult {
         )
         .map_err(|e| ToolError::DatabaseError(e.to_string()))?;
 
-    let pattern = format!("%{}%", query);
+    let pattern = format!("%{query}%");
     let rows = stmt
         .query_map(rusqlite::params![pattern, limit], |row| {
             Ok(serde_json::json!({

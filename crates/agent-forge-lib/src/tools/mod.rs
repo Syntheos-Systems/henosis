@@ -36,10 +36,10 @@ impl std::fmt::Display for ToolError {
     /// Human-readable form used when an error bubbles to the CLI output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ToolError::MissingField(s) => write!(f, "Missing required field: {}", s),
-            ToolError::InvalidValue(s) => write!(f, "Invalid value: {}", s),
-            ToolError::DatabaseError(s) => write!(f, "Database error: {}", s),
-            ToolError::IoError(s) => write!(f, "I/O error: {}", s),
+            ToolError::MissingField(s) => write!(f, "Missing required field: {s}"),
+            ToolError::InvalidValue(s) => write!(f, "Invalid value: {s}"),
+            ToolError::DatabaseError(s) => write!(f, "Database error: {s}"),
+            ToolError::IoError(s) => write!(f, "I/O error: {s}"),
         }
     }
 }
@@ -71,5 +71,5 @@ pub fn set_session_active(id: &str, kind: &str) {
         }
     };
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("agent-forge-active"), format!("{}:{}", id, kind));
+    let _ = std::fs::write(dir.join("agent-forge-active"), format!("{id}:{kind}"));
 }

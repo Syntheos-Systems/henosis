@@ -31,7 +31,7 @@ pub fn comment_check(_db: &Database, input: CommentCheckInput) -> ToolResult {
         .ok_or_else(|| ToolError::MissingField("file_path".into()))?;
 
     let content = std::fs::read_to_string(&file_path)
-        .map_err(|e| ToolError::IoError(format!("Cannot read {}: {}", file_path, e)))?;
+        .map_err(|e| ToolError::IoError(format!("Cannot read {file_path}: {e}")))?;
 
     let ext = Path::new(&file_path)
         .extension()
@@ -57,12 +57,9 @@ pub fn comment_check(_db: &Database, input: CommentCheckInput) -> ToolResult {
     };
 
     let summary = if missing == 0 {
-        format!("All {} declarations in {} are commented", total, file_path)
+        format!("All {total} declarations in {file_path} are commented")
     } else {
-        format!(
-            "{}/{} declarations in {} lack a leading comment",
-            missing, total, file_path
-        )
+        format!("{missing}/{total} declarations in {file_path} lack a leading comment")
     };
 
     let mut output = if missing == 0 {

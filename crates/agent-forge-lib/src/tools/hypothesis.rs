@@ -104,8 +104,7 @@ pub fn log_outcome(db: &Database, input: LogOutcomeInput) -> ToolResult {
 
     if rows == 0 {
         return Err(ToolError::InvalidValue(format!(
-            "Hypothesis not found: {}",
-            hypothesis_id
+            "Hypothesis not found: {hypothesis_id}"
         )));
     }
 
@@ -140,7 +139,7 @@ pub fn recall_errors(db: &Database, input: RecallErrorsInput) -> ToolResult {
         )
         .map_err(|e| ToolError::DatabaseError(e.to_string()))?;
 
-    let pattern = format!("%{}%", query);
+    let pattern = format!("%{query}%");
     let rows = stmt
         .query_map(rusqlite::params![pattern, limit], |row| {
             Ok(serde_json::json!({

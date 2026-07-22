@@ -40,7 +40,7 @@ pub fn skill_search(bridge: Option<&dyn SkillsBridge>, input: SkillSearchInput) 
         .unwrap_or(serde_json::json!([]));
     let count = skills.as_array().map(|a| a.len()).unwrap_or(0);
 
-    let mut output = Output::ok(format!("Found {} matching skills", count));
+    let mut output = Output::ok(format!("Found {count} matching skills"));
     output.data = Some(serde_json::json!({ "skills": skills }));
     Ok(output)
 }
@@ -81,8 +81,7 @@ pub fn skill_capture(bridge: Option<&dyn SkillsBridge>, input: SkillCaptureInput
         .and_then(|v| v.as_str())
         .unwrap_or("captured");
 
-    let mut output =
-        Output::ok_with_id(skill_id.to_string(), format!("Skill captured: {}", message));
+    let mut output = Output::ok_with_id(skill_id.to_string(), format!("Skill captured: {message}"));
     output.data = Some(result);
     Ok(output)
 }
@@ -165,7 +164,7 @@ pub fn skill_fix(bridge: Option<&dyn SkillsBridge>, input: SkillFixInput) -> Too
         .and_then(|v| v.as_str())
         .unwrap_or("fixed");
 
-    let mut output = Output::ok_with_id(new_id.to_string(), format!("Skill fixed: {}", message));
+    let mut output = Output::ok_with_id(new_id.to_string(), format!("Skill fixed: {message}"));
     output.data = Some(result);
     Ok(output)
 }
@@ -216,7 +215,7 @@ pub fn skill_derive(bridge: Option<&dyn SkillsBridge>, input: SkillDeriveInput) 
         .and_then(|v| v.as_str())
         .unwrap_or("derived");
 
-    let mut output = Output::ok_with_id(new_id.to_string(), format!("Skill derived: {}", message));
+    let mut output = Output::ok_with_id(new_id.to_string(), format!("Skill derived: {message}"));
     output.data = Some(result);
     Ok(output)
 }
@@ -238,7 +237,7 @@ pub fn skill_lineage(bridge: Option<&dyn SkillsBridge>, input: SkillLineageInput
     let bridge = require(bridge)?;
     let result = bridge.get_lineage(skill_id).map_err(ToolError::IoError)?;
 
-    let mut output = Output::ok(format!("Lineage for skill #{}", skill_id));
+    let mut output = Output::ok(format!("Lineage for skill #{skill_id}"));
     output.data = Some(result);
     Ok(output)
 }

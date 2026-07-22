@@ -46,7 +46,7 @@ pub fn repo_map(_db: &Database, input: RepoMapInput) -> ToolResult {
 
     let root = Path::new(&path);
     if !root.exists() {
-        return Err(ToolError::IoError(format!("Path does not exist: {}", path)));
+        return Err(ToolError::IoError(format!("Path does not exist: {path}")));
     }
 
     let mut symbols: Vec<Symbol> = Vec::new();

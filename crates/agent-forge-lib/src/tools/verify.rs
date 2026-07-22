@@ -240,11 +240,10 @@ pub fn verify(
     let total = results.len();
 
     let mut output = if all_passed {
-        Output::ok(format!("Verification passed ({}/{} steps)", passed, total))
+        Output::ok(format!("Verification passed ({passed}/{total} steps)"))
     } else {
         Output::error(format!(
-            "Verification failed ({}/{} steps passed)",
-            passed, total
+            "Verification failed ({passed}/{total} steps passed)"
         ))
     };
 
@@ -288,7 +287,7 @@ pub fn challenge_code(_db: &Database, input: ChallengeCodeInput) -> ToolResult {
 
     // Read the file for line count and comment scan
     let content = std::fs::read_to_string(&file_path)
-        .map_err(|e| ToolError::IoError(format!("Cannot read {}: {}", file_path, e)))?;
+        .map_err(|e| ToolError::IoError(format!("Cannot read {file_path}: {e}")))?;
 
     let lines = content.lines().count();
 

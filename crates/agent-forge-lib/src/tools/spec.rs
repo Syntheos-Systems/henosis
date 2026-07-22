@@ -170,12 +170,11 @@ pub fn update_spec(db: &Database, input: UpdateSpecInput) -> ToolResult {
 
     if rows == 0 {
         return Err(ToolError::InvalidValue(format!(
-            "Spec not found: {}",
-            spec_id
+            "Spec not found: {spec_id}"
         )));
     }
 
-    Ok(Output::ok(format!("Spec {} marked as {}", spec_id, status)))
+    Ok(Output::ok(format!("Spec {spec_id} marked as {status}")))
 }
 
 /// Input for `list_specs`: optional status filter and result cap (default 20).
@@ -269,7 +268,7 @@ pub fn get_spec(db: &Database, input: GetSpecInput) -> ToolResult {
                 }))
             },
         )
-        .map_err(|e| ToolError::DatabaseError(format!("Spec not found: {}", e)))?;
+        .map_err(|e| ToolError::DatabaseError(format!("Spec not found: {e}")))?;
 
     // Get related hypotheses
     let mut hyp_stmt = db
@@ -354,7 +353,7 @@ pub fn get_spec(db: &Database, input: GetSpecInput) -> ToolResult {
         .filter_map(|r| r.ok())
         .collect();
 
-    let mut output = Output::ok(format!("Spec {}", spec_id));
+    let mut output = Output::ok(format!("Spec {spec_id}"));
     output.data = Some(serde_json::json!({
         "spec": spec,
         "hypotheses": hypotheses,

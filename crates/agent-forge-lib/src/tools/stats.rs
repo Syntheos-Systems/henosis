@@ -231,8 +231,7 @@ pub fn stats(db: &Database, input: StatsInput) -> ToolResult {
         .collect();
 
     let mut output = Output::ok(format!(
-        "Protocol stats (last {} days): {} specs ({:.0}% completed), {} hypotheses ({:.0}% accurate), {} verifications ({:.0}% pass)",
-        days, total_specs, spec_completion_rate, total_hypotheses, hypothesis_accuracy, total_verifications, verify_pass_rate
+        "Protocol stats (last {days} days): {total_specs} specs ({spec_completion_rate:.0}% completed), {total_hypotheses} hypotheses ({hypothesis_accuracy:.0}% accurate), {total_verifications} verifications ({verify_pass_rate:.0}% pass)"
     ));
 
     output.data = Some(serde_json::json!({

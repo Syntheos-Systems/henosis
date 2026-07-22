@@ -112,7 +112,7 @@ impl Database {
     fn migrate(&self) -> SqliteResult<()> {
         let has_column = |table: &str, col: &str| -> bool {
             self.conn
-                .prepare(&format!("SELECT {} FROM {} LIMIT 0", col, table))
+                .prepare(&format!("SELECT {col} FROM {table} LIMIT 0"))
                 .is_ok()
         };
 

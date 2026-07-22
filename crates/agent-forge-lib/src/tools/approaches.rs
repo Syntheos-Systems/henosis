@@ -76,8 +76,7 @@ pub fn consider_approaches(db: &Database, input: ConsiderApproachesInput) -> Too
             .map_err(|e| ToolError::DatabaseError(e.to_string()))?;
         if exists == 0 {
             return Err(ToolError::InvalidValue(format!(
-                "spec_id '{}' does not exist",
-                spec_id
+                "spec_id '{spec_id}' does not exist"
             )));
         }
     }

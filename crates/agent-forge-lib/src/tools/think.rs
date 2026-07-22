@@ -45,7 +45,7 @@ pub fn think(_db: &Database, input: ThinkInput) -> ToolResult {
             4. What are the tradeoffs?\n\
             5. What is my recommendation and why?",
             problem,
-            constraints.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
+            constraints.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"),
             input.context.unwrap_or_else(|| "None provided".into()),
         ),
     }));

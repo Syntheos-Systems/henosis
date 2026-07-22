@@ -51,7 +51,7 @@ pub fn search_code(_db: &Database, input: SearchCodeInput) -> ToolResult {
 
     let root = Path::new(&path);
     if !root.exists() {
-        return Err(ToolError::IoError(format!("Path does not exist: {}", path)));
+        return Err(ToolError::IoError(format!("Path does not exist: {path}")));
     }
 
     let mut results: Vec<SearchResult> = Vec::new();
