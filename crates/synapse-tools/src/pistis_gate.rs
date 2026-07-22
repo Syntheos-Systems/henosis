@@ -30,8 +30,7 @@
 //!
 //! Tool names are mapped to required capabilities via a static lookup shared by
 //! both authorities. The map covers all built-in Synapse tools. Unknown tools
-//! require no capabilities (they are not blocked by this gate; add them to the
-//! map to restrict them).
+//! are denied so a missing policy entry cannot silently bypass authorization.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -131,8 +130,8 @@ impl PistisClient {
 
 /// Build the static map from tool name to required capabilities.
 ///
-/// Covers all built-in Synapse tools. Unknown tools are not restricted
-/// by this gate (their required slice is empty). Shared by both authorities.
+/// Covers all built-in Synapse tools. Unknown tools are denied by both
+/// authorities. Shared by both authorities.
 pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
     let fs_read = || Capability::new(Capability::FS_READ);
     let fs_write = || Capability::new(Capability::FS_WRITE);
@@ -151,7 +150,7 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         ("write", vec![fs_write()]),
         ("edit", vec![fs_write()]),
         // Filesystem read+write (delegate may read and write)
-        ("delegate", vec![fs_read(), fs_write(), bash()]),
+        ("delegate_task", vec![fs_read(), fs_write(), bash()]),
         // Network
         ("web_fetch", vec![network()]),
         ("web_search", vec![network()]),
@@ -180,6 +179,7 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         ("skill_execute", vec![network()]),
         ("skill_create", vec![network()]),
         ("skill_list", vec![network()]),
+        ("skill_invoke", vec![network()]),
         ("handoff_store", vec![network()]),
         ("handoff_restore", vec![network()]),
         ("handoff_search", vec![network()]),
@@ -218,8 +218,8 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         // Agent-forge -- mix of network and local execution
         ("repo_map", vec![fs_read()]),
         ("search_code", vec![fs_read()]),
-        ("forge_execute", vec![bash()]),
-        ("forge_verify", vec![bash()]),
+        ("execute", vec![bash()]),
+        ("verify", vec![bash()]),
         ("ast_search", vec![fs_read()]),
         ("log_hypothesis", vec![network()]),
         ("log_outcome", vec![network()]),
@@ -228,8 +228,8 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         ("session_diff", vec![network()]),
         ("prose_analyze", vec![network()]),
         ("prose_learn", vec![network()]),
-        // LSP -- reads diagnostics from a local server
-        ("lsp_diagnostics", vec![fs_read()]),
+        // LSP -- diagnostics launch language-specific local processes
+        ("lsp_diagnostics", vec![fs_read(), bash()]),
         ("lsp_symbol_search", vec![fs_read()]),
         // Session search -- reads local SQLite
         ("session_search", vec![fs_read()]),
@@ -247,8 +247,8 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
 /// checked against the static tool->capability map.
 ///
 /// This is the default backend. It requires no Henosis dependency, so Synapse
-/// runs on its own. A tool with no mapped requirement is allowed; a tool whose
-/// requirements are not all granted is denied, naming the first missing one.
+/// runs on its own. An unmapped tool is denied; a mapped tool whose requirements
+/// are not all granted is denied, naming the first missing capability.
 pub struct LocalAuthority {
     /// The capabilities granted for this session.
     client: PistisClient,
@@ -280,10 +280,14 @@ impl LocalAuthority {
 /// Implements the standalone capability check.
 #[async_trait::async_trait]
 impl PistisAuthority for LocalAuthority {
-    /// Allow tools with no mapped requirement; otherwise require every mapped
-    /// capability to be granted, naming the first missing one on denial.
+    /// Deny unmapped tools; otherwise require every mapped capability to be
+    /// granted, naming the first missing one on denial.
     async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
-        let required: &[Capability] = self.cap_map.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+        let Some(required) = self.cap_map.get(name) else {
+            return AuthorizationOutcome::Deny(format!(
+                "no capability policy registered for tool '{name}'"
+            ));
+        };
         match self.client.check(required) {
             Ok(()) => AuthorizationOutcome::Allow,
             Err(missing) => AuthorizationOutcome::Deny(format!(
@@ -449,17 +453,16 @@ pub mod henosis {
     /// Implements the in-process Henosis capability check, fail-closed.
     #[async_trait::async_trait]
     impl PistisAuthority for HenosisAuthority {
-        /// Allow tools with no mapped requirement; otherwise authorize every
-        /// mapped capability against the materialized room state. A room with no
+        /// Deny unmapped tools; otherwise authorize every mapped capability
+        /// against the materialized room state. A room with no
         /// materialized authority state denies (fail-closed) -- Pistis cannot
         /// verify, so it does not allow.
         async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
-            let required: &[Capability] =
-                self.cap_map.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
-            if required.is_empty() {
-                // Unknown / unrestricted tool -- not this authority's concern.
-                return AuthorizationOutcome::Allow;
-            }
+            let Some(required) = self.cap_map.get(name) else {
+                return AuthorizationOutcome::Deny(format!(
+                    "no capability policy registered for tool '{name}'"
+                ));
+            };
 
             let Some(state) = self.source.room_state(&self.room) else {
                 return AuthorizationOutcome::Deny(format!(
@@ -545,12 +548,27 @@ mod tests {
     async fn denies_delegate_when_grants_are_partial() {
         let gate = read_only_gate();
         let decision = gate
-            .before_execute("delegate", &Value::Null, Path::new("/tmp"))
+            .before_execute("delegate_task", &Value::Null, Path::new("/tmp"))
             .await;
         assert!(matches!(decision, GateDecision::Deny(_)));
     }
 
-    /// A permissive gate allows everything.
+    /// Process and network tools cannot run with only filesystem-read access.
+    #[tokio::test]
+    async fn denies_sensitive_builtins_without_their_grants() {
+        let gate = read_only_gate();
+        for tool in &["execute", "verify", "skill_invoke", "lsp_diagnostics"] {
+            let decision = gate
+                .before_execute(tool, &Value::Null, Path::new("/tmp"))
+                .await;
+            assert!(
+                matches!(decision, GateDecision::Deny(_)),
+                "expected Deny for tool '{tool}'"
+            );
+        }
+    }
+
+    /// A permissive gate allows mapped tools because it holds every capability.
     #[tokio::test]
     async fn permissive_gate_allows_all() {
         let gate = PistisGate::permissive(Arc::new(PermissiveGate));
@@ -565,23 +583,41 @@ mod tests {
         }
     }
 
-    /// Unknown tool names (not in the cap map) are allowed through.
+    /// Unknown tool names are denied because no capability policy covers them.
     #[tokio::test]
-    async fn unknown_tool_allowed() {
+    async fn unknown_tool_denied() {
         let gate = read_only_gate();
         let decision = gate
             .before_execute("totally_unknown_tool", &Value::Null, Path::new("/tmp"))
             .await;
-        assert!(matches!(decision, GateDecision::Allow));
+        assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+
+    /// Every tool in the default registry has an explicit capability policy.
+    #[test]
+    fn default_registry_tools_have_capability_policies() {
+        let map = capability_map();
+        let registry = crate::default_tools();
+        let missing: Vec<String> = registry
+            .all_tool_schemas()
+            .into_iter()
+            .filter_map(|schema| schema["name"].as_str().map(str::to_owned))
+            .filter(|name| !map.contains_key(name.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "unmapped built-in tools: {missing:?}");
+        assert!(map.contains_key("delegate_task"));
     }
 
     /// The `with_authority` constructor accepts any `PistisAuthority`; a custom
     /// always-deny authority denies every tool.
     #[tokio::test]
     async fn with_authority_uses_custom_backend() {
+        /// Test authority that rejects every tool name.
         struct DenyAll;
+        /// Implements the unconditional denial policy used by this test.
         #[async_trait::async_trait]
         impl PistisAuthority for DenyAll {
+            /// Reject the requested tool with a deterministic policy reason.
             async fn authorize_tool(&self, name: &str) -> AuthorizationOutcome {
                 AuthorizationOutcome::Deny(format!("policy: {name} forbidden"))
             }
@@ -618,7 +654,9 @@ mod henosis_tests {
 
     /// A fixed clock so the trust math is deterministic.
     struct FixedClock(OffsetDateTime);
+    /// Supplies the fixed timestamp used by Henosis authority tests.
     impl Clock for FixedClock {
+        /// Return the clock's configured timestamp.
         fn now(&self) -> OffsetDateTime {
             self.0
         }
@@ -680,15 +718,15 @@ mod henosis_tests {
         assert!(matches!(decision, GateDecision::Deny(_)));
     }
 
-    /// A tool with no mapped requirement is allowed regardless of room state.
+    /// A tool with no mapped policy is denied regardless of room state.
     #[tokio::test]
-    async fn henosis_allows_unrestricted_tool() {
+    async fn henosis_denies_unmapped_tool() {
         let p = PrincipalId::new();
         let gate = gate_for(p);
         let decision = gate
             .before_execute("totally_unknown_tool", &Value::Null, Path::new("/tmp"))
             .await;
-        assert!(matches!(decision, GateDecision::Allow));
+        assert!(matches!(decision, GateDecision::Deny(_)));
     }
 
     /// Fail-closed: an empty room-state source denies every restricted tool.
