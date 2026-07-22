@@ -1,8 +1,6 @@
 //! Shared test scaffolding for the session runtime: a scriptable stub provider
 //! and a manager builder. Compiled only under `cfg(test)`.
 
-#![cfg(test)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,15 +18,19 @@ use super::manager::SessionManager;
 
 /// Provider that emits a fixed text delta then stops. No network.
 pub struct StubProvider {
+    /// Text returned by both buffered and streaming test requests.
     pub reply: String,
 }
 
+/// Implements the provider contract with deterministic in-memory responses.
 #[async_trait::async_trait]
 impl Provider for StubProvider {
+    /// Returns the stable provider name used by tests.
     fn name(&self) -> &str {
         "stub"
     }
 
+    /// Returns the configured reply as a completed buffered response.
     async fn send(&self, _req: &ChatRequest) -> Result<ChatResponse> {
         Ok(ChatResponse {
             id: "stub".into(),
@@ -44,6 +46,7 @@ impl Provider for StubProvider {
         })
     }
 
+    /// Streams the configured reply, usage totals, and a terminal event.
     fn send_streaming(
         &self,
         _req: &ChatRequest,
