@@ -61,7 +61,7 @@ token = "your-foundry-token"
 model = "claude-sonnet-4-6"
 max_tokens = 4096
 
-# Agent using Synapse with Claude Max provider (full tool access via Max subscription)
+# Agent using Synapse with Claude Max provider (text-only in shared bridge sessions)
 [[agents]]
 name = "Builder"
 username = "agent-builder"

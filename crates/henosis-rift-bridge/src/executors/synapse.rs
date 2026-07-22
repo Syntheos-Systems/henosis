@@ -6,13 +6,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use synapse_core::executors::SynapseExecutor;
 use synapse_core::hooks::HookConfig;
 use synapse_core::types::AgentConfig as SynapseAgentConfig;
-use synapse_provider::{create_provider, ProviderConfig, ToolExecutor};
-use synapse_tools::{default_tools, ToolRegistryExecutor};
+use synapse_provider::{ProviderConfig, ToolExecutor, create_provider};
+use synapse_tools::{ToolRegistryExecutor, default_tools};
 
 /// Build a `SynapseExecutor` from bridge-level configuration values.
 ///
@@ -36,12 +36,6 @@ pub fn build_synapse_executor(
     // Build tool registry for execution mode.
     let tools = Arc::new(default_tools());
 
-    // Build ToolExecutor for ClaudeMax's MCP bridge (wraps the tool registry).
-    let tool_executor: Arc<dyn ToolExecutor> = Arc::new(ToolRegistryExecutor::new(
-        Arc::clone(&tools),
-        working_dir.clone(),
-    ));
-
     // Construct the provider from config.
     let provider_config = match provider_type {
         "foundry-anthropic" => {
@@ -54,13 +48,21 @@ pub fn build_synapse_executor(
             let token = token.context("foundry-openai provider requires 'token'")?;
             ProviderConfig::FoundryOpenAI { host, token }
         }
-        "claude-max" | "claude-cli" => ProviderConfig::ClaudeMax {
-            model: Some(model_str.clone()),
-            cli_path: None,
-            cred_namespace: None,
-            cred_key: None,
-            tools: tool_executor,
-        },
+        "claude-max" | "claude-cli" => {
+            // Claude Max owns its MCP loop inside a persistent provider. That
+            // loop cannot inherit this executor's per-task Pistis gate or
+            // worktree safely, so keep it text-only until providers are scoped
+            // to one authorized task.
+            let tool_executor: Arc<dyn ToolExecutor> =
+                Arc::new(ToolRegistryExecutor::disabled(working_dir.clone()));
+            ProviderConfig::ClaudeMax {
+                model: Some(model_str.clone()),
+                cli_path: None,
+                cred_namespace: None,
+                cred_key: None,
+                tools: tool_executor,
+            }
+        }
         "anthropic" => {
             let key = api_key
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())

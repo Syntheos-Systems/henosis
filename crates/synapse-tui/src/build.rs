@@ -26,6 +26,7 @@ use synapse_tools::{ToolRegistry, ToolRegistryExecutor, default_tools};
 /// `Provider: Send + Sync`. Mirrors the same newtype in synapse-cli.
 struct ProviderWrapper(Box<dyn Provider>);
 
+/// Delegates provider behavior through the boxed provider object.
 #[async_trait::async_trait]
 impl Provider for ProviderWrapper {
     /// Report the provider name from the wrapped implementation.
@@ -126,23 +127,14 @@ fn foundry_creds() -> Result<(String, String)> {
 
 /// Build a `ProviderConfig` for `name`, reading credentials from config/env.
 /// Returns `Err` (never exits) on missing credentials or an unknown provider.
-fn provider_config_for(
-    name: &str,
-    tools: &Arc<ToolRegistry>,
-    cwd: &Path,
-) -> Result<ProviderConfig> {
+fn provider_config_for(name: &str, cwd: &Path) -> Result<ProviderConfig> {
     let cfg = match name {
         "anthropic" => ProviderConfig::AnthropicAuto,
         "claude-max" => {
-            // LIMITATION: the provider is shared across all sessions, so this
-            // tool executor is bound to the launch directory -- claude-max tool
-            // calls do NOT run in each session's own worktree. Foundry/Anthropic
-            // providers are unaffected (they do not use a tool executor). Fixing
-            // this for claude-max would require per-session provider instances.
-            let executor = Arc::new(ToolRegistryExecutor::new(
-                Arc::clone(tools),
-                cwd.to_path_buf(),
-            ));
+            // The provider is shared across sessions, so it cannot safely bind
+            // MCP calls to a session's gate and working directory. Keep the
+            // provider text-only until it is instantiated per session.
+            let executor = Arc::new(ToolRegistryExecutor::disabled(cwd.to_path_buf()));
             // ClaudeMax takes an Option<model>; None lets the provider pick its
             // own default, so we do not reuse resolve_model() (which substitutes
             // a concrete fallback).
@@ -248,8 +240,8 @@ pub fn build() -> Result<Runtime> {
     let tools = Arc::new(default_tools());
     let name = resolve_provider_name();
     let model = resolve_model();
-    let cfg = provider_config_for(&name, &tools, &cwd)
-        .with_context(|| format!("resolving provider {name:?}"))?;
+    let cfg =
+        provider_config_for(&name, &cwd).with_context(|| format!("resolving provider {name:?}"))?;
     let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ProviderWrapper(
         create_provider(cfg).with_context(|| format!("constructing provider {name:?}"))?,
     ));
@@ -296,12 +288,14 @@ fn build_runtime(
 }
 
 #[cfg(test)]
+/// Exercises provider selection and shared runtime defaults.
 mod tests {
     use super::*;
 
     /// Minimal stub provider used only to exercise `build_runtime`.
     struct P;
 
+    /// Implements the provider contract for the runtime test stub.
     #[async_trait::async_trait]
     impl Provider for P {
         /// Return a fixed name for the stub.
@@ -328,6 +322,7 @@ mod tests {
         }
     }
 
+    /// Verifies the runtime builder installs the intended agent defaults.
     #[test]
     fn build_runtime_sets_defaults() {
         let rt = build_runtime(
@@ -342,30 +337,30 @@ mod tests {
         assert_eq!(rt.base_config.max_tool_result_tokens, 8000);
     }
 
+    /// Verifies unknown provider identifiers fail closed.
     #[test]
     fn unknown_provider_errors() {
-        let tools = Arc::new(ToolRegistry::new());
-        assert!(provider_config_for("totally-unknown", &tools, Path::new("/tmp")).is_err());
+        assert!(provider_config_for("totally-unknown", Path::new("/tmp")).is_err());
     }
 
+    /// Verifies local credential-free providers remain selectable.
     #[test]
     fn anthropic_and_ollama_need_no_credentials() {
-        let tools = Arc::new(ToolRegistry::new());
         assert!(matches!(
-            provider_config_for("anthropic", &tools, Path::new("/tmp")),
+            provider_config_for("anthropic", Path::new("/tmp")),
             Ok(ProviderConfig::AnthropicAuto)
         ));
         assert!(matches!(
-            provider_config_for("ollama", &tools, Path::new("/tmp")),
+            provider_config_for("ollama", Path::new("/tmp")),
             Ok(ProviderConfig::Ollama { .. })
         ));
     }
 
+    /// Verifies Claude Max remains selectable in fail-closed text-only mode.
     #[test]
-    fn claude_max_builds_with_tool_executor() {
-        let tools = Arc::new(ToolRegistry::new());
+    fn claude_max_builds_in_text_only_mode() {
         assert!(matches!(
-            provider_config_for("claude-max", &tools, Path::new("/tmp")),
+            provider_config_for("claude-max", Path::new("/tmp")),
             Ok(ProviderConfig::ClaudeMax { .. })
         ));
     }

@@ -32,7 +32,7 @@ fn test_rejects_missing_token_for_foundry() {
     assert!(result.is_err(), "foundry provider requires token");
 }
 
-/// Verifies Claude Max configuration can be constructed without explicit credentials.
+/// Verifies text-only Claude Max configuration can be constructed without explicit credentials.
 #[test]
 fn test_claude_max_needs_no_credentials() {
     let result = build_synapse_executor(
@@ -47,7 +47,7 @@ fn test_claude_max_needs_no_credentials() {
     );
     assert!(
         result.is_ok(),
-        "claude-max should work with no explicit credentials"
+        "text-only claude-max should work with no explicit credentials"
     );
 }
 

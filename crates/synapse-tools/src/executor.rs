@@ -28,19 +28,32 @@ pub struct ToolRegistryExecutor {
     cwd: PathBuf,
 }
 
+/// Adds constructors for enabled and fail-closed provider tool execution.
 impl ToolRegistryExecutor {
     /// Build an executor wrapping `registry` with the given `cwd`.
     pub fn new(registry: Arc<ToolRegistry>, cwd: PathBuf) -> Self {
         Self { registry, cwd }
     }
+
+    /// Build a fail-closed executor that exposes no MCP tools.
+    ///
+    /// Shared providers cannot safely reuse a task-scoped gate or working
+    /// directory. Callers use this constructor until they can create one
+    /// provider instance per authorized session.
+    pub fn disabled(cwd: PathBuf) -> Self {
+        Self::new(Arc::new(ToolRegistry::new()), cwd)
+    }
 }
 
 #[async_trait]
+/// Exposes registry schemas and execution through the provider-facing contract.
 impl ToolExecutor for ToolRegistryExecutor {
+    /// Return schemas for every tool visible to the provider.
     fn tool_schemas(&self) -> Vec<serde_json::Value> {
         self.registry.all_tool_schemas()
     }
 
+    /// Execute one provider-originated tool call against the bound registry and cwd.
     async fn execute_tool(
         &self,
         name: &str,
@@ -67,5 +80,19 @@ impl ToolExecutor for ToolRegistryExecutor {
                 is_error: true,
             }),
         }
+    }
+}
+
+/// Verifies the fail-closed executor advertises no callable tools.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Confirms shared providers cannot discover tools through the disabled executor.
+    #[test]
+    fn disabled_executor_has_no_tool_schemas() {
+        let executor = ToolRegistryExecutor::disabled(PathBuf::from("/tmp"));
+
+        assert!(executor.tool_schemas().is_empty());
     }
 }
