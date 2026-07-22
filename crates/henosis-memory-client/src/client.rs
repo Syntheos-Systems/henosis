@@ -238,7 +238,7 @@ impl Client {
                         .map(ToOwned::to_owned)
                 })
                 .unwrap_or_else(|| body_excerpt(&bytes));
-            Err(format!("HTTP {} {}: {}", status, url, msg))
+            Err(format!("HTTP {status} {url}: {msg}"))
         }
     }
 

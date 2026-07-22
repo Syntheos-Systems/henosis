@@ -107,7 +107,7 @@ pub fn current_agent_slot() -> String {
         .or_else(|_| env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
     let hostname = read_hostname();
-    format!("claude-code-{}-{}", user, hostname)
+    format!("claude-code-{user}-{hostname}")
 }
 
 /// Resolve the host name from `/proc` or the `HOSTNAME` env, with a fallback.
@@ -163,7 +163,7 @@ pub async fn resolve_api_key(agent_slot: &str) -> Result<String, CredError> {
         return Err(CredError::NoAgentKey);
     }
 
-    let path = format!("/bootstrap/kleos-bearer?agent={}", agent_slot);
+    let path = format!("/bootstrap/kleos-bearer?agent={agent_slot}");
 
     let body: serde_json::Value = if let Ok(sock) = env::var("PHYLAXD_SOCKET") {
         unix_get_json(&sock, &path, &token).await?
@@ -218,17 +218,16 @@ async fn unix_get_json(
 
     let mut stream = UnixStream::connect(sock_path)
         .await
-        .map_err(|e| CredError::Unreachable(format!("unix socket {}: {}", sock_path, e)))?;
+        .map_err(|e| CredError::Unreachable(format!("unix socket {sock_path}: {e}")))?;
 
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        path, token
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
 
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
+        .map_err(|e| CredError::Unreachable(format!("write: {e}")))?;
 
     // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
@@ -239,7 +238,7 @@ async fn unix_get_json(
     )
     .await
     .map_err(|_| CredError::Unreachable("read: timed out".into()))?
-    .map_err(|e| CredError::Unreachable(format!("read: {}", e)))?;
+    .map_err(|e| CredError::Unreachable(format!("read: {e}")))?;
 
     parse_http_response_body(&response)
 }
@@ -264,17 +263,16 @@ async fn tcp_get_json(bind: &str, path: &str, token: &str) -> Result<serde_json:
 
     let mut stream = TcpStream::connect(bind)
         .await
-        .map_err(|e| CredError::Unreachable(format!("tcp {}: {}", bind, e)))?;
+        .map_err(|e| CredError::Unreachable(format!("tcp {bind}: {e}")))?;
 
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        path, bind, token
+        "GET {path} HTTP/1.1\r\nHost: {bind}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
 
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
+        .map_err(|e| CredError::Unreachable(format!("write: {e}")))?;
 
     // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
@@ -285,7 +283,7 @@ async fn tcp_get_json(bind: &str, path: &str, token: &str) -> Result<serde_json:
     )
     .await
     .map_err(|_| CredError::Unreachable("read: timed out".into()))?
-    .map_err(|e| CredError::Unreachable(format!("read: {}", e)))?;
+    .map_err(|e| CredError::Unreachable(format!("read: {e}")))?;
 
     parse_http_response_body(&response)
 }
@@ -322,7 +320,7 @@ fn parse_http_response_body(response: &[u8]) -> Result<serde_json::Value, CredEr
         }
     }
 
-    serde_json::from_slice(body).map_err(|e| CredError::BadResponse(format!("JSON parse: {}", e)))
+    serde_json::from_slice(body).map_err(|e| CredError::BadResponse(format!("JSON parse: {e}")))
 }
 
 #[cfg(test)]
