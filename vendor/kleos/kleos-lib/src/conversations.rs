@@ -1,3 +1,5 @@
+//! Conversation persistence, message processing, and credential-aware content scrubbing.
+
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -28,6 +30,7 @@ pub struct Conversation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Summarizes a conversation with its message count.
 pub struct ConversationListItem {
     pub id: i64,
     pub agent: String,
@@ -40,6 +43,7 @@ pub struct ConversationListItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Represents one persisted conversation message.
 pub struct Message {
     pub id: i64,
     pub conversation_id: i64,
@@ -50,6 +54,7 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Represents one full-text message search result.
 pub struct MessageSearchResult {
     pub id: i64,
     pub conversation_id: i64,
@@ -62,6 +67,7 @@ pub struct MessageSearchResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines fields accepted when creating a conversation.
 pub struct CreateConversationRequest {
     pub agent: String,
     pub session_id: Option<String>,
@@ -70,12 +76,14 @@ pub struct CreateConversationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines mutable fields accepted when updating a conversation.
 pub struct UpdateConversationRequest {
     pub title: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines fields accepted when adding a conversation message.
 pub struct AddMessageRequest {
     pub role: String,
     pub content: String,
@@ -83,6 +91,7 @@ pub struct AddMessageRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines one message supplied to a bulk operation.
 pub struct BulkMessageInput {
     pub role: String,
     pub content: String,
@@ -90,6 +99,7 @@ pub struct BulkMessageInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines a conversation and messages to insert together.
 pub struct BulkInsertRequest {
     pub agent: String,
     pub session_id: Option<String>,
@@ -99,6 +109,7 @@ pub struct BulkInsertRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines fields used to create or update a session conversation.
 pub struct UpsertConversationRequest {
     pub agent: String,
     pub session_id: String,
@@ -108,6 +119,7 @@ pub struct UpsertConversationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Defines a scoped full-text message search request.
 pub struct SearchMessagesRequest {
     pub query: String,
     pub limit: Option<usize>,
@@ -127,6 +139,7 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
     })
 }
 
+/// Maps a query row to a conversation summary.
 fn row_to_conversation_list_item(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ConversationListItem> {
@@ -142,6 +155,7 @@ fn row_to_conversation_list_item(
     })
 }
 
+/// Maps a query row to one conversation message.
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
@@ -153,6 +167,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+/// Maps a query row to one message search result.
 fn row_to_message_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSearchResult> {
     Ok(MessageSearchResult {
         id: row.get(0)?,
@@ -168,6 +183,7 @@ fn row_to_message_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mes
 
 use crate::memory::fts::sanitize_fts_query;
 
+/// Serializes optional JSON metadata for database storage.
 fn metadata_to_string(meta: &Option<serde_json::Value>) -> Option<String> {
     meta.as_ref().map(|v| v.to_string())
 }
@@ -197,6 +213,7 @@ pub async fn create_conversation(
     get_conversation_for_user(db, new_id, user_id).await
 }
 
+/// Retrieves one conversation owned by the requesting user.
 #[tracing::instrument(skip(db), fields(conversation_id = id, user_id))]
 pub async fn get_conversation_for_user(
     db: &Database,
@@ -215,6 +232,7 @@ pub async fn get_conversation_for_user(
     .await
 }
 
+/// Retrieves the latest conversation for an agent session and user.
 #[tracing::instrument(skip(db), fields(agent = %agent, session_id = %session_id, user_id))]
 pub async fn get_conversation_by_session(
     db: &Database,
@@ -238,6 +256,7 @@ pub async fn get_conversation_by_session(
     .await
 }
 
+/// Lists recent conversations owned by the requesting user.
 #[tracing::instrument(skip(db), fields(user_id, limit))]
 pub async fn list_conversations(
     db: &Database,
@@ -262,6 +281,7 @@ pub async fn list_conversations(
     .await
 }
 
+/// Lists recent conversations for one user-owned agent.
 #[tracing::instrument(skip(db), fields(user_id, agent = %agent, limit))]
 pub async fn list_conversations_by_agent(
     db: &Database,
@@ -288,6 +308,7 @@ pub async fn list_conversations_by_agent(
     .await
 }
 
+/// Updates mutable fields on one user-owned conversation.
 #[tracing::instrument(skip(db, req), fields(conversation_id = id, user_id))]
 pub async fn update_conversation(
     db: &Database,
@@ -310,6 +331,7 @@ pub async fn update_conversation(
     get_conversation_for_user(db, id, user_id).await
 }
 
+/// Deletes one conversation owned by the requesting user.
 #[tracing::instrument(skip(db), fields(conversation_id = id, user_id))]
 pub async fn delete_conversation(db: &Database, id: i64, user_id: i64) -> Result<()> {
     let affected = db
@@ -326,6 +348,7 @@ pub async fn delete_conversation(db: &Database, id: i64, user_id: i64) -> Result
     Ok(())
 }
 
+/// Refreshes the update timestamp on one user-owned conversation.
 #[tracing::instrument(skip(db), fields(conversation_id = id, user_id))]
 pub async fn touch_conversation(db: &Database, id: i64, user_id: i64) -> Result<()> {
     db.write(move |conn| {
@@ -340,10 +363,10 @@ pub async fn touch_conversation(db: &Database, id: i64, user_id: i64) -> Result<
 
 // --- Message operations ---
 
-#[tracing::instrument(skip(db, credd, req), fields(conversation_id, user_id, role = %req.role))]
+#[tracing::instrument(skip(db, phylaxd, req), fields(conversation_id, user_id, role = %req.role))]
 pub async fn add_message(
     db: &Database,
-    credd: &crate::cred::CreddClient,
+    phylaxd: &crate::cred::PhylaxdClient,
     conversation_id: i64,
     user_id: i64,
     req: AddMessageRequest,
@@ -353,7 +376,7 @@ pub async fn add_message(
     // tenant's conversation.
     let conversation = get_conversation_for_user(db, conversation_id, user_id).await?;
     let meta_str = metadata_to_string(&req.metadata);
-    let content = scrub_message(db, credd, user_id, &conversation.agent, &req.content).await?;
+    let content = scrub_message(db, phylaxd, user_id, &conversation.agent, &req.content).await?;
     let role = req.role.clone();
     let new_id: i64 = db
         .write(move |conn| {
@@ -388,6 +411,7 @@ pub async fn add_message(
     .await
 }
 
+/// Lists messages in a user-owned conversation with pagination.
 #[tracing::instrument(skip(db), fields(conversation_id, user_id, limit, offset))]
 pub async fn list_messages(
     db: &Database,
@@ -426,6 +450,7 @@ pub async fn list_messages(
     .await
 }
 
+/// Searches messages while restricting matches to the requesting user's conversations.
 #[tracing::instrument(skip(db, req), fields(user_id, limit = ?req.limit))]
 pub async fn search_messages(
     db: &Database,
@@ -470,10 +495,10 @@ pub async fn search_messages(
 
 // --- Bulk and Upsert ---
 
-#[tracing::instrument(skip(db, credd, req), fields(agent = %req.agent, message_count = req.messages.len(), user_id))]
+#[tracing::instrument(skip(db, phylaxd, req), fields(agent = %req.agent, message_count = req.messages.len(), user_id))]
 pub async fn bulk_insert_conversation(
     db: &Database,
-    credd: &crate::cred::CreddClient,
+    phylaxd: &crate::cred::PhylaxdClient,
     req: BulkInsertRequest,
     user_id: i64,
 ) -> Result<Conversation> {
@@ -495,7 +520,7 @@ pub async fn bulk_insert_conversation(
     for msg in req.messages {
         add_message(
             db,
-            credd,
+            phylaxd,
             conv_id,
             user_id,
             AddMessageRequest {
@@ -509,10 +534,11 @@ pub async fn bulk_insert_conversation(
     get_conversation_for_user(db, conv_id, user_id).await
 }
 
-#[tracing::instrument(skip(db, credd, req), fields(agent = %req.agent, session_id = %req.session_id, user_id))]
+/// Creates or updates a session conversation and inserts any supplied messages.
+#[tracing::instrument(skip(db, phylaxd, req), fields(agent = %req.agent, session_id = %req.session_id, user_id))]
 pub async fn upsert_conversation(
     db: &Database,
-    credd: &crate::cred::CreddClient,
+    phylaxd: &crate::cred::PhylaxdClient,
     req: UpsertConversationRequest,
     user_id: i64,
 ) -> Result<Conversation> {
@@ -553,7 +579,7 @@ pub async fn upsert_conversation(
         for msg in messages {
             add_message(
                 db,
-                credd,
+                phylaxd,
                 conv.id,
                 user_id,
                 AddMessageRequest {
@@ -574,11 +600,13 @@ pub async fn upsert_conversation(
 // --- Tests ---
 
 #[cfg(test)]
+/// Tests conversation metadata, search sanitization, and message scrubbing.
 mod tests {
     use super::*;
     use crate::sessions::scrub::apply_scrub;
 
     #[test]
+    /// Verifies full-text query sanitization.
     fn test_sanitize_fts_query() {
         assert_eq!(sanitize_fts_query("hello world"), "hello world");
         assert_eq!(sanitize_fts_query("hello-world!"), "hello world");
@@ -587,6 +615,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies optional metadata serialization.
     fn test_metadata_to_string() {
         let none: Option<serde_json::Value> = None;
         assert_eq!(metadata_to_string(&none), None);
@@ -597,12 +626,14 @@ mod tests {
     }
 
     #[test]
+    /// Verifies known secrets are redacted from message content.
     fn test_apply_scrub_redacts_known_secret() {
         let result = apply_scrub("token alpha-secret seen", &["alpha-secret".to_string()]);
         assert_eq!(result, "token [REDACTED] seen");
     }
 
     #[test]
+    /// Verifies clean message content remains unchanged.
     fn test_apply_scrub_leaves_clean_text_unchanged() {
         let input = "normal conversation text";
         let result = apply_scrub(input, &["alpha-secret".to_string()]);

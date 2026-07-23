@@ -5,11 +5,11 @@
 -- which means any tenant-shard code path that calls
 -- `kleos_lib::services::broca::log_action` would error out on insert.
 --
--- The most visible path that exercises this is `credd.resolve_text`, which
+-- The most visible path that exercises this is credential resolution, which
 -- logs every secret resolution via `audit_resolution` -> `log_action`. That
 -- runs in routes/prompts (Phase 3.7) whenever a prompt contains a
 -- `{SECRET_...}` placeholder. Making `broca_actions` tenant-local is the
--- prerequisite for running credd resolution against the tenant DB.
+-- prerequisite for running credential resolution against the tenant DB.
 --
 -- Per the TENANT_USERID_SHIM policy: every row in a tenant shard carries the
 -- shard owner's user_id. The column stays for now so kleos-lib services do

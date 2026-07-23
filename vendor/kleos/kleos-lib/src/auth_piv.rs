@@ -1,3 +1,5 @@
+//! Request signing, identity enrollment, and PIV-backed authentication primitives.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -846,7 +848,7 @@ impl RequestSigner {
     /// default `~/.kleos/identity.key`. Returns `None` if nothing is configured.
     pub fn from_env_or_file(host: &str, agent: &str, model: &str) -> Result<Option<Self>> {
         // Allow a host to force the software tier (skip PIV) via
-        // KLEOS_SIGNER_TIER=soft, mirroring credd's CREDD_KLEOS_SIGNER_TIER. This
+        // KLEOS_SIGNER_TIER=soft, mirroring the credential broker's signer-tier setting. This
         // is the correct mode where a YubiKey is absent or its PIV slot is
         // unreliable but a soft Ed25519 identity is enrolled.
         let _force_soft = skip_piv_for_tier(std::env::var("KLEOS_SIGNER_TIER").ok().as_deref());

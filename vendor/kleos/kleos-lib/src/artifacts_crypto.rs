@@ -5,7 +5,7 @@
 //! (AES-256-GCM standard output from the `aes_gcm` crate).
 //!
 //! Key hierarchy:
-//!   master_key (32 bytes, from env/credd)
+//!   master_key (32 bytes, from environment or credential broker)
 //!     -> HKDF-SHA256(salt="kleos-artifact-v1", info=tenant_id)
 //!       -> per-tenant AES-256-GCM key (32 bytes)
 
@@ -107,6 +107,7 @@ pub struct ArtifactEncryption {
     master_key: Option<[u8; 32]>,
 }
 
+/// Implements tenant-scoped encryption operations for `ArtifactEncryption`.
 impl ArtifactEncryption {
     /// Create from a key source string. Empty string disables encryption.
     /// Valid hex (64 chars) or base64 (44 chars) enables it.
@@ -149,6 +150,7 @@ impl ArtifactEncryption {
     }
 }
 
+/// Tests for artifact encryption and tenant key derivation.
 #[cfg(test)]
 mod tests {
     use super::*;

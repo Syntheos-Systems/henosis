@@ -1,3 +1,5 @@
+//! Credential-authority client integration tests.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,24 +10,27 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::cred::{find_secret_patterns, CreddClient, ProxyRequest};
+use crate::cred::{find_secret_patterns, PhylaxdClient, ProxyRequest};
 use crate::db::Database;
 
 #[derive(Clone)]
-struct MockCreddState {
+/// Holds expected authorization and documents for a mock authority server.
+struct MockPhylaxdState {
     expected_auth: String,
     documents: Arc<HashMap<(String, String), Value>>,
 }
 
 #[derive(Clone, Default)]
+/// Records authorization observed by the mock proxy upstream.
 struct UpstreamState {
     seen_authorization: Arc<Mutex<Option<String>>>,
 }
 
 #[tokio::test]
+/// Verifies placeholder resolution returns secrets and redacts audit payloads.
 async fn resolve_text_substitutes_placeholders_and_logs_audit() {
     let db = Database::connect_memory().await.expect("db");
-    let (base_url, _handle) = spawn_mock_credd(HashMap::from([
+    let (base_url, _handle) = spawn_mock_phylaxd(HashMap::from([
         (
             ("foo".to_string(), "bar".to_string()),
             json!({
@@ -46,7 +51,7 @@ async fn resolve_text_substitutes_placeholders_and_logs_audit() {
         ),
     ]))
     .await;
-    let client = CreddClient::for_testing(base_url, "test-agent-key", false, 60);
+    let client = PhylaxdClient::for_testing(base_url, "test-agent-key", false, 60);
 
     let resolved = client
         .resolve_text(
@@ -92,9 +97,10 @@ async fn resolve_text_substitutes_placeholders_and_logs_audit() {
 }
 
 #[tokio::test]
+/// Verifies raw secret retrieval remains compile-time or runtime gated.
 async fn raw_fetch_is_compile_or_runtime_gated() {
     let db = Database::connect_memory().await.expect("db");
-    let (base_url, _handle) = spawn_mock_credd(HashMap::from([(
+    let (base_url, _handle) = spawn_mock_phylaxd(HashMap::from([(
         ("foo".to_string(), "bar".to_string()),
         json!({
             "service": "foo",
@@ -104,7 +110,7 @@ async fn raw_fetch_is_compile_or_runtime_gated() {
         }),
     )]))
     .await;
-    let client = CreddClient::for_testing(base_url, "test-agent-key", false, 60);
+    let client = PhylaxdClient::for_testing(base_url, "test-agent-key", false, 60);
 
     let err = client
         .get_raw(&db, 1, "cred-test", "foo", "bar")
@@ -116,9 +122,10 @@ async fn raw_fetch_is_compile_or_runtime_gated() {
 }
 
 #[tokio::test]
+/// Verifies proxy requests attach the resolved secret as authorization.
 async fn proxy_forwards_secret_in_auth_header() {
     let db = Database::connect_memory().await.expect("db");
-    let (credd_url, _credd_handle) = spawn_mock_credd(HashMap::from([(
+    let (phylaxd_url, _phylaxd_handle) = spawn_mock_phylaxd(HashMap::from([(
         ("foo".to_string(), "bar".to_string()),
         json!({
             "service": "foo",
@@ -130,7 +137,7 @@ async fn proxy_forwards_secret_in_auth_header() {
     .await;
     let upstream_state = UpstreamState::default();
     let (upstream_url, _upstream_handle) = spawn_upstream(upstream_state.clone()).await;
-    let client = CreddClient::for_testing(credd_url, "test-agent-key", false, 60);
+    let client = PhylaxdClient::for_testing(phylaxd_url, "test-agent-key", false, 60);
 
     let response = client
         .proxy(
@@ -168,6 +175,7 @@ async fn proxy_forwards_secret_in_auth_header() {
 }
 
 #[test]
+/// Verifies the pattern parser accepts raw and nested secret references.
 fn pattern_parser_handles_raw_and_nested_keys() {
     let patterns =
         find_secret_patterns("{{secret:svc/key}} {{secret-raw:security/blocklist/0}} trailing");
@@ -179,10 +187,11 @@ fn pattern_parser_handles_raw_and_nested_keys() {
     assert_eq!(patterns[1].key, "blocklist/0");
 }
 
-async fn spawn_mock_credd(
+/// Starts a mock credential-authority server with the supplied documents.
+async fn spawn_mock_phylaxd(
     documents: HashMap<(String, String), Value>,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let state = MockCreddState {
+    let state = MockPhylaxdState {
         expected_auth: "Bearer test-agent-key".to_string(),
         documents: Arc::new(documents),
     };
@@ -195,6 +204,7 @@ async fn spawn_mock_credd(
     spawn_router(app).await
 }
 
+/// Starts a mock upstream server that records its authorization header.
 async fn spawn_upstream(state: UpstreamState) -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new()
         .route("/upstream", post(mock_upstream))
@@ -203,6 +213,7 @@ async fn spawn_upstream(state: UpstreamState) -> (String, tokio::task::JoinHandl
     spawn_router(app).await
 }
 
+/// Starts an Axum router on a loopback ephemeral port.
 async fn spawn_router(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -214,8 +225,9 @@ async fn spawn_router(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{}", addr), handle)
 }
 
+/// Serves one secret document from the mock credential authority.
 async fn mock_secret(
-    State(state): State<MockCreddState>,
+    State(state): State<MockPhylaxdState>,
     Path((service, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
@@ -234,8 +246,9 @@ async fn mock_secret(
     Ok(Json(document))
 }
 
+/// Serves the list of mock credential references.
 async fn mock_list(
-    State(state): State<MockCreddState>,
+    State(state): State<MockPhylaxdState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     if headers
@@ -254,6 +267,7 @@ async fn mock_list(
     Ok(Json(json!({ "secrets": secrets })))
 }
 
+/// Records authorization received by the mock proxied upstream.
 async fn mock_upstream(
     State(state): State<UpstreamState>,
     headers: HeaderMap,

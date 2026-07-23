@@ -1,10 +1,12 @@
+//! Guarded outbound proxying with broker-resolved credential injection.
+
 pub use super::types::{ProxyRequest, ProxyResponse};
 
 use std::collections::HashMap;
 
 use reqwest::Method;
 
-use crate::cred::client::{CreddClient, FetchSecretRequest, SecretAccessMode};
+use crate::cred::client::{FetchSecretRequest, PhylaxdClient, SecretAccessMode};
 use crate::db::Database;
 use crate::webhooks::resolve_and_validate_url;
 use crate::{EngError, Result};
@@ -30,7 +32,9 @@ fn is_stripped_response_header(name: &str) -> bool {
         .any(|h| name.eq_ignore_ascii_case(h))
 }
 
-impl CreddClient {
+/// Implements proxy operations for the credential-authority client.
+impl PhylaxdClient {
+    /// Proxies a validated request with a resolved secret in the chosen header.
     pub async fn proxy(
         &self,
         db: &Database,

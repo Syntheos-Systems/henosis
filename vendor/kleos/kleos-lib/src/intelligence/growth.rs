@@ -7,7 +7,7 @@
 #[cfg(feature = "brain_hopfield")]
 use crate::brain::dream::types::DreamCycleResult;
 use crate::config::Config;
-use crate::cred::{has_secret_patterns, CreddClient};
+use crate::cred::{has_secret_patterns, PhylaxdClient};
 use crate::db::Database;
 use crate::intelligence::llm::{call_llm, is_llm_available};
 use crate::intelligence::types::{
@@ -140,8 +140,10 @@ async fn resolve_growth_observation(
     }
 
     let config = Config::from_env();
-    let credd = CreddClient::from_config(&config);
-    credd.resolve_text(db, user_id, service, observation).await
+    let phylaxd = PhylaxdClient::from_config(&config);
+    phylaxd
+        .resolve_text(db, user_id, service, observation)
+        .await
 }
 
 /// Build context lines from a dream cycle result for growth reflection.

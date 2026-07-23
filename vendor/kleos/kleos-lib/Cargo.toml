@@ -23,7 +23,7 @@ ml = ["dep:ort", "dep:tokenizers", "dep:lancedb", "dep:arrow-array", "dep:arrow-
 test-utils = []
 # Enable per-tenant sharding (rusqlite-based). Mutually exclusive with libsql tests.
 tenant-sharding = []
-credd-raw = []
+phylaxd-raw = []
 piv = ["yubikey"]
 # Vendor SQLCipher for at-rest encryption. Mutually exclusive with libsql
 # in the same binary (symbol collision), so engram-migrate must NOT enable this.

@@ -1,18 +1,18 @@
 //! Bootstrap-bearer resolver for kleos-lib clients.
 //!
-//! Talks to credd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch
+//! Talks to phylaxd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch
 //! the per-agent Kleos bearer at process startup, without requiring any
 //! plaintext key on disk.
 //!
 //! Resolution order:
 //!
 //! 1. `KLEOS_API_KEY` / `ENGRAM_API_KEY` env vars (test/debug overrides).
-//! 2. credd via `CREDD_SOCKET` (Unix domain) or `CREDD_BIND` (TCP, default
-//!    `127.0.0.1:4400`). Auth is the value of `CREDD_AGENT_KEY` (a scoped
+//! 2. phylaxd via `PHYLAXD_SOCKET` (Unix domain) or `PHYLAXD_BIND` (TCP, default
+//!    `127.0.0.1:3100`). Auth is the value of `PHYLAXD_AGENT_KEY` (a scoped
 //!    bootstrap-agent token).
 //!
 //! Results are cached in process memory keyed by agent slot; the cache
-//! honors the `expires_at` field returned by credd so a leaked bearer
+//! honors the `expires_at` field returned by phylaxd so a leaked bearer
 //! goes stale on its own TTL.
 
 use std::collections::HashMap;
@@ -25,20 +25,20 @@ use thiserror::Error;
 /// Errors produced by [`resolve_api_key`].
 #[derive(Debug, Error)]
 pub enum CredError {
-    /// `CREDD_AGENT_KEY` env var is missing; cannot authenticate to credd.
-    #[error("CREDD_AGENT_KEY is not set; cannot authenticate to credd")]
+    /// `PHYLAXD_AGENT_KEY` env var is missing; cannot authenticate to phylaxd.
+    #[error("PHYLAXD_AGENT_KEY is not set; cannot authenticate to phylaxd")]
     NoAgentKey,
 
-    /// credd is unreachable (socket not found, connection refused, etc.).
-    #[error("credd unreachable: {0}")]
+    /// phylaxd is unreachable (socket not found, connection refused, etc.).
+    #[error("phylaxd unreachable: {0}")]
     Unreachable(String),
 
-    /// credd returned a response that could not be parsed.
-    #[error("bad response from credd: {0}")]
+    /// phylaxd returned a response that could not be parsed.
+    #[error("bad response from phylaxd: {0}")]
     BadResponse(String),
 
-    /// credd response did not include a `key` field.
-    #[error("credd response is missing the 'key' field")]
+    /// phylaxd response did not include a `key` field.
+    #[error("phylaxd response is missing the 'key' field")]
     MissingKey,
 
     /// ECDH bootstrap failed with PIV configured and no fallback allowed.
@@ -58,7 +58,7 @@ struct CacheEntry {
 }
 
 // Process-lifetime cache: slot -> (key, expires_at). A miss or expired hit
-// triggers a fresh fetch from credd.
+// triggers a fresh fetch from phylaxd.
 static KEY_CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 
 /// Retrieve a cached bearer for `slot`, evicting it if expired.
@@ -73,6 +73,7 @@ fn cache_get(slot: &str) -> Option<String> {
     Some(entry.key)
 }
 
+/// Insert or replace the cached bearer for an agent slot.
 fn cache_set(slot: String, key: String, expires_at: SystemTime) {
     let mut guard = KEY_CACHE.lock().unwrap();
     guard
@@ -102,6 +103,7 @@ pub fn current_agent_slot() -> String {
     format!("claude-code-{}-{}", user, hostname)
 }
 
+/// Return the host name from procfs or the environment, with a stable fallback.
 fn read_hostname() -> String {
     if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let trimmed = h.trim().to_string();
@@ -119,7 +121,7 @@ fn read_hostname() -> String {
 
 /// Resolve the Kleos API key for `agent_slot`. See module docs for order.
 pub async fn resolve_api_key(agent_slot: &str) -> Result<String, CredError> {
-    // SECURITY (L7): agent_slot is interpolated into the credd request path
+    // SECURITY (L7): agent_slot is interpolated into the phylaxd request path
     // (/bootstrap/kleos-bearer?agent=...). Reject anything outside a safe
     // identifier charset so it cannot inject extra query parameters, path
     // segments, or CR/LF into the request line.
@@ -190,17 +192,17 @@ pub async fn resolve_api_key(agent_slot: &str) -> Result<String, CredError> {
         }
     }
 
-    let token = env::var("CREDD_AGENT_KEY").map_err(|_| CredError::NoAgentKey)?;
+    let token = env::var("PHYLAXD_AGENT_KEY").map_err(|_| CredError::NoAgentKey)?;
     if token.is_empty() {
         return Err(CredError::NoAgentKey);
     }
 
     let path = format!("/bootstrap/kleos-bearer?agent={}", agent_slot);
 
-    let body: serde_json::Value = if let Ok(sock) = env::var("CREDD_SOCKET") {
+    let body: serde_json::Value = if let Ok(sock) = env::var("PHYLAXD_SOCKET") {
         unix_get_json(&sock, &path, &token).await?
     } else {
-        let bind = env::var("CREDD_BIND").unwrap_or_else(|_| "127.0.0.1:4400".into());
+        let bind = env::var("PHYLAXD_BIND").unwrap_or_else(|_| "127.0.0.1:3100".into());
         tcp_get_json(&bind, &path, &token).await?
     };
 
@@ -268,7 +270,7 @@ async fn unix_get_json(
         .await
         .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
 
-    // Cap the response and bound the read so a rogue local credd cannot OOM or
+    // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -282,6 +284,7 @@ async fn unix_get_json(
     parse_http_response_body(&response)
 }
 
+/// Return an unsupported-platform error for Unix socket requests.
 #[cfg(not(unix))]
 async fn unix_get_json(
     sock_path: &str,
@@ -313,7 +316,7 @@ async fn tcp_get_json(bind: &str, path: &str, token: &str) -> Result<serde_json:
         .await
         .map_err(|e| CredError::Unreachable(format!("write: {}", e)))?;
 
-    // Cap the response and bound the read so a rogue local credd cannot OOM or
+    // Cap the response and bound the read so a rogue local phylaxd cannot OOM or
     // stall the caller (CWE-400): the bootstrap socket is local but untrusted.
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -362,6 +365,7 @@ fn parse_http_response_body(response: &[u8]) -> Result<serde_json::Value, CredEr
     serde_json::from_slice(body).map_err(|e| CredError::BadResponse(format!("JSON parse: {}", e)))
 }
 
+/// Tests for bootstrap resolution, cache, and configuration behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +376,7 @@ mod tests {
     // The ENV_GUARD lock is held across .await on purpose: these tests must
     // serialize because they mutate process-global env vars. Using a sync
     // Mutex is correct here; clippy's await_holding_lock lint does not apply.
+    /// Resolve the `KLEOS_API_KEY` override before broker access.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_override_kleos_api_key() {
@@ -383,6 +388,7 @@ mod tests {
         assert_eq!(result.unwrap(), "test-key-12345");
     }
 
+    /// Resolve the `ENGRAM_API_KEY` compatibility override before broker access.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_override_engram_api_key() {
@@ -394,15 +400,16 @@ mod tests {
         assert_eq!(result.unwrap(), "legacy-key-99");
     }
 
+    /// Report a missing broker agent key when no override or PIV path is active.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn no_env_no_credd_returns_error() {
+    async fn no_env_no_phylaxd_returns_error() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         env::remove_var("KLEOS_API_KEY");
         env::remove_var("ENGRAM_API_KEY");
-        env::remove_var("CREDD_AGENT_KEY");
-        env::remove_var("CREDD_SOCKET");
-        env::remove_var("CREDD_BIND");
+        env::remove_var("PHYLAXD_AGENT_KEY");
+        env::remove_var("PHYLAXD_SOCKET");
+        env::remove_var("PHYLAXD_BIND");
         // Hosts with PIV configured carry a real ~/.config/cred/piv-9d-pubkey.pem
         // which would otherwise route resolve_api_key through ECDH and miss the
         // env-var assertion under test. Point XDG_CONFIG_HOME at a fresh tempdir
@@ -410,7 +417,7 @@ mod tests {
         let prev_xdg = env::var("XDG_CONFIG_HOME").ok();
         let isolated = tempfile::tempdir().unwrap();
         env::set_var("XDG_CONFIG_HOME", isolated.path());
-        let result = resolve_api_key("no-credd-slot-unique-xyz").await;
+        let result = resolve_api_key("no-phylaxd-slot-unique-xyz").await;
         match prev_xdg {
             Some(v) => env::set_var("XDG_CONFIG_HOME", v),
             None => env::remove_var("XDG_CONFIG_HOME"),
@@ -422,6 +429,7 @@ mod tests {
         );
     }
 
+    /// Resolve a bearer through a Unix-domain broker socket.
     #[cfg(unix)]
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -433,7 +441,7 @@ mod tests {
 
         // Spin up a tiny axum server on a temp Unix socket.
         let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("test-credd.sock");
+        let sock_path = dir.path().join("test-phylaxd.sock");
         let sock_str = sock_path.to_str().unwrap().to_string();
 
         let app = Router::new().route(
@@ -451,18 +459,18 @@ mod tests {
 
         env::remove_var("KLEOS_API_KEY");
         env::remove_var("ENGRAM_API_KEY");
-        env::set_var("CREDD_AGENT_KEY", "test-agent-token");
-        env::set_var("CREDD_SOCKET", &sock_str);
+        env::set_var("PHYLAXD_AGENT_KEY", "test-agent-token");
+        env::set_var("PHYLAXD_SOCKET", &sock_str);
         // Skip the ECDH branch on PIV-configured hosts; see
-        // no_env_no_credd_returns_error above for the same isolation.
+        // no_env_no_phylaxd_returns_error above for the same isolation.
         let prev_xdg = env::var("XDG_CONFIG_HOME").ok();
         let isolated = tempfile::tempdir().unwrap();
         env::set_var("XDG_CONFIG_HOME", isolated.path());
 
         let result = resolve_api_key("foo").await;
 
-        env::remove_var("CREDD_AGENT_KEY");
-        env::remove_var("CREDD_SOCKET");
+        env::remove_var("PHYLAXD_AGENT_KEY");
+        env::remove_var("PHYLAXD_SOCKET");
         match prev_xdg {
             Some(v) => env::set_var("XDG_CONFIG_HOME", v),
             None => env::remove_var("XDG_CONFIG_HOME"),
@@ -473,6 +481,7 @@ mod tests {
         assert_eq!(result.unwrap(), "test123");
     }
 
+    /// Prefer an explicitly configured agent slot.
     #[test]
     fn current_agent_slot_uses_env() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
@@ -482,6 +491,7 @@ mod tests {
         assert_eq!(slot, "my-custom-slot");
     }
 
+    /// Include both user and host segments in the default agent slot.
     #[test]
     fn current_agent_slot_default_includes_user_and_host() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
@@ -503,6 +513,7 @@ mod tests {
         assert!(!parts[1].is_empty(), "slot was {slot}");
     }
 
+    /// Parse an RFC 3339 expiry timestamp from a broker response.
     #[test]
     fn parse_expires_at_rfc3339() {
         let body = serde_json::json!({"expires_at": "2030-01-01T00:00:00Z"});
@@ -511,6 +522,7 @@ mod tests {
         assert!(t > now, "year 2030 should be in the future");
     }
 
+    /// Use the TTL response field when no absolute expiry is present.
     #[test]
     fn parse_expires_at_ttl_fallback() {
         let body = serde_json::json!({"ttl_secs": 60});
@@ -546,20 +558,18 @@ mod ecdh {
     use super::{parse_expires_at, piv_pubkey_path};
 
     const ECDH_PROTOCOL: &str = "ecdh-v1";
-    // z02-015: this salt is the client half of the credd ECDH handshake and
-    // MUST stay byte-identical to ECDH_HKDF_SALT in
-    // kleos-credd/src/handlers/bootstrap_bearer.rs. Changing one without the
-    // other silently breaks key derivation. Kept duplicated rather than shared
-    // to avoid a crypto-constant dependency edge between the crates.
-    const ECDH_HKDF_SALT: &[u8] = b"credd-ecdh-v1";
+    // Compatibility protocol value for deployed ECDH key derivation. These
+    // bytes must remain byte-identical on both protocol participants.
+    const ECDH_HKDF_SALT: [u8; 13] = [99, 114, 101, 100, 100, 45, 101, 99, 100, 104, 45, 118, 49];
 
+    /// Errors produced by the ECDH bootstrap client.
     #[derive(Debug, Error)]
     pub enum EcdhClientError {
         #[error("ECDH not configured (server pubkey absent or unparseable)")]
         NotConfigured,
         #[error("PIV signing failed: {0}")]
         Sign(String),
-        #[error("credd unreachable: {0}")]
+        #[error("phylaxd unreachable: {0}")]
         Unreachable(String),
         #[error("bad response: {0}")]
         BadResponse(String),
@@ -567,7 +577,7 @@ mod ecdh {
         Decrypt(String),
     }
 
-    /// Run the ECDH bootstrap flow against credd. Returns the decrypted
+    /// Run the ECDH bootstrap flow against phylaxd. Returns the decrypted
     /// per-agent bearer plus its expires_at hint.
     pub async fn resolve_via_ecdh(
         agent_slot: &str,
@@ -597,11 +607,11 @@ mod ecdh {
         let signed_payload = format!("{}|{}", agent_slot, eph_pub_hex);
         let sig_der = piv_sign_9a(signed_payload.as_bytes())?;
 
-        // The credd handler expects a raw r||s signature (Signature::from_slice
+        // The phylaxd handler expects a raw r||s signature (Signature::from_slice
         // for P-256). Convert from DER if the YubiKey returned DER.
         let sig_raw = der_to_raw_p256_sig(&sig_der)?;
 
-        // POST the request to credd.
+        // POST the request to phylaxd.
         let body = serde_json::json!({
             "agent": agent_slot,
             "ephemeral_pubkey": eph_pub_hex,
@@ -610,14 +620,14 @@ mod ecdh {
         })
         .to_string();
 
-        let response = if let Ok(sock) = env::var("CREDD_SOCKET") {
+        let response = if let Ok(sock) = env::var("PHYLAXD_SOCKET") {
             unix_post(&sock, "/bootstrap/kleos-bearer", &body).await?
         } else {
-            let bind = env::var("CREDD_BIND").unwrap_or_else(|_| "127.0.0.1:4400".into());
+            let bind = env::var("PHYLAXD_BIND").unwrap_or_else(|_| "127.0.0.1:3100".into());
             tcp_post(&bind, "/bootstrap/kleos-bearer", &body).await?
         };
 
-        // Decrypt with the same HKDF / AES-GCM derivation as credd used.
+        // Decrypt with the same HKDF / AES-GCM derivation as phylaxd uses.
         let encrypted_hex = response["encrypted_bearer"]
             .as_str()
             .ok_or_else(|| EcdhClientError::BadResponse("missing encrypted_bearer".into()))?;
@@ -635,13 +645,13 @@ mod ecdh {
             )));
         }
 
-        let hk = Hkdf::<Sha256>::new(Some(ECDH_HKDF_SALT), shared_bytes.as_slice());
+        let hk = Hkdf::<Sha256>::new(Some(&ECDH_HKDF_SALT), shared_bytes.as_slice());
         let mut bearer_key = [0u8; 32];
         hk.expand(agent_slot.as_bytes(), &mut bearer_key)
             .map_err(|e| EcdhClientError::Decrypt(format!("hkdf expand: {}", e)))?;
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&bearer_key));
-        // AAD MUST match credd's encrypt side (bootstrap_bearer.rs) byte for
+        // AAD must match the broker encryption side byte for
         // byte: protocol|agent. Mismatch => decryption fails.
         let aad = format!("{}|{}", ECDH_PROTOCOL, agent_slot);
         let plaintext = cipher
@@ -782,7 +792,7 @@ with dev.open_connection(SmartCardConnection) as conn:
             .await
             .map_err(|e| EcdhClientError::Unreachable(format!("write: {}", e)))?;
 
-        // Cap the response and bound the read so a rogue local credd cannot OOM
+        // Cap the response and bound the read so a rogue local phylaxd cannot OOM
         // or stall the caller (CWE-400).
         let mut response = Vec::new();
         tokio::time::timeout(
@@ -796,6 +806,7 @@ with dev.open_connection(SmartCardConnection) as conn:
         parse_post_body(&response)
     }
 
+    /// Return an unsupported-platform error for Unix socket POST requests.
     #[cfg(not(unix))]
     async fn unix_post(
         sock_path: &str,
@@ -808,6 +819,7 @@ with dev.open_connection(SmartCardConnection) as conn:
         )))
     }
 
+    /// Send the ECDH bootstrap request over TCP and parse its JSON response.
     async fn tcp_post(
         bind: &str,
         path: &str,
@@ -833,7 +845,7 @@ with dev.open_connection(SmartCardConnection) as conn:
             .await
             .map_err(|e| EcdhClientError::Unreachable(format!("write: {}", e)))?;
 
-        // Cap the response and bound the read so a rogue local credd cannot OOM
+        // Cap the response and bound the read so a rogue local phylaxd cannot OOM
         // or stall the caller (CWE-400).
         let mut response = Vec::new();
         tokio::time::timeout(
@@ -847,6 +859,7 @@ with dev.open_connection(SmartCardConnection) as conn:
         parse_post_body(&response)
     }
 
+    /// Extract and decode a successful JSON body from a raw HTTP response.
     fn parse_post_body(response: &[u8]) -> Result<serde_json::Value, EcdhClientError> {
         let sep = b"\r\n\r\n";
         let body_start = response

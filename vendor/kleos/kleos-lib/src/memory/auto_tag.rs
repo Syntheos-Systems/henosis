@@ -1,3 +1,6 @@
+//! Deterministic service, action, and category inference for stored memories.
+
+/// Infer deterministic service and action tags from memory content.
 pub fn infer_tags(content: &str) -> Vec<String> {
     let lower = content.to_lowercase();
     let mut tags = Vec::new();
@@ -5,7 +8,6 @@ pub fn infer_tags(content: &str) -> Vec<String> {
     let service_map: &[(&str, &str)] = &[
         ("kleos", "kleos"),
         ("engram", "engram"),
-        ("credd", "credd"),
         ("kleos-ingest", "kleos-ingest"),
         ("eidolon", "eidolon"),
     ];
@@ -36,6 +38,7 @@ pub fn infer_tags(content: &str) -> Vec<String> {
     tags
 }
 
+/// Infer a memory category from deterministic content markers.
 pub fn infer_category(content: &str) -> Option<&'static str> {
     let lower = content.to_lowercase();
 

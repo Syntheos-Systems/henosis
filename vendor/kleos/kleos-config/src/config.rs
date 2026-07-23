@@ -1,8 +1,10 @@
+//! Shared runtime configuration and environment resolution for Kleos services.
+
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 /// Default URL for the local phylaxd credential authority.
-pub const DEFAULT_CREDENTIAL_AUTHORITY_URL: &str = "http://127.0.0.1:4400";
+pub const DEFAULT_CREDENTIAL_AUTHORITY_URL: &str = "http://127.0.0.1:3100";
 
 /// Shim: for every `KLEOS_X` env var found, set `ENGRAM_X` if not already set.
 ///
@@ -55,7 +57,7 @@ pub fn resolve_db_path(configured: &std::path::Path) -> std::path::PathBuf {
     configured.to_path_buf()
 }
 
-/// Resolve the credential authority URL from preferred and legacy env vars.
+/// Resolve the credential authority URL from its environment override or default.
 pub fn resolve_credential_authority_url() -> String {
     credential_authority_url_from_env()
         .unwrap_or_else(|| DEFAULT_CREDENTIAL_AUTHORITY_URL.to_string())
@@ -63,9 +65,7 @@ pub fn resolve_credential_authority_url() -> String {
 
 /// Resolve a credential authority URL override from the environment.
 fn credential_authority_url_from_env() -> Option<String> {
-    std::env::var("PHYLAXD_URL")
-        .or_else(|_| std::env::var("CREDD_URL"))
-        .ok()
+    std::env::var("PHYLAXD_URL").ok()
 }
 
 /// How the at-rest encryption key is sourced.
@@ -314,12 +314,12 @@ pub struct SessionsConfig {
     pub stream_timeout_secs: u64,
     pub scrub_secrets: bool,
     /// Behavior when scrubbing is enabled but the secret list cannot be loaded
-    /// AND no prior list is cached to fall back on (e.g. credd down at cold
+    /// AND no prior list is cached to fall back on (e.g. phylaxd down at cold
     /// start). `true` (the default) fails OPEN: persist the message and log,
-    /// avoiding a hard dependency on credd for message writes (credd is
+    /// avoiding a hard dependency on phylaxd for message writes (phylaxd is
     /// optional, and scrub_secrets defaults on). `false` fails CLOSED: reject
     /// the write so a fault cannot persist an unscrubbed secret -- appropriate
-    /// for deployments that always run credd. Note: a transient outage with a
+    /// for deployments that always run phylaxd. Note: a transient outage with a
     /// warm cache still scrubs using the last-known secret list, so this policy
     /// only governs the cold-cache case.
     pub scrub_fail_open: bool,
@@ -335,7 +335,7 @@ impl Default for SessionsConfig {
             stream_timeout_secs: 1800,
             scrub_secrets: true,
             // Fail open by default in the cold-cache case so message writes do
-            // not hard-depend on credd (which is optional). A warm cache still
+            // not hard-depend on phylaxd (which is optional). A warm cache still
             // scrubs via the stale-list fallback; strict deployments set false.
             scrub_fail_open: true,
         }
@@ -370,7 +370,7 @@ impl Default for PromptConfig {
 /// Credential authority client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CreddConfig {
+pub struct PhylaxdConfig {
     pub url: String,
     pub agent_key_env: String,
     pub allow_raw: bool,
@@ -378,12 +378,12 @@ pub struct CreddConfig {
 }
 
 /// Default credential authority client settings.
-impl Default for CreddConfig {
+impl Default for PhylaxdConfig {
     /// Builds default credential authority settings.
     fn default() -> Self {
         Self {
             url: DEFAULT_CREDENTIAL_AUTHORITY_URL.to_string(),
-            agent_key_env: "CREDD_AGENT_KEY".to_string(),
+            agent_key_env: "PHYLAXD_AGENT_KEY".to_string(),
             allow_raw: false,
             cache_ttl_secs: 60,
         }
@@ -399,7 +399,7 @@ pub struct EidolonConfig {
     #[serde(skip, default)]
     pub api_key: Option<SecretString>,
     #[serde(default)]
-    pub credd: CreddConfig,
+    pub phylaxd: PhylaxdConfig,
     #[serde(default)]
     pub gate: GateConfig,
     #[serde(default)]
@@ -431,17 +431,17 @@ impl EidolonConfig {
         }
         let c = &mut self;
         if let Some(v) = credential_authority_url_from_env() {
-            c.credd.url = v;
+            c.phylaxd.url = v;
         }
-        if let Ok(v) = crate::kleos_env("CREDD_AGENT_KEY_ENV") {
-            c.credd.agent_key_env = v;
+        if let Ok(v) = crate::kleos_env("PHYLAXD_AGENT_KEY_ENV") {
+            c.phylaxd.agent_key_env = v;
         }
-        if let Ok(v) = crate::kleos_env("CREDD_ALLOW_RAW") {
-            c.credd.allow_raw = matches!(v.as_str(), "1" | "true" | "TRUE" | "yes");
+        if let Ok(v) = crate::kleos_env("PHYLAXD_ALLOW_RAW") {
+            c.phylaxd.allow_raw = matches!(v.as_str(), "1" | "true" | "TRUE" | "yes");
         }
-        if let Ok(v) = crate::kleos_env("CREDD_CACHE_TTL_SECS") {
+        if let Ok(v) = crate::kleos_env("PHYLAXD_CACHE_TTL_SECS") {
             if let Ok(n) = v.parse() {
-                c.credd.cache_ttl_secs = n;
+                c.phylaxd.cache_ttl_secs = n;
             }
         }
         if let Ok(v) = crate::kleos_env("EIDOLON_GATE_APPROVAL_TIMEOUT") {
@@ -1473,19 +1473,13 @@ mod tests {
     /// Runs a test body with credential-authority env vars isolated.
     fn with_credential_authority_env(test: impl FnOnce()) {
         let old_phylaxd = std::env::var("PHYLAXD_URL").ok();
-        let old_credd = std::env::var("CREDD_URL").ok();
         std::env::remove_var("PHYLAXD_URL");
-        std::env::remove_var("CREDD_URL");
 
         test();
 
         match old_phylaxd {
             Some(value) => std::env::set_var("PHYLAXD_URL", value),
             None => std::env::remove_var("PHYLAXD_URL"),
-        }
-        match old_credd {
-            Some(value) => std::env::set_var("CREDD_URL", value),
-            None => std::env::remove_var("CREDD_URL"),
         }
     }
 
@@ -1494,9 +1488,9 @@ mod tests {
     fn eidolon_config_defaults_are_populated() {
         let c = EidolonConfig::default();
         assert!(!c.enabled);
-        assert_eq!(c.credd.url, DEFAULT_CREDENTIAL_AUTHORITY_URL);
-        assert_eq!(c.credd.agent_key_env, "CREDD_AGENT_KEY");
-        assert!(!c.credd.allow_raw);
+        assert_eq!(c.phylaxd.url, DEFAULT_CREDENTIAL_AUTHORITY_URL);
+        assert_eq!(c.phylaxd.agent_key_env, "PHYLAXD_AGENT_KEY");
+        assert!(!c.phylaxd.allow_raw);
         assert!(c
             .gate
             .blocked_patterns
@@ -1509,7 +1503,7 @@ mod tests {
         assert_eq!(c.sessions.buffer_size, 4096);
         assert!(c.sessions.scrub_secrets);
         // Cold-cache scrub policy defaults to fail-open so message writes do
-        // not hard-depend on credd; a warm cache still scrubs via stale fallback.
+        // not hard-depend on phylaxd; a warm cache still scrubs via stale fallback.
         assert!(c.sessions.scrub_fail_open);
         assert_eq!(c.prompt.default_max_tokens, 4000);
         assert_eq!(c.prompt.max_tokens_cap, 128000);
@@ -1527,28 +1521,14 @@ mod tests {
     /// Verifies partial TOML files merge with defaults.
     #[test]
     #[serial_test::serial(credential_authority_env)]
-    /// Verifies PHYLAXD_URL wins over legacy CREDD_URL.
-    fn credential_authority_prefers_phylaxd_url() {
+    /// Verifies PHYLAXD_URL overrides the configured default.
+    fn credential_authority_uses_phylaxd_url() {
         with_credential_authority_env(|| {
             std::env::set_var("PHYLAXD_URL", "http://127.0.0.1:3100");
-            std::env::set_var("CREDD_URL", "http://127.0.0.1:4400");
 
             let c = EidolonConfig::from_env();
 
-            assert_eq!(c.credd.url, "http://127.0.0.1:3100");
-        });
-    }
-
-    #[test]
-    #[serial_test::serial(credential_authority_env)]
-    /// Verifies CREDD_URL remains a transition fallback.
-    fn credential_authority_uses_credd_url_fallback() {
-        with_credential_authority_env(|| {
-            std::env::set_var("CREDD_URL", "http://127.0.0.1:4401");
-
-            let c = EidolonConfig::from_env();
-
-            assert_eq!(c.credd.url, "http://127.0.0.1:4401");
+            assert_eq!(c.phylaxd.url, "http://127.0.0.1:3100");
         });
     }
 
@@ -1558,15 +1538,15 @@ mod tests {
     fn credential_authority_preserves_existing_url_without_env() {
         with_credential_authority_env(|| {
             let c = EidolonConfig {
-                credd: CreddConfig {
+                phylaxd: PhylaxdConfig {
                     url: "http://configured.example:4400".to_string(),
-                    ..CreddConfig::default()
+                    ..PhylaxdConfig::default()
                 },
                 ..EidolonConfig::default()
             }
             .apply_env();
 
-            assert_eq!(c.credd.url, "http://configured.example:4400");
+            assert_eq!(c.phylaxd.url, "http://configured.example:4400");
         });
     }
 
