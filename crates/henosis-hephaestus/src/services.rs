@@ -5,8 +5,7 @@
 //! orchestrator and provider modules from having any knowledge of how the
 //! surrounding service mesh is reached.
 //!
-//! These were originally bundled inside `Clients` in clients.rs. Extracted as
-//! part of the Phase 1 refactor so the orchestrator can depend on a small,
+//! The service clients are separate from `Clients` so the orchestrator can depend on a small,
 //! provider-agnostic surface.
 
 use std::time::Duration;

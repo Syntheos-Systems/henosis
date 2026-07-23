@@ -71,12 +71,10 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4", "v8", "serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 async-trait = "0.1"
-# SQLite for kernel-service storage (matches Kleos's rusqlite 0.31). Per-crate `bundled` feature
-# avoids a system libsqlite dependency. Migration convention: PRAGMA user_version + ordered
-# migrations/Vn__*.sql -- see 2026-06-10-henosis-db-and-migration-convention.md.
+# SQLite for kernel-service storage. Per-crate `bundled` features avoid a system libsqlite
+# dependency; kernel stores apply ordered migrations through PRAGMA user_version.
 rusqlite = { version = "0.31" }
-# Postgres for runtime-service storage (Rift, Hermes, Hephaestus, Plutus). Declared now so those
-# crates inherit one pinned version; unused until the first Postgres crate lands.
+# Postgres storage for Rift, Hermes, Hephaestus, Plutus, and production authority services.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid"] }
 zeroize = { version = "1", features = ["derive"] }
 # Field-level AES-256-GCM encryption for the embedded credential compatibility store.
@@ -87,20 +85,18 @@ hmac = "0.12"
 subtle = "2.5"
 # Ed25519 credential signing and verification over stored OpenSSH private keys.
 ssh-key = { version = "0.6", features = ["ed25519"] }
-# Property testing for security-critical invariants (the EidolonGate fail-closed proofs). Dev-only.
+# Property testing for security-critical EidolonGate fail-closed invariants. Dev-only.
 proptest = "1"
-# Eidolon supervisor (Story 2.5): session-JSONL watching, rule regexes, bounded file-position cache.
-# Versions match the Kleos workspace the supervisor was absorbed from.
+# Eidolon supervisor: session-JSONL watching, rule regexes, and a bounded file-position cache.
 notify = "8"
 notify-debouncer-mini = "0.6"
 regex = "1"
 lru = "0.16"
 yubikey = { version = "0.8" }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-# Home/cache dir resolution for the memory-client session-token cache (Story 4.1).
+# Home and cache directory resolution for the memory-client session-token cache.
 dirs = "5"
-# Synapse-provider/session absorption (Story 4.1 step 2). Versions pinned to match the Synapse
-# workspace these crates were copy-and-owned from, so the LLM-provider behavior is unchanged.
+# Shared dependencies for the Synapse provider and session runtime.
 anyhow = "1"
 log = "0.4"
 futures = "0.3"

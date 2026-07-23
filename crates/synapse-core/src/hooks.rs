@@ -57,6 +57,7 @@ pub struct HookSpec {
     pub label: Option<String>,
 }
 
+/// Return the default hook execution timeout in seconds.
 fn default_timeout_secs() -> u64 {
     10
 }
@@ -70,6 +71,7 @@ pub struct HookConfig {
     pub hooks: Vec<HookSpec>,
 }
 
+/// Provides hook-configuration queries.
 impl HookConfig {
     /// Return hooks for a given phase, optionally filtered by tool name.
     /// For PreToolUse/PostToolUse, hooks whose `matcher` does not match the
@@ -180,9 +182,8 @@ pub async fn run_phase_hooks(config: &HookConfig, phase: HookPhase, cwd: &Path) 
 }
 
 /// ToolGate adapter that fires PreToolUse hooks before tool execution and
-/// PostToolUse hooks after. Wraps an inner gate (typically `PermissiveGate`
-/// in Phase 0, an interactive confirmation gate in Phase 3) so hook policy
-/// composes with permission policy.
+/// PostToolUse hooks after. It wraps an inner gate such as `PermissiveGate`
+/// or an interactive confirmation gate, so hook policy composes with permission policy.
 ///
 /// A PreToolUse hook that exits with code 2 denies the tool; any other
 /// non-zero exit code is logged as a warning but does not block.
@@ -193,6 +194,7 @@ pub struct HookGate {
     inner: SharedGate,
 }
 
+/// Builds hook-gate adapters.
 impl HookGate {
     /// Wrap an inner gate with hook execution.
     pub fn new(config: Arc<HookConfig>, inner: SharedGate) -> Self {
@@ -201,7 +203,9 @@ impl HookGate {
 }
 
 #[async_trait::async_trait]
+/// Runs configured hooks around tool-gate decisions.
 impl ToolGate for HookGate {
+    /// Run matching pre-tool hooks before delegating to the inner gate.
     async fn before_execute(
         &self,
         name: &str,
@@ -230,6 +234,7 @@ impl ToolGate for HookGate {
         self.inner.before_execute(name, params, cwd).await
     }
 
+    /// Run matching post-tool hooks after the inner tool execution completes.
     async fn after_execute(
         &self,
         name: &str,

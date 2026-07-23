@@ -1,5 +1,5 @@
 //! The Eidolon policy configuration: forbidden prompt-injection patterns and the persona-drift
-//! deny threshold. Story 2.3's output filter shares this config, so it lives in its own module.
+//! deny threshold. The output filter shares this configuration, so it lives in its own module.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,7 @@ pub struct EidolonPolicy {
 /// default severity, so any ordinarily-recorded drift flag denies until it is cleared), and the
 /// built-in sensitive-field set for output scrubbing.
 impl Default for EidolonPolicy {
+    /// Builds the standard injection, drift, and redaction policy.
     fn default() -> Self {
         Self {
             injection_patterns: default_injection_patterns(),

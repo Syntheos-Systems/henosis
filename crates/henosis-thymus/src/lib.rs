@@ -2,8 +2,7 @@
 #![warn(clippy::all)]
 //! # henosis-thymus
 //!
-//! Thymus, the quality-evaluation kernel service, extracted from `kleos-lib` onto the Henosis
-//! substrate (Phase 1 Story 1.5, the fifth and final extracted kernel service).
+//! Thymus, the quality-evaluation kernel service for the Henosis substrate.
 //!
 //! The Kleos thymus service keyed everything on stringly `agent` fields inside a
 //! `user_id: i64` shard. This extraction puts quality on the principal model: the evaluated
@@ -19,11 +18,9 @@
 //!
 //! ## Scope
 //!
-//! Slice 1 (this commit): rubric CRUD with criteria validation, evaluations (weighted scoring,
-//! agent rolling summaries), quality metrics (record + series summary), behavioral-drift
-//! events (typed vocabulary, distinct-flag propagation), and stats. NOT ported here: Kleos
-//! session-quality rows (coupled to Kleos sessions; they arrive with the Eidolon supervisor in
-//! Phase 2) and the LLM session judge (parallel track T1, Kleos-internal until the cutover).
+//! Thymus provides rubric CRUD with criteria validation, evaluations, quality metrics,
+//! behavioral-drift events, and stats. Session-quality rows and LLM judging remain outside this
+//! service.
 
 pub mod error;
 pub mod events;

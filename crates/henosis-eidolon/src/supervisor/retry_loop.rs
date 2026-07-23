@@ -1,7 +1,6 @@
 //! Retry-loop detection: the same command issued several times in a row.
 //!
-//! Ported (copy-and-own) from Kleos `eidolon-supervisor/src/checks/retry_loop.rs`, unchanged in
-//! behavior: a bounded history of recent commands, firing when the tail holds `RETRY_THRESHOLD`
+//! A bounded history of recent commands triggers when its tail holds `RETRY_THRESHOLD`
 //! identical entries.
 
 use std::collections::VecDeque;
@@ -20,6 +19,7 @@ pub struct RetryTracker {
     recent_commands: VecDeque<String>,
 }
 
+/// Implements retry-loop tracking and rule evaluation.
 impl RetryTracker {
     /// An empty tracker.
     pub fn new() -> Self {
@@ -70,6 +70,7 @@ impl RetryTracker {
 
 /// An empty tracker is the default.
 impl Default for RetryTracker {
+    /// Builds an empty retry tracker.
     fn default() -> Self {
         Self::new()
     }

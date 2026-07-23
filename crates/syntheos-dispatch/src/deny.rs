@@ -1,11 +1,8 @@
-//! Fail-closed defaults for the live binary: a deny-everything gate chain and an executor that
-//! refuses to run anything.
+//! Fail-closed fallback gates and executor for explicit bootstrap and test configurations.
 //!
-//! Until the real authorities (Pistis, Plutus, Eidolon, Human, phylaxd) land, the live server
-//! wires [`deny_gate_chain`] so every dispatched action is denied at the first gate. This is the
-//! correct Phase 0 posture for a running system: deny by default, swap in real gates by trait
-//! object as each authority ships. Allow-all placeholders live in [`crate::stubs`] behind the
-//! non-default `stubs` feature and never reach a release build.
+//! Production supplies concrete authority gates and executors. These fallbacks preserve the
+//! canonical gate shape while denying every action when a caller explicitly has no authorities
+//! or executor to provide.
 
 use async_trait::async_trait;
 use syntheos_contracts::{
@@ -15,8 +12,7 @@ use syntheos_contracts::{
 use crate::dispatcher::CANONICAL_GATE_ORDER;
 use crate::executor::{Executor, ExecutorError};
 
-/// A gate that denies everything, reporting a fixed authority name. Stands in, fail-closed, for
-/// an authority gate not yet implemented.
+/// A gate that denies everything for an authority unavailable in the current configuration.
 pub struct DenyGate {
     /// The authority name this gate reports and denies on behalf of.
     name: &'static str,
@@ -41,10 +37,7 @@ impl Gate for DenyGate {
     /// Denies every request because the authority is not wired.
     async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
         Ok(GateDecision::Deny {
-            reason: format!(
-                "fail-closed: the {} authority is not yet implemented",
-                self.name
-            ),
+            reason: format!("fail-closed: the {} authority is unavailable", self.name),
         })
     }
 }
@@ -52,8 +45,8 @@ impl Gate for DenyGate {
 /// The canonical deny-by-default gate chain, in dispatch order:
 /// `pistis -> plutus -> eidolon -> human -> phylaxd`, every gate a [`DenyGate`].
 ///
-/// This is what the live binary wires until real authorities land: structurally canonical (so
-/// [`crate::Dispatcher::new`] accepts it) but denying every action at the first gate.
+/// The chain is structurally canonical so [`crate::Dispatcher::new`] accepts it, but it denies
+/// every action at the first gate.
 pub fn deny_gate_chain() -> Vec<Box<dyn Gate>> {
     CANONICAL_GATE_ORDER
         .into_iter()
@@ -62,14 +55,14 @@ pub fn deny_gate_chain() -> Vec<Box<dyn Gate>> {
 }
 
 /// An executor that refuses to run anything: the fail-closed counterpart to [`deny_gate_chain`]
-/// for the live binary until real executors (Hermes, Synapse) land.
+/// for a server without a configured executor.
 ///
 /// Behind [`deny_gate_chain`] it is unreachable (every action is denied before execution); it
-/// exists so that even a future mis-wiring of the chain cannot silently execute an action.
+/// exists so that a chain misconfiguration cannot silently execute an action.
 pub struct DenyExecutor;
 
 #[async_trait]
-/// Refuses every executor invocation in the live fail-closed configuration.
+/// Refuses every executor invocation in a fail-closed fallback configuration.
 impl Executor for DenyExecutor {
     /// Returns an error for every attempted invocation.
     async fn execute(
@@ -81,5 +74,43 @@ impl Executor for DenyExecutor {
             "fail-closed: no executor is wired for tool '{}'",
             invocation.tool
         )))
+    }
+}
+
+#[cfg(test)]
+/// Tests fail-closed default behavior.
+mod tests {
+    use super::*;
+    use syntheos_contracts::{PrincipalId, TenantId};
+
+    #[tokio::test]
+    /// Reports the unavailable authority in a stable failure reason.
+    async fn deny_gate_reports_public_failure_reason() {
+        let gate = DenyGate::new("pistis");
+        let request = GateRequest {
+            context: RequestContext {
+                tenant: TenantId::new(),
+                principal: PrincipalId::new(),
+                persona: None,
+                session: None,
+                room: None,
+                task: None,
+                workflow: None,
+                authority: None,
+            },
+            invocation: ToolInvocation {
+                tool: "test".to_string(),
+                action: "run".to_string(),
+                args: serde_json::json!({}),
+            },
+        };
+
+        let decision = gate.check(&request).await.expect("deny gate must decide");
+        assert_eq!(
+            decision,
+            GateDecision::Deny {
+                reason: "fail-closed: the pistis authority is unavailable".to_string()
+            }
+        );
     }
 }

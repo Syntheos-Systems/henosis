@@ -11,9 +11,7 @@
 //! 2. Checks `Permission::OrgRead` via [`OperatorAuth::require`].
 //! 3. Delegates to [`compose_dashboard`] with the JWT's org and principal.
 //!
-//! The `usage` section is always null per the spec's documented honesty rule:
-//! Plutus usage metering is not yet wired into the dashboard (Phase 2 billing).
-//! This is not a stub -- it is the spec's explicit placeholder.
+//! The `usage` section remains null until Plutus usage metering is wired into the dashboard.
 
 use std::collections::BTreeMap;
 
@@ -311,7 +309,7 @@ pub async fn compose_dashboard(
         }
     };
 
-    // Usage: always null per the spec's honesty rule (Phase 2 billing metering, not yet wired).
+    // Usage remains null until Plutus metering is available.
     let usage = UsageStats {
         tokens_today: None,
         cost_today: None,

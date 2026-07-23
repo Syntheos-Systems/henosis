@@ -1,14 +1,10 @@
 //! The persistent SQLite-backed [`PrincipalDirectory`].
 //!
-//! This is the unit-6 DB decision (ADR Item 3 / gating story G2): `InMemoryDirectory` cannot
-//! survive a restart, but the `user_id -> PrincipalId` backfill the projection convention
-//! prescribes must persist to be usable as a one-time migration tool, and Phase 1 Chiasm/Soma
-//! extraction needs principal lookup that outlives process restarts.
+//! `InMemoryDirectory` cannot survive a restart; this backend persists principal lookups and
+//! the `user_id -> PrincipalId` mapping used by legacy-data backfills.
 //!
 //! Backend: `rusqlite` (matches Kleos's SQLite tooling). Schema is managed by the kernel-crate
-//! migration convention -- `PRAGMA user_version` plus ordered `migrations/Vn__*.sql` files
-//! (see `2026-06-10-henosis-db-and-migration-convention.md`). This crate is the reference
-//! implementation of that convention; copy `apply_migrations` into each later SQLite kernel crate.
+//! migration convention: `PRAGMA user_version` plus ordered `migrations/Vn__*.sql` files.
 //!
 //! Concurrency: a single `Connection` behind a `Mutex` (a principal directory is low-volume).
 //! No `.await` is held across the lock. A connection pool can replace the `Mutex` later without
@@ -234,11 +230,12 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_is_none() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
-        assert!(dir
-            .lookup(PrincipalId::new())
-            .await
-            .expect("lookup")
-            .is_none());
+        assert!(
+            dir.lookup(PrincipalId::new())
+                .await
+                .expect("lookup")
+                .is_none()
+        );
     }
 
     /// Principal kind and optional display values survive storage round trips.

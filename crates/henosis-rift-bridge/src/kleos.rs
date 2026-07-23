@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 
 use henosis_broca::{BrocaStore, LogAction};
 use henosis_chiasm::{ChiasmStore, NewTask, Task, TaskFilter, TaskPatch, TaskStatus};
@@ -563,7 +563,7 @@ pub struct MemoryRow {
 /// client needs, behind one trait so it can be backed either by upstream Kleos
 /// over HTTP ([`HttpMemoryBackend`]) or by the in-process cognition store
 /// ([`CognitionMemoryBackend`], `cognition` feature). Chiasm/Broca always run
-/// in-process; only memory had no in-process store before Wave 3.
+/// in-process; memory can use either backend.
 #[async_trait]
 pub trait BridgeMemory: Send + Sync {
     /// Search memory for `query`, returning up to `limit` hits.
@@ -657,8 +657,8 @@ impl BridgeMemory for HttpMemoryBackend {
 }
 
 /// Memory backend over the in-process cognition store (vendored kleos-lib via
-/// the `henosis-cognition` facade). The Wave 3 in-process path: no HTTP, no
-/// `:4200` -- memory store and FTS search run against a local kleos-lib
+/// the `henosis-cognition` facade). This path uses no HTTP or `:4200`: memory
+/// storage and FTS search run against a local kleos-lib
 /// `Database` in the bridge process. Gated on the `cognition` feature so the
 /// default bridge build never compiles the heavy ML stack.
 #[cfg(feature = "cognition")]
@@ -726,10 +726,9 @@ impl BridgeMemory for CognitionMemoryBackend {
 /// Chiasm task operations and Broca activity run fully in-process against
 /// `ChiasmStore`/`BrocaStore`. Memory operations go through the [`BridgeMemory`]
 /// seam: upstream Kleos over HTTP by default, or the in-process cognition store
-/// under the `cognition` feature (Wave 3). This is the in-Henosis counterpart to
-/// [`HttpKleosClient`], which stays the standalone-bridge path -- the same trait,
-/// two deployments (mirroring the standalone/Henosis split of the Synapse
-/// PistisGate authority).
+/// under the `cognition` feature. This is the in-Henosis counterpart to
+/// [`HttpKleosClient`], supporting both standalone and local-store deployments
+/// through the same trait.
 pub struct InProcessKleosClient {
     /// In-process Chiasm task store.
     chiasm: Arc<ChiasmStore>,
@@ -1029,7 +1028,7 @@ pub fn summarize_active_tasks(tasks: &[KleosTaskSummary]) -> Option<String> {
 #[cfg(test)]
 /// Tests for Kleos context helper behavior.
 mod tests {
-    use super::{build_memory_query, summarize_active_tasks, KleosTaskSummary};
+    use super::{KleosTaskSummary, build_memory_query, summarize_active_tasks};
 
     /// Verifies the memory query keeps the channel and recent human context.
     #[test]

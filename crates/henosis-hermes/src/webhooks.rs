@@ -1,4 +1,4 @@
-//! Inbound webhook ingestion (Phase 5, section 7.1).
+//! Inbound webhook ingestion.
 //!
 //! Receives provider webhooks, verifies their signatures, normalizes them into a
 //! [`WebhookEvent`], and publishes verified events to Axon. Signature
@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use hmac::{Hmac, Mac};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use tracing::warn;
 

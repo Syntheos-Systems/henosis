@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Transitional HTTP client + Ed25519 request signer for Synapse's memory/coordination access during absorption. Software-key only (no PIV/YubiKey); retired when in-process kernel dispatch lands."
+description = "HTTP client and software Ed25519 request signer for Synapse memory and coordination access."
 
 [dependencies]
 reqwest = { workspace = true }

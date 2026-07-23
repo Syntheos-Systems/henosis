@@ -1,4 +1,4 @@
-//! The one-time Kleos `user_id -> PrincipalId` absorption backfill (projection convention 3.2).
+//! Imports legacy task data by mapping legacy owner keys to principals.
 //!
 //! Reads a legacy Kleos SQLite database, mints one `PrincipalKind::Human` principal per distinct
 //! legacy `user_id` via the canonical [`PrincipalDirectory`], records the mapping in
@@ -12,20 +12,19 @@
 //! `(source, legacy_task_id)`. Owner keys are NOT source-scoped: Kleos user ids are
 //! registry-global, and the same key maps to the same Human principal from every source.
 //!
-//! Rules, all from the projection convention:
-//! - **Runs once per source, not at startup** (3.2). Re-running is safe: the map tables make
+//! Import rules:
+//! - **Runs once per source, not at startup.** Re-running is safe: the map tables make
 //!   it idempotent per source.
-//! - **No on-demand minting** (3.3). Every principal is minted here; a legacy row that cannot be
+//! - **No on-demand minting.** Every principal is minted here; a legacy row that cannot be
 //!   handled fails the run with an explicit [`ChiasmError::Backfill`] naming the problem.
-//! - **The map tables are migration artifacts** (3.1), scheduled to drop one release cycle after
-//!   absorption.
+//! - **The map tables are import artifacts** and are retained for idempotency.
 //!
 //! Deliberate scope choices: legacy `agent` strings are NOT minted as principals -- agent
-//! identity is Soma's domain (Story 1.2, convention 3.4); the label is preserved per task in
+//! identity is Soma's domain; the label is preserved per task in
 //! `chiasm_legacy_task_id_map.legacy_agent` so a later pass can resolve assignees. Path claims
 //! are NOT imported (transient TTL leases, all expired by migration time). Kleos guardrail
 //! columns (`condition`, `guardrail_url`, `guardrail_retries`) are not part of the Henosis task
-//! model and are dropped. No Axon events are emitted -- this is a migration, not live traffic.
+//! model and are dropped. No Axon events are emitted because the import is not live traffic.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -297,7 +296,7 @@ fn read_legacy_deps(legacy: &Connection) -> Result<Vec<LegacyDep>, ChiasmError> 
     Ok(out)
 }
 
-/// Run the absorption backfill from ONE legacy Kleos SQLite database at `legacy_db` into the
+/// Run the legacy import from ONE Kleos SQLite database at `legacy_db` into the
 /// Henosis chiasm store at `target_db`, minting principals in `directory` and homing every
 /// imported task under `tenant`. `source` labels which Kleos database this is (monolith vs a
 /// tenant shard); each source has its own legacy id space and its own idempotency scope.
@@ -329,12 +328,12 @@ pub async fn backfill_from_kleos(
         .map_err(berr)?;
     apply_migrations(&mut target)?;
 
-    // Phase 1: read + validate ALL legacy data before touching anything.
+    // Step 1: read + validate ALL legacy data before touching anything.
     let tasks = read_legacy_tasks(&legacy)?;
     let updates = read_legacy_updates(&legacy)?;
     let deps = read_legacy_deps(&legacy)?;
 
-    // Phase 2: load prior-run state so re-runs are idempotent.
+    // Step 2: load prior-run state so re-runs are idempotent.
     let mut user_map: BTreeMap<i64, PrincipalId> = {
         let mut stmt = target
             .prepare("SELECT user_id, principal_id FROM chiasm_legacy_user_id_map")
@@ -416,7 +415,7 @@ pub async fn backfill_from_kleos(
         });
     }
 
-    // Phase 3: mint principals for unmapped legacy keys. The legacy key is a tenant/owner key
+    // Step 3: mint principals for unmapped legacy keys. The legacy key is a tenant/owner key
     // in single-operator Kleos, so it classifies as the operating Human (convention 3.2).
     let minted = pending_users.len();
     for legacy_key in pending_users {
@@ -432,7 +431,7 @@ pub async fn backfill_from_kleos(
         user_map.insert(legacy_key, principal.id);
     }
 
-    // Phase 4: one transaction for every target write.
+    // Step 4: one transaction for every target write.
     let tx = target.transaction().map_err(berr)?;
     for (legacy_key, pid) in &user_map {
         tx.execute(
@@ -541,6 +540,7 @@ pub async fn backfill_from_kleos(
 }
 
 #[cfg(test)]
+/// Tests legacy-task import validation and idempotency.
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -607,10 +607,10 @@ mod tests {
         conn.execute_batch(LEGACY_DDL).expect("legacy ddl");
         conn.execute_batch(
             "INSERT INTO chiasm_tasks (agent, project, title, status, summary, user_id, created_at, updated_at)
-             VALUES ('claude-code', 'henosis', 'ship slice 4', 'active', 'porting', 1,
+             VALUES ('claude-code', 'henosis', 'ship release checklist', 'active', 'in progress', 1,
                      '2026-06-01 10:00:00', '2026-06-02 11:30:00');
              INSERT INTO chiasm_tasks (agent, project, title, status, user_id, created_at, updated_at)
-             VALUES ('synapse', 'henosis', 'review slice 4', 'blocked', 1,
+             VALUES ('synapse', 'henosis', 'review release checklist', 'blocked', 1,
                      '2026-06-01 10:05:00', '2026-06-01 10:05:00');
              INSERT INTO chiasm_tasks (agent, project, title, status, user_id, created_at, updated_at)
              VALUES ('codex', 'kleos', 'other-owner task', 'completed', 2,
@@ -633,6 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms dry runs validate and count rows without mutating storage.
     async fn dry_run_counts_without_writing() {
         let (legacy, target) = db_pair("dry");
         build_legacy_fixture(&legacy);
@@ -667,6 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms an applied import projects tasks into owner-scoped records.
     async fn apply_imports_everything_principal_correct() {
         let (legacy, target) = db_pair("apply");
         build_legacy_fixture(&legacy);
@@ -707,7 +709,7 @@ mod tests {
         assert_eq!(mine.len(), 2, "legacy key 1 owned two tasks");
         let ship = mine
             .iter()
-            .find(|t| t.title == "ship slice 4")
+            .find(|t| t.title == "ship release checklist")
             .expect("ship task");
         assert_eq!(ship.status, TaskStatus::Active);
         assert_eq!(ship.tenant, tenant);
@@ -769,6 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms rerunning an import does not duplicate projected records.
     async fn rerun_is_idempotent() {
         let (legacy, target) = db_pair("rerun");
         build_legacy_fixture(&legacy);
@@ -810,6 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms invalid legacy statuses fail before any writes occur.
     async fn bad_legacy_status_fails_before_any_write() {
         let (legacy, target) = db_pair("badstatus");
         build_legacy_fixture(&legacy);
@@ -847,6 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms imports tolerate source databases without dependency tables.
     async fn legacy_db_without_deps_table_imports_tasks() {
         let (legacy, target) = db_pair("nodeps");
         {

@@ -95,7 +95,7 @@ pub struct Task {
     pub output_format: String,
     /// Submitted output, once produced.
     pub output: Option<String>,
-    /// Plan text (LLM generation deferred to the Broca extraction).
+    /// Optional plan text supplied by the task producer.
     pub plan: Option<String>,
     /// Reviewer feedback.
     pub feedback: Option<String>,
@@ -160,7 +160,7 @@ pub struct TaskPatch {
     pub status: Option<TaskStatus>,
     /// New summary.
     pub summary: Option<String>,
-    /// New assignee (set only; clearing an assignee is not a slice-1 operation).
+    /// New assignee (set only; clearing an assignee is unsupported).
     pub assignee: Option<PrincipalId>,
 }
 

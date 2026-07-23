@@ -1,16 +1,13 @@
-//! Aggregated client bundle held in `AppState`. After the Phase 1 refactor
-//! this file is a thin coordinator: the LLM loop lives in `orchestrator.rs`,
+//! Aggregated client bundle held in `AppState`. This file is a thin coordinator: the LLM loop
+//! lives in `orchestrator.rs`,
 //! the provider implementations in `providers/`, and the coordination
 //! services (Kleos, Chiasm, Axon, cred) in `services.rs`. `Clients` retains
-//! its original method shapes so `tasks.rs` does not need to change in this
-//! commit -- subsequent commits can wire `tasks.rs` directly to the
-//! orchestrator and `Services` if desired.
+//! its method shapes for compatibility with `tasks.rs`.
 //!
 //! The two LLM entry points (`anthropic_complete` and `anthropic_resume`)
-//! are now provider-agnostic despite their legacy names: they construct the
+//! are provider-agnostic despite their compatibility names: they construct the
 //! configured provider via the factory and call into `orchestrator::run` /
-//! `orchestrator::resume`. The names remain to keep this commit focused on
-//! the structural change; renaming to `complete` / `resume` is a follow-up.
+//! `orchestrator::resume`.
 
 use reqwest::Client;
 use std::sync::Arc;
@@ -100,7 +97,7 @@ impl Clients {
     /// Construct from a Config. Builds a single shared reqwest client used
     /// by every dependent client so the connection pool is unified across
     /// LLM, gate checks, Kleos, Chiasm, and Axon. Hermes is dispatched
-    /// in-process (story 5.4); `cfg.hermes_url` is retained in Config for
+    /// in-process; `cfg.hermes_url` is retained in Config for
     /// backwards compatibility but is no longer used here.
     pub fn new(cfg: Config) -> Self {
         let http = Client::builder()
@@ -261,8 +258,8 @@ impl Clients {
         .await?)
     }
 
-    /// Resume a tool-use loop from an existing message history. Legacy name
-    /// preserved; body provider-agnostic. `stream` is optional.
+    /// Resume a tool-use loop from an existing message history. The compatibility name has a
+    /// provider-agnostic body. `stream` is optional.
     #[allow(clippy::too_many_arguments)]
     pub async fn anthropic_resume(
         &self,

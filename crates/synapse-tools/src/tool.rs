@@ -37,8 +37,8 @@ pub enum GateDecision {
 /// Tauri app) impose confirmation prompts, hook scripts, or auditing without
 /// modifying individual tools.
 ///
-/// The default `PermissiveGate` allows everything. Phase 3 (Ratatui TUI) will
-/// add a confirmation gate; Phase 0 (hooks) adds a hook-executing gate.
+/// The default `PermissiveGate` allows everything. Hosts can add confirmation
+/// or hook-executing gates without modifying individual tools.
 #[async_trait::async_trait]
 pub trait ToolGate: Send + Sync {
     /// Called before a tool runs. Return `Deny` to short-circuit with an

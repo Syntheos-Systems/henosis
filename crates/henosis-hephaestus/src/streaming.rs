@@ -3,12 +3,11 @@
 //! emits them. Subscribers that lag or disconnect are silently dropped --
 //! task execution must never depend on a listener being attached.
 //!
-//! Phase 1 emits synthesized events derived from the orchestrator's
+//! The current implementation emits synthesized events derived from the orchestrator's
 //! non-streaming `Provider::send` results: text_delta per text block,
 //! tool_start per tool_use, plus turn_end / task_complete / task_paused /
-//! task_failed. When `Provider::send_streaming` is wired into the
-//! orchestrator (later phase) the synthetic events will be replaced with
-//! real per-token deltas with no schema change for clients.
+//! task_failed. The orchestrator does not currently call `Provider::send_streaming`; the event
+//! schema can carry real per-token deltas without a client-facing change.
 
 use std::collections::HashMap;
 use std::convert::Infallible;

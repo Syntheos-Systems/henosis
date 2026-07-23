@@ -1,17 +1,9 @@
 //! The eidolon supervisor: watches agent session JSONL directories, detects rule violations,
-//! and publishes them as typed events on the in-process Axon bus (Story 2.5).
+//! and publishes them as typed events on the in-process Axon bus.
 //!
-//! Ported (copy-and-own, the agent-forge pattern) from Kleos `eidolon-supervisor` (741 LOC).
-//! Deviations from Kleos, each deliberate:
-//! - Alerting is an Axon [`ViolationDetected`] event instead of three Kleos HTTP calls
-//!   (`/inbox`, `/axon/publish`, `/supervisor/inject`); Henosis consumers subscribe on the bus
-//!   (a Rift-backed operator alert arrives in Phase 4, the inject path with sessions/Synapse).
-//! - Rule regexes compile ONCE at construction, and an invalid pattern is a construction error
-//!   instead of a silently skipped check.
-//! - The file-scope check is wired (Kleos shipped it dead); an empty allow-list disables it.
-//! - Cooldowns use `std::time::Instant` (monotonic) instead of wall-clock chrono.
-//! - The promise-vs-action drift check is NOT ported: it was a no-op placeholder in Kleos and
-//!   its real implementation needs cross-turn session state (Phase 4 / T1 territory).
+//! Alerts are emitted as [`ViolationDetected`] events for subscribers to handle. Rule regexes
+//! compile once at construction, file-scope checking is enabled by a non-empty allow-list, and
+//! cooldowns use monotonic [`std::time::Instant`] values.
 
 mod retry_loop;
 mod rule_match;
@@ -67,7 +59,7 @@ pub enum CheckType {
     RetryLoop,
     /// Edits outside the allowed path set.
     ScopeViolation,
-    /// Promise-vs-action drift (reserved; not yet implemented, see module docs).
+    /// Reserved promise-vs-action drift detector; the supervisor currently ignores this value.
     Drift,
 }
 
@@ -83,6 +75,7 @@ pub enum Severity {
     Critical,
 }
 
+/// Implements Severity wire-format conversion.
 impl Severity {
     /// The canonical wire token for this severity.
     pub fn as_str(&self) -> &'static str {
@@ -124,6 +117,7 @@ pub struct ViolationDetected {
     pub session_id: Option<String>,
 }
 
+/// Implements Axon event metadata for detected violations.
 impl TypedEvent for ViolationDetected {
     const CHANNEL: &'static str = SUPERVISION_CHANNEL;
     const KIND: &'static str = "violation.detected";
@@ -215,6 +209,7 @@ pub struct Supervisor {
     cooldowns: HashMap<String, Instant>,
 }
 
+/// Implements supervisor construction, scanning, and event publication.
 impl Supervisor {
     /// Build the supervisor, compiling every `RuleMatch` pattern. An invalid pattern is a
     /// construction error: a rule that cannot run must not be silently skipped.

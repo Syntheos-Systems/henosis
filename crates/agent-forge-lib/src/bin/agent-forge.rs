@@ -1,10 +1,9 @@
-//! `agent-forge`: the thin CLI wrapper over `agent-forge-lib` (Phase 2 Story 2.1).
+//! `agent-forge`: the thin CLI wrapper over `agent-forge-lib`.
 //!
-//! The CLI contract is byte-compatible with the upstream Kleos-repo binary: every invocation
-//! names a subcommand, reads a JSON input file, runs one tool against the on-disk SQLite forge
-//! DB, and writes the JSON `Output` envelope back, so external hooks keep working unchanged.
-//! All tool logic lives in the library; this file only parses arguments, does the file IO, and
-//! wires the HTTP skills bridge (`KLEOS_URL` / `KLEOS_API_KEY`).
+//! Every invocation names a subcommand, reads a JSON input file, runs one tool against the
+//! on-disk SQLite forge database, and writes the JSON `Output` envelope back. All tool logic
+//! lives in the library; this file only parses arguments, performs file IO, and wires the HTTP
+//! skills bridge through `KLEOS_URL` and `KLEOS_API_KEY`.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

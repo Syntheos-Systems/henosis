@@ -2,8 +2,7 @@
 
 /// A Broca narration operation failed.
 ///
-/// `#[non_exhaustive]`: variants may grow as more of the Kleos surface (LLM ask, the legacy
-/// backfill) is ported into this crate.
+/// `#[non_exhaustive]`: variants may grow as narration-service capabilities expand.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BrocaError {

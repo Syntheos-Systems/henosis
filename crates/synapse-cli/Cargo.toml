@@ -25,8 +25,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
-# In-workspace replacement for kleos-client + kleos-lib during Synapse
-# absorption (Story 4.1). Retired once in-process dispatch lands.
+# Workspace memory client for signed Kleos requests.
 henosis-memory-client = { path = "../henosis-memory-client" }
 hostname = { workspace = true }
 chrono = "0.4.44"

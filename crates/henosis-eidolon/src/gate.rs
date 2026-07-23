@@ -250,7 +250,7 @@ mod tests {
     use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
 
     use super::*;
-    use crate::policy::{default_injection_patterns, DriftSeverity};
+    use crate::policy::{DriftSeverity, default_injection_patterns};
     use crate::signal::DriftFlag;
 
     /// A drift signal reporting no flags.
@@ -706,7 +706,7 @@ mod tests {
     }
 
     proptest! {
-        /// THE fail-closed property (roadmap R4): when the drift authority errors, no payload
+        /// The fail-closed property: when the drift authority errors, no payload
         /// whatsoever can produce an Allow -- the outcome is a sync-check Deny or a GateError.
         #[test]
         fn erroring_signal_never_allows(args in arb_json(), msg in "[a-zA-Z0-9 ]{0,40}") {

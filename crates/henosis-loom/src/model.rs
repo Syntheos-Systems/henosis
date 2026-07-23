@@ -2,8 +2,8 @@
 //!
 //! The Kleos `Workflow`/`Run` carried `i64` surrogate keys and a `user_id: i64` owner (often
 //! hardcoded to `1` in row mapping). Here workflows and runs are owner-scoped projections keyed
-//! by [`WorkflowId`]/[`RunId`] (UUID v8, from `syntheos-contracts` -- they are referenced across
-//! services from Phase 5 on), statuses and step types are typed enums, and timestamps are
+//! by [`WorkflowId`]/[`RunId`] (UUID v8 from `syntheos-contracts`), statuses and step types are
+//! typed enums, and timestamps are
 //! [`Timestamp`] (UTC). Steps and logs keep `i64` keys: they are run-internal audit rows, the
 //! `chiasm_task_updates` precedent. No `user_id: i64` survives the port.
 
@@ -17,9 +17,9 @@ use crate::error::LoomError;
 /// The kind of work a step performs.
 ///
 /// Serializes snake_case, matching the Kleos type strings. `Transform` runs inline via the
-/// built-in executor; `Hephaestus` dispatches in-process to the absorbed agent executor
-/// (Phase 5, story 5.5) via the [`crate::HephaestusDispatch`] seam; `Webhook`/`Llm` wait
-/// for their executors (Hermes/Synapse, Phases 4-5); the rest complete externally via
+/// built-in executor; `Hephaestus` dispatches in-process through the
+/// [`crate::HephaestusDispatch`] seam; `Webhook` and `Llm` wait for their executors; the rest
+/// complete externally via
 /// [`crate::LoomStore::complete_step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,13 +32,13 @@ pub enum StepType {
     Parallel,
     /// A wait/delay step resolved externally.
     Wait,
-    /// An HTTP webhook call (executor arrives with Hermes, Phase 5).
+    /// An HTTP webhook call handled by a registered executor.
     Webhook,
-    /// An LLM call (executor arrives with Synapse, Phase 4).
+    /// An LLM call handled by a registered executor.
     Llm,
     /// A pure JSON transform, executed inline by [`crate::TransformExecutor`].
     Transform,
-    /// An agent task dispatched in-process to the Hephaestus executor (Phase 5, story 5.5).
+    /// An agent task dispatched in-process to the Hephaestus executor.
     ///
     /// The [`crate::HephaestusDispatch`] seam in the kernel crate keeps henosis-loom free of a
     /// runtime dependency on henosis-hephaestus; the real implementation lives in
@@ -46,6 +46,7 @@ pub enum StepType {
     Hephaestus,
 }
 
+/// Implements StepType storage conversion.
 impl StepType {
     /// The canonical storage/wire token for this step type.
     pub fn as_str(&self) -> &'static str {
@@ -93,6 +94,7 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// Implements RunStatus storage conversion.
 impl RunStatus {
     /// The canonical storage/wire token for this status.
     pub fn as_str(&self) -> &'static str {
@@ -142,6 +144,7 @@ pub enum StepStatus {
     Skipped,
 }
 
+/// Implements StepStatus storage conversion.
 impl StepStatus {
     /// The canonical storage/wire token for this status.
     pub fn as_str(&self) -> &'static str {
@@ -315,6 +318,7 @@ pub enum LogLevel {
     Error,
 }
 
+/// Implements LogLevel storage conversion.
 impl LogLevel {
     /// The canonical storage/wire token for this level.
     pub fn as_str(&self) -> &'static str {

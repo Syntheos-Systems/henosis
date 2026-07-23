@@ -2,26 +2,15 @@
 #![warn(clippy::all)]
 //! # agent-forge-lib
 //!
-//! Agent-Forge as a library (Phase 2 Story 2.1): the structured-reasoning gate tools --
-//! spec/hypothesis/approaches/verify/challenge, Tree-sitter AST search and repo maps, session
-//! learning, and the skills surface -- extracted from the Kleos-repo CLI binary so
-//! `syntheos-server` (and the Phase 2 EidolonGate work) can call them in-process. The thin
-//! `agent-forge` binary in this crate keeps the exact CLI contract (subcommand + `--input` /
-//! `--output` JSON files + `--db`), so existing hooks keep working against this build.
+//! Reusable structured-reasoning gates for specifications, hypotheses, approach comparison,
+//! verification, adversarial review, Tree-sitter search, repository maps, session learning,
+//! and skill discovery. `syntheos-server` calls the library in process, while the thin
+//! `agent-forge` binary preserves the JSON-file CLI contract used by automation.
 //!
-//! This is a copy-and-own absorption (the chiasm/soma precedent): the Kleos repo's
-//! `agent-forge` keeps shipping untouched until the cutover retires it; this copy is kept
-//! intentionally close to upstream (chrono timestamps and all) so fixes can be ported across
-//! by diff until then.
-//!
-//! The one structural change from upstream: Kleos HTTP coupling goes through the
-//! [`SkillsBridge`] seam instead of a hardwired client (the OutputFilter/Narrator/StepExecutor
-//! pattern). The CLI wires the feature-gated [`bridge::HttpSkillsBridge`] (`KLEOS_URL` +
-//! `KLEOS_API_KEY` env; the phylaxd keyless fallback deliberately stays in the
-//! Kleos-repo binary, which keeps that cross-repo dependency out of this workspace).
-//! NOTE: the roadmap story text mentions a `FORGE_URL` fallback; no such variable exists in
-//! the upstream source or hooks -- the real variable is `KLEOS_URL`, and nothing was invented
-//! for the phantom one.
+//! Optional skill operations cross the [`SkillsBridge`] seam instead of depending on a
+//! hardwired remote client. The CLI wires the feature-gated
+//! [`bridge::HttpSkillsBridge`] through `KLEOS_URL` and `KLEOS_API_KEY`; builds without that
+//! bridge retain every local reasoning and repository-analysis tool.
 
 pub mod bridge;
 pub mod db;
@@ -36,9 +25,9 @@ pub use tools::{ToolError, ToolResult};
 
 use serde_json::Value;
 
-/// Every agent-forge tool, one variant per CLI subcommand (the names map 1:1).
+/// Every agent-forge tool, with one variant per CLI subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // The variants ARE the documentation: they mirror the CLI verbs 1:1.
+#[allow(missing_docs)] // Variant names mirror the documented CLI verbs.
 pub enum Tool {
     SpecTask,
     ConsiderApproaches,
@@ -74,8 +63,8 @@ pub enum Tool {
 /// [`Output`] error envelope rather than an `Err`, mirroring the CLI contract.
 ///
 /// `bridge` supplies the skills backend; with `None`, the six `Skill*` tools (and the
-/// opportunistic skill lookups inside `SpecTask`/`Verify`/`SessionLearn`) degrade exactly as
-/// the upstream CLI does without a reachable Kleos.
+/// opportunistic skill lookups inside `SpecTask`/`Verify`/`SessionLearn`) return their
+/// standard unavailable result when no skill backend is reachable.
 pub fn run_tool(
     db: &Database,
     tool: Tool,

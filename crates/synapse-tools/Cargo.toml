@@ -19,15 +19,13 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 walkdir = "2"
 hostname = { workspace = true }
-# In-workspace replacement for kleos-client + kleos-lib::{auth_piv, cred::bootstrap}
-# during Synapse absorption (Story 4.1). Retired once in-process dispatch lands.
+# Workspace memory client for signed Kleos requests.
 henosis-memory-client = { path = "../henosis-memory-client" }
 synapse-session = { path = "../synapse-session" }
 synapse-provider = { path = "../synapse-provider" }
 urlencoding = "2"
-# Optional in-process Pistis authority backend (Story 4.2). Off by default so
-# Synapse still builds and runs standalone (LocalAuthority); Henosis turns this
-# feature on to back PistisGate with real henosis-pistis room-state authority.
+# Optional in-process Pistis authority backend. Off by default so Synapse
+# remains standalone; Henosis enables it for room-state authorization.
 henosis-pistis = { path = "../henosis-pistis", optional = true }
 syntheos-contracts = { path = "../syntheos-contracts", optional = true }
 # Only used by the henosis-pistis-backed authority tests (clock construction).

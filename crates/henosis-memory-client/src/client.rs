@@ -1,12 +1,8 @@
 //! `Client` is the HTTP client used to talk to a Kleos-protocol memory server.
 //!
-//! Copy-and-owned from `kleos-client/src/client.rs` (Story 4.1, Synapse
-//! absorption). This is a transient standalone bridge: in-process kernel
-//! dispatch replaces it in Wave 5-6. Only the generic string-path HTTP surface
-//! that Synapse's memory tools actually call (`get`/`post`/`put`/`patch`/
-//! `delete`) is retained; the typed `routes.rs` helpers, `call_route`, the
-//! `/mcp` passthrough, and the multipart/byte/timeout variants were dropped as
-//! unused, and with them the `percent-encoding`/`multipart` dependencies.
+//! The client provides the generic string-path HTTP surface used by Synapse memory tools:
+//! `get`, `post`, `put`, `patch`, and `delete`. It intentionally omits typed route helpers,
+//! MCP passthrough, multipart requests, byte responses, and per-request timeout variants.
 
 use serde_json::Value;
 

@@ -1,9 +1,8 @@
 //! Compose the system prompt from ordered, swappable sections.
 //!
-//! Synapse's pre-Phase-1 prompt was a single static string baked into the
-//! CLI. That made persona injection, skill listings, and Kleos recall
-//! impossible to express cleanly -- each addition meant a `format!`
-//! cascade. This module replaces it with a builder that owns an ordered
+//! Synapse composes its system prompt from ordered, swappable sections. This
+//! avoids a monolithic CLI string and lets persona injection, skill listings,
+//! and Kleos recall evolve independently. The builder owns an ordered
 //! list of `PromptSection`s and renders them into a single string at
 //! turn boundaries.
 //!
@@ -25,9 +24,8 @@
 //! Sections that have no content render as nothing -- no empty headings,
 //! no `(no persona)` placeholders.
 //!
-//! The builder is `Clone` so per-turn recomposition (Phase 3) only needs
-//! to mutate the sections that changed. For now we build once at session
-//! start and reuse the rendered string.
+//! The builder is `Clone`, allowing callers to update changed sections and
+//! reuse the rendered string when the prompt is unchanged.
 
 use crate::persona::Persona;
 use std::fmt::Write;

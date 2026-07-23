@@ -175,8 +175,8 @@ impl CredentialStore {
 
     /// Fetch a secret's raw ciphertext blob, or a [`CredentialStoreError::SecretNotFound`].
     ///
-    /// Crate-internal: the resolve modes (later slice) use this to decrypt in-process without
-    /// exposing a plaintext read on the public surface.
+    /// Crate-internal: resolve modes use this to decrypt in-process without exposing a plaintext
+    /// read on the public surface.
     pub(crate) fn load_ciphertext(
         &self,
         tenant: &TenantId,

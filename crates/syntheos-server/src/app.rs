@@ -50,23 +50,23 @@ const MAX_TASK_ACTIVITY_LIMIT: usize = 500;
 /// Cheap to clone (it is all `Arc`s), as the `axum` `State` extractor requires.
 #[derive(Clone)]
 pub struct AppState {
-    /// The unified action dispatcher (deny-by-default gate chain in Phase 0).
+    /// The unified action dispatcher with a deny-by-default gate chain.
     dispatcher: Arc<Dispatcher>,
     /// The principal directory actors are enrolled into and looked up from.
     directory: Arc<dyn PrincipalDirectory>,
     /// The in-process event bus (held for a future event-stream surface).
     bus: Arc<AxonBus>,
-    /// The Chiasm task store (the first Phase 1 kernel service, Story 1.7).
+    /// The Chiasm task store.
     chiasm: Arc<ChiasmStore>,
-    /// The Soma presence store (Story 1.2).
+    /// The Soma presence store.
     soma: Arc<SomaStore>,
-    /// The Broca narration log (Story 1.3).
+    /// The Broca narration log.
     broca: Arc<BrocaStore>,
-    /// The Loom workflow engine (Story 1.4).
+    /// The Loom workflow engine.
     loom: Arc<LoomStore>,
-    /// The Thymus quality store (Story 1.5).
+    /// The Thymus quality store.
     thymus: Arc<ThymusStore>,
-    /// The in-process cognitive core facade over vendored kleos-lib (Wave 2).
+    /// The in-process cognitive core facade over vendored kleos-lib.
     /// Feature-gated: present only under `--features cognition` so the default
     /// build never compiles the heavy ML stack. Additive -- nothing in the
     /// non-feature build references it.
@@ -280,12 +280,10 @@ impl AppState {
         self
     }
 
-    /// The in-process cognitive core facade (Wave 2). Present only under the
-    /// `cognition` feature.
+    /// The in-process cognitive core facade, present only under the `cognition` feature.
     ///
-    /// Read by the `/cognition/memory*` routes (Wave 3). The handle from
-    /// `main.rs` wraps a persistent path-backed session, so stored memory is
-    /// durable across restarts.
+    /// The `/cognition/memory*` routes use a persistent path-backed session supplied by
+    /// `main.rs`, so stored memory survives restarts.
     #[cfg(feature = "cognition")]
     pub fn cognition(&self) -> &Arc<henosis_cognition::Cognition> {
         &self.cognition
@@ -297,8 +295,7 @@ impl AppState {
     }
 }
 
-/// Build the router: the Phase 0 surface (health, version, enroll, dispatch) plus the Phase 1
-/// Chiasm task and Soma presence surfaces, optionally merged with the operator API.
+/// Build the loopback-compatible kernel router, optionally merged with the operator API.
 ///
 /// When `state.operator` is `Some`, the operator surface (`/api/auth/*`,
 /// `/api/dashboard`, `/ws`) is merged into the kernel router. When `None`
@@ -362,9 +359,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/thymus/stats", get(thymus_stats));
 
-    // The cognition surface (Wave 3): present only under the `cognition` feature,
-    // and the only routes that read `AppState::cognition()`. Mounted here so the
-    // default build's router is byte-for-byte unchanged.
+    // The cognition surface is present only under the `cognition` feature and contains the only
+    // routes that read `AppState::cognition()`.
     #[cfg(feature = "cognition")]
     {
         router = router
@@ -584,9 +580,9 @@ fn chiasm_error(e: ChiasmError) -> (StatusCode, String) {
 
 /// Body for [`chiasm_create_task`].
 ///
-/// `tenant` and `principal_id` are caller-asserted in Phase 1: the server has no authentication
-/// layer yet, so identity rides in the body the same way `/dispatch` carries a `RequestContext`.
-/// PistisGate (Phase 3) replaces caller-asserted identity with verified capability checks.
+/// This compatibility route accepts caller-asserted `tenant` and `principal_id` values and must
+/// remain restricted to trusted loopback callers. Public deployments use the authenticated
+/// authority router instead.
 #[derive(Debug, Deserialize)]
 pub struct ChiasmCreateTask {
     /// Tenant the task belongs to.
@@ -759,9 +755,9 @@ fn soma_error(e: SomaError) -> (StatusCode, String) {
 
 /// Body for [`soma_register`].
 ///
-/// `principal_id` must already be enrolled (via `POST /enroll` or the future Pistis admission
-/// path); registration verifies and never mints. Identity is caller-asserted in Phase 1, the
-/// same posture as the Chiasm surface.
+/// `principal_id` must already be enrolled via `POST /enroll`; registration verifies and never
+/// mints. This compatibility route accepts caller-asserted identity and is not part of the
+/// production router.
 #[derive(Debug, Deserialize)]
 pub struct SomaRegisterRequest {
     /// The agent's canonical principal id.
@@ -803,12 +799,11 @@ async fn soma_register(
 
 /// Query string for [`soma_list`]: caller-asserted tenant plus optional AND-filters.
 ///
-/// `tenant` is caller-asserted in Phase 1 (the server has no authentication yet, same as the
-/// chiasm read APIs); Phase 3 replaces it with a verified value. It is required so the listing
-/// is tenant-scoped and cannot enumerate other tenants' agents.
+/// `tenant` is caller-asserted on this loopback compatibility route. It is required so the
+/// listing remains tenant-scoped; the route is excluded from the production router.
 #[derive(Debug, Deserialize)]
 pub struct SomaListQuery {
-    /// Tenant whose agents are listed (caller-asserted in Phase 1).
+    /// Caller-asserted tenant whose agents are listed.
     pub tenant: TenantId,
     /// Only agents of this type.
     pub agent_type: Option<String>,
@@ -936,7 +931,7 @@ fn broca_error(e: BrocaError) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
-/// Body for [`broca_log`]. Identity is caller-asserted in Phase 1, the established posture.
+/// Body for [`broca_log`], a loopback compatibility route with caller-asserted identity.
 #[derive(Debug, Deserialize)]
 pub struct BrocaLogRequest {
     /// Tenant the action belongs to.
@@ -1726,7 +1721,7 @@ mod tests {
         )
     }
 
-    /// Build app state exactly as the live binary does: deny-by-default chain + deny executor.
+    /// Build an explicit deny-by-default app state for fallback-path tests.
     fn deny_state() -> AppState {
         let bus = Arc::new(AxonBus::new());
         let directory: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());
@@ -1869,8 +1864,7 @@ mod tests {
         serde_json::from_str(&body_string(response).await).expect("outcome json")
     }
 
-    /// Story 2.6 acceptance: a policy-violating invocation is denied BY EIDOLON through the live
-    /// server dispatch surface.
+    /// A policy-violating invocation is denied by Eidolon through the live dispatch surface.
     #[tokio::test]
     async fn dispatch_eidolon_denies_injection() {
         let (state, _thymus) = eidolon_state();
@@ -1886,8 +1880,7 @@ mod tests {
         assert_eq!(outcome["Denied"]["gate"], serde_json::json!("eidolon"));
     }
 
-    /// Story 2.2/2.6 acceptance: a drift flag recorded in the REAL Thymus store denies the
-    /// flagged principal's next dispatch, through the ThymusDriftSignal adapter.
+    /// A Thymus drift flag denies the flagged principal's next dispatch through the adapter.
     #[tokio::test]
     async fn dispatch_eidolon_denies_on_thymus_drift() {
         let (state, thymus) = eidolon_state();
@@ -2017,9 +2010,7 @@ mod tests {
         );
     }
 
-    /// The human slot is the REAL HumanGate, not a deny-everything stub: an
-    /// invocation declaring no approval requirement passes it (a `DenyGate`
-    /// would reject it). Story 4.6.
+    /// The HumanGate slot allows an invocation that declares no approval requirement.
     #[tokio::test]
     async fn human_slot_is_real_gate_not_deny_stub() {
         use henosis_plutus::MockPolicyBackend;
@@ -2161,10 +2152,8 @@ mod tests {
         ));
     }
 
-    /// Story 3.7 acceptance: through the live chain, the REAL PistisGate lets a request that
-    /// declares no capability traverse the pistis slot, where the plutus gate (configured with a
-    /// deny-no-org mock for this test) denies it -- and fails a capability-bearing request closed
-    /// at the pistis slot, since the empty room-state source has no authority state to verify.
+    /// The live Pistis gate passes requests without a capability claim and fails unverifiable
+    /// capability-bearing requests closed before Plutus.
     #[tokio::test]
     async fn live_chain_pistis_passes_then_plutus_denies() {
         use syntheos_contracts::{GateRequest, RequestContext, ToolInvocation};
@@ -2768,7 +2757,7 @@ mod tests {
             "rubric_id": rubric["id"],
             "agent": agent,
             "evaluator": owner,
-            "subject": "slice review",
+            "subject": "quality review",
             "scores": {"quality": 0.8},
         });
         let response = app
@@ -2788,7 +2777,7 @@ mod tests {
             serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(evaluation["overall_score"], 0.8);
 
-        // THE Phase 1 acceptance: the evaluation propagated into the agent's Soma presence.
+        // The evaluation propagates into the agent's Soma presence.
         let response = app
             .clone()
             .oneshot(
@@ -3191,9 +3180,7 @@ mod tests {
         assert_eq!(acao.to_str().unwrap(), allowed_origin);
     }
 
-    /// The Wave 3 wiring proof: a memory POSTed to `/cognition/memory` is then
-    /// returned by `/cognition/memory/search`, exercising the route ->
-    /// `AppState::cognition()` path end to end (FTS, in-memory test session).
+    /// A stored memory is returned by search through the complete cognition router path.
     #[cfg(feature = "cognition")]
     #[tokio::test]
     async fn cognition_store_then_search_round_trips_through_router() {
@@ -3201,7 +3188,7 @@ mod tests {
 
         // Store a memory through the route.
         let store_body = serde_json::json!({
-            "content": "Wave 3 wires the cognition route into AppState.",
+            "content": "The cognition route stores memory through AppState.",
             "source": "cognition-route-test",
         });
         let response = router(state.clone())

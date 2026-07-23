@@ -4,8 +4,7 @@ use syntheos_contracts::TaskId;
 
 /// A Chiasm task operation failed.
 ///
-/// `#[non_exhaustive]`: variants may grow as more of the Kleos surface (queue, claims,
-/// dependencies) is ported into this crate.
+/// `#[non_exhaustive]`: variants may grow as task-service capabilities expand.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ChiasmError {
@@ -36,8 +35,8 @@ pub enum ChiasmError {
     },
 
     /// The one-time legacy backfill failed (unreadable legacy DB, unparseable legacy row,
-    /// or a directory enrollment error). Per projection convention 3.3, bad legacy data is
-    /// an explicit failure naming the problem -- never silently discarded.
+    /// or a directory enrollment error). Bad legacy data produces an explicit failure naming
+    /// the problem rather than being silently discarded.
     #[error("legacy backfill failed: {0}")]
     Backfill(String),
 }

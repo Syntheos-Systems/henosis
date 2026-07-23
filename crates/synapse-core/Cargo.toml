@@ -23,9 +23,9 @@ async-trait = { workspace = true }
 dirs.workspace = true
 toml = "0.8"
 dashmap = { workspace = true }
-# In-process persona ranking (Story 4.3): replaces the `frameshift select`
-# subprocess. The pinned source lives in Henosis's excluded FrameShift vendor
-# workspace so clean checkouts do not depend on a sibling repository.
+# In-process persona ranking replaces the `frameshift select` subprocess. The
+# pinned source lives in Henosis's excluded FrameShift vendor workspace so clean
+# checkouts do not depend on a sibling repository.
 frameshift-orchestrator = { path = "../../vendor/frameshift/frameshift-orchestrator" }
 
 [dev-dependencies]

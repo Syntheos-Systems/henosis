@@ -1,7 +1,7 @@
 //! The drift-signal seam: where the gate reads the requesting principal's active drift state.
 //!
-//! The server adapts `ThymusStore` to this trait at wiring time (Story 2.6), the same pattern as
-//! Thymus's `QualitySink` (adapted over Soma) -- so `henosis-eidolon` never depends on
+//! The server adapts `ThymusStore` to this trait at wiring time, the same pattern as
+//! Thymus's `QualitySink` (adapted over Soma), so `henosis-eidolon` never depends on
 //! `henosis-thymus`.
 
 use async_trait::async_trait;

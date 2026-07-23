@@ -2,7 +2,7 @@
 #![warn(clippy::all)]
 //! # syntheos-axon
 //!
-//! The in-process pub/sub backbone for the Henosis agent OS: Phase 0 unit 2.
+//! The in-process pub/sub backbone for the Henosis agent OS.
 //!
 //! A single [`AxonBus`] (held as `Arc<AxonBus>`) carries [`syntheos_contracts::AxonEnvelope`]s
 //! between services running in the same process, over `tokio::sync::broadcast`. Services can use
@@ -14,7 +14,8 @@
 //!
 //! No persistence, replay, cursors, retention, webhooks, or cross-process delivery, and no
 //! delivery guarantee under backpressure (a lagging subscriber is signalled and resumes -- see
-//! [`AxonError::Lagged`]). The durable Kleos axon is reconciled later, at service-absorption time.
+//! [`AxonError::Lagged`]). Durable cross-process delivery belongs in
+//! `syntheos-axon-durable`.
 
 pub mod bus;
 pub mod error;

@@ -1,18 +1,15 @@
-//! Per-provider and global invocation metrics (Phase 4, section 6.1).
+//! Per-provider and global invocation metrics.
 //!
 //! Counts are cumulative atomic counters since process start; latency
 //! percentiles are computed over a bounded ring of the most recent samples
-//! (capped per provider). This is the concrete implementation the plan
-//! specifies -- lock-free counters plus a capped latency buffer -- rather than a
-//! true time-windowed store; a rolling-window refinement is deferred to
-//! post-absorption. Recording is best-effort and never blocks an invocation.
+//! (capped per provider). Recording is best-effort and never blocks an invocation.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tool::InvokeResponse;
 
@@ -31,6 +28,7 @@ pub enum Outcome {
     ValidationFailed,
 }
 
+/// Implements stable outcome labels.
 impl Outcome {
     /// Stable lowercase label for audit records and `GET /audit` filtering.
     pub fn label(self) -> &'static str {
@@ -85,6 +83,7 @@ struct ProviderMetrics {
     latency_ms: RwLock<VecDeque<u64>>,
 }
 
+/// Implements per-provider metric recording and snapshots.
 impl ProviderMetrics {
     /// Fold one invocation's outcome, latency, and retry count into the totals.
     fn record(&self, outcome: Outcome, duration_ms: u64, retries: u32) {
@@ -171,6 +170,7 @@ pub struct MetricsRegistry {
     started: Instant,
 }
 
+/// Implements registry-wide metric recording and snapshots.
 impl MetricsRegistry {
     /// Construct an empty registry, stamping the process start time.
     pub fn new() -> Self {
@@ -227,6 +227,7 @@ impl MetricsRegistry {
     }
 }
 
+/// Builds an empty metrics registry.
 impl Default for MetricsRegistry {
     /// Delegates to [`MetricsRegistry::new`].
     fn default() -> Self {
@@ -235,6 +236,7 @@ impl Default for MetricsRegistry {
 }
 
 #[cfg(test)]
+/// Tests metric aggregation and percentile calculation.
 mod tests {
     use super::*;
 

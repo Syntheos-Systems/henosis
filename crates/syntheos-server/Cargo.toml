@@ -12,32 +12,32 @@ name = "henosis"
 path = "src/main.rs"
 
 [dependencies]
-# The Phase 0 foundation this server wires together.
+# Core contracts, event transport, dispatch, identity, approvals, and audit.
 syntheos-contracts = { path = "../syntheos-contracts" }
 syntheos-axon = { path = "../syntheos-axon" }
 syntheos-dispatch = { path = "../syntheos-dispatch" }
 syntheos-identity = { path = "../syntheos-identity" }
 henosis-approval = { path = "../henosis-approval" }
 henosis-audit = { path = "../henosis-audit" }
-# Phase 1 kernel services, wired into AppState as they are extracted (Story 1.7).
+# Stateful kernel services wired into AppState.
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
 henosis-loom = { path = "../henosis-loom" }
-# Phase 5 / story 5.5: in-process Hephaestus executor wired into the Loom CompositeStepExecutor.
+# In-process Hephaestus executor wired into Loom's CompositeStepExecutor.
 henosis-hephaestus = { path = "../henosis-hephaestus" }
 henosis-thymus = { path = "../henosis-thymus" }
-# The eidolon authority: the real gate in the eidolon slot + the output filter (Story 2.6).
+# Eidolon policy gate and output filter.
 henosis-eidolon = { path = "../henosis-eidolon" }
-# The pistis authority: the real gate in the pistis slot (Story 3.3).
+# Pistis capability authority.
 henosis-pistis = { path = "../henosis-pistis" }
 # Embedded credential compatibility store used by loopback integrations and tests.
 henosis-credential-store = { path = "../henosis-credential-store" }
-# The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
+# Rift-backed human approval authority.
 henosis-rift = { path = "../henosis-rift" }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
-# The Plutus policy authority: the real gate in the plutus slot (Story 6.x / row 1).
+# Plutus policy authority.
 henosis-plutus = { path = "../henosis-plutus" }
 # Optional cognitive-core facade over vendored kleos-lib. Only the `cognition` feature pulls in
 # the heavy ML stack, so the default Henosis build excludes ort, tokenizers, and LanceDB.
@@ -58,8 +58,7 @@ zeroize.workspace = true
 # Synchronous, redirect-disabled HTTP client for short-lived operator CLI commands.
 reqwest = { workspace = true, features = ["blocking"] }
 libc = "0.2"
-# `now` for the Stripe webhook signature tolerance window (Story 6.4a). Pinned directly,
-# matching henosis-plutus, which owns the verifier this clock is handed to.
+# Clock support for the Stripe webhook signature tolerance window, matching the verifier owner.
 chrono = "0.4"
 # HTTP surface.
 axum = { workspace = true, features = ["ws"] }
@@ -97,8 +96,6 @@ henosis-plutus = { path = "../henosis-plutus", features = ["test-helpers"] }
 
 [features]
 default = []
-# The in-process cognitive core (Wave 2). OFF by default so the standard build
-# does not compile the vendored kleos-lib ML stack; turning it on adds the
-# `cognition` field to AppState and pulls henosis-cognition in.
+# The in-process cognitive core is off by default so standard builds do not compile the
+# vendored kleos-lib ML stack. Enabling it adds the cognition field to AppState.
 cognition = ["dep:henosis-cognition"]
-# Real service surfaces land here as they are absorbed (e.g. "rift", "synapse", "hermes").

@@ -1,26 +1,20 @@
 //! Slash-command registry for the Synapse front-ends.
 //!
-//! The pre-Phase-1 CLI matched slash commands inline against a hardcoded
-//! `match input.as_str()` table -- workable for the 8 builtins but a dead
-//! end as `/persona`, `/skill`, `/dump`, `/restore`, `/model`, `/effort`,
-//! `/loop` and file-backed commands enter the picture. This module is the
-//! single registry the CLI, the upcoming Ratatui TUI, and the Tauri front-end
-//! all consult.
+//! The command registry centralizes slash-command metadata and execution for
+//! the CLI and other front ends.
 //!
 //! ## Scope for v1
 //!
-//! - In-process registry: registered at session start, immutable afterward.
-//!   File-backed hot-reload from `~/.synapse/commands/*.md` lands in Phase 3.
-//! - Synchronous execution surface for now. Commands run on the front-end's
+//! - In-process registry: registered at session start and immutable afterward.
+//! - Synchronous execution surface. Commands run on the front-end's
 //!   thread, return a `CommandOutcome` that the front-end interprets
 //!   (print text, swap config, exit, schedule a turn).
 //! - No tool access from commands -- they manipulate session state and
 //!   may emit text/events. Commands that need agent work (`/search`)
 //!   call back into the front-end via `CommandOutcome::Queue`.
 //!
-//! Commands keep their own name(), description(), aliases(), and
-//! help_text() so the future `/help` and command-palette UI just enumerate
-//! the registry.
+//! Commands keep their own name(), description(), aliases(), and help_text() so `/help` and
+//! command-palette interfaces can enumerate the registry.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -177,8 +171,7 @@ impl CommandRegistry {
         )
     }
 
-    /// Enumerate registered commands in stable order. Powers `/help` and
-    /// the command palette overlay (Phase 6).
+    /// Enumerate registered commands in stable order for `/help` and the command palette.
     pub fn list(&self) -> impl Iterator<Item = &SharedCommand> {
         self.primary.values()
     }
@@ -195,8 +188,8 @@ impl CommandRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in commands (lightweight scaffolds). The CLI wraps these with its
-// own behaviour for now; this layer ensures the trait shape is exercised.
+// Built-in commands. The CLI wraps these with its own behavior while this layer provides the
+// shared trait contract.
 // ---------------------------------------------------------------------------
 
 /// `/quit` -- end the session. Aliases: /exit, /q.

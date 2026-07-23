@@ -9,9 +9,8 @@
 //!
 //! Convention: a capability-bearing invocation carries a string `capability`
 //! arg (the requirement name) and a string `action_kind` arg (an [`ActionKind`]
-//! token). The requirement is set by the trusted invocation builder, never by
-//! the principal; richer tool->capability mapping is future work (synapse-tools
-//! wiring). A malformed requirement -- unknown `action_kind` -- is DENIED.
+//! token). The trusted invocation builder sets this requirement rather than the
+//! principal. A malformed requirement -- unknown `action_kind` -- is DENIED.
 //!
 //! Fail-closed by construction. The only paths to `Allow` are: no capability
 //! requirement declared, or an explicit admitted-and-trusted-and-capable
@@ -40,11 +39,9 @@ pub trait RoomStateSource: Send + Sync {
 
 /// An in-memory [`RoomStateSource`] backed by a room-id map.
 ///
-/// This is the source the server wires until live Matrix materialization lands:
-/// constructed empty, it returns `None` for every room, so the real gate denies
-/// every capability-bearing request (fail-closed) while still allowing requests
-/// that declare no capability. Materialized rooms can be inserted as the live
-/// path comes online.
+/// The default empty source returns `None` for every room, so the gate denies every
+/// capability-bearing request while allowing requests that declare no capability. Deployments
+/// may provide materialized room state.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryRoomStateSource {
     /// Materialized state keyed by room id.
@@ -437,7 +434,7 @@ mod tests {
         );
     }
 
-    /// R7 invariant (roadmap line 410): an unavailable backing authority must
+    /// Security invariant: an unavailable backing authority must
     /// produce a `Deny`, never an `Allow`. Property: for any principal, room,
     /// capability name, and (well-formed) action kind, a capability-bearing
     /// request evaluated against an *empty* room-state source -- the authority

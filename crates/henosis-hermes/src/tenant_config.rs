@@ -1,4 +1,4 @@
-//! Per-tenant adapter configuration (Phase 5, section 7.3).
+//! Per-tenant adapter configuration.
 //!
 //! Operators can enable/disable a provider per tenant, override its rate limit,
 //! and inject default args merged into every invocation. Configuration lives in
@@ -6,13 +6,8 @@
 //! applies to any pair without an explicit entry.
 //!
 //! Durable persistence is a local JSON file, loaded on startup and rewritten on
-//! every mutation. This deviates deliberately from the plan's "persist to Kleos
-//! under category `hermes_tenant_config`": Kleos's memory store is semantic
-//! (embeddings, importance, decay, ranked search), a poor fit for exact config
-//! retrieval, and config persistence in *standalone* Hermes is transient -- once
-//! Hermes is absorbed into Henosis it moves to a proper Henosis store (the
-//! plan's own Non-Goals defer internal service handles to the absorption wave).
-//! A simple file store is exact, testable, and cheap to discard at absorption.
+//! every mutation. A file store supports exact configuration retrieval without
+//! depending on a semantic memory index.
 //! `enabled`, `default_args`, and `rate_limit_override` are all enforced today.
 
 use std::collections::HashMap;
@@ -29,7 +24,7 @@ pub struct TenantAdapterConfig {
     /// Whether this provider is enabled for the tenant. Default `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Per-minute rate-limit override (stored; enforcement is a follow-up).
+    /// Enforced per-minute rate-limit override.
     #[serde(default)]
     pub rate_limit_override: Option<u32>,
     /// Args merged (as defaults) into every invocation for this tenant+provider.
@@ -42,6 +37,7 @@ fn default_true() -> bool {
     true
 }
 
+/// Builds the default tenant adapter configuration.
 impl Default for TenantAdapterConfig {
     /// Returns the permissive default: enabled, no rate-limit override, no
     /// default args.
@@ -69,6 +65,7 @@ fn key(tenant: &str, provider: &str) -> String {
     format!("{tenant}:{provider}")
 }
 
+/// Implements tenant configuration lookup and persistence.
 impl TenantConfigStore {
     /// Construct an in-memory store (no persistence). Used by tests.
     pub fn new() -> Self {
@@ -178,6 +175,7 @@ pub fn merge_default_args(default_args: Option<&Value>, request_args: Value) -> 
 }
 
 #[cfg(test)]
+/// Tests tenant configuration defaults and durable updates.
 mod tests {
     use super::*;
     use serde_json::json;

@@ -2,9 +2,8 @@
 //!
 //! This module is feature-gated behind the non-default `stubs` cargo feature (and this crate's
 //! own `cfg(test)`), so the allow-all chain can never compile into a default or release build.
-//! The live binary's fail-closed defaults live in [`crate::deny`]. Real authorities (Pistis,
-//! Plutus, Eidolon, Human, phylaxd) and real executors (Hermes, Synapse) replace both by trait
-//! object as they land.
+//! Production supplies concrete authority gates and executors; [`crate::deny`] provides
+//! explicit fail-closed fallbacks.
 
 use async_trait::async_trait;
 use syntheos_contracts::{
@@ -14,8 +13,7 @@ use syntheos_contracts::{
 use crate::dispatcher::CANONICAL_GATE_ORDER;
 use crate::executor::{Executor, ExecutorError};
 
-/// A gate that allows everything, reporting a fixed name. Stands in for an authority gate not
-/// yet wired in.
+/// A gate that allows everything while reporting a fixed test authority name.
 pub struct StubGate {
     /// The name this stub reports (matching the authority it stands in for).
     name: &'static str,
@@ -44,8 +42,7 @@ impl Gate for StubGate {
 }
 
 /// The canonical gate chain, all allow-all stubs, in dispatch order:
-/// `pistis -> plutus -> eidolon -> human -> phylaxd`. TESTS ONLY -- the live default is
-/// [`crate::deny::deny_gate_chain`].
+/// `pistis -> plutus -> eidolon -> human -> phylaxd`. TESTS ONLY.
 pub fn stub_gate_chain() -> Vec<Box<dyn Gate>> {
     CANONICAL_GATE_ORDER
         .into_iter()
@@ -53,8 +50,7 @@ pub fn stub_gate_chain() -> Vec<Box<dyn Gate>> {
         .collect()
 }
 
-/// An executor that echoes the invocation back as its result. TESTS ONLY -- placeholder until
-/// real executors are wired in.
+/// An executor that echoes the invocation back as its result. TESTS ONLY.
 pub struct EchoExecutor;
 
 #[async_trait]

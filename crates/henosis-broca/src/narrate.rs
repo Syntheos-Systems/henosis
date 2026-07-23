@@ -1,10 +1,7 @@
 //! Template narration and the pluggable LLM-narrator seam.
 //!
-//! The template table is ported from the Kleos narrator (itself a port of the Ghost-Frame
-//! `narrator.ts`). Template narration is pure and synchronous; anything smarter goes through
-//! the [`Narrator`] trait, an async seam the server can fill with a Synapse/Foundry-backed
-//! implementation at wiring time (Phase 4) without changing this crate -- the same
-//! evolve-without-breaking pattern as the dispatcher's `OutputFilter` slot (G1).
+//! Template narration is pure and synchronous. The [`Narrator`] trait provides an async seam
+//! for a server-wired Synapse/Foundry-backed implementation without changing this crate.
 
 use async_trait::async_trait;
 
@@ -132,9 +129,9 @@ pub fn narrate_from_template(action: &str, payload: &serde_json::Value) -> Optio
 
 /// The pluggable narrator: turns an action that has no template into a short English sentence.
 ///
-/// The Phase 1 store ships with no narrator (template-or-nothing). A Synapse/Foundry-backed
-/// implementation plugs in at server wiring time (Phase 4); failures are decoration failures
-/// ([`BrocaError::Narration`]) and never affect the logged action itself.
+/// Stores without a narrator leave unmatched actions without a generated sentence. A
+/// Synapse/Foundry-backed implementation may be wired by the server; narration failures
+/// ([`BrocaError::Narration`]) never affect the logged action itself.
 #[async_trait]
 pub trait Narrator: Send + Sync {
     /// Produce a one-sentence human-readable narrative for `action` and its `payload`.
@@ -146,6 +143,7 @@ pub trait Narrator: Send + Sync {
 }
 
 #[cfg(test)]
+/// Tests template rendering and narrator behavior.
 mod tests {
     use super::*;
 

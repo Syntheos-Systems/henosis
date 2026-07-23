@@ -1,10 +1,7 @@
 //! The skills-backend seam and its feature-gated HTTP implementation.
 //!
-//! Upstream agent-forge hardwired a blocking Kleos HTTP client into the skill tools (plus
-//! opportunistic lookups in spec/verify/session). The lib replaces that with the
-//! [`SkillsBridge`] trait -- the same evolve-without-breaking pattern as the kernel crates'
-//! seams -- so in-process consumers can supply a native backend (the Henosis skills service,
-//! when it exists) while the CLI keeps the HTTP behavior via [`HttpSkillsBridge`].
+//! The [`SkillsBridge`] trait lets in-process consumers supply a skills backend. The optional
+//! [`HttpSkillsBridge`] implements the same contract through the Kleos HTTP skills API.
 
 use serde_json::Value;
 
@@ -42,10 +39,8 @@ pub trait SkillsBridge: Send + Sync {
     fn get_lineage(&self, skill_id: i64) -> Result<Value, String>;
 }
 
-/// Blocking HTTP [`SkillsBridge`] against the Kleos skills API (the upstream `KleosClient`,
-/// re-homed behind the seam). Auth is `KLEOS_API_KEY` env only -- the phylaxd keyless
-/// fallback stays in the Kleos repo's binary, keeping that cross-repo dependency out of this
-/// workspace.
+/// Blocking HTTP [`SkillsBridge`] against the Kleos skills API. Authentication uses the
+/// optional `KLEOS_API_KEY` environment variable.
 #[cfg(feature = "http-bridge")]
 pub mod http {
     use super::SkillsBridge;
@@ -66,7 +61,7 @@ pub mod http {
     /// Constructs authenticated requests and handles JSON responses for the skills API.
     impl HttpSkillsBridge {
         /// Build from the environment. `Err` only when the HTTP client itself cannot be
-        /// constructed; an unset URL falls back to localhost (the upstream behavior).
+        /// constructed; an unset URL falls back to `http://localhost:4200`.
         pub fn from_env() -> Result<Self, String> {
             let base_url =
                 env::var("KLEOS_URL").unwrap_or_else(|_| "http://localhost:4200".to_string());

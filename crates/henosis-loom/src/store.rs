@@ -1,24 +1,18 @@
 //! The SQLite-backed Loom workflow store and its dependency-driven step engine.
 //!
-//! Reimplements the Kleos loom service (`kleos-lib/src/services/loom.rs`) against the Henosis
-//! substrate: workflows and runs are owner-scoped on [`PrincipalId`] (the Kleos `user_id` was
-//! hardcoded to 1 in row mapping), identities are [`WorkflowId`]/[`RunId`] (UUID v8), statuses
-//! and step types are typed enums, lifecycle events are typed and published to the in-process
-//! [`AxonBus`], and schema is managed by the kernel-crate migration convention. Concurrency:
-//! one `Connection` behind a `Mutex`, the established pattern.
+//! Workflows and runs are owner-scoped on [`PrincipalId`], use [`WorkflowId`]/[`RunId`] (UUID
+//! v8), and publish typed lifecycle events on the in-process [`AxonBus`]. The versioned SQLite
+//! schema uses one `Connection` behind a `Mutex`.
 //!
-//! The engine (`advance_run`) is the Kleos algorithm: a run advances by starting every pending
-//! step whose dependencies are all completed, handing it the run input overlaid with its
+//! The engine (`advance_run`) advances a run by starting every pending step whose dependencies
+//! are all completed, handing it the run input overlaid with its
 //! dependency outputs; a run completes when no step is pending or running, merging completed
-//! outputs. Execution is delegated through the [`StepExecutor`] seam -- the attached executor
+//! outputs. Execution is delegated through the [`StepExecutor`] seam: the attached executor
 //! runs the types it claims inline (the built-in [`crate::TransformExecutor`] covers pure-JSON
 //! steps); every other started step waits for external completion via [`LoomStore::complete_step`].
-//! Hephaestus swaps in the real executor in Phase 5 with no API change.
 //!
-//! Deliberate deviations from Kleos, all documented inline: definitions are validated as DAGs
-//! at write time (Kleos let an unsatisfiable `depends_on` deadlock a run); `create_run`
-//! advances immediately (Kleos left runs pending until an external nudge); and `timeout_ms`
-//! is actually enforced, by [`LoomStore::sweep_timeouts`] (Kleos stored it and never checked).
+//! Definitions are validated as DAGs at write time, `create_run` advances immediately, and
+//! [`LoomStore::sweep_timeouts`] enforces `timeout_ms`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -384,8 +378,7 @@ impl LoomStore {
     }
 
     /// Attach a [`StepExecutor`] that runs the step types it claims inline during advance
-    /// passes. Builder-style, used at server wiring time (Hephaestus swaps in the real one in
-    /// Phase 5).
+    /// passes. Builder-style, used at server wiring time.
     pub fn with_executor(mut self, executor: Box<dyn StepExecutor>) -> Self {
         self.executor = Some(executor);
         self
@@ -1569,14 +1562,18 @@ mod tests {
             store.list_workflows(principal).await.expect("list").len(),
             1
         );
-        assert!(store
-            .delete_workflow(principal, wf.id)
-            .await
-            .expect("delete"));
-        assert!(!store
-            .delete_workflow(principal, wf.id)
-            .await
-            .expect("delete"));
+        assert!(
+            store
+                .delete_workflow(principal, wf.id)
+                .await
+                .expect("delete")
+        );
+        assert!(
+            !store
+                .delete_workflow(principal, wf.id)
+                .await
+                .expect("delete")
+        );
     }
 
     #[tokio::test]
@@ -1898,11 +1895,12 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(run
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("timed out"));
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out")
+        );
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
     }
@@ -1932,11 +1930,13 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(cancelled.len(), 1);
-        assert!(store
-            .list_runs(PrincipalId::new(), RunFilter::default())
-            .await
-            .expect("list")
-            .is_empty());
+        assert!(
+            store
+                .list_runs(PrincipalId::new(), RunFilter::default())
+                .await
+                .expect("list")
+                .is_empty()
+        );
 
         let stats = store.stats(principal).await.expect("stats");
         assert_eq!(stats.workflows, 1);

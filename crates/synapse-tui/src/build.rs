@@ -6,8 +6,7 @@
 //! Claude Max (subprocess), auto-detected Anthropic OAuth, Ollama, proxy, etc.
 //! all work from configuration.
 //!
-//! NOTE: this resolution duplicates synapse-cli's provider match; lifting a
-//! shared resolver into synapse-core is a tracked follow-up.
+//! Provider resolution is kept local to the TUI and mirrors the CLI's provider match.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

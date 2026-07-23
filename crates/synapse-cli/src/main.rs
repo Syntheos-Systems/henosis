@@ -486,8 +486,8 @@ async fn handle_registry_outcome(
         SwitchModel { provider, model } => {
             // We don't rebuild the Provider here -- that requires a
             // re-run of provider_config + create_provider with the new
-            // settings. Phase 1's surface only mutates the model
-            // string; the user can /settings to fully swap providers.
+            // settings. This command only mutates the model string; the user
+            // can use /settings to fully swap providers.
             if let Some(p) = provider {
                 eprintln!("{DIM}provider swap requested ({p}); use /settings to apply{RESET}");
             }
@@ -625,9 +625,8 @@ fn harden_synapse_dir_perms() {}
 /// loses non-repudiation for Broca audit entries). A yellow warning means
 /// the YubiKey wasn't reachable but a file/env key is present.
 ///
-/// Phase 8 will extend this with X.509 cert expiry parsing once the
-/// YubiKey backend exposes `not_after` -- for v0.x the boolean "signer
-/// present?" check is the highest-value signal.
+/// The YubiKey backend does not expose `not_after`, so this checks signer presence rather than
+/// certificate expiry.
 fn piv_status_warning() {
     let host = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -1296,8 +1295,7 @@ async fn main() -> anyhow::Result<()> {
                             // Wrap each memory body in <kleos_memory> tags so
                             // the model treats it as untrusted data, not as
                             // a system directive. This closes the prompt-
-                            // injection hole the pre-Phase-1 code had where
-                            // memory bodies were appended raw.
+                            // injection risk caused by appending raw memory bodies.
                             let blocks: Vec<String> = memories
                                 .iter()
                                 .filter_map(|m| {
@@ -1427,9 +1425,8 @@ async fn main() -> anyhow::Result<()> {
     // Load hook configuration from ~/.synapse/hooks.toml if present.
     // Hooks fire at SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop.
     let hooks_config = load_hooks_config();
-    // Install a HookGate that wraps PermissiveGate -- in Phase 0 the only
-    // gate behavior is hook execution. Phase 3 swaps the inner gate for the
-    // interactive TUI permission gate.
+    // Install a HookGate that wraps PermissiveGate so configured hooks run
+    // around tool execution.
     let tool_gate: Option<synapse_tools::SharedGate> = if hooks_config.hooks.is_empty() {
         None
     } else {
@@ -1667,10 +1664,8 @@ async fn main() -> anyhow::Result<()> {
                 RegistryDispatch::Exit => break,
                 RegistryDispatch::Handled => continue,
                 RegistryDispatch::Queue(_text) => {
-                    // Reserved for `/loop` / future async-prompt
-                    // commands. No producer in v1, so for now
-                    // the REPL just continues -- the registry
-                    // is the right place to add producers later.
+                    // Queue is reserved for asynchronous prompt commands. The current registry
+                    // has no producer, so the REPL continues without submitting a turn.
                     continue;
                 }
             }

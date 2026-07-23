@@ -4,10 +4,9 @@
 //! direction, kept as a separate interface so input authorization and output redaction never
 //! collapse into one another.
 //!
-//! Phase 0 ships only the seam: the dispatcher holds an optional filter and, when none is set,
-//! passes results through unchanged. The real policy filter (the EidolonGate output side) lands
-//! in Phase 2 as an [`OutputFilter`] impl wired through `Dispatcher::with_output_filter` -- an
-//! additive change that does not touch the dispatcher's construction API. The trait is `async`
+//! The dispatcher holds an optional filter and, when none is set, passes results through
+//! unchanged. A policy filter can implement [`OutputFilter`] and be wired through
+//! `Dispatcher::with_output_filter` without changing the dispatcher's construction API. The trait is `async`
 //! (matching [`crate::Gate`]) so a real filter may consult an external policy or redaction
 //! service without a later breaking change to this signature.
 

@@ -3,9 +3,8 @@
 //! Kleos hardcoded transform/webhook/LLM execution inside `advance_run`. Here execution is a
 //! trait: the engine asks the attached [`StepExecutor`] whether it handles a ready step's type
 //! and runs it inline when it does; everything else stays `running` for external completion
-//! via `complete_step` (the Kleos action/decision/wait semantics). Hephaestus provides the
-//! real executor in Phase 5 (roadmap story 5.5 swaps it in); until then the built-in
-//! [`TransformExecutor`] covers pure-JSON steps so a step graph runs end-to-end today.
+//! via `complete_step`. The built-in [`TransformExecutor`] covers pure-JSON steps so a step
+//! graph can run end-to-end.
 
 use async_trait::async_trait;
 use syntheos_contracts::RunId;
@@ -45,8 +44,8 @@ pub trait StepExecutor: Send + Sync {
     async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String>;
 }
 
-/// The built-in executor for [`StepType::Transform`]: pure JSON manipulation, ported from the
-/// Kleos transform step. Config selects one mode:
+/// The built-in executor for [`StepType::Transform`]: pure JSON manipulation. Config selects
+/// one mode:
 ///
 /// - `{"mapping": {"target.path": "source.path", ...}}` -- dot-path remapping.
 /// - `{"template": "text with {{var.path}}"}` (or an object of such strings) -- interpolation.
@@ -54,11 +53,14 @@ pub trait StepExecutor: Send + Sync {
 pub struct TransformExecutor;
 
 #[async_trait]
+/// Implements transform-step execution.
 impl StepExecutor for TransformExecutor {
+    /// Reports whether the requested type is a transform step.
     fn handles(&self, step_type: StepType) -> bool {
         step_type == StepType::Transform
     }
 
+    /// Executes the configured transformation against the step input.
     async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
         if let Some(mapping) = ctx.config.get("mapping") {
             let mapping = mapping
@@ -181,6 +183,7 @@ impl<D: HephaestusDispatch> HephaestusStepExecutor<D> {
 }
 
 #[async_trait]
+/// Implements Hephaestus step dispatch.
 impl<D: HephaestusDispatch + 'static> StepExecutor for HephaestusStepExecutor<D> {
     /// Claims only [`StepType::Hephaestus`] steps.
     fn handles(&self, step_type: StepType) -> bool {
@@ -231,6 +234,7 @@ impl CompositeStepExecutor {
 }
 
 #[async_trait]
+/// Implements ordered composite step dispatch.
 impl StepExecutor for CompositeStepExecutor {
     /// Returns true if any member executor handles `step_type`.
     fn handles(&self, step_type: StepType) -> bool {
@@ -277,6 +281,7 @@ pub fn interpolate(template: &str, vars: &serde_json::Value) -> String {
 }
 
 #[cfg(test)]
+/// Tests the built-in and composed step executors.
 mod tests {
     use super::*;
 
@@ -313,6 +318,7 @@ mod tests {
     struct FakeDispatch;
 
     #[async_trait]
+    /// Implements a fixture Hephaestus dispatch for executor tests.
     impl HephaestusDispatch for FakeDispatch {
         /// Echo the input JSON, adding `"dispatched": true` to confirm this ran.
         async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {

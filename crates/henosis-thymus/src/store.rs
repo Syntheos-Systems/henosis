@@ -13,9 +13,7 @@
 //! time, so neither kernel crate depends on the other. Propagation is fire-and-forget: the
 //! evaluation row is the record, the presence projection is a cache of it.
 //!
-//! NOT ported in this slice: Kleos session-quality rows (coupled to Kleos sessions; they
-//! arrive with the Eidolon supervisor in Phase 2) and the LLM judge (parallel track T1, which
-//! stays in Kleos until the cutover).
+//! Session-quality rows and LLM judging are outside this store's responsibility.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -185,6 +183,7 @@ fn read_raw_rubric(row: &rusqlite::Row) -> rusqlite::Result<RawRubric> {
     })
 }
 
+/// Converts raw rubric columns into typed values.
 impl RawRubric {
     /// Parse raw columns into a typed [`Rubric`].
     fn into_rubric(self) -> Result<Rubric, ThymusError> {
@@ -259,6 +258,7 @@ fn read_raw_evaluation(row: &rusqlite::Row) -> rusqlite::Result<RawEvaluation> {
     })
 }
 
+/// Converts raw evaluation columns into typed values.
 impl RawEvaluation {
     /// Parse raw columns into a typed [`Evaluation`].
     fn into_evaluation(self) -> Result<Evaluation, ThymusError> {
@@ -283,6 +283,7 @@ impl RawEvaluation {
     }
 }
 
+/// Opens and configures the quality store.
 impl ThymusStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     /// No sink is attached; see [`Self::with_quality_sink`].
@@ -966,6 +967,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), ThymusError> {
     Ok(())
 }
 
+/// Quality-store behavior tests.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +986,7 @@ mod tests {
     /// Records the call and succeeds.
     #[async_trait]
     impl QualitySink for &'static RecordingSink {
+        /// Record one quality-sink update for test assertions.
         async fn apply(
             &self,
             agent: PrincipalId,
@@ -1054,6 +1057,7 @@ mod tests {
         kinds
     }
 
+    /// Verifies rubric creation, updates, validation, and deletion.
     #[tokio::test]
     async fn rubric_crud_and_validation() {
         let (store, _sink, _bus) = store_with_sink();
@@ -1065,11 +1069,13 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(got, r);
-        assert!(store
-            .get_rubric(PrincipalId::new(), r.id)
-            .await
-            .expect("get")
-            .is_none());
+        assert!(
+            store
+                .get_rubric(PrincipalId::new(), r.id)
+                .await
+                .expect("get")
+                .is_none()
+        );
 
         // Empty criteria, duplicate names, bad weight/scale are rejected.
         let bad = |criteria: Vec<Criterion>| NewRubric {
@@ -1133,6 +1139,7 @@ mod tests {
         assert!(store.delete_rubric(principal, r.id).await.expect("delete"));
     }
 
+    /// Verifies weighted evaluation scores and propagation to the quality sink.
     #[tokio::test]
     async fn evaluate_computes_weighted_score_and_propagates() {
         let (store, sink, bus) = store_with_sink();
@@ -1148,7 +1155,7 @@ mod tests {
                 rubric_id: r.id,
                 agent,
                 evaluator: principal,
-                subject: "slice review".to_string(),
+                subject: "quality review".to_string(),
                 input: None,
                 output: None,
                 scores: scores(5.0, 5.0),
@@ -1207,6 +1214,7 @@ mod tests {
         assert!(matches!(err, ThymusError::InvalidInput(_)));
     }
 
+    /// Rejects deletion of rubrics that still have evaluations.
     #[tokio::test]
     async fn rubric_with_evaluations_cannot_be_deleted() {
         let (store, _sink, _bus) = store_with_sink();
@@ -1233,6 +1241,7 @@ mod tests {
         assert!(matches!(err, ThymusError::RubricInUse(_)));
     }
 
+    /// Verifies evaluation listing and aggregate agent scores.
     #[tokio::test]
     async fn list_and_agent_scores_aggregate() {
         let (store, _sink, _bus) = store_with_sink();
@@ -1266,11 +1275,13 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(mine.len(), 2);
-        assert!(store
-            .list_evaluations(PrincipalId::new(), EvaluationFilter::default())
-            .await
-            .expect("list")
-            .is_empty());
+        assert!(
+            store
+                .list_evaluations(PrincipalId::new(), EvaluationFilter::default())
+                .await
+                .expect("list")
+                .is_empty()
+        );
 
         let summary = store.agent_scores(principal, agent).await.expect("scores");
         assert_eq!(summary.evaluation_count, 2);
@@ -1280,6 +1291,7 @@ mod tests {
         assert!((summary.by_criterion["speed"] - 2.5).abs() < 1e-9);
     }
 
+    /// Verifies metric recording and summary calculation.
     #[tokio::test]
     async fn metrics_record_and_summarize() {
         let (store, _sink, bus) = store_with_sink();
@@ -1324,6 +1336,7 @@ mod tests {
         assert!(matches!(err, ThymusError::InvalidInput(_)));
     }
 
+    /// Verifies distinct drift flags propagate through the quality sink.
     #[tokio::test]
     async fn drift_events_propagate_distinct_flags() {
         let (store, sink, bus) = store_with_sink();
@@ -1378,6 +1391,7 @@ mod tests {
         assert_eq!(stats.drift_by_type.get("safety/medium"), Some(&1));
     }
 
+    /// Verifies persisted quality data survives reopening the SQLite store.
     #[tokio::test]
     async fn quality_persists_across_reopen() {
         let tmp =
@@ -1417,7 +1431,7 @@ mod tests {
 
     /// `agent_drift_flags` is scoped by (tenant, agent): the distinct (type, severity) pairs for
     /// that agent in that tenant only, regardless of which owner recorded them. This is the read
-    /// the Eidolon gate consumes through the server's DriftSignal adapter (Story 2.6).
+    /// policy consumers receive through the server's DriftSignal adapter.
     #[tokio::test]
     async fn agent_drift_flags_scoped_by_tenant_and_agent() {
         let (store, _sink, _bus) = store_with_sink();

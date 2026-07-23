@@ -1,4 +1,4 @@
-//! The one-time Kleos soma absorption backfill (projection convention 3.2 + 3.4).
+//! The one-time Kleos Soma import backfill (projection convention 3.2 + 3.4).
 //!
 //! Reads a legacy Kleos SQLite database and imports `soma_agents` onto the Henosis presence
 //! store. Two identities are involved, and the convention treats them differently:
@@ -18,7 +18,7 @@
 //! id spaces (the shared monolith plus per-tenant shards), so every import carries an
 //! operator-chosen **source label**: the agent map keys on `(source, legacy_agent_id)`, and a
 //! legacy agent whose `(tenant, name)` presence already exists in the target (the same logical
-//! agent absorbed from an earlier source) REUSES that presence's principal instead of minting
+//! agent imported from an earlier source) REUSES that presence's principal instead of minting
 //! a duplicate. Owner keys are NOT source-scoped (registry-global, convention 3.4).
 //!
 //! Legacy JSON columns are sanitized on the way in (the live store parses strictly): a
@@ -53,7 +53,7 @@ pub struct BackfillReport {
     /// The operator-chosen label of the source database this run imported from.
     pub source: String,
     /// How many legacy agents resolved to an EXISTING same-(tenant, name) presence (the same
-    /// logical agent absorbed from an earlier source) instead of minting a new principal.
+    /// logical agent imported from an earlier source) instead of minting a new principal.
     pub agents_reused_existing: usize,
     /// Legacy owner key -> Human principal (reused from chiasm, prior runs, or minted here).
     pub owners_by_legacy_user: BTreeMap<i64, PrincipalId>,
@@ -234,10 +234,10 @@ fn read_i64_map(
     Ok(map)
 }
 
-/// Run the soma absorption backfill from ONE legacy Kleos SQLite database at `legacy_db` into
+/// Run the Soma import backfill from ONE legacy Kleos SQLite database at `legacy_db` into
 /// the Henosis soma store at `target_db`, homing every imported presence under `tenant`.
 /// `source` labels which Kleos database this is (monolith vs a tenant shard); each source has
-/// its own legacy id space and idempotency scope, and same-named agents already absorbed from
+/// its own legacy id space and idempotency scope, and same-named agents already imported from
 /// another source reuse their existing principal.
 ///
 /// `chiasm_db` is the path to the already-backfilled Henosis CHIASM database; when given, owner
@@ -292,7 +292,7 @@ pub async fn backfill_from_kleos(
         t
     };
 
-    // Phase 1: read + validate + sanitize ALL legacy data before touching anything.
+    // Step 1: read + validate + sanitize ALL legacy data before touching anything.
     let agents = read_legacy_agents(&legacy)?;
     // Names must be unique within the target tenant. Legacy uniqueness was (name, user_id), so
     // a cross-owner duplicate collides when both land in one tenant -- explicit error, the
@@ -310,7 +310,7 @@ pub async fn backfill_from_kleos(
         }
     }
 
-    // Phase 2: prior-run state (idempotent re-runs) + the chiasm cross-map (convention 3.4).
+    // Step 2: prior-run state (idempotent re-runs) + the chiasm cross-map (convention 3.4).
     let mut owner_map = read_i64_map(
         &target,
         "SELECT user_id, principal_id FROM soma_legacy_user_id_map",
@@ -377,7 +377,7 @@ pub async fn backfill_from_kleos(
         .count();
     let owners_minted = pending_owner_keys.len() - owners_reused_from_chiasm;
 
-    // Same logical agent absorbed from an earlier source: a (tenant, name) presence already in
+    // Same logical agent imported from an earlier source: a (tenant, name) presence already in
     // the target means REUSE its principal, not a duplicate mint.
     let mut reusable: BTreeMap<i64, PrincipalId> = BTreeMap::new();
     for agent in &pending_agents {
@@ -413,7 +413,7 @@ pub async fn backfill_from_kleos(
         });
     }
 
-    // Phase 3: resolve owner principals (chiasm reuse first, then mint) and mint one Agent
+    // Step 3: resolve owner principals (chiasm reuse first, then mint) and mint one Agent
     // principal per pending legacy agent.
     for key in pending_owner_keys {
         let principal = match chiasm_map.get(&key) {
@@ -443,7 +443,7 @@ pub async fn backfill_from_kleos(
         minted_agents.push((agent, principal.id));
     }
 
-    // Phase 4: one transaction for every target write.
+    // Step 4: one transaction for every target write.
     let tx = target.transaction().map_err(berr)?;
     for (key, pid) in &owner_map {
         tx.execute(
@@ -524,7 +524,7 @@ mod tests {
         CREATE TABLE soma_agents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            type TEXT NOT NULL,
+            \"type\" TEXT NOT NULL,
             description TEXT,
             capabilities TEXT DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'pending',

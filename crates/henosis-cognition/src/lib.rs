@@ -39,6 +39,7 @@ use tokio::sync::Semaphore;
 // embedding applications (syntheos-server, henosis-rift-bridge) can construct
 // requests and read results through `henosis_cognition::*` without taking a
 // direct dependency on the vendored `kleos-lib`.
+pub use kleos_lib::Result as KleosResult;
 pub use kleos_lib::brain::hopfield::{BrainEdge, BrainPattern, EdgeType, RecallResult};
 pub use kleos_lib::context::types::{ContextOptions, ContextResult};
 pub use kleos_lib::embeddings::EmbeddingProvider;
@@ -65,7 +66,6 @@ pub use kleos_lib::skills::{
     CreateSkillRequest, EvolutionFeedRow, ExecutionRecord, Skill, SkillJudgment, SkillKind,
     ToolQuality, UpdateSkillRequest,
 };
-pub use kleos_lib::Result as KleosResult;
 
 /// The default single-user id for the lightweight session. Kleos memory rows are
 /// owner-scoped (`user_id`); the lite session is single-user, so unset request
@@ -1008,10 +1008,12 @@ mod tests {
             .forge_session_learn("db key must use uuid not name".into(), None, None, None)
             .await
             .expect("forge_session_learn");
-        assert!(learned["id"]
-            .as_str()
-            .expect("learn id")
-            .starts_with("learn_"));
+        assert!(
+            learned["id"]
+                .as_str()
+                .expect("learn id")
+                .starts_with("learn_")
+        );
     }
 
     /// Intelligence pass-throughs smoke test: memory_health and contradiction scan succeed on empty DB.
@@ -1189,7 +1191,7 @@ mod tests {
             .await
             .expect("open in-memory cognitive core");
 
-        cog.scratchpad_put("sess-1", "tester", "test-model", "phase", "wave2", 60)
+        cog.scratchpad_put("sess-1", "tester", "test-model", "status", "active", 60)
             .await
             .expect("scratchpad put");
 
@@ -1198,8 +1200,8 @@ mod tests {
             .await
             .expect("scratchpad list");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "phase");
-        assert_eq!(entries[0].value, "wave2");
+        assert_eq!(entries[0].key, "status");
+        assert_eq!(entries[0].value, "active");
     }
 
     /// Scratchpad rows with matching namespaces and keys remain isolated by the facade owner.
@@ -1247,11 +1249,13 @@ mod tests {
             .scratchpad_delete_session("shared-session")
             .await
             .expect("first user delete");
-        assert!(first
-            .scratchpad_list(None, None, Some("shared-session"))
-            .await
-            .expect("first user list")
-            .is_empty());
+        assert!(
+            first
+                .scratchpad_list(None, None, Some("shared-session"))
+                .await
+                .expect("first user list")
+                .is_empty()
+        );
         assert_eq!(
             second
                 .scratchpad_list(None, None, Some("shared-session"))
@@ -1277,8 +1281,7 @@ mod tests {
                 .expect("open path-backed session");
             let stored = cog
                 .memory_store(StoreRequest {
-                    content: "Wave 3 wires the bridge memory onto an in-process cognition store."
-                        .to_string(),
+                    content: "The bridge uses an in-process cognition store.".to_string(),
                     source: "henosis-cognition-test".to_string(),
                     ..Default::default()
                 })

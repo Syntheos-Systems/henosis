@@ -12,7 +12,7 @@ license = "Elastic-2.0"
 # Path convention matches every other synapse consumer in the workspace.
 synapse-provider = { path = "../synapse-provider" }
 
-# Hermes tool gateway -- in-process dispatch (story 5.4). HTTP path removed.
+# Hermes tool gateway for in-process dispatch. The HTTP path is removed.
 henosis-hermes = { path = "../henosis-hermes" }
 
 # Web + async runtime
@@ -41,7 +41,7 @@ async-stream = { workspace = true }
 
 # Misc utilities
 uuid = { workspace = true }
-# chrono not declared in [workspace.dependencies]; pin locally to match upstream.
+# chrono is pinned locally because it is not declared in [workspace.dependencies].
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 anyhow = { workspace = true }
 # thiserror 2 is a semver break from the workspace-pinned 1.x; declare locally
@@ -55,6 +55,6 @@ sha2 = { workspace = true }
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
-# Note: the upstream [profile.release] is intentionally dropped -- profile
+# Note: the source [profile.release] is intentionally dropped because profile
 # sections on a non-root workspace member are ignored; the root Cargo.toml owns
 # release profile settings for the whole workspace.

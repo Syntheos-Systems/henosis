@@ -29,7 +29,7 @@ pub use openai_compat::HephaestusProxyProvider;
 ///
 /// `tenant_id` is forwarded to the Anthropic path's auth chain. For
 /// OpenAI-compatible providers the tenant id is currently ignored; per-tenant
-/// keying lands in Phase 5 (Plutus).
+/// keying is delegated to the configured credential authority.
 ///
 /// The reqwest client passed in is the same shared instance held by `Services`
 /// so connection pools stay unified across LLM, Hermes, and coordination

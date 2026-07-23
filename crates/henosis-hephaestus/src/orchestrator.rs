@@ -1,5 +1,4 @@
-//! Provider-agnostic tool-use loop. This is the core of the Phase 1
-//! refactor: the LLM loop takes `&dyn Provider` and never touches an HTTP
+//! Provider-agnostic tool-use loop. The LLM loop takes `&dyn Provider` and never touches an HTTP
 //! client, never knows about Anthropic-specific headers, and never parses
 //! provider-specific JSON.
 //!
@@ -264,9 +263,8 @@ async fn loop_inner(
         }
         accumulated_text.push_str(&turn_text);
 
-        // Emit a turn_end event with the lowercased stop_reason. Synthetic
-        // for now; once send_streaming is wired in this comes straight from
-        // StreamEvent::MessageStop.
+        // Emit a synthesized turn_end event with the lowercased stop_reason. The current
+        // orchestrator consumes completed provider responses rather than streaming events.
         if let Some(s) = stream {
             let stop_reason = match response.stop_reason {
                 StopReason::EndTurn => "end_turn",

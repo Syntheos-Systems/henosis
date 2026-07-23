@@ -1,4 +1,4 @@
-//! In-process Hermes tool dispatch. Replaces the former HTTP client (story 5.4).
+//! In-process Hermes tool dispatch. Replaces the former HTTP client.
 //!
 //! `HermesClient` now holds an `Arc<ToolRegistry>`, a `CircuitRegistry`, and an
 //! `InvokeContext` assembled at startup. `call_tool` looks up the tool by name in

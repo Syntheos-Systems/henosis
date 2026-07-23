@@ -1,11 +1,11 @@
-//! `soma-backfill`: the one-time Kleos -> Henosis soma absorption CLI (projection convention
+//! `soma-backfill`: the one-time Kleos -> Henosis Soma import CLI (projection convention
 //! 3.2 + 3.4). Dry-run by default; pass `--apply` to write. Run the CHIASM backfill first and
 //! pass its database via `--chiasm` so the same legacy owner key maps to the same Human
-//! principal across services. Run against a COPY of the Kleos production database first
-//! (roadmap risk R1) and inspect the dry-run report before applying anywhere.
+//! principal across services. Run against a copy of the Kleos production database first and
+//! inspect the dry-run report before applying anywhere.
 //!
 //! Each imported database has its own legacy id space, so every run names its source (e.g.
-//! `monolith`, `tenant-1`); same-named agents already absorbed from another source reuse their
+//! `monolith`, `tenant-1`); same-named agents already imported from another source reuse their
 //! existing principal.
 //!
 //! ```text

@@ -2,7 +2,7 @@
 #![warn(clippy::all)]
 //! # syntheos-dispatch
 //!
-//! The unified action dispatcher for the Henosis agent OS: Phase 0 unit 3.
+//! The unified action dispatcher for the Henosis agent OS.
 //!
 //! Every tool/action call in the OS passes through one [`Dispatcher`]. It runs an ordered,
 //! fail-closed chain of authorization [`syntheos_contracts::Gate`]s; if every gate allows the
@@ -40,8 +40,8 @@ pub mod outcome;
 #[cfg(any(test, feature = "stubs"))]
 pub mod stubs;
 
-pub use deny::{deny_gate_chain, DenyExecutor, DenyGate};
-pub use dispatcher::{Dispatcher, CANONICAL_GATE_ORDER};
+pub use deny::{DenyExecutor, DenyGate, deny_gate_chain};
+pub use dispatcher::{CANONICAL_GATE_ORDER, Dispatcher};
 pub use error::DispatchError;
 pub use executor::{Executor, ExecutorError};
 pub use guard::{ExecutionDecision, ExecutionGuard, ExecutionOutcome};

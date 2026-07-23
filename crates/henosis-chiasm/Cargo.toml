@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Chiasm: the task-coordination kernel service, extracted onto syntheos-contracts + in-process Axon."
+description = "Chiasm: tenant-scoped task coordination over an in-process event bus."
 
 [dependencies]
 # Canonical ids (TaskId/TenantId/PrincipalId), Timestamp, and the TypedEvent trait.
@@ -14,7 +14,7 @@ syntheos-contracts = { path = "../syntheos-contracts" }
 syntheos-axon = { path = "../syntheos-axon" }
 # PrincipalDirectory: the enrollment authority the legacy backfill mints principals through.
 syntheos-identity = { path = "../syntheos-identity" }
-# SQLite backend (bundled = no system libsqlite). Migration convention: PRAGMA user_version.
+# SQLite backend (bundled = no system libsqlite), versioned with PRAGMA user_version.
 rusqlite = { workspace = true, features = ["bundled"] }
 # ChiasmError.
 thiserror.workspace = true

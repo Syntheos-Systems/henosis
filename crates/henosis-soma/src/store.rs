@@ -4,14 +4,14 @@
 //! Henosis substrate: an agent IS a canonical principal, so [`AgentPresence`] keys on the
 //! agent's own [`PrincipalId`] (replacing the Kleos `i64` surrogate + `user_id` shard), and
 //! registration VERIFIES the principal exists in the canonical directory -- it never mints one
-//! (projection convention section 1; the enrollment authority is Pistis from Phase 2 on).
+//! (the enrollment authority owns principal creation).
 //! Lifecycle events are typed and published to the in-process [`AxonBus`]; schema is managed by
 //! the kernel-crate migration convention (`PRAGMA user_version` + `migrations/Vn__*.sql`).
 //! Concurrency: one `Connection` behind a `Mutex`, the chiasm precedent.
 //!
-//! Scope (Story 1.2 slice 1): presence register/heartbeat/status, reads, stale listing,
-//! capability search, quality updates, stats. Kleos groups and agent logs are deliberately NOT
-//! ported here (logs overlap Broca narration, Story 1.3); the legacy backfill is the next slice.
+//! The store provides presence registration, heartbeats, status, reads, stale listing,
+//! capability search, quality updates, and stats. It does not manage groups or agent logs;
+//! Broca owns narration and [`crate::backfill`] handles legacy imports.
 //!
 //! One deliberate behavior fix over Kleos: a bare heartbeat revives `pending` as well as
 //! `offline` to `online`. In Kleos only `offline` revived, so agents registered as `pending`
@@ -352,10 +352,9 @@ impl SomaStore {
     /// List registered agents in `tenant`, newest-registered first, AND-filtered by
     /// [`PresenceFilter`].
     ///
-    /// Tenant-scoped: presence rows carry a tenant, and a caller must not be able to
-    /// enumerate other tenants' agents. This mirrors the chiasm kernel precedent (every
-    /// read is owner-scoped) applied at Soma's tenant grain. The tenant is caller-asserted
-    /// in Phase 1; Phase 3 replaces the asserted value with a verified one.
+    /// Tenant-scoped: presence rows carry a tenant, and every query restricts results to the
+    /// supplied value. Network-facing callers must derive that value from authenticated request
+    /// context; only the explicitly loopback-compatible routes accept a caller assertion.
     pub async fn list(
         &self,
         tenant: TenantId,

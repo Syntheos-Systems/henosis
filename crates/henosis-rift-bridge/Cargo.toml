@@ -61,17 +61,17 @@ anyhow = "1"
 # Pinned FrameShift persona selection engine in the excluded vendor workspace.
 frameshift-orchestrator = { path = "../../vendor/frameshift/frameshift-orchestrator" }
 
-# In-process Kleos seam (Story 4.4 step 3): InProcessKleosClient backs the
-# KleosClient trait with the henosis kernel stores instead of HTTP-to-Kleos.
+# In-process Kleos seam: InProcessKleosClient backs the KleosClient trait with
+# Henosis kernel stores instead of HTTP-to-Kleos.
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-broca = { path = "../henosis-broca" }
 # Default memory backend: route the two memory ops to upstream Kleos via the
 # workspace memory client (generic signed HTTP). Under the `cognition` feature
-# the in-process cognition store replaces this for in-process memory (Wave 3).
+# the in-process cognition store can replace it for local memory operations.
 henosis-memory-client = { path = "../henosis-memory-client" }
 # AxonBus is required to open in-process Chiasm/Broca stores (main.rs backend).
 syntheos-axon = { path = "../syntheos-axon" }
-# The in-process cognition store (Wave 3). OPTIONAL: only the `cognition` feature
+# The in-process cognition store. OPTIONAL: only the `cognition` feature
 # pulls it -- and with it the vendored kleos-lib ML stack -- in, so the default
 # bridge build stays free of ort/tokenizers/lancedb.
 henosis-cognition = { path = "../henosis-cognition", optional = true }

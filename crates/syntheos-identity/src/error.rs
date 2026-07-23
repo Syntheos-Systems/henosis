@@ -4,8 +4,8 @@ use syntheos_contracts::PrincipalId;
 
 /// An identity-directory operation failed.
 ///
-/// The Phase 0 in-memory directory is infallible except for the uniqueness guard; this type
-/// exists so a storage-backed implementation (the unit-6 DB decision) can surface backend
+/// The in-memory directory is infallible except for the uniqueness guard; this type
+/// exists so a storage-backed implementation can surface backend
 /// failures without changing the trait. `#[non_exhaustive]`: variants may grow with real backends.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

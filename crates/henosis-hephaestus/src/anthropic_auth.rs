@@ -58,8 +58,8 @@ pub trait AnthropicTokenProvider: Send + Sync {
     async fn token(&self, tenant_id: Option<&str>) -> Result<String, AuthError>;
 }
 
-/// Stub: will talk to Plutus once Phase 4 ships. For now always returns
-/// PlutusUnavailable so the chain falls through to dev.
+/// Placeholder provider that always returns `PlutusUnavailable` so the chain falls through to
+/// the development provider.
 pub struct PlutusTokenProvider {
     /// Base URL of the Plutus credential service.
     pub base_url: String,
@@ -68,10 +68,10 @@ pub struct PlutusTokenProvider {
 #[async_trait]
 /// Provides the placeholder Plutus token lookup used by the provider chain.
 impl AnthropicTokenProvider for PlutusTokenProvider {
-    /// Always returns `PlutusUnavailable` -- Phase 4 stub not yet implemented.
+    /// Always returns `PlutusUnavailable` because this provider has no transport implementation.
     async fn token(&self, _tenant_id: Option<&str>) -> Result<String, AuthError> {
         Err(AuthError::PlutusUnavailable(format!(
-            "plutus stub at {} (Phase 4 not implemented)",
+            "plutus token provider at {} is not configured",
             self.base_url
         )))
     }
@@ -188,5 +188,29 @@ impl ProviderChain {
             tenant_id: tenant_id.map(String::from),
             env: self.env,
         })
+    }
+}
+
+#[cfg(test)]
+/// Tests credential-provider failure contracts.
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    /// Reports an actionable configuration error for an unconfigured provider.
+    async fn unconfigured_plutus_provider_reports_public_error() {
+        let provider = PlutusTokenProvider {
+            base_url: "https://plutus.invalid".to_string(),
+        };
+
+        let error = provider
+            .token(Some("tenant"))
+            .await
+            .expect_err("placeholder provider must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "plutus not available: plutus token provider at https://plutus.invalid is not configured"
+        );
     }
 }

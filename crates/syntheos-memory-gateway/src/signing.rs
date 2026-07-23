@@ -443,9 +443,8 @@ impl RequestSigner {
 ///
 /// SECURITY: `PIV_PIN` is read from the process environment, which is readable
 /// via `/proc/<pid>/environ` by sufficiently privileged or co-tenant processes.
-/// This is a known weakness of the env-var path; a file-descriptor / stdin PIN
-/// channel is the preferred hardening (tracked as follow-up). We warn once so
-/// operators are aware rather than silently relying on it.
+/// This is a known weakness of the env-var path. Hardened deployments should use a
+/// file-descriptor or standard-input PIN channel; this path warns operators explicitly.
 #[cfg(feature = "piv")]
 fn runtime_piv_pin() -> Result<String, GatewayError> {
     match std::env::var("PIV_PIN") {

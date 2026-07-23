@@ -1,10 +1,7 @@
-//! The Broca domain types, reshaped onto the Henosis principal model.
+//! The Broca domain types use tenant and principal identifiers with UTC timestamps.
 //!
-//! The Kleos `ActionEntry` carried a stringly `agent` and a `user_id: i64` owner. Here the
-//! actor is the agent's own [`PrincipalId`], rows belong to a [`TenantId`], timestamps are
-//! [`Timestamp`] (UTC), and the Kleos `axon_event_id` back-reference is gone (the in-process
-//! bus is ephemeral; durable correlation is a Phase 2 `syntheos-axon-durable` concern). No
-//! `user_id: i64` survives the port.
+//! The in-process event bus is ephemeral; callers that require durable correlation retain it
+//! in their own storage.
 
 use std::collections::BTreeMap;
 

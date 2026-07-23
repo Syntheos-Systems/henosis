@@ -12,9 +12,8 @@ description = "Agent-Forge as a library: the structured-reasoning gate tools (sp
 # The CLI ships with the HTTP skills bridge; in-process consumers (syntheos-server) can opt out
 # and inject their own SkillsBridge.
 default = ["http-bridge"]
-# Blocking reqwest implementation of SkillsBridge against the Kleos skills API (KLEOS_URL +
-# KLEOS_API_KEY env). The phylaxd keyless fallback stays in the Kleos repo's binary;
-# this workspace copy deliberately drops that cross-repo dependency.
+# Blocking reqwest implementation of SkillsBridge against the Kleos skills API through
+# KLEOS_URL and optional KLEOS_API_KEY environment variables.
 http-bridge = ["dep:reqwest"]
 
 [[bin]]
@@ -30,10 +29,9 @@ serde = { workspace = true }
 serde_json.workspace = true
 # The forge database (bundled = no system libsqlite, matching the kernel crates).
 rusqlite = { workspace = true, features = ["bundled"] }
-# Artifact ids (the upstream tool contract uses v4, unlike the v8 contracts ids).
+# Artifact ids use UUID v4 as required by the forge tool contract.
 uuid = { workspace = true, features = ["v4"] }
-# Upstream timestamps are chrono-formatted TEXT; kept as-is to stay diffable against the
-# Kleos copy until retirement (crate-local dep, not workspace-wide).
+# Forge timestamps use chrono-formatted text.
 chrono = "0.4"
 # Repo walking for the AST tools.
 walkdir = "2"

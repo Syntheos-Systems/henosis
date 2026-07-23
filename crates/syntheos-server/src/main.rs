@@ -1,5 +1,4 @@
-//! `syntheos-server` binary: the single entry point that boots the Henosis foundation and serves
-//! the Phase 0 HTTP surface.
+//! `syntheos-server` binary: the single entry point that boots and serves Henosis.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -41,8 +40,7 @@ use tower_http::timeout::TimeoutLayer;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Largest request body the server accepts, in bytes (1 MiB). Phase 0 payloads are small JSON;
-/// anything bigger is rejected before it can exhaust memory.
+/// Largest request body the server accepts, in bytes (1 MiB).
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Bridges the Loom [`HephaestusDispatch`] seam to the in-process Hephaestus executor.
@@ -67,7 +65,7 @@ struct HephaestusRuntimeDispatch {
 }
 
 #[async_trait]
-/// Execute Loom Hephaestus steps against the absorbed in-process runtime.
+/// Execute Loom Hephaestus steps against the in-process runtime.
 impl HephaestusDispatch for HephaestusRuntimeDispatch {
     /// Forward the step payload to the in-process Hephaestus executor and await the result.
     ///
@@ -347,10 +345,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .with_execution_guard(execution_guard),
     );
 
-    // The eidolon supervisor task (Stories 2.5/2.6): watches session JSONL and publishes
-    // violation events on the shared bus. Opt-in and all-or-nothing: it runs only when the
-    // watch dir AND the identity its events carry are explicitly configured -- a supervisor
-    // with a fabricated identity would poison the audit trail.
+    // The Eidolon supervisor watches session JSONL and publishes violation events on the shared
+    // bus. It runs only when both the watch directory and event identity are configured, because
+    // a fabricated identity would poison the audit trail.
     match supervisor_from_env(bus.clone()) {
         Ok(Some(sup)) => {
             tokio::spawn(sup.run());
@@ -362,16 +359,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err),
     }
 
-    // The in-process cognitive core (Wave 2/3). Feature-gated: the default build
-    // never constructs it. The lite session has no embedder and no background
-    // loops -- the runtime composition of "kleos within Henosis without the whole
-    // stack".
-    //
-    // PERSISTENT + WIRED (Wave 3): opened over a path-backed store
-    // (`SYNTHEOS_COGNITION_DB`, default `data/cognition.db`), so stored memory
-    // survives a restart, and the `/cognition/memory*` routes read it. The parent
-    // directory is created on boot. The facade surface is still partial (see
-    // scripts/known-incomplete.md row 3).
+    // The feature-gated cognitive core uses a lightweight session without an embedder or
+    // background loops. It opens a persistent path-backed store at `SYNTHEOS_COGNITION_DB`
+    // (default `data/cognition.db`) for the `/cognition/memory*` routes. The parent directory
+    // is created on boot. See scripts/known-incomplete.md for the remaining facade limits.
     #[cfg(feature = "cognition")]
     let cognition = {
         let db_path = std::env::var("SYNTHEOS_COGNITION_DB")

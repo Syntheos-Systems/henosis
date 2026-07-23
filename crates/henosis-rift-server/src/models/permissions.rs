@@ -1,4 +1,4 @@
-/// Bitfield permissions — Discord-style
+/// Bitfield permissions using Discord-style flags.
 #[allow(dead_code)]
 pub mod perms {
     pub const VIEW_CHANNELS: i64 = 1 << 0;

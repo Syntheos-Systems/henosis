@@ -1,18 +1,12 @@
 //! The SQLite-backed Broca narration log.
 //!
-//! Reimplements the Kleos broca action log (`kleos-lib/src/services/broca.rs`) against the
-//! Henosis substrate: the actor is the agent's own [`PrincipalId`] (replacing the Kleos
-//! stringly `agent` + `user_id` shard), reads scope by [`TenantId`], every logged action
-//! publishes a typed `narration.logged` event onto the in-process [`AxonBus`], and schema is
-//! managed by the kernel-crate migration convention (`PRAGMA user_version` +
-//! `migrations/Vn__*.sql`). Concurrency: one `Connection` behind a `Mutex`, the chiasm/soma
-//! precedent.
+//! Actions are scoped by [`TenantId`] and [`PrincipalId`], published as typed
+//! `narration.logged` events on the in-process [`AxonBus`], and stored in a versioned SQLite
+//! schema. One `Connection` is serialized by a `Mutex`.
 //!
 //! Narration is layered: a caller-supplied sentence wins; otherwise the template renderer
 //! runs at log time; otherwise the optional pluggable [`Narrator`] (an LLM seam filled at
-//! server wiring time, Phase 4) can be consulted lazily via
-//! [`BrocaStore::get_or_narrate`]. The Kleos `ask` LLM-to-SQL surface is NOT ported in this
-//! slice -- it is Synapse-coupled and follows in Phase 4.
+//! server wiring time) can be consulted lazily via [`BrocaStore::get_or_narrate`].
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,7 +18,7 @@ use syntheos_contracts::{PrincipalId, TenantId, Timestamp, TypedEvent};
 use crate::error::BrocaError;
 use crate::events::ActionLogged;
 use crate::model::{ActionEntry, ActionFilter, BrocaStats, LogAction};
-use crate::narrate::{narrate_from_template, Narrator};
+use crate::narrate::{Narrator, narrate_from_template};
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__broca_actions.sql"))];
@@ -41,7 +35,7 @@ pub struct BrocaStore {
     conn: Mutex<Connection>,
     /// The bus narration events are published onto.
     bus: Arc<AxonBus>,
-    /// The optional LLM narrator seam. `None` = template-or-nothing (the Phase 1 posture).
+    /// The optional LLM narrator seam. `None` leaves unmatched actions without narration.
     narrator: Option<Box<dyn Narrator>>,
 }
 
@@ -103,6 +97,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawAction> {
     })
 }
 
+/// Converts raw storage rows into public action entries.
 impl RawAction {
     /// Parse raw columns into a typed [`ActionEntry`], surfacing any corrupt value as a
     /// backend error.
@@ -126,6 +121,7 @@ impl RawAction {
     }
 }
 
+/// Implements the Broca store operations.
 impl BrocaStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     /// No narrator is attached; see [`Self::with_narrator`].
@@ -406,6 +402,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), BrocaError> {
 }
 
 #[cfg(test)]
+/// Tests Broca store persistence, scoping, narration, and statistics.
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -441,6 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms that a logged templated action can be retrieved unchanged.
     async fn log_then_get_roundtrips_with_template_narrative() {
         let (store, bus) = store();
         let mut rx = bus.subscribe("narration");
@@ -470,6 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms caller narration takes precedence and unmatched actions remain bare.
     async fn caller_narrative_wins_and_unknown_action_logs_without_one() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -494,6 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Rejects payload values that are not JSON objects.
     async fn log_rejects_non_object_payload() {
         let (store, _bus) = store();
         let err = store
@@ -507,6 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms action reads are scoped to the requested tenant.
     async fn get_is_tenant_scoped() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -515,14 +516,17 @@ mod tests {
             .await
             .expect("log");
         assert!(store.get(tenant, entry.id).await.expect("get").is_some());
-        assert!(store
-            .get(TenantId::new(), entry.id)
-            .await
-            .expect("get")
-            .is_none());
+        assert!(
+            store
+                .get(TenantId::new(), entry.id)
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]
+    /// Confirms query filters, pagination, ordering, and tenant scoping.
     async fn query_filters_and_paginates() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -601,14 +605,17 @@ mod tests {
             .expect("query");
         assert_eq!(page2.len(), 1);
         // Another tenant sees nothing.
-        assert!(store
-            .query(TenantId::new(), ActionFilter::default())
-            .await
-            .expect("query")
-            .is_empty());
+        assert!(
+            store
+                .query(TenantId::new(), ActionFilter::default())
+                .await
+                .expect("query")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
+    /// Confirms timestamp filtering retains only entries at or after the cutoff.
     async fn since_filters_on_nanosecond_instants() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -641,7 +648,9 @@ mod tests {
 
     /// Returns a fixed sentence regardless of input.
     #[async_trait]
+    /// Implements canned narration for seam tests.
     impl Narrator for CannedNarrator {
+        /// Produces a fixed sentence containing the action name.
         async fn narrate(
             &self,
             action: &str,
@@ -652,6 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms template and custom narrator results are layered and persisted.
     async fn get_or_narrate_layers_template_then_narrator() {
         let bus = Arc::new(AxonBus::new());
         let store = BrocaStore::open_in_memory(bus)
@@ -701,6 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms unmatched actions remain unnarrated without a configured narrator.
     async fn get_or_narrate_without_narrator_leaves_none() {
         let (store, _bus) = store();
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
@@ -712,10 +723,14 @@ mod tests {
             .get_or_narrate(tenant, bare.id)
             .await
             .expect("narrate");
-        assert!(entry.narrative.is_none(), "template-or-nothing in Phase 1");
+        assert!(
+            entry.narrative.is_none(),
+            "unmatched action has no narration"
+        );
     }
 
     #[tokio::test]
+    /// Confirms statistics count only actions in the requested tenant.
     async fn stats_count_per_tenant() {
         let (store, _bus) = store();
         let tenant = TenantId::new();
@@ -749,6 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms stored actions survive reopening a file-backed database.
     async fn actions_persist_across_reopen() {
         let tmp = std::env::temp_dir().join(format!("henosis-broca-{}.sqlite", PrincipalId::new()));
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());

@@ -17,14 +17,14 @@ use crate::executor::ExecutorError;
 pub enum DispatchError {
     /// Construction was attempted with no gates at all. An ungated dispatcher would execute
     /// every action unconditionally, so this is rejected outright.
-    #[error(
-        "gate chain is empty: a dispatcher without gates would allow everything (fail-closed)"
-    )]
+    #[error("gate chain is empty: a dispatcher without gates would allow everything (fail-closed)")]
     EmptyGateChain,
 
     /// Construction was attempted with a chain that is not *exactly* the canonical authority set:
     /// a missing authority, a duplicate, a misordering, or an extra non-canonical gate.
-    #[error("gate chain is not canonical: expected exactly the authority order {expected:?}, got {got:?}")]
+    #[error(
+        "gate chain is not canonical: expected exactly the authority order {expected:?}, got {got:?}"
+    )]
     NonCanonicalChain {
         /// The canonical authority order every chain must be, exactly.
         expected: Vec<String>,

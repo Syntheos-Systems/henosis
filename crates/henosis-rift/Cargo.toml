@@ -1,6 +1,5 @@
-# HumanGate over Rift approvals (Story 4.5). The synchronous "human" gate slot
-# in the dispatcher chain: escalates approval-required actions to a human via
-# Rift and blocks until they approve or it times out.
+# HumanGate backs the synchronous `human` gate slot. It escalates
+# approval-required actions through Rift and waits for a decision or timeout.
 [package]
 name = "henosis-rift"
 version = "0.1.0"

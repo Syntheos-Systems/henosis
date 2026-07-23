@@ -1,4 +1,4 @@
-//! Structured audit trail (Phase 4, section 6.2).
+//! Structured audit trail for tool invocations.
 //!
 //! Every tool invocation produces an [`AuditRecord`]: who (tenant), what (tool,
 //! provider), how it went (outcome, retries, duration), and a SHA-256 hash of
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::axon::AxonPublisher;
@@ -92,6 +92,7 @@ pub struct AuditTrail {
     axon: AxonPublisher,
 }
 
+/// Implements bounded audit recording and publication.
 impl AuditTrail {
     /// Construct an audit trail over an Axon publisher.
     pub fn new(axon: AxonPublisher) -> Self {
@@ -205,6 +206,7 @@ impl AuditTrail {
 }
 
 #[cfg(test)]
+/// Tests audit record retention and publication behavior.
 mod tests {
     use super::*;
 
@@ -214,6 +216,7 @@ mod tests {
         AuditTrail::new(AxonPublisher::from_env())
     }
 
+    /// Records one compact fixture entry in an audit trail.
     fn rec(trail: &AuditTrail, tenant: Option<&str>, tool: &str, outcome: Outcome) {
         trail.record(
             tenant.map(String::from),

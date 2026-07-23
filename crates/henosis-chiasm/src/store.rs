@@ -1,15 +1,12 @@
 //! The SQLite-backed Chiasm task store.
 //!
-//! Reimplements the Kleos chiasm task surface (`kleos-lib/src/services/chiasm/tasks.rs`) against
-//! the Henosis substrate: ownership is a [`PrincipalId`] (every read/write scopes on it, replacing
-//! the Kleos `WHERE user_id = ?` predicate), lifecycle events are typed and published to the
-//! in-process [`AxonBus`], and schema is managed by the kernel-crate migration convention
-//! (`PRAGMA user_version` + `migrations/Vn__*.sql`). Concurrency: one `Connection` behind a
-//! `Mutex` (a pool can replace it later without changing this surface).
+//! Ownership is a [`PrincipalId`], lifecycle events are typed and published to the in-process
+//! [`AxonBus`], and schema versioning uses `PRAGMA user_version` with `migrations/Vn__*.sql`.
+//! One `Connection` is serialized behind a `Mutex`.
 //!
-//! Slices 1-3 cover task CRUD/history/stats, the work queue (enqueue/claim), heartbeat + stale
-//! sweep, path claims (TTL leases), and the dependency DAG (BFS cycle check + auto-unblock).
-//! The legacy `user_id -> PrincipalId` backfill lands in a later slice.
+//! The store supports task CRUD/history/statistics, the work queue (enqueue/claim), heartbeat
+//! and stale sweep, path claims (TTL leases), dependency-DAG cycle checks and auto-unblock, and
+//! legacy `user_id -> PrincipalId` imports.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1244,10 +1241,8 @@ impl ChiasmStore {
     /// yet committed its status change, so the call is order-independent. Returns the tasks it
     /// activated. [`ChiasmError::NotFound`] if the completed task is not owned by `principal`.
     ///
-    /// Two deliberate deviations from the Kleos port: the unblock is scoped to the dependent's
-    /// owner principal (Kleos hardcoded `user_id = 1`), and only `blocked` dependents are
-    /// activated (Kleos activated dependents in ANY status, which could resurrect a completed
-    /// or stale task).
+    /// The unblock is scoped to the dependent's owner principal and only `blocked` dependents
+    /// are activated. Completed or stale tasks are never resurrected.
     pub async fn check_and_unblock(
         &self,
         principal: PrincipalId,

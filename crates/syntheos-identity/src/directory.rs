@@ -1,8 +1,7 @@
-//! The principal directory trait gates resolve against, plus the Phase 0 in-memory
-//! implementation.
+//! The principal directory trait gates resolve against, plus an in-memory implementation.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -13,8 +12,8 @@ use crate::error::DirectoryError;
 /// The canonical actor registry. A gate turns the `PrincipalId` carried in a
 /// [`syntheos_contracts::GateRequest`] into a full [`Principal`] by consulting this.
 ///
-/// Async and `Result`-returning so a storage-backed implementation (the unit-6 DB decision)
-/// drops in without changing call sites. Object-safe via `async_trait`, so it can be held as
+/// Async and `Result`-returning so a storage-backed implementation drops in without changing
+/// call sites. Object-safe via `async_trait`, so it can be held as
 /// `Arc<dyn PrincipalDirectory>`.
 #[async_trait]
 pub trait PrincipalDirectory: Send + Sync {
@@ -32,7 +31,7 @@ pub trait PrincipalDirectory: Send + Sync {
     async fn list(&self) -> Result<Vec<Principal>, DirectoryError>;
 }
 
-/// The Phase 0 in-memory [`PrincipalDirectory`]: a process-local map, no persistence.
+/// An in-memory [`PrincipalDirectory`]: a process-local map with no persistence.
 ///
 /// Share it as `Arc<InMemoryDirectory>`; all methods take `&self`. Like the Axon bus it uses a
 /// std `RwLock` -- no `.await` is ever held across the lock.
@@ -41,6 +40,7 @@ pub struct InMemoryDirectory {
     principals: RwLock<HashMap<PrincipalId, Principal>>,
 }
 
+/// Provides constructors for the in-memory directory.
 impl InMemoryDirectory {
     /// Create an empty directory.
     pub fn new() -> Self {
@@ -50,12 +50,15 @@ impl InMemoryDirectory {
     }
 }
 
+/// Provides a default empty directory.
 impl Default for InMemoryDirectory {
+    /// Create an empty in-memory directory.
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Provides internal in-memory directory operations.
 impl InMemoryDirectory {
     /// Insert `principal` into the map, rejecting the insert if the id already exists.
     ///
@@ -90,7 +93,9 @@ impl InMemoryDirectory {
 }
 
 #[async_trait]
+/// Implements principal-directory operations with the in-memory map.
 impl PrincipalDirectory for InMemoryDirectory {
+    /// Mint and enroll a principal in the directory.
     async fn enroll(
         &self,
         kind: PrincipalKind,
@@ -104,22 +109,26 @@ impl PrincipalDirectory for InMemoryDirectory {
         self.insert_unique(principal)
     }
 
+    /// Look up an enrolled principal by id.
     async fn lookup(&self, id: PrincipalId) -> Result<Option<Principal>, DirectoryError> {
         let map = self.principals.read().unwrap_or_else(|e| e.into_inner());
         Ok(map.get(&id).cloned())
     }
 
+    /// List all enrolled principals.
     async fn list(&self) -> Result<Vec<Principal>, DirectoryError> {
         let map = self.principals.read().unwrap_or_else(|e| e.into_inner());
         Ok(map.values().cloned().collect())
     }
 }
 
+/// In-memory directory behavior tests.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Verifies an enrolled principal can be retrieved.
     #[tokio::test]
     async fn enroll_then_lookup() {
         let dir = InMemoryDirectory::new();
@@ -131,16 +140,19 @@ mod tests {
         assert_eq!(got, p);
     }
 
+    /// Verifies a missing principal resolves to `None`.
     #[tokio::test]
     async fn lookup_unknown_is_none() {
         let dir = InMemoryDirectory::new();
-        assert!(dir
-            .lookup(PrincipalId::new())
-            .await
-            .expect("lookup")
-            .is_none());
+        assert!(
+            dir.lookup(PrincipalId::new())
+                .await
+                .expect("lookup")
+                .is_none()
+        );
     }
 
+    /// Verifies each enrollment receives a distinct principal id.
     #[tokio::test]
     async fn enroll_mints_unique_ids() {
         let dir = InMemoryDirectory::new();
@@ -155,6 +167,7 @@ mod tests {
         assert_ne!(a.id, b.id);
     }
 
+    /// Verifies principal kind and display text round-trip through the directory.
     #[tokio::test]
     async fn kind_and_display_preserved() {
         let dir = InMemoryDirectory::new();
@@ -167,6 +180,7 @@ mod tests {
         assert_eq!(got.display.as_deref(), Some("hermes"));
     }
 
+    /// Verifies listing returns every enrolled principal.
     #[tokio::test]
     async fn list_returns_all_enrolled() {
         let dir = InMemoryDirectory::new();
@@ -182,6 +196,7 @@ mod tests {
         assert_eq!(dir.list().await.expect("list").len(), 3);
     }
 
+    /// Verifies the directory works through the trait-object interface.
     #[tokio::test]
     async fn usable_as_trait_object() {
         let dir: Arc<dyn PrincipalDirectory> = Arc::new(InMemoryDirectory::new());

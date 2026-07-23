@@ -1,8 +1,8 @@
 #![deny(missing_docs)]
-//! Durable write-through sidecar for the in-process Axon bus (Story 2.4, per the G3 split).
+//! Durable write-through sidecar for the in-process Axon bus.
 //!
 //! [`syntheos_axon::AxonBus`] stays exactly what it is: lossy, in-memory, live telemetry. This
-//! crate is the OTHER half of the G3 decision: [`DurableAxonBus`] wraps the in-process bus and
+//! crate provides durable delivery: [`DurableAxonBus`] wraps the in-process bus and
 //! persists every envelope to SQLite BEFORE fanning it out, giving audit-grade durability,
 //! cursor-based consumption, and replay -- without putting a database write on the hot path of
 //! consumers that only need telemetry (they keep using the in-process bus directly).

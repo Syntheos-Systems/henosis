@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
 const CONTEXT_LINES: usize = 2;
-const MAX_FILE_BYTES: usize = 10 * 1024 * 1024; // 10 MB — skip larger files
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024; // Skip files larger than 10 MB.
 
 /// Searches text files with regular expressions and bounded context output.
 pub struct GrepTool;

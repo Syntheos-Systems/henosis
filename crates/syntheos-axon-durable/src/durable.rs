@@ -117,6 +117,7 @@ pub struct DurableAxonBus {
     bus: Arc<AxonBus>,
 }
 
+/// Implements durable publish, replay, and consumer-cursor operations.
 impl DurableAxonBus {
     /// Open (or create) the durable log at `path`, applying migrations, wrapping `bus`.
     pub fn open(path: impl AsRef<Path>, bus: Arc<AxonBus>) -> Result<Self, DurableAxonError> {
@@ -529,6 +530,8 @@ mod tests {
             /// What was audited.
             what: String,
         }
+
+        /// Defines the typed event identity for the audit test fixture.
         impl TypedEvent for AuditMark {
             const CHANNEL: &'static str = "audit";
             const KIND: &'static str = "audit.mark";

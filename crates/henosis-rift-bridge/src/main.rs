@@ -15,7 +15,7 @@ use henosis_rift_bridge::config::{BridgeConfig, EmbeddingConfig};
 use henosis_rift_bridge::embedding::CognitionEmbedder;
 use henosis_rift_bridge::embedding::{Embedder, OpenAiEmbedder};
 use henosis_rift_bridge::execution::approval::{
-    decide_drain_action, ApprovalRegistry, DrainAction,
+    ApprovalRegistry, DrainAction, decide_drain_action,
 };
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
 use henosis_rift_bridge::stimulus::{
@@ -50,7 +50,7 @@ struct EmbeddingRuntime {
     cognition: Option<Arc<dyn henosis_cognition::EmbeddingProvider>>,
 }
 
-use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
+use henosis_rift_bridge::rift_client::{RiftRestClient, RiftWsEvent, ws_listen};
 use henosis_rift_bridge::room::Room;
 
 /// Entry point: load config, provision agents, then run the event loop.
@@ -520,7 +520,7 @@ async fn build_kleos_client(
 /// Under the `cognition` feature, memory runs against a local kleos-lib store in
 /// the bridge process: persistent at `db_dir/cognition.db` when `db_dir` is set,
 /// else a volatile in-memory store. Without the feature, memory routes to
-/// upstream Kleos over HTTP (the pre-Wave-3 behavior).
+/// upstream Kleos over HTTP when the local cognition feature is disabled.
 #[cfg(feature = "cognition")]
 async fn build_memory_backend(
     config: &BridgeConfig,
@@ -601,7 +601,7 @@ fn load_cred_secret(reference: &str) -> Result<String, Box<dyn std::error::Error
 /// ONNX session or contacting an HTTP endpoint.
 #[cfg(test)]
 mod tests {
-    use super::{select_embedding_backend, EmbeddingBackendChoice};
+    use super::{EmbeddingBackendChoice, select_embedding_backend};
 
     /// Verifies an explicit URL always preserves the HTTP override.
     #[test]

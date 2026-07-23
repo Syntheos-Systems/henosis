@@ -179,7 +179,7 @@ fn event_object(event: &Value) -> Result<&Value, DecideError> {
 ///
 /// Uses `.get(0)` rather than indexing: an absent or empty `items.data` array is a typed
 /// error, not a panic. Stripe sends one line item per subscription in the single-price model
-/// this story supports (multi-price subscriptions are a documented non-goal of 6.4a).
+/// this billing model supports (multi-price subscriptions are not supported).
 fn first_price_id(obj: &Value) -> Result<String, DecideError> {
     obj.get("items")
         .and_then(|i| i.get("data"))
@@ -929,11 +929,13 @@ mod tests {
         );
 
         assert_eq!(run(&store, &event).await, BillingOutcome::UnknownCustomer);
-        assert!(store
-            .entitlement_for_subscription(&sub)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .entitlement_for_subscription(&sub)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Live: replaying the same event id applies nothing a second time.

@@ -1,9 +1,7 @@
 //! Regex rule matching over a session-JSONL entry's text surfaces.
 //!
-//! Ported (copy-and-own) from Kleos `eidolon-supervisor/src/checks/rule_match.rs`, with one
-//! deviation: patterns arrive PRE-COMPILED ([`CompiledRule`]) instead of being re-compiled per
-//! entry per rule, and an invalid pattern is a construction error rather than a silently
-//! skipped check (fail-closed: a rule that cannot run must not pretend it ran).
+//! Patterns arrive pre-compiled as [`CompiledRule`] values. Invalid patterns fail
+//! construction rather than silently skipping a check.
 
 use super::{CheckType, CompiledRule, Violation};
 

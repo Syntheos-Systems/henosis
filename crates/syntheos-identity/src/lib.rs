@@ -2,18 +2,18 @@
 #![warn(clippy::all)]
 //! # syntheos-identity
 //!
-//! The principal directory for the Henosis agent OS: Phase 0 unit 4.
+//! The principal directory for the Henosis agent OS.
 //!
 //! [`syntheos_contracts::Principal`] is the canonical actor; this crate is where actors are
 //! enrolled and looked up. A gate turns the `PrincipalId` carried in a
 //! [`syntheos_contracts::GateRequest`] into a full actor by consulting a
-//! [`PrincipalDirectory`]. The trait is async and `Result`-returning so the Phase 0
+//! [`PrincipalDirectory`]. The trait is async and `Result`-returning so the
 //! [`InMemoryDirectory`] and the persistent [`SqliteDirectory`] are interchangeable behind the
 //! same surface, without changing any call site.
 //!
 //! Two backends ship: [`InMemoryDirectory`] (process-local, no persistence -- for tests and the
 //! earliest boot) and [`SqliteDirectory`] (the unit-6 DB decision -- persists across restarts,
-//! which the `user_id -> PrincipalId` backfill and Phase 1 extraction require).
+//! which supports legacy `user_id -> PrincipalId` backfills).
 //!
 //! ## What this is not
 //!

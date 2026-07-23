@@ -1,4 +1,4 @@
-//! Plutus billing surface (Story 6.4a): Stripe-facing billing primitives.
+//! Stripe-facing billing primitives for Plutus.
 //!
 //! [`signature`] verifies inbound Stripe webhook deliveries; [`pipeline`] then decides what a
 //! verified event means and applies it to an org's entitlement, tier, and quota. This module
@@ -13,11 +13,11 @@ pub mod pipeline;
 pub mod signature;
 
 pub use pipeline::{
-    apply_decision, decide, parse_event, BillingDecision, BillingOutcome, DecideError, StripeEvent,
+    BillingDecision, BillingOutcome, DecideError, StripeEvent, apply_decision, decide, parse_event,
 };
 #[cfg(any(test, feature = "test-helpers"))]
 pub use signature::sign_stripe_payload;
-pub use signature::{verify_stripe_signature, SignatureError, DEFAULT_TOLERANCE_SECS};
+pub use signature::{DEFAULT_TOLERANCE_SECS, SignatureError, verify_stripe_signature};
 
 use std::fmt;
 use std::str::FromStr;

@@ -20,7 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 # EidolonError (policy construction validation).
 thiserror.workspace = true
-# Supervisor (Story 2.5): rule patterns are regexes, compiled once at construction.
+# Supervisor rule patterns are regexes compiled once at construction.
 regex.workspace = true
 # Supervisor: filesystem watching of session JSONL directories.
 notify.workspace = true

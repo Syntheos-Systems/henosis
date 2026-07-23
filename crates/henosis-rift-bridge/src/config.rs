@@ -203,7 +203,7 @@ fn default_max_same_persona() -> usize {
     2
 }
 
-/// In-process Kleos backend settings (Story 4.4). When `in_process` is true the
+/// In-process Kleos backend settings. When `in_process` is true the
 /// bridge opens henosis kernel stores instead of talking to Kleos over HTTP.
 #[derive(Debug, Deserialize, Clone)]
 pub struct KleosBackendConfig {
@@ -579,9 +579,11 @@ mod tests {
             auth_token: "control-token-that-is-at-least-32-bytes".to_string(),
             allow_insecure_remote: false,
         };
-        assert!(control
-            .validate(&["another-strong-secret-value-here"])
-            .is_ok());
+        assert!(
+            control
+                .validate(&["another-strong-secret-value-here"])
+                .is_ok()
+        );
     }
 
     /// Verifies remote listeners and unsafe tokens fail closed.

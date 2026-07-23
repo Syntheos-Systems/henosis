@@ -1,7 +1,6 @@
-//! `chiasm-backfill`: the one-time Kleos -> Henosis chiasm absorption CLI (projection
-//! convention 3.2). Dry-run by default; pass `--apply` to write. Run it against a COPY of the
-//! Kleos production database first (roadmap risk R1) and inspect the dry-run report before
-//! applying anywhere.
+//! `chiasm-backfill` imports legacy Chiasm data into a tenant-scoped store. It is dry-run by
+//! default; pass `--apply` to write. Run it against a copy of a source database and inspect the
+//! dry-run report before applying anywhere.
 //!
 //! Each imported database has its own legacy id space, so every run names its source
 //! (e.g. `monolith`, `tenant-1`); idempotency is per source.
@@ -15,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use henosis_chiasm::backfill::{backfill_from_kleos, BackfillOptions};
+use henosis_chiasm::backfill::{BackfillOptions, backfill_from_kleos};
 use syntheos_contracts::TenantId;
 use syntheos_identity::SqliteDirectory;
 

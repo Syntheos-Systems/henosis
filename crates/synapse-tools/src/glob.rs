@@ -125,7 +125,7 @@ fn glob_path_chars(pat: &[char], txt: &[char]) -> bool {
         (Some(&'*'), _) => {
             // Check for `**`
             if pat.len() >= 2 && pat[1] == '*' {
-                // `**` — consume optional leading slash in pattern
+                // `**` consumes an optional leading slash in the pattern.
                 let rest = if pat.len() >= 3 && pat[2] == '/' {
                     &pat[3..]
                 } else {
@@ -143,7 +143,7 @@ fn glob_path_chars(pat: &[char], txt: &[char]) -> bool {
                 }
                 false
             } else {
-                // Single `*` — matches anything except `/`
+                // A single `*` matches anything except `/`.
                 let rest_pat = &pat[1..];
                 for i in 0..=txt.len() {
                     if i > 0 && txt[i - 1] == '/' {

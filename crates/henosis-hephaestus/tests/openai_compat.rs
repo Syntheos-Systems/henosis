@@ -1,4 +1,4 @@
-//! Phase 1 acceptance test for the OpenAI-compatible provider path.
+//! Acceptance test for the OpenAI-compatible provider path.
 //! Spins up a wiremock server impersonating an OpenAI-compatible endpoint
 //! (the /chat/completions wire shape that ProxyProvider speaks). Verifies
 //! that with `HEPHAESTUS_PROVIDER=openai-compat` and a configured base URL
@@ -18,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Service credential used by the isolated HTTP acceptance server.
 const API_TOKEN: &str = "hephaestus-api-token-that-is-at-least-32-bytes";
 
-/// Bundle of mocked upstream services used by the OpenAI-compat test.
+/// Bundle of mocked external services used by the OpenAI-compat test.
 /// Same coordination services as the Anthropic harness; only the LLM
 /// endpoint shape differs.
 struct Mocks {
@@ -110,7 +110,7 @@ impl Mocks {
             kleos_token_slot: "test/kleos".into(),
             chiasm_url: self.chiasm.uri(),
             chiasm_agent: "hephaestus".into(),
-            chiasm_project: "phase1-openai-test".into(),
+            chiasm_project: "openai-compat-test".into(),
             chiasm_token_slot: None,
             axon_url: self.kleos.uri(),
             plutus_url: None,

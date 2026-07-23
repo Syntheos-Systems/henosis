@@ -5,14 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Loom: the workflow-orchestration kernel service, extracted onto syntheos-contracts + in-process Axon."
+description = "Loom: tenant-scoped workflow orchestration over an in-process event bus."
 
 [dependencies]
 # Canonical ids (WorkflowId/RunId/PrincipalId/TenantId), Timestamp, and the TypedEvent trait.
 syntheos-contracts = { path = "../syntheos-contracts" }
 # In-process bus the workflow lifecycle events are published onto.
 syntheos-axon = { path = "../syntheos-axon" }
-# SQLite backend (bundled = no system libsqlite). Migration convention: PRAGMA user_version.
+# SQLite backend (bundled = no system libsqlite), versioned with PRAGMA user_version.
 rusqlite = { workspace = true, features = ["bundled"] }
 # LoomError.
 thiserror.workspace = true

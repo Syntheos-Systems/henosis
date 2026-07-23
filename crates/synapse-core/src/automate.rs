@@ -6,7 +6,7 @@
 //! - In-process [`frameshift_orchestrator::select`] -- rank installed personas
 //!   against a task summary. The top-scored persona is the pick, gated by a
 //!   confidence floor. This is the same ranking the `frameshift select` CLI
-//!   performs, called directly instead of via a subprocess (Story 4.3).
+//!   performs, called directly instead of via a subprocess.
 //! - `frameshift automate status` (subprocess) -- learn whether automate is on
 //!   for the current project and which persona is active. This reads
 //!   Frameshift's per-project automate-mode state, whose on-disk path is
@@ -110,8 +110,7 @@ pub struct AutomateStatus {
 /// This reads Frameshift's per-project automate-mode state, whose on-disk path
 /// is computed by Frameshift's client crate (project-root -> state-dir hashing),
 /// not exposed by the orchestrator lib. It stays a subprocess probe by design;
-/// it is mode config, not the persona load/selection path that Story 4.3 moved
-/// in-process.
+/// it is mode configuration, not the persona load or selection path.
 pub fn status() -> AutomateStatus {
     let output = match Command::new("frameshift")
         .args(["automate", "status"])

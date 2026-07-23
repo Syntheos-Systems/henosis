@@ -1,6 +1,5 @@
-//! Kleos tools -- unified access to Kleos memory system via henosis-memory-client
-//! (the in-workspace transitional client copy-and-owned from kleos-client during
-//! Story 4.1 absorption).
+//! Kleos tools -- unified access to the Kleos memory system through the
+//! workspace `henosis-memory-client`.
 
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;

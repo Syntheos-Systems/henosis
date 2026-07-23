@@ -8,17 +8,17 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde_json::json;
 
+use crate::AppState;
 use crate::circuit::invoke_with_circuit;
 use crate::metrics::Outcome;
 use crate::rate_limit::CheckOutcome;
-use crate::tool::{err, error_response, InvokeContext, InvokeRequest, InvokeResponse};
-use crate::AppState;
+use crate::tool::{InvokeContext, InvokeRequest, InvokeResponse, err, error_response};
 
 /// A controlled Hermes invocation plus the HTTP transport metadata needed by
 /// the gateway wrapper.
@@ -62,7 +62,7 @@ pub async fn invoke_tool(
 
 /// Invoke one Hermes tool through the complete shared control path.
 ///
-/// Both the HTTP gateway and absorbed in-process callers use this function so
+/// Both the HTTP gateway and in-process callers use this function so
 /// tenant policy, rate limits, circuits, metrics, audit, and Axon events cannot
 /// diverge between transports.
 pub async fn invoke_controlled(
@@ -377,12 +377,13 @@ pub async fn adapters_health(State(state): State<AppState>) -> impl IntoResponse
 /// Tests for the transport-independent controlled invocation path.
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
 
+    use crate::ToolRegistry;
     use crate::audit::{AuditQuery, AuditTrail};
     use crate::axon::AxonPublisher;
     use crate::circuit::CircuitRegistry;
@@ -391,7 +392,6 @@ mod tests {
     use crate::rate_limit::{RateLimitConfig, RateLimiter};
     use crate::tenant_config::{TenantAdapterConfig, TenantConfigStore};
     use crate::tool::{Tool, ToolSchema};
-    use crate::ToolRegistry;
 
     /// A deterministic adapter that records how often Hermes reaches it.
     struct EchoTool {

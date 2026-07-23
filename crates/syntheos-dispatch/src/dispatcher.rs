@@ -34,8 +34,8 @@ pub const CANONICAL_GATE_ORDER: [&str; 5] = ["pistis", "plutus", "eidolon", "hum
 ///
 /// The output filter is the OUTPUT-direction counterpart to the input gate chain. It is optional
 /// (default `None` = pass results through unchanged) and set additively via
-/// [`Dispatcher::with_output_filter`], so the real Phase 2 policy filter wires in without any
-/// change to the construction API.
+/// [`Dispatcher::with_output_filter`], so a policy filter can be added without changing the
+/// construction API.
 ///
 /// Share it as `Arc<Dispatcher>`; all methods take `&self`.
 pub struct Dispatcher {
@@ -78,7 +78,7 @@ impl Dispatcher {
     /// Attach an output filter, applied to a successful result before it is returned.
     ///
     /// Additive and consuming: the construction/validation done by [`Dispatcher::new`] is
-    /// unchanged, so wiring the real Phase 2 policy filter is not a breaking change. Calling this
+    /// unchanged, so wiring a policy filter is not a breaking change. Calling this
     /// more than once keeps the last filter.
     pub fn with_output_filter(mut self, filter: Box<dyn OutputFilter>) -> Self {
         self.output_filter = Some(filter);
@@ -264,8 +264,7 @@ impl Dispatcher {
         {
             Ok(mut result) => {
                 // Output-filter seam: redact/transform the result after execution. No filter wired
-                // = pass-through (the Phase 0 default). The real policy filter (the EidolonGate
-                // output side) lands in Phase 2 as an OutputFilter impl set via with_output_filter.
+                // = pass-through. A policy filter can be installed with `with_output_filter`.
                 if let Some(filter) = &self.output_filter {
                     match filter.filter(&mut result, &request.context).await {
                         FilterDecision::Pass => {}
@@ -378,10 +377,10 @@ mod tests {
     use super::*;
     use crate::deny::deny_gate_chain;
     use crate::executor::ExecutorError;
-    use crate::stubs::{stub_gate_chain, EchoExecutor, StubGate};
+    use crate::stubs::{EchoExecutor, StubGate, stub_gate_chain};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use syntheos_contracts::{AxonEnvelope, GateError, RequestContext, ToolInvocation};
 
     /// Build a minimal request for `tool`/`action`.
@@ -760,9 +759,11 @@ mod tests {
             .dispatch(retryable_request.clone())
             .await
             .expect_err("terminal persistence must fail");
-        assert!(first_error
-            .to_string()
-            .contains("outcome persistence failed"));
+        assert!(
+            first_error
+                .to_string()
+                .contains("outcome persistence failed")
+        );
         assert_eq!(*state.lock().unwrap(), RetryLedgerState::Indeterminate);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -770,9 +771,11 @@ mod tests {
             .dispatch(retryable_request)
             .await
             .expect_err("indeterminate retry must fail closed");
-        assert!(retry_error
-            .to_string()
-            .contains("execution result is indeterminate"));
+        assert!(
+            retry_error
+                .to_string()
+                .contains("execution result is indeterminate")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

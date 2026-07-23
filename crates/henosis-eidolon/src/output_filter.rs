@@ -244,7 +244,7 @@ mod tests {
 
         use syntheos_axon::AxonBus;
         use syntheos_contracts::{Gate, GateRequest, ToolInvocation};
-        use syntheos_dispatch::stubs::{stub_gate_chain, EchoExecutor};
+        use syntheos_dispatch::stubs::{EchoExecutor, stub_gate_chain};
         use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 
         /// An executor returning a result that carries a credential field.

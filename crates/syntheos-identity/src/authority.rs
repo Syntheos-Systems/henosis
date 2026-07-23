@@ -3,7 +3,7 @@
 //! Each persisted secret is a SHA-256 digest. Public metadata deliberately omits the digest and
 //! the cleartext credential, which is returned only by the issuing or rotating operation.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -681,13 +681,17 @@ mod tests {
             &authenticated,
             "jobs.read"
         ));
-        assert!(directory
-            .revoke_machine_token(tenant, issued.metadata.id, 151)
-            .expect("revoke"));
-        assert!(directory
-            .authenticate_machine_token(&issued.token, 152)
-            .expect("auth")
-            .is_none());
+        assert!(
+            directory
+                .revoke_machine_token(tenant, issued.metadata.id, 151)
+                .expect("revoke")
+        );
+        assert!(
+            directory
+                .authenticate_machine_token(&issued.token, 152)
+                .expect("auth")
+                .is_none()
+        );
     }
 
     /// Refresh rotation revokes the predecessor and leaves only the new secret usable.
@@ -704,14 +708,18 @@ mod tests {
             .expect("rotate")
             .expect("active");
         assert_eq!(replacement.metadata.family_id, issued.metadata.family_id);
-        assert!(directory
-            .authenticate_operator_refresh(&issued.token, 151)
-            .expect("auth")
-            .is_none());
-        assert!(directory
-            .authenticate_operator_refresh(&replacement.token, 151)
-            .expect("auth")
-            .is_some());
+        assert!(
+            directory
+                .authenticate_operator_refresh(&issued.token, 151)
+                .expect("auth")
+                .is_none()
+        );
+        assert!(
+            directory
+                .authenticate_operator_refresh(&replacement.token, 151)
+                .expect("auth")
+                .is_some()
+        );
     }
 
     /// Malformed credentials reject, and already-expired credentials cannot be issued.
@@ -738,14 +746,18 @@ mod tests {
                 100,
             )
             .expect("issue");
-        assert!(directory
-            .authenticate_machine_token("hen_v1_not-a-uuid.abc", 100)
-            .expect("malformed")
-            .is_none());
-        assert!(directory
-            .authenticate_machine_token(&issued.token, 200)
-            .expect("expired")
-            .is_none());
+        assert!(
+            directory
+                .authenticate_machine_token("hen_v1_not-a-uuid.abc", 100)
+                .expect("malformed")
+                .is_none()
+        );
+        assert!(
+            directory
+                .authenticate_machine_token(&issued.token, 200)
+                .expect("expired")
+                .is_none()
+        );
         let metadata = directory
             .list_machine_tokens(tenant)
             .expect("list")
@@ -759,9 +771,11 @@ mod tests {
     #[test]
     fn refresh_issuance_rejects_expired_expiry() {
         let directory = SqliteDirectory::open_in_memory().expect("open");
-        assert!(directory
-            .issue_operator_refresh(TenantId::new(), PrincipalId::new(), Some(100), 100)
-            .is_err());
+        assert!(
+            directory
+                .issue_operator_refresh(TenantId::new(), PrincipalId::new(), Some(100), 100)
+                .is_err()
+        );
     }
 
     /// Oversized labels and scopes are rejected before authority metadata is persisted.
@@ -769,30 +783,36 @@ mod tests {
     fn machine_issuance_rejects_unbounded_metadata() {
         let directory = SqliteDirectory::open_in_memory().expect("open");
         let tenant = TenantId::new();
-        assert!(directory
-            .create_machine_token(
-                tenant,
-                PrincipalId::new(),
-                "x".repeat(MAX_LABEL_BYTES + 1),
-                Vec::new(),
-                None,
-                100,
-            )
-            .is_err());
-        assert!(directory
-            .create_machine_token(
-                tenant,
-                PrincipalId::new(),
-                "bounded",
-                vec!["x".repeat(MAX_SCOPE_BYTES + 1)],
-                None,
-                100,
-            )
-            .is_err());
-        assert!(directory
-            .list_machine_tokens(tenant)
-            .expect("list")
-            .is_empty());
+        assert!(
+            directory
+                .create_machine_token(
+                    tenant,
+                    PrincipalId::new(),
+                    "x".repeat(MAX_LABEL_BYTES + 1),
+                    Vec::new(),
+                    None,
+                    100,
+                )
+                .is_err()
+        );
+        assert!(
+            directory
+                .create_machine_token(
+                    tenant,
+                    PrincipalId::new(),
+                    "bounded",
+                    vec!["x".repeat(MAX_SCOPE_BYTES + 1)],
+                    None,
+                    100,
+                )
+                .is_err()
+        );
+        assert!(
+            directory
+                .list_machine_tokens(tenant)
+                .expect("list")
+                .is_empty()
+        );
     }
 
     /// Family revocation requires the exact tenant and principal that own the durable family.
@@ -804,33 +824,43 @@ mod tests {
         let issued = directory
             .issue_operator_refresh(tenant, principal, Some(300), 100)
             .expect("issue");
-        assert!(!directory
-            .revoke_operator_refresh_family(
-                TenantId::new(),
-                principal,
-                issued.metadata.family_id,
-                110,
-            )
-            .expect("wrong tenant"));
-        assert!(!directory
-            .revoke_operator_refresh_family(
-                tenant,
-                PrincipalId::new(),
-                issued.metadata.family_id,
-                110,
-            )
-            .expect("wrong principal"));
-        assert!(directory
-            .authenticate_operator_refresh(&issued.token, 120)
-            .expect("still active")
-            .is_some());
-        assert!(directory
-            .revoke_operator_refresh_family(tenant, principal, issued.metadata.family_id, 121)
-            .expect("revoke"));
-        assert!(directory
-            .authenticate_operator_refresh(&issued.token, 122)
-            .expect("revoked")
-            .is_none());
+        assert!(
+            !directory
+                .revoke_operator_refresh_family(
+                    TenantId::new(),
+                    principal,
+                    issued.metadata.family_id,
+                    110,
+                )
+                .expect("wrong tenant")
+        );
+        assert!(
+            !directory
+                .revoke_operator_refresh_family(
+                    tenant,
+                    PrincipalId::new(),
+                    issued.metadata.family_id,
+                    110,
+                )
+                .expect("wrong principal")
+        );
+        assert!(
+            directory
+                .authenticate_operator_refresh(&issued.token, 120)
+                .expect("still active")
+                .is_some()
+        );
+        assert!(
+            directory
+                .revoke_operator_refresh_family(tenant, principal, issued.metadata.family_id, 121)
+                .expect("revoke")
+        );
+        assert!(
+            directory
+                .authenticate_operator_refresh(&issued.token, 122)
+                .expect("revoked")
+                .is_none()
+        );
     }
 
     /// Independent connections serialize rotation and logout so no successor remains active.
@@ -865,16 +895,20 @@ mod tests {
         assert!(logout.join().expect("logout thread"));
 
         let observer = SqliteDirectory::open(&path).expect("open observer");
-        assert!(observer
-            .authenticate_operator_refresh(&issued.token, 151)
-            .expect("old token")
-            .is_none());
+        assert!(
+            observer
+                .authenticate_operator_refresh(&issued.token, 151)
+                .expect("old token")
+                .is_none()
+        );
         if let Some(replacement) = replacement {
             assert_eq!(replacement.metadata.family_id, issued.metadata.family_id);
-            assert!(observer
-                .authenticate_operator_refresh(&replacement.token, 151)
-                .expect("replacement")
-                .is_none());
+            assert!(
+                observer
+                    .authenticate_operator_refresh(&replacement.token, 151)
+                    .expect("replacement")
+                    .is_none()
+            );
         }
         drop(observer);
         let _ = std::fs::remove_file(path);

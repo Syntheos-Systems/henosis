@@ -1,9 +1,9 @@
-//! Phase 1 acceptance tests:
+//! Orchestration acceptance tests:
 //!  1. happy_path_three_step_loop  -- full agent loop with one Hermes tool
 //!  2. hitl_pause_and_resume       -- ask_human flow + POST /resume
 //!  3. crash_recovery_resumes      -- replay a task from a Kleos checkpoint
 //!
-//! All upstream services (Anthropic, Kleos, Chiasm, Axon, Eidolon, Hermes)
+//! All external services (Anthropic, Kleos, Chiasm, Axon, Eidolon, Hermes)
 //! are mocked with wiremock; the Hephaestus router is built in-process and
 //! served on a random local port.
 
@@ -27,7 +27,7 @@ const API_TOKEN: &str = "hephaestus-api-token-that-is-at-least-32-bytes";
 
 // -- mock harness ------------------------------------------------------------
 
-/// Bundle of mocked upstream services used across the acceptance tests.
+/// Bundle of mocked external services used across the acceptance tests.
 struct Mocks {
     /// Mocked Anthropic Messages API endpoint.
     anthropic: MockServer,
@@ -124,7 +124,7 @@ impl Mocks {
             kleos_token_slot: "test/kleos".into(),
             chiasm_url: self.chiasm.uri(),
             chiasm_agent: "hephaestus".into(),
-            chiasm_project: "phase1-test".into(),
+            chiasm_project: "orchestration-test".into(),
             chiasm_token_slot: None,
             axon_url: self.kleos.uri(),
             plutus_url: None,
@@ -332,7 +332,7 @@ async fn happy_path_three_step_loop() {
         .mount(&mocks.anthropic)
         .await;
 
-    // No Hermes HTTP mock needed: story 5.4 dispatches tools in-process.
+    // No Hermes HTTP mock is needed because tools dispatch in-process.
     // `fake_tool` is not in the Hermes registry, so the in-process path
     // returns a structured tool_not_found error which the LLM receives as
     // a tool_result and then ends the turn normally.
@@ -498,7 +498,7 @@ async fn crash_recovery_resumes_from_checkpoint() {
         "status": "running",
         "tenant_id": null,
         "agent": "hephaestus",
-        "project": "phase1-test",
+        "project": "orchestration-test",
         "title": "recovered task",
         "input": "prior request",
         "system": null,

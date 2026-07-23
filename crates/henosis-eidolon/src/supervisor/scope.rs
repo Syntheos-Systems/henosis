@@ -1,9 +1,7 @@
 //! File-scope checking: edits outside an allow-listed path set.
 //!
-//! Ported (copy-and-own) from Kleos `eidolon-supervisor/src/checks/scope.rs` with one
-//! deviation: Kleos shipped this check `#[allow(dead_code)]` and never wired it; Henosis wires
-//! it whenever the supervisor config carries a non-empty `allowed_paths` (empty = disabled,
-//! same contract as the gate's empty pattern list).
+//! The check runs whenever the supervisor configuration carries a non-empty `allowed_paths`.
+//! An empty list disables it, matching the gate's empty pattern-list behavior.
 
 use super::{Severity, Violation};
 

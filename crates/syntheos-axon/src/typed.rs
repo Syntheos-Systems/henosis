@@ -18,6 +18,7 @@ pub struct TypedReceiver<E> {
     _marker: PhantomData<E>,
 }
 
+/// Constructs typed receivers from raw channel subscriptions.
 impl<E> TypedReceiver<E> {
     /// Wrap a raw broadcast receiver as a typed receiver for `E`.
     pub(crate) fn new(inner: Receiver<AxonEnvelope>) -> Self {
@@ -28,6 +29,7 @@ impl<E> TypedReceiver<E> {
     }
 }
 
+/// Receives and deserializes events matching the requested typed-event contract.
 impl<E> TypedReceiver<E>
 where
     E: TypedEvent + DeserializeOwned,

@@ -401,8 +401,7 @@ pub mod henosis {
     /// a clock, and the action kind synapse tool calls are arbitrated under
     /// (default [`ActionKind::Message`] -- a synapse tool call is an in-room
     /// agent action). The principal is supplied at construction; agent-name ->
-    /// `PrincipalId` resolution is the caller's concern (Henosis wiring / Story
-    /// 4.4), not this gate's.
+    /// `PrincipalId` resolution is the caller's concern, not this gate's.
     pub struct HenosisAuthority {
         /// Where materialized room state is obtained.
         source: Arc<dyn RoomStateSource>,

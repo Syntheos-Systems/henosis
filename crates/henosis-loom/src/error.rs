@@ -4,8 +4,7 @@ use syntheos_contracts::{RunId, WorkflowId};
 
 /// A Loom workflow operation failed.
 ///
-/// `#[non_exhaustive]`: variants may grow as more of the Kleos surface (webhook/LLM steps,
-/// the legacy backfill) is ported into this crate.
+/// `#[non_exhaustive]`: variants may grow as workflow-service capabilities expand.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoomError {

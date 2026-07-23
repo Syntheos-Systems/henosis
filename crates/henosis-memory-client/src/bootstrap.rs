@@ -1,8 +1,7 @@
 //! Bootstrap-bearer resolver for the memory client.
 //!
-//! Copy-and-owned from `kleos-lib/src/cred/bootstrap.rs` (Story 4.1). Talks to
-//! phylaxd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch the
-//! per-agent bearer at process startup without any plaintext key on disk.
+//! Talks to phylaxd's `/bootstrap/kleos-bearer?agent=<slot>` endpoint to fetch a per-agent
+//! bearer at process startup without storing a plaintext key on disk.
 //!
 //! Resolution order:
 //!
