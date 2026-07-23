@@ -1,0 +1,20 @@
+name: Bug report
+description: Report a reproducible Henosis defect without secrets.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, tokens, private URLs, or production data.
+  - type: input
+    id: version
+    attributes: { label: Henosis version, placeholder: v0.1.0-alpha.1 }
+    validations: { required: true }
+  - type: textarea
+    id: reproduction
+    attributes: { label: Reproduction steps }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected and actual behavior }
+    validations: { required: true }

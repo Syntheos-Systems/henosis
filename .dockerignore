@@ -1,0 +1,9 @@
+.git
+.github
+target
+tests
+*.rlib
+*.sqlite
+.env
+**/.env.production
+containers/secrets

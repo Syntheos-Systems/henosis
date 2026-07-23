@@ -1,0 +1,6 @@
+* @Ghost-Frame
+/install.sh @Ghost-Frame
+/install.ps1 @Ghost-Frame
+/containers/ @Ghost-Frame
+/.github/ @Ghost-Frame
+/scripts/ @Ghost-Frame

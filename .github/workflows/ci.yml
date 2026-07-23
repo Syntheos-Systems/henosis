@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'candidate/**']
     tags: ['v*']
   pull_request:
 
@@ -13,237 +13,138 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_INCREMENTAL: "0"
-  CARGO_TERM_COLOR: always
-
 jobs:
   quality:
     name: Rust quality
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install system dependencies
-        run: sudo apt-get update -q && sudo apt-get install -y libpcsclite-dev libpq-dev libssl-dev pkg-config ripgrep
-      - name: Install Rust 1.88
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.88.0
-      - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
-      - name: Run tests
-        run: cargo test --locked --workspace --exclude henosis-cognition
-      - name: Scan for unfinished production code
-        run: ./scripts/stub-scan.sh
-      - name: Validate release package contract
-        run: ./tests/release-package.sh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -y libpcsclite-dev libpq-dev libssl-dev pkg-config ripgrep
+      - run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo +1.88.0 fmt --all --check
+      - run: cargo +1.88.0 clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
+      - run: cargo +1.88.0 test --locked --workspace --exclude henosis-cognition
+      - run: ./scripts/stub-scan.sh
 
   dependencies:
     name: Dependency audit
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install RustSec audit tool
-        run: cargo install cargo-audit --version 0.22.2 --locked
-      - name: Audit locked dependencies
-        run: ./scripts/dependency-audit.sh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: ./scripts/dependency-audit.sh
 
   secrets:
     name: Secret scan
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out complete history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Install Gitleaks 8.30.1
-        env:
-          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-        run: |
-          archive="$RUNNER_TEMP/gitleaks.tar.gz"
-          curl --fail --location --silent --show-error \
-            --output "$archive" \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "$GITLEAKS_SHA256  $archive" | sha256sum --check
-          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
-      - name: Scan complete history
-        run: |
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
+      - run: |
+          curl --fail --location --silent --show-error -o "$RUNNER_TEMP/gitleaks.tar.gz" https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  '"$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
           "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --no-banner --redact .
+
+  release-package-contract:
+    name: Release package contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: ./tests/install.sh
+      - run: ./tests/release-package.sh
+      - run: ./tests/container-contract.sh
 
   release-package-windows:
     name: Windows release package contract
     runs-on: windows-2025
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Execute Windows packager contract
-        shell: pwsh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - shell: pwsh
+        run: ./tests/install.ps1
+      - shell: pwsh
         run: ./tests/release-package.ps1
 
   release-version:
-    name: Release version gate
-    needs: [quality, dependencies, secrets, release-package-windows]
+    name: Release tag matches binary
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Require public Sigstore provenance support
-        env:
-          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$REPOSITORY_VISIBILITY" != "public" ]]; then
-            echo "Authenticated releases require a public repository on the current GitHub plan." >&2
-            exit 1
-          fi
-      - name: Match the release tag to syntheos-server
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          version="$(awk -F '"' '/^version = / { print $2; exit }' crates/syntheos-server/Cargo.toml)"
-          test -n "$version"
-          test "$tag" = "v$version"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/syntheos-server/Cargo.toml)"
+          test -n "$package_version"
+          test "$GITHUB_REF_NAME" = "v$package_version"
 
   release-build:
-    name: Release ${{ matrix.target }}
-    needs: [quality, dependencies, secrets, release-version]
+    name: Native ${{ matrix.target }}
+    needs: [quality, dependencies, secrets, release-package-contract, release-package-windows, release-version]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      attestations: write
-      artifact-metadata: write
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            binary: syntheos-server
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            binary: syntheos-server
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            binary: syntheos-server
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            binary: syntheos-server.exe
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, extension: tar.gz }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, extension: tar.gz }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, extension: tar.gz }
+          - { runner: macos-15, target: aarch64-apple-darwin, extension: tar.gz }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc, extension: zip }
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust 1.88 and target
-        shell: bash
-        if: runner.os != 'Windows'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: runner.os != 'Windows'
         run: |
           rustup toolchain install 1.88.0 --profile minimal
           rustup target add --toolchain 1.88.0 ${{ matrix.target }}
-      - name: Install Rust 1.88 and target
+          if [ "${{ runner.os }}" = Linux ]; then sudo apt-get update -q && sudo apt-get install -y musl-tools; fi
+          if [ "${{ runner.os }}" = macOS ]; then brew install gnu-tar; fi
+      - if: runner.os == 'Windows'
         shell: pwsh
-        if: runner.os == 'Windows'
         run: |
           rustup toolchain install 1.88.0 --profile minimal
           rustup target add --toolchain 1.88.0 ${{ matrix.target }}
-      - name: Install Linux musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update -q && sudo apt-get install -y musl-tools
-      - name: Install GNU tar on macOS
-        if: runner.os == 'macOS'
-        run: brew install gnu-tar
-      - name: Build release binary
-        shell: bash
-        if: runner.os != 'Windows'
+      - if: runner.os != 'Windows'
         run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
-      - name: Build release binary
+      - if: runner.os != 'Windows'
+        run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" ./scripts/package-release.sh "target/${{ matrix.target }}/release/henosis" "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" dist
+      - if: runner.os == 'Windows'
         shell: pwsh
-        if: runner.os == 'Windows'
-        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
-      - name: Set deterministic release metadata
-        shell: bash
-        if: runner.os != 'Windows'
         run: |
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-      - name: Set deterministic release metadata
-        shell: pwsh
-        if: runner.os == 'Windows'
-        run: |
-          "RELEASE_VERSION=$($env:GITHUB_REF_NAME.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Package Unix archive
-        shell: bash
-        if: runner.os != 'Windows'
-        run: ./scripts/package-release.sh "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$RELEASE_VERSION" "${{ matrix.target }}" dist
-      - name: Package Windows archive
-        shell: pwsh
-        if: runner.os == 'Windows'
-        run: >-
-          & .\scripts\package-release.ps1
-          -BinaryPath "target\${{ matrix.target }}\release\${{ matrix.binary }}"
-          -Version "$env:RELEASE_VERSION"
-          -Target "${{ matrix.target }}"
-          -OutputDirectory dist
-          -SourceDateEpoch ([long]$env:SOURCE_DATE_EPOCH)
-      - name: Attest native archive
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: dist/*
-      - name: Upload native archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: henosis-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 7
+          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
+          & .\scripts\package-release.ps1 -BinaryPath "target\${{ matrix.target }}\release\henosis.exe" -Version $env:GITHUB_REF_NAME.Substring(1) -Target '${{ matrix.target }}' -OutputDirectory dist -SourceDateEpoch ([long](git log -1 --format=%ct))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: henosis-${{ matrix.target }}, path: dist/*, if-no-files-found: error }
 
-  release-publish:
-    name: Publish authenticated release
-    needs: release-build
+  container:
+    name: Container linux/amd64,linux/arm64
+    needs: [quality, dependencies, secrets, release-package-contract, release-version]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      attestations: write
-      artifact-metadata: write
-      id-token: write
+    permissions: { contents: read, packages: write }
     steps:
-      - name: Download native archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: henosis-*
-          path: release
-          merge-multiple: true
-      - name: Generate release checksums
-        shell: bash
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@f7cfeb0f5f9b5f643092424b81cf6e15f73ed401 # v3.6.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ github.token }} }
+      - run: docker buildx build --platform linux/amd64,linux/arm64 --file containers/Dockerfile --tag ghcr.io/${{ github.repository }}:${{ github.ref_name }} --push .
+
+  release-publish:
+    name: Publish release
+    needs: [release-build, container]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: henosis-*, path: release, merge-multiple: true }
+      - run: |
+          cd release
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 5
+      - env: { GH_TOKEN: ${{ github.token }} }
         run: |
-          set -euo pipefail
-          find release -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' \
-            | LC_ALL=C sort \
-            | while IFS= read -r archive; do sha256sum "release/$archive"; done \
-            > release/SHA256SUMS
-          test "$(wc -l < release/SHA256SUMS)" -eq 4
-      - name: Attest release checksums
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: release/SHA256SUMS
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" release/* \
-            --verify-tag \
-            --title "Henosis $GITHUB_REF_NAME" \
-            --generate-notes
+          release_kind=
+          case "$GITHUB_REF_NAME" in *-*) release_kind=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" release/* --title "Henosis $GITHUB_REF_NAME" $release_kind --generate-notes

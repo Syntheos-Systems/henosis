@@ -2,5 +2,7 @@
 **/target
 *.swp
 .env
+containers/.env.production
+containers/secrets/
 .DS_Store
 /data

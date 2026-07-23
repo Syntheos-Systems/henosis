@@ -1,524 +1,162 @@
 #!/bin/sh
-# Install Henosis from this checkout or from a supplied syntheos-server binary.
+# Install a verified native Henosis release for the current Unix platform.
 
 set -eu
 
-PROGRAM="henosis-installer"
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+PROGRAM=henosis-installer
+RELEASE_BASE=${HENOSIS_RELEASE_BASE:-https://github.com/Syntheos-Systems/henosis/releases/download}
+VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.1}
 INSTALL_DIR=${HENOSIS_INSTALL_DIR:-"${HOME}/.local/bin"}
-CONFIG_DIR=${HENOSIS_CONFIG_DIR:-"${XDG_CONFIG_HOME:-${HOME}/.config}/henosis"}
-DATA_DIR=${HENOSIS_DATA_DIR:-"${XDG_DATA_HOME:-${HOME}/.local/share}/henosis"}
-SERVICE_DIR=${HENOSIS_SERVICE_DIR:-"${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"}
-SOURCE_DIR=$SCRIPT_DIR
-SOURCE_BINARY=""
-POSTGRES_URL=${SYNTHEOS_PLUTUS_DB:-}
-LOCAL_POLICY=${SYNTHEOS_LOCAL_POLICY:-0}
-LOCAL_OPTION=0
-POSTGRES_OPTION=0
-BIND_ADDR=${SYNTHEOS_ADDR:-127.0.0.1:8088}
-INSTALL_SERVICE=1
-START_SERVICE=1
-HEALTH_ATTEMPTS=${HENOSIS_HEALTH_ATTEMPTS:-30}
-BUILD_LOG=""
-PROMPT_STTY=""
+HEADLESS=0
 
-# Print one informational line without exposing configuration values.
+# Print an installer message to standard error.
 info() {
-    printf '%s: %s\n' "$PROGRAM" "$*"
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
 }
 
-# Print an error and terminate the installer.
+# Stop the installer, using JSON in explicitly headless mode.
 die() {
-    printf '%s: error: %s\n' "$PROGRAM" "$*" >&2
+    if [ "$HEADLESS" -eq 1 ]; then
+        printf '{"ok":false,"error":"%s"}\n' "$(printf '%s' "$*" | tr '"' "'")"
+    else
+        printf '%s: error: %s\n' "$PROGRAM" "$*" >&2
+    fi
     exit 1
 }
 
 # Display the supported installer interface.
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--local | --postgres-url URL] [options]
+Usage: install.sh [--version TAG] [--install-dir DIRECTORY] [--headless]
 
-Install the integrated Henosis server from the current source checkout.
+Downloads the native Henosis release for this operating system and CPU,
+verifies its mandatory SHA-256 checksum, installs it per-user, and runs:
+  henosis init --quick
 
-Database:
-  --local runs the real single-operator policy gate on loopback without Postgres.
-  Its quota and rate-limit counters reset when the process restarts.
-  On a fresh interactive install, the Postgres URL is requested without echo.
-  For automation, set SYNTHEOS_PLUTUS_DB.
-  The --postgres-url option exposes the URL in process listings and may save it
-  in shell history.
-
-Options:
-  --local               Use loopback-only local policy for development.
-  --binary PATH         Install a prebuilt syntheos-server instead of building.
-  --source-dir PATH     Source checkout to build (default: installer directory).
-  --install-dir PATH    Binary directory (default: ~/.local/bin).
-  --config-dir PATH     Private configuration directory.
-  --data-dir PATH       Persistent SQLite data directory.
-  --service-dir PATH    systemd user unit directory.
-  --bind ADDRESS        Listen address (default: 127.0.0.1:8088).
-  --no-service          Do not install or control a systemd user service.
-  --no-start            Install the service but do not start it.
-  -h, --help            Show this help.
-
-Existing configuration is preserved exactly. Re-running the installer updates
-the binary and service definition without rotating identities or secrets.
+Environment:
+  HENOSIS_VERSION       Release tag, default v0.1.0-alpha.1
+  HENOSIS_RELEASE_BASE  Release download base URL
+  HENOSIS_INSTALL_DIR   Destination directory, default ~/.local/bin
 EOF
-}
-
-# Require a value after an option and expose it through OPTION_VALUE.
-take_value() {
-    option=$1
-    remaining=$2
-    [ "$remaining" -ge 2 ] || die "$option requires a value"
-    OPTION_VALUE=$3
 }
 
 # Parse command-line options into installer state.
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --postgres-url|--binary|--source-dir|--install-dir|--config-dir|--data-dir|--service-dir|--bind)
-                take_value "$1" "$#" "${2-}"
-                case "$1" in
-                    --postgres-url)
-                        POSTGRES_URL=$OPTION_VALUE
-                        POSTGRES_OPTION=1
-                        ;;
-                    --binary) SOURCE_BINARY=$OPTION_VALUE ;;
-                    --source-dir) SOURCE_DIR=$OPTION_VALUE ;;
-                    --install-dir) INSTALL_DIR=$OPTION_VALUE ;;
-                    --config-dir) CONFIG_DIR=$OPTION_VALUE ;;
-                    --data-dir) DATA_DIR=$OPTION_VALUE ;;
-                    --service-dir) SERVICE_DIR=$OPTION_VALUE ;;
-                    --bind) BIND_ADDR=$OPTION_VALUE ;;
-                esac
-                shift 2
-                ;;
-            --local)
-                LOCAL_POLICY=1
-                LOCAL_OPTION=1
-                shift
-                ;;
-            --no-service)
-                INSTALL_SERVICE=0
-                START_SERVICE=0
-                shift
-                ;;
-            --no-start)
-                START_SERVICE=0
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
+            --version) [ "$#" -ge 2 ] || die '--version requires a value'; VERSION=$2; shift 2 ;;
+            --install-dir) [ "$#" -ge 2 ] || die '--install-dir requires a value'; INSTALL_DIR=$2; shift 2 ;;
+            --headless) HEADLESS=1; shift ;;
+            -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
     done
 }
 
-# Reject values that cannot be represented safely in generated files.
-validate_single_line() {
-    label=$1
-    value=$2
-    carriage_return=$(printf '\r')
-    case "$value" in
-        *'
-'*) die "$label must be a single line" ;;
-        *"$carriage_return"*) die "$label must be a single line" ;;
+# Map the current Unix platform to the release target triple.
+release_target() {
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "$os:$arch" in
+        Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
+        Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
+        Darwin:x86_64) printf '%s\n' x86_64-apple-darwin ;;
+        Darwin:arm64) printf '%s\n' aarch64-apple-darwin ;;
+        *) die "unsupported platform: $os/$arch" ;;
     esac
 }
 
-# Validate the supported host:port listen form and reject an unusable port.
-validate_bind_addr() {
-    validate_single_line "bind address" "$BIND_ADDR"
-    case "$BIND_ADDR" in
-        *:*) ;;
-        *) die "bind address must use host:port form" ;;
-    esac
-    bind_host=${BIND_ADDR%:*}
-    case "$bind_host" in
-        ''|*[!A-Za-z0-9_.:\[\]-]*) die "bind address contains unsupported host characters" ;;
-    esac
-    bind_port=${BIND_ADDR##*:}
-    case "$bind_port" in
-        ''|*[!0-9]*) die "bind address port must be an integer from 1 through 65535" ;;
-    esac
-    [ "$bind_port" -ge 1 ] 2>/dev/null && [ "$bind_port" -le 65535 ] 2>/dev/null \
-        || die "bind address port must be an integer from 1 through 65535"
-}
-
-# Require the server's local policy backend to remain on an IP loopback address.
-validate_local_bind() {
-    if [ "$LOCAL_POLICY" != "1" ]; then
-        return 0
-    fi
-    bind_host=${BIND_ADDR%:*}
-    case "$bind_host" in
-        127.*|'[::1]'|::1) ;;
-        *) die "--local requires a loopback --bind address" ;;
-    esac
-}
-
-# Convert a path to an absolute path after creating its directory.
-prepare_dir() {
-    path=$1
-    mkdir -p "$path"
-    (CDPATH= cd -- "$path" && pwd -P)
-}
-
-# Generate a UUID with RFC 9562 version and variant bits suitable for Henosis IDs.
-generate_uuid_v8() {
-    raw=$(openssl rand -hex 16) || die "OpenSSL could not generate a UUID"
-    printf '%s-%s-8%s-8%s-%s\n' \
-        "$(printf '%s' "$raw" | cut -c1-8)" \
-        "$(printf '%s' "$raw" | cut -c9-12)" \
-        "$(printf '%s' "$raw" | cut -c14-16)" \
-        "$(printf '%s' "$raw" | cut -c18-20)" \
-        "$(printf '%s' "$raw" | cut -c21-32)"
-}
-
-# Escape a value for systemd EnvironmentFile double-quoted syntax.
-quote_env_value() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-# Restore terminal settings after a hidden interactive prompt.
-restore_terminal() {
-    if [ -n "$PROMPT_STTY" ]; then
-        stty "$PROMPT_STTY" < /dev/tty 2>/dev/null || true
-        PROMPT_STTY=""
-    fi
-}
-
-# Read the required Postgres URL without echoing it or placing it in shell history.
-prompt_postgres_url() {
-    [ -t 0 ] || die "Postgres is required; pass --postgres-url or set SYNTHEOS_PLUTUS_DB"
-    PROMPT_STTY=$(stty -g < /dev/tty) || die "could not read terminal settings"
-    stty -echo < /dev/tty || die "could not disable terminal echo"
-    printf 'Postgres URL for the Plutus authority: ' > /dev/tty
-    if ! IFS= read -r POSTGRES_URL < /dev/tty; then
-        restore_terminal
-        die "could not read the Postgres URL"
-    fi
-    restore_terminal
-    printf '\n' > /dev/tty
-}
-
-# Write the initial owner-only runtime environment without printing secrets.
-write_initial_env() {
-    env_path=$1
-    env_tmp=$(mktemp "${CONFIG_DIR}/.henosis.env.XXXXXX") \
-        || die "could not create a private configuration file"
-    chmod 600 "$env_tmp"
-    tenant=$(generate_uuid_v8)
-    principal=$(generate_uuid_v8)
-    phylax_key=$(openssl rand -hex 32) || die "OpenSSL could not generate the Phylax key"
-    {
-        printf '# Generated by the Henosis installer. Keep this file private.\n'
-        printf 'RUST_LOG=info\n'
-        printf 'SYNTHEOS_ADDR=%s\n' "$BIND_ADDR"
-        if [ "$LOCAL_POLICY" = "1" ]; then
-            printf 'SYNTHEOS_LOCAL_POLICY=1\n'
-        else
-            printf 'SYNTHEOS_PLUTUS_DB="%s"\n' "$(quote_env_value "$POSTGRES_URL")"
-        fi
-        printf 'SYNTHEOS_PLUTUS_OPERATOR_TENANT=%s\n' "$tenant"
-        printf 'SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL=%s\n' "$principal"
-        printf 'SYNTHEOS_PHYLAX_KEY=%s\n' "$phylax_key"
-        printf 'SYNTHEOS_IDENTITY_DB="%s/identity.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_CHIASM_DB="%s/chiasm.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_SOMA_DB="%s/soma.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_BROCA_DB="%s/broca.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_LOOM_DB="%s/loom.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_THYMUS_DB="%s/thymus.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-        printf 'SYNTHEOS_PHYLAX_DB="%s/phylax.sqlite"\n' "$(quote_env_value "$DATA_DIR")"
-    } > "$env_tmp"
-    mv "$env_tmp" "$env_path"
-    chmod 600 "$env_path"
-}
-
-# Record the data directory needed by the service sandbox without storing secrets.
-write_install_state() {
-    state_path=$1
-    state_tmp=$(mktemp "${CONFIG_DIR}/.install-state.XXXXXX") \
-        || die "could not create installer state"
-    chmod 600 "$state_tmp"
-    printf 'DATA_DIR=%s\n' "$DATA_DIR" > "$state_tmp"
-    mv "$state_tmp" "$state_path"
-    chmod 600 "$state_path"
-}
-
-# Recover the original data directory without executing installer state as shell code.
-configured_data_dir() {
-    state_path=$1
-    configured=$(sed -n 's/^DATA_DIR=//p' "$state_path" | tail -n 1)
-    [ -n "$configured" ] || die "installer state has no DATA_DIR"
-    printf '%s\n' "$configured"
-}
-
-# Read the unquoted bind address generated by this installer without sourcing the file.
-configured_bind_addr() {
-    env_path=$1
-    configured=$(sed -n 's/^SYNTHEOS_ADDR=//p' "$env_path" | tail -n 1)
-    [ -n "$configured" ] || die "existing configuration has no SYNTHEOS_ADDR"
-    printf '%s\n' "$configured"
-}
-
-# Identify the policy mode already recorded in an installer-owned environment file.
-configured_policy_mode() {
-    env_path=$1
-    if grep -Fx 'SYNTHEOS_LOCAL_POLICY=1' "$env_path" >/dev/null; then
-        printf 'local\n'
-    else
-        printf 'postgres\n'
-    fi
-}
-
-# Verify that the supplied Postgres endpoint is usable when psql is available.
-check_postgres() {
-    if ! command -v psql >/dev/null 2>&1; then
-        info "psql not found; the server will perform the Postgres connection check at startup"
-        return
-    fi
-    if ! PGCONNECT_TIMEOUT=5 PGDATABASE="$POSTGRES_URL" psql -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' \
-        >/dev/null 2>&1; then
-        die "could not connect to the configured Postgres database"
-    fi
-    info "Postgres connection verified"
-}
-
-# Build syntheos-server once and return the executable path emitted by Cargo.
-build_server() {
-    command -v cargo >/dev/null 2>&1 || die "cargo is required when --binary is not supplied"
-    [ -f "$SOURCE_DIR/Cargo.toml" ] || die "source directory has no Cargo.toml"
-    BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/henosis-build.XXXXXX") \
-        || die "could not create a build log"
-    info "building syntheos-server from the current checkout"
-    if ! (CDPATH= cd -- "$SOURCE_DIR" && cargo build --locked --release -p syntheos-server \
-        --bin syntheos-server --message-format=json-render-diagnostics) > "$BUILD_LOG"; then
-        die "Cargo build failed"
-    fi
-    built=$(sed -n '/"name":"syntheos-server"/s/.*"executable":"\([^"]*\)".*/\1/p' "$BUILD_LOG" | tail -n 1)
-    [ -n "$built" ] && [ -x "$built" ] || die "Cargo did not report a syntheos-server executable"
-    SOURCE_BINARY=$built
-}
-
-# Install a binary atomically and retain a timestamped copy of the prior version.
-install_binary() {
-    [ -f "$SOURCE_BINARY" ] || die "binary not found: $SOURCE_BINARY"
-    [ -x "$SOURCE_BINARY" ] || die "binary is not executable: $SOURCE_BINARY"
-    destination="$INSTALL_DIR/syntheos-server"
-    binary_tmp=$(mktemp "${INSTALL_DIR}/.syntheos-server.XXXXXX") \
-        || die "could not create a temporary binary"
-    cp "$SOURCE_BINARY" "$binary_tmp"
-    chmod 755 "$binary_tmp"
-    if [ -e "$destination" ]; then
-        backup=$(mktemp "${destination}.bak.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") \
-            || die "could not reserve a binary backup path"
-        cp -p "$destination" "$backup"
-        info "preserved the previous binary at $backup"
-    fi
-    mv "$binary_tmp" "$destination"
-    INSTALLED_BINARY=$destination
-}
-
-# Escape a path for systemd directives that do not accept shell-style quotes.
-escape_systemd_path() {
-    tab=$(printf '\t')
-    printf '%s' "$1" | sed \
-        -e 's/\\/\\x5c/g' \
-        -e 's/%/%%/g' \
-        -e 's/ /\\x20/g' \
-        -e "s/$tab/\\\\x09/g" \
-        -e 's/"/\\x22/g' \
-        -e "s/'/\\\\x27/g" \
-        -e 's/#/\\x23/g'
-}
-
-# Write the systemd user unit atomically, backing up a prior definition.
-install_systemd_unit() {
-    command -v systemctl >/dev/null 2>&1 || die "systemctl is unavailable; use --no-service"
-    if ! systemctl --user show-environment >/dev/null 2>&1; then
-        die "the systemd user manager is unavailable; use --no-service"
-    fi
-    unit_path="$SERVICE_DIR/henosis.service"
-    unit_tmp=$(mktemp "${SERVICE_DIR}/.henosis.service.XXXXXX") \
-        || die "could not create a temporary service unit"
-    {
-        printf '[Unit]\n'
-        printf 'Description=Henosis agent runtime\n'
-        printf 'Documentation=https://github.com/Syntheos-Systems/henosis\n'
-        printf 'Wants=network-online.target\n'
-        printf 'After=network-online.target\n\n'
-        printf '[Service]\n'
-        printf 'Type=simple\n'
-        printf 'WorkingDirectory=%s\n' "$(escape_systemd_path "$DATA_DIR")"
-        printf 'ExecStart=%s\n' "$(escape_systemd_path "$INSTALLED_BINARY")"
-        printf 'EnvironmentFile=%s\n' "$(escape_systemd_path "$CONFIG_DIR/henosis.env")"
-        printf 'Restart=on-failure\n'
-        printf 'RestartSec=5s\n'
-        printf 'NoNewPrivileges=true\n'
-        printf 'PrivateTmp=true\n'
-        printf 'ProtectSystem=strict\n'
-        printf 'ProtectHome=read-only\n'
-        printf 'ReadWritePaths=%s\n\n' "$(escape_systemd_path "$DATA_DIR")"
-        printf '[Install]\n'
-        printf 'WantedBy=default.target\n'
-    } > "$unit_tmp"
-    if [ -e "$unit_path" ] && ! cmp -s "$unit_tmp" "$unit_path"; then
-        backup=$(mktemp "${unit_path}.bak.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") \
-            || die "could not reserve a service backup path"
-        cp -p "$unit_path" "$backup"
-        info "preserved the previous service unit at $backup"
-    fi
-    mv "$unit_tmp" "$unit_path"
-    systemctl --user daemon-reload
-}
-
-# Convert the configured listen address into a local health-check URL.
-health_url() {
-    addr=$1
-    port=${addr##*:}
-    host=${addr%:*}
-    case "$host" in
-        0.0.0.0|'[::]'|'::') host=127.0.0.1 ;;
-    esac
-    printf 'http://%s:%s/health\n' "$host" "$port"
-}
-
-# Probe the server once with curl or wget.
-probe_health() {
+# Download a URL into an explicit path using an available secure downloader.
+download() {
     url=$1
+    destination=$2
     if command -v curl >/dev/null 2>&1; then
-        [ "$(curl -fsS --max-time 2 "$url" 2>/dev/null || true)" = "ok" ]
+        curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --output "$destination" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        [ "$(wget -qO- -T 2 "$url" 2>/dev/null || true)" = "ok" ]
+        wget --https-only -qO "$destination" "$url"
     else
-        die "curl or wget is required to verify the running service"
+        die 'curl or wget is required to download Henosis'
     fi
 }
 
-# Wait for the real Henosis health endpoint after service startup.
-wait_for_health() {
-    url=$(health_url "$BIND_ADDR")
-    attempt=1
-    while [ "$attempt" -le "$HEALTH_ATTEMPTS" ]; do
-        if probe_health "$url"; then
-            info "health check passed at $url"
-            return
+# Calculate a SHA-256 digest in the standard lowercase hexadecimal representation.
+sha256() {
+    file=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        die 'sha256sum or shasum is required to verify Henosis'
+    fi
+}
+
+# Verify an archive against the release manifest and fail closed on every mismatch.
+verify_archive() {
+    manifest=$1
+    archive=$2
+    name=$3
+    expected=$(awk -v name="$name" '$2 == name || $2 == "*" name { print $1 }' "$manifest")
+    [ "$(printf '%s\n' "$expected" | wc -l | tr -d ' ')" -eq 1 ] || die "checksum manifest has no unique entry for $name"
+    case "$expected" in *[!0-9a-fA-F]*|'') die "checksum manifest contains an invalid checksum for $name" ;; esac
+    [ "${#expected}" -eq 64 ] || die "checksum manifest contains an invalid checksum for $name"
+    actual=$(sha256 "$archive")
+    [ "$actual" = "$expected" ] || die "checksum verification failed for $name"
+}
+
+# Restore the previous installation after a failed transactional activation.
+rollback() {
+    if [ "${ACTIVATED:-0}" -eq 1 ]; then
+        if [ -n "${BACKUP:-}" ] && [ -f "$BACKUP" ]; then
+            mv -f "$BACKUP" "$DESTINATION"
+        else
+            rm -f "$DESTINATION"
         fi
-        sleep 1
-        attempt=$((attempt + 1))
-    done
-    systemctl --user status henosis.service --no-pager >&2 || true
-    die "service did not become healthy at $url"
-}
-
-# Remove only installer-owned temporary build output records.
-cleanup() {
-    restore_terminal
-    if [ -n "$BUILD_LOG" ] && [ -f "$BUILD_LOG" ]; then
-        rm -f "$BUILD_LOG"
     fi
 }
 
-# Execute the ordered installation transaction.
+# Remove only the private temporary workspace created by this installer.
+cleanup() {
+    rollback
+    [ -n "${WORK_DIR:-}" ] && rm -rf "$WORK_DIR"
+}
+
+# Download, verify, activate, and initialize the native release.
 main() {
     parse_args "$@"
-    [ "$(uname -s)" = "Linux" ] || die "this installer currently supports Linux only"
-    command -v openssl >/dev/null 2>&1 || die "openssl is required for secure identity and key generation"
-    validate_single_line "Postgres URL" "$POSTGRES_URL"
-    validate_single_line "install directory" "$INSTALL_DIR"
-    validate_single_line "configuration directory" "$CONFIG_DIR"
-    validate_single_line "data directory" "$DATA_DIR"
-    validate_single_line "service directory" "$SERVICE_DIR"
-    validate_bind_addr
-    case "$LOCAL_POLICY" in
-        0|1) ;;
-        *) die "SYNTHEOS_LOCAL_POLICY must be exactly 1 when enabled" ;;
-    esac
-    if [ "$LOCAL_POLICY" = "1" ] && [ -n "$POSTGRES_URL" ]; then
-        die "--local and Postgres configuration are mutually exclusive"
+    target=$(release_target)
+    archive_name="henosis-${VERSION#v}-${target}.tar.gz"
+    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/henosis-install.XXXXXX") || die 'could not create temporary directory'
+    trap cleanup EXIT HUP INT TERM
+    mkdir -p "$INSTALL_DIR"
+    [ -d "$INSTALL_DIR" ] || die "install directory is not a directory: $INSTALL_DIR"
+    archive="$WORK_DIR/$archive_name"
+    manifest="$WORK_DIR/SHA256SUMS"
+    url_base="${RELEASE_BASE%/}/$VERSION"
+    info "downloading $archive_name"
+    download "$url_base/SHA256SUMS" "$manifest" || die 'could not download checksum manifest'
+    download "$url_base/$archive_name" "$archive" || die "could not download $archive_name"
+    verify_archive "$manifest" "$archive" "$archive_name"
+    tar -xzf "$archive" -C "$WORK_DIR" || die 'could not extract verified archive'
+    candidate="$WORK_DIR/henosis-${VERSION#v}-${target}/henosis"
+    [ -f "$candidate" ] && [ -x "$candidate" ] || die 'verified archive does not contain an executable henosis'
+    DESTINATION="$INSTALL_DIR/henosis"
+    BACKUP="$WORK_DIR/henosis.previous"
+    ACTIVATED=0
+    if [ -f "$DESTINATION" ]; then cp -p "$DESTINATION" "$BACKUP"; fi
+    install -m 755 "$candidate" "$WORK_DIR/henosis.new"
+    mv -f "$WORK_DIR/henosis.new" "$DESTINATION"
+    ACTIVATED=1
+    if ! "$DESTINATION" init --quick; then
+        die 'henosis init --quick failed; restored the previous installation'
     fi
-    validate_local_bind
-    case "$HEALTH_ATTEMPTS" in
-        ''|*[!0-9]*) die "HENOSIS_HEALTH_ATTEMPTS must be a positive integer" ;;
-    esac
-    [ "$HEALTH_ATTEMPTS" -ge 1 ] || die "HENOSIS_HEALTH_ATTEMPTS must be a positive integer"
-
-    INSTALL_DIR=$(prepare_dir "$INSTALL_DIR")
-    CONFIG_DIR=$(prepare_dir "$CONFIG_DIR")
-    chmod 700 "$CONFIG_DIR"
-    env_path="$CONFIG_DIR/henosis.env"
-    state_path="$CONFIG_DIR/install-state"
-    if [ -e "$env_path" ]; then
-        [ -f "$env_path" ] && [ ! -L "$env_path" ] || die "existing configuration is not a regular file"
-        [ -f "$state_path" ] && [ ! -L "$state_path" ] \
-            || die "existing configuration has no trusted installer state; move it aside or use another --config-dir"
-        BIND_ADDR=$(configured_bind_addr "$env_path")
-        DATA_DIR=$(configured_data_dir "$state_path")
-        configured_mode=$(configured_policy_mode "$env_path")
-        if [ "$LOCAL_OPTION" -eq 1 ] && [ "$configured_mode" != "local" ]; then
-            die "existing configuration uses Postgres; choose another --config-dir for --local"
-        fi
-        if [ "$POSTGRES_OPTION" -eq 1 ] && [ "$configured_mode" != "postgres" ]; then
-            die "existing configuration uses local policy; choose another --config-dir for Postgres"
-        fi
-        if [ "$configured_mode" = "local" ]; then
-            LOCAL_POLICY=1
-        else
-            LOCAL_POLICY=0
-        fi
-        validate_single_line "stored data directory" "$DATA_DIR"
-        validate_bind_addr
-        validate_local_bind
-        chmod 600 "$env_path" "$state_path"
-        info "preserving existing configuration and authority secrets"
+    ACTIVATED=0
+    rm -f "$BACKUP"
+    if [ "$HEADLESS" -eq 1 ]; then
+        printf '{"ok":true,"binary":"%s","version":"%s","target":"%s"}\n' "$DESTINATION" "$VERSION" "$target"
     else
-        if [ "$LOCAL_POLICY" != "1" ] && [ -z "$POSTGRES_URL" ]; then
-            prompt_postgres_url
-        fi
-        validate_single_line "Postgres URL" "$POSTGRES_URL"
-        DATA_DIR=$(prepare_dir "$DATA_DIR")
-        if [ "$LOCAL_POLICY" != "1" ]; then
-            check_postgres
-        fi
-        write_initial_env "$env_path"
-        write_install_state "$state_path"
-        info "created private runtime configuration at $env_path"
+        info "installed $DESTINATION"
     fi
-    DATA_DIR=$(prepare_dir "$DATA_DIR")
-    chmod 700 "$DATA_DIR"
-    if [ "$INSTALL_SERVICE" -eq 1 ]; then
-        SERVICE_DIR=$(prepare_dir "$SERVICE_DIR")
-    fi
-
-    if [ -z "$SOURCE_BINARY" ]; then
-        build_server
-    fi
-    install_binary
-    info "installed $INSTALLED_BINARY"
-
-    if [ "$INSTALL_SERVICE" -eq 1 ]; then
-        install_systemd_unit
-        if [ "$START_SERVICE" -eq 1 ]; then
-            systemctl --user enable --now henosis.service
-            wait_for_health
-        else
-            info "service installed but not started (--no-start)"
-        fi
-    else
-        info "service integration skipped (--no-service)"
-        info "run with: set -a; . $env_path; set +a; $INSTALLED_BINARY"
-    fi
-
-    info "installation complete"
 }
 
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 main "$@"

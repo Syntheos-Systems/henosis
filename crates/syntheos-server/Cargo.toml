@@ -1,11 +1,15 @@
 [package]
 name = "syntheos-server"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The single HTTP entry point that boots the Henosis foundation."
+
+[[bin]]
+name = "henosis"
+path = "src/main.rs"
 
 [dependencies]
 # The Phase 0 foundation this server wires together.
