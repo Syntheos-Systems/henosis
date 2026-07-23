@@ -467,6 +467,7 @@ impl AuditStore {
 
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_stream_writable_in(&transaction, &outcome.tenant_id)?;
         let existing = load_execution_record(
             &transaction,
             &outcome.tenant_id,
@@ -1871,10 +1872,17 @@ mod tests {
         }
     }
 
-    /// Proves an ambiguous completion persistently blocks later audit appends.
+    /// Proves an ambiguous completion persistently blocks later audit appends and outcomes.
     #[test]
     fn ambiguous_completion_blocks_stream() {
         let store = AuditStore::open_in_memory().unwrap();
+        let key = "blocked-completion";
+        let claim = store
+            .claim_execution(input(AuditPhase::Intent, key))
+            .unwrap();
+        assert!(matches!(claim, ExecutionClaim::Acquired(_)));
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 1);
+
         store
             .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
             .unwrap();
@@ -1886,6 +1894,18 @@ mod tests {
             store.append(input(AuditPhase::Intent, "blocked")),
             Err(AuditError::StreamBlocked { .. })
         ));
+        assert!(matches!(
+            store.complete_execution(input(AuditPhase::Outcome, key), json!({"safe": true})),
+            Err(AuditError::StreamBlocked { .. })
+        ));
+
+        let record = store
+            .execution_record("tenant-a", "machine:test", key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExecutionState::Claimed);
+        assert!(record.sanitized_result.is_none());
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 1);
     }
 
     /// Proves production witness clients reject plaintext and credential-bearing URLs.
