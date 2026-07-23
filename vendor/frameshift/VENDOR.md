@@ -3,6 +3,7 @@
 Mode: PRISTINE
 Pin: 1a96331867006d37e5decd1280b4cdb3ae28706f
 Upstream: frameshift
+Content-SHA256: 3a190b5d2d0a3da0f6952e3d0085341fcd9495958c191dd561208a85deca86ed
 Mirror: frameshift-source=crates/frameshift-source
 Mirror: frameshift-orchestrator=crates/frameshift-orchestrator
 

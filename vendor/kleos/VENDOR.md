@@ -3,6 +3,7 @@
 Mode: PATCHED
 Pin: 4c7206bbbc661d936c46ae05a839118e905257d4
 Upstream: kleos
+Content-SHA256: a9d3c07d659df0e44ec2c28f557b679320fde4c1d0999fc713463b30259bd707
 Ref: origin/main
 Mirror: kleos-config=kleos-config
 Mirror: kleos-lib=kleos-lib
@@ -72,9 +73,10 @@ Resolve any rejected hunk by reviewing the upstream change and retaining the doc
 phylaxd behavior only where it remains required. Do not mark the vendor pristine after applying
 the Henosis delta.
 
-## Gate (run on every pull)
+## Gates (run on every pull)
 
 ```
+./scripts/vendor-drift.sh
 cargo check --manifest-path vendor/kleos/Cargo.toml --workspace
 ```
 

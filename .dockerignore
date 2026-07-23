@@ -2,8 +2,15 @@
 .github
 target
 tests
+/data
 *.rlib
 *.sqlite
 .env
+**/.env
 **/.env.production
 containers/secrets
+**/secrets
+*.pem
+*.key
+*.p12
+*.pfx

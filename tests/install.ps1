@@ -24,4 +24,9 @@ Assert-InstallerText "return 'x86_64-pc-windows-msvc'"
 Assert-InstallerText 'ConvertTo-Json -Compress'
 Assert-InstallerText '$uri.Scheme -ne [Uri]::UriSchemeHttps'
 Assert-InstallerText 'without credentials, query, or fragment'
+Assert-InstallerText 'ConvertFrom-Json'
+Assert-InstallerText 'selected release is not immutable'
+Assert-InstallerText "Join-Path `$PSScriptRoot 'HENOSIS_ARCHIVE'"
+Assert-InstallerText "Join-Path `$PSScriptRoot 'henosis.exe'"
+Assert-InstallerText 'release archive marker does not match this installer'
 Write-Output 'Windows installer contract passed'

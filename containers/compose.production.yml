@@ -1,6 +1,6 @@
 services:
   henosis:
-    image: ${HENOSIS_IMAGE:?Set HENOSIS_IMAGE to an immutable Henosis image reference}
+    image: ${HENOSIS_IMAGE_REPOSITORY:?Set HENOSIS_IMAGE_REPOSITORY}@sha256:${HENOSIS_IMAGE_DIGEST:?Set HENOSIS_IMAGE_DIGEST to the 64-character image digest}
     init: true
     user: "10001:10001"
     read_only: true

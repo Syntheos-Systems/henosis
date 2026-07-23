@@ -30,7 +30,8 @@ write_install_readme() {
 This archive contains the native \`henosis\` executable for \`$3\`.
 
 Verify this archive with the release \`SHA256SUMS\` manifest before installing.
-Run \`./install.sh --headless\` from the extracted archive for a per-user verified installation.
+Run \`./install.sh --headless\` from the extracted archive for a per-user offline installation.
+The archive marker binds the installer to the adjacent verified \`henosis\` executable.
 The installer runs \`henosis init --quick\` and rolls back if initialization fails.
 EOF
 }
@@ -55,6 +56,7 @@ mkdir -p "$stage" "$output_directory"
 install -m 755 "$binary_path" "$stage/henosis"
 install -m 755 "$REPOSITORY_DIR/install.sh" "$stage/install.sh"
 install -m 644 "$REPOSITORY_DIR/LICENSE" "$stage/LICENSE"
+printf 'v%s %s\n' "$version" "$target" > "$stage/HENOSIS_ARCHIVE"
 write_install_readme "$stage/README.md" "$version" "$target"
 "$tar_command" --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner -C "$stage_parent" -cf - "$root" | gzip -n > "$archive"
 printf '%s\n' "$archive"

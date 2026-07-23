@@ -37,6 +37,20 @@ function Get-ReleaseBase {
     return $uri.AbsoluteUri.TrimEnd('/')
 }
 
+# Return an absolute HTTPS release metadata API without credentials, query, or fragment.
+function Get-ReleaseApi {
+    $candidate = if ($env:HENOSIS_RELEASE_API) { $env:HENOSIS_RELEASE_API.TrimEnd('/') } else { 'https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne [Uri]::UriSchemeHttps -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment)) {
+        Stop-Install 'HENOSIS_RELEASE_API must be an absolute HTTPS URL without credentials, query, or fragment'
+    }
+    return $uri.AbsoluteUri.TrimEnd('/')
+}
+
 # Return the release target supported by this Windows host.
 function Get-ReleaseTarget {
     if (-not $IsWindows) { Stop-Install 'this installer supports Windows only' }
@@ -45,8 +59,6 @@ function Get-ReleaseTarget {
     }
     return 'x86_64-pc-windows-msvc'
 }
-
-$releaseBase = Get-ReleaseBase
 
 # Return the SHA-256 digest for one file in lowercase hexadecimal form.
 function Get-Sha256 {
@@ -79,8 +91,38 @@ function Get-ReleaseFile {
     Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
 }
 
+# Require the release API document to identify a published immutable release.
+function Assert-ImmutableRelease {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ((Get-Item -LiteralPath $Path).Length -gt 1MB) { Stop-Install 'release metadata exceeds the 1 MiB safety limit' }
+    try { $metadata = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
+    catch { Stop-Install 'release metadata is not valid JSON' }
+    if ($metadata.tag_name -ne $Version) { Stop-Install 'release metadata does not match the selected version' }
+    if ($metadata.draft -ne $false) { Stop-Install 'selected release is not published' }
+    if ($metadata.immutable -ne $true) { Stop-Install 'selected release is not immutable' }
+}
+
+# Resolve the adjacent binary from a verified release archive, when present.
+function Get-ArchiveBinary {
+    param([Parameter(Mandatory = $true)][string]$Target)
+
+    $marker = Join-Path $PSScriptRoot 'HENOSIS_ARCHIVE'
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { return $null }
+    $parts = @((Get-Content -LiteralPath $marker -Raw).Trim() -split '\s+')
+    if ($parts.Count -ne 2 -or $parts[0] -ne $Version -or $parts[1] -ne $Target) {
+        Stop-Install 'release archive marker does not match this installer'
+    }
+    $candidate = Join-Path $PSScriptRoot 'henosis.exe'
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        Stop-Install 'release archive does not contain an adjacent henosis.exe'
+    }
+    return $candidate
+}
+
 # Install the archive transactionally and initialize the binary before committing it.
 function Install-Release {
+    if ($Version -notmatch '^v[0-9][0-9A-Za-z.-]*$') { Stop-Install 'release version must be a valid v-prefixed tag' }
     $target = Get-ReleaseTarget
     $archiveName = "henosis-$($Version.TrimStart('v'))-$target.zip"
     $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("henosis-install-" + [guid]::NewGuid().ToString('N'))
@@ -89,13 +131,21 @@ function Install-Release {
     $activated = $false
     try {
         New-Item -ItemType Directory -Force -Path $workDirectory, $InstallDirectory | Out-Null
-        Get-ReleaseFile -Uri "$releaseBase/$Version/SHA256SUMS" -OutFile (Join-Path $workDirectory 'SHA256SUMS')
-        $archivePath = Join-Path $workDirectory $archiveName
-        Get-ReleaseFile -Uri "$releaseBase/$Version/$archiveName" -OutFile $archivePath
-        Assert-ArchiveChecksum -ManifestPath (Join-Path $workDirectory 'SHA256SUMS') -ArchivePath $archivePath -ArchiveName $archiveName
-        Expand-Archive -LiteralPath $archivePath -DestinationPath $workDirectory -Force
-        $candidate = Join-Path $workDirectory "henosis-$($Version.TrimStart('v'))-$target\\henosis.exe"
-        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { Stop-Install 'verified archive does not contain henosis.exe' }
+        $candidate = Get-ArchiveBinary -Target $target
+        if ($null -eq $candidate) {
+            $releaseBase = Get-ReleaseBase
+            $releaseApi = Get-ReleaseApi
+            $metadataPath = Join-Path $workDirectory 'release.json'
+            Get-ReleaseFile -Uri "$releaseApi/$Version" -OutFile $metadataPath
+            Assert-ImmutableRelease -Path $metadataPath
+            Get-ReleaseFile -Uri "$releaseBase/$Version/SHA256SUMS" -OutFile (Join-Path $workDirectory 'SHA256SUMS')
+            $archivePath = Join-Path $workDirectory $archiveName
+            Get-ReleaseFile -Uri "$releaseBase/$Version/$archiveName" -OutFile $archivePath
+            Assert-ArchiveChecksum -ManifestPath (Join-Path $workDirectory 'SHA256SUMS') -ArchivePath $archivePath -ArchiveName $archiveName
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $workDirectory -Force
+            $candidate = Join-Path $workDirectory "henosis-$($Version.TrimStart('v'))-$target\\henosis.exe"
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { Stop-Install 'verified archive does not contain henosis.exe' }
+        }
         if (Test-Path -LiteralPath $destination -PathType Leaf) { Copy-Item -LiteralPath $destination -Destination $backup -Force }
         Copy-Item -LiteralPath $candidate -Destination $destination -Force
         $activated = $true

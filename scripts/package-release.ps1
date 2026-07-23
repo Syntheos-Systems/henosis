@@ -47,7 +47,8 @@ function Write-InstallReadme {
 This archive contains the native ``henosis.exe`` executable for ``$ReleaseTarget``.
 
 Verify this archive with the release ``SHA256SUMS`` manifest before installing.
-Run ``.\\install.ps1 -Headless`` from the extracted archive for a per-user verified installation.
+Run ``.\\install.ps1 -Headless`` from the extracted archive for a per-user offline installation.
+The archive marker binds the installer to the adjacent verified ``henosis.exe`` executable.
 The installer runs ``henosis init --quick`` and rolls back if initialization fails.
 "@ | Set-Content -LiteralPath $Path -NoNewline -Encoding utf8
 }
@@ -68,6 +69,7 @@ try {
     Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $content 'henosis.exe') -Force
     Copy-Item -LiteralPath $installer -Destination (Join-Path $content 'install.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryDirectory 'LICENSE') -Destination (Join-Path $content 'LICENSE') -Force
+    "v$Version $Target" | Set-Content -LiteralPath (Join-Path $content 'HENOSIS_ARCHIVE') -NoNewline -Encoding ascii
     Write-InstallReadme -Path (Join-Path $content 'README.md') -ReleaseVersion $Version -ReleaseTarget $Target
     $timestamp = [DateTimeOffset]::FromUnixTimeSeconds($SourceDateEpoch)
     Add-Type -AssemblyName System.IO.Compression
@@ -75,7 +77,7 @@ try {
     $stream = [System.IO.File]::Open($archivePath, [System.IO.FileMode]::Create)
     try {
         $archive = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create)
-        try { foreach ($name in @('LICENSE', 'README.md', 'henosis.exe', 'install.ps1')) { Add-ReleaseEntry -Archive $archive -EntryName "$root/$name" -SourcePath (Join-Path $content $name) -Timestamp $timestamp } } finally { $archive.Dispose() }
+        try { foreach ($name in @('HENOSIS_ARCHIVE', 'LICENSE', 'README.md', 'henosis.exe', 'install.ps1')) { Add-ReleaseEntry -Archive $archive -EntryName "$root/$name" -SourcePath (Join-Path $content $name) -Timestamp $timestamp } } finally { $archive.Dispose() }
     } finally { $stream.Dispose() }
 } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Output $archivePath

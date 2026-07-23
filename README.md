@@ -13,22 +13,16 @@ Henosis is built around one rule: an agent action is not complete merely because
 
 ## Public alpha
 
-Native release archives contain one launch executable: `henosis`. The installers select the host platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account, run `henosis init --quick`, and restore the prior executable if initialization fails.
+Native release archives contain one launch executable: `henosis`. The installers select the host
+platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account,
+run `henosis init --quick`, and restore the prior executable if initialization fails.
 
-Unix:
-
-```sh
-curl --fail --location --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Syntheos-Systems/henosis/main/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/Syntheos-Systems/henosis/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Headless
-```
-
-Set `HENOSIS_VERSION` to select a release tag. The alpha reference tag is `v0.1.0-alpha.1`.
+The copy-and-paste installer commands are published only after the first signed release is
+immutable. They pin the reviewed installer script to its full Git commit while selecting the
+release version separately, so a moved tag cannot replace code before verification. Before
+downloading a binary, the installer requires GitHub to report that release as published and
+immutable. Set `HENOSIS_VERSION`, `HENOSIS_RELEASE_BASE`, `HENOSIS_RELEASE_API`, or
+`HENOSIS_INSTALL_DIR` to override installer defaults.
 
 The installer creates private local configuration without asking for or generating a user password. Start the loopback service:
 
@@ -79,18 +73,46 @@ Use `containers/compose.production.yml` only after:
 
 1. Copying `containers/production.env.example` to the ignored `containers/.env.production` file and replacing every placeholder.
 2. Placing a base64-encoded 32-byte audit origin signing key and the witness public key in the ignored `containers/secrets` directory with restrictive permissions.
-3. Pinning `HENOSIS_IMAGE` to an immutable digest and placing the service behind an authenticated TLS reverse proxy.
+3. Copying `HENOSIS_IMAGE_REPOSITORY` and `HENOSIS_IMAGE_DIGEST` from the release
+   `container-image.env` asset.
 4. Choosing the first operator email and password in the bootstrap variables. Remove both bootstrap variables after the first successful start.
 
-The production compose file publishes no host port.
+Start production Compose with the same private environment file for interpolation and service
+configuration:
+
+```sh
+docker compose --env-file containers/.env.production -f containers/compose.production.yml up -d
+```
+
+The image reference always contains `@sha256:`. Docker rejects a missing or malformed digest
+before starting the service. The production compose file publishes no host port.
 
 ## Release verification
 
-Every release publishes platform archives and `SHA256SUMS`. Verify an archive before use:
+Every release publishes platform archives, `SHA256SUMS`, SPDX SBOMs, and Sigstore attestation
+bundles. Verify an archive before use:
 
 ```sh
-sha256sum --check SHA256SUMS
+grep -F '  henosis-0.1.0-alpha.1-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
+  | sha256sum --check
 ```
+
+GitHub also stores OIDC-backed provenance for each archive. The GitHub CLI verifies the artifact,
+repository identity, and release workflow:
+
+```sh
+gh attestation verify henosis-0.1.0-alpha.1-x86_64-unknown-linux-musl.tar.gz \
+  --repo Syntheos-Systems/henosis \
+  --signer-workflow Syntheos-Systems/henosis/.github/workflows/ci.yml
+```
+
+The release workflow accepts only an annotated tag signed by the GhostFrame key recorded in the
+protected `release` environment's `RELEASE_ALLOWED_SIGNERS` variable. The
+`security/release-allowed-signers` file is the public audit copy, not the workflow's trust source.
+The tagged commit must exist on `origin/main`. Before publication, repository release immutability
+must be enabled and an active `v*` tag ruleset must restrict tag creation, updates, and deletion to
+GhostFrame. The workflow compares the exact remote tag object immediately before and after
+publication.
 
 The release workflow builds Linux x86-64 and arm64, macOS Intel and Apple Silicon, and Windows x86-64 archives. It also publishes a Linux amd64/arm64 container image when GitHub package publishing is available.
 

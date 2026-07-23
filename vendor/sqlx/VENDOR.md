@@ -3,6 +3,7 @@
 Mode: OWNED
 Pin: 0.8.6
 Upstream: crates.io:sqlx
+Content-SHA256: fbcfbeb220d0e970c8e126158900f015faeec81d8f1fca40408bccef65181792
 
 This is a vendored, minimally-patched copy of the **sqlx 0.8.6 facade crate** wired into the
 workspace via `[patch.crates-io]` in the root `Cargo.toml`.

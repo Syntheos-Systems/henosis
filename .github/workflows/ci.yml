@@ -54,7 +54,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./tests/install.sh
       - run: ./tests/release-package.sh
+      - run: ./tests/release-trust.sh
       - run: ./tests/container-contract.sh
+      - run: ./tests/vendor-drift.sh
+      - run: ./scripts/vendor-drift.sh --metadata-only
 
   release-package-windows:
     name: Windows release package contract
@@ -67,12 +70,20 @@ jobs:
         run: ./tests/release-package.ps1
 
   release-version:
-    name: Release tag matches binary
+    name: Verify release tag shape
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
       - run: |
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          tag_object="$(git rev-parse "refs/tags/$GITHUB_REF_NAME")"
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          case "$GITHUB_SHA" in "$tag_object"|"$tag_commit") ;; *) exit 1 ;; esac
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
           package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/syntheos-server/Cargo.toml)"
           test -n "$package_version"
           test "$GITHUB_REF_NAME" = "v$package_version"
@@ -113,38 +124,157 @@ jobs:
         run: |
           cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
           & .\scripts\package-release.ps1 -BinaryPath "target\${{ matrix.target }}\release\henosis.exe" -Version $env:GITHUB_REF_NAME.Substring(1) -Target '${{ matrix.target }}' -OutputDirectory dist -SourceDateEpoch ([long](git log -1 --format=%ct))
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with: { name: henosis-${{ matrix.target }}, path: dist/*, if-no-files-found: error }
-
-  container:
-    name: Container linux/amd64,linux/arm64
-    needs: [quality, dependencies, secrets, release-package-contract, release-version]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
-    permissions: { contents: read, packages: write }
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-qemu-action@f7cfeb0f5f9b5f643092424b81cf6e15f73ed401 # v3.6.0
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
-        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ github.token }} }
-      - run: docker buildx build --platform linux/amd64,linux/arm64 --file containers/Dockerfile --tag ghcr.io/${{ github.repository }}:${{ github.ref_name }} --push .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: henosis-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release-publish:
-    name: Publish release
-    needs: [release-build, container]
+    name: Publish attested release
+    needs: [release-build, release-version]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    permissions: { contents: write }
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
+      - name: Reverify release authority
+        env:
+          RELEASE_ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
+        run: |
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          test -n "$RELEASE_ALLOWED_SIGNERS"
+          test "$(cat "$GITHUB_WORKSPACE/security/release-allowed-signers")" = "$RELEASE_ALLOWED_SIGNERS"
+          printf '%s\n' "$RELEASE_ALLOWED_SIGNERS" > "$RUNNER_TEMP/release-allowed-signers"
+          test "$(wc -l < "$RUNNER_TEMP/release-allowed-signers")" -eq 1
+          git config --local gpg.ssh.allowedSignersFile "$RUNNER_TEMP/release-allowed-signers"
+          git verify-tag "$GITHUB_REF_NAME"
+          tag_object="$(git rev-parse "refs/tags/$GITHUB_REF_NAME")"
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          case "$GITHUB_SHA" in "$tag_object"|"$tag_commit") ;; *) exit 1 ;; esac
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
+      - name: Require immutable release policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { pattern: henosis-*, path: release, merge-multiple: true }
-      - run: |
+      - name: Create native checksums
+        run: |
           cd release
           find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 5
-      - env: { GH_TOKEN: ${{ github.token }} }
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release/henosis-${{ github.ref_name }}-source.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest native provenance
+        id: native-provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: release/SHA256SUMS
+      - name: Attest native SBOM
+        id: native-sbom
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: release/SHA256SUMS
+          sbom-path: release/henosis-${{ github.ref_name }}-source.spdx.json
+      - name: Name container image
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and publish container
+        id: container
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: containers/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+      - name: Attest container provenance
+        id: container-provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.container.outputs.digest }}
+          push-to-registry: true
+      - name: Generate container SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.image.outputs.name }}@${{ steps.container.outputs.digest }}
+          format: spdx-json
+          output-file: release/henosis-${{ github.ref_name }}-container.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest container SBOM
+        id: container-sbom
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.container.outputs.digest }}
+          sbom-path: release/henosis-${{ github.ref_name }}-container.spdx.json
+          push-to-registry: true
+      - name: Record immutable container reference
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.container.outputs.digest }}
+        run: |
+          digest="${IMAGE_DIGEST#sha256:}"
+          test "${#digest}" -eq 64
+          case "$digest" in *[!0-9a-f]*) exit 1 ;; esac
+          {
+            printf 'HENOSIS_IMAGE_REPOSITORY=%s\n' "$IMAGE_NAME"
+            printf 'HENOSIS_IMAGE_DIGEST=%s\n' "$digest"
+            printf 'HENOSIS_IMAGE_REFERENCE=%s@sha256:%s\n' "$IMAGE_NAME" "$digest"
+          } > "release/henosis-${GITHUB_REF_NAME}-container-image.env"
+      - name: Add portable attestation bundles
+        env:
+          NATIVE_PROVENANCE: ${{ steps.native-provenance.outputs.bundle-path }}
+          NATIVE_SBOM: ${{ steps.native-sbom.outputs.bundle-path }}
+          CONTAINER_PROVENANCE: ${{ steps.container-provenance.outputs.bundle-path }}
+          CONTAINER_SBOM: ${{ steps.container-sbom.outputs.bundle-path }}
+        run: |
+          cp "$NATIVE_PROVENANCE" "release/henosis-${GITHUB_REF_NAME}-native-provenance.sigstore.json"
+          cp "$NATIVE_SBOM" "release/henosis-${GITHUB_REF_NAME}-native-sbom.sigstore.json"
+          cp "$CONTAINER_PROVENANCE" "release/henosis-${GITHUB_REF_NAME}-container-provenance.sigstore.json"
+          cp "$CONTAINER_SBOM" "release/henosis-${GITHUB_REF_NAME}-container-sbom.sigstore.json"
+      - env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           release_kind=
           case "$GITHUB_REF_NAME" in *-*) release_kind=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" release/* --title "Henosis $GITHUB_REF_NAME" $release_kind --generate-notes
+          verified_tag_object="$(git rev-parse "refs/tags/$GITHUB_REF_NAME")"
+          set -- $(git ls-remote --exit-code --tags origin "refs/tags/$GITHUB_REF_NAME")
+          test "$#" -eq 2
+          test "$1" = "$verified_tag_object"
+          test "$2" = "refs/tags/$GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" release/* --title "Henosis $GITHUB_REF_NAME" \
+            $release_kind --generate-notes --verify-tag
+          set -- $(git ls-remote --exit-code --tags origin "refs/tags/$GITHUB_REF_NAME")
+          test "$#" -eq 2
+          test "$1" = "$verified_tag_object"
+          test "$2" = "refs/tags/$GITHUB_REF_NAME"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .immutable)" = true
