@@ -15,6 +15,9 @@ pub enum PistisError {
     /// A signature did not validate, or a key was malformed.
     #[error("signature invalid: {0}")]
     SignatureInvalid(String),
+    /// A raw room snapshot violated the gate-pinned trust-chain contract.
+    #[error("invalid room state: {0}")]
+    InvalidRoomState(String),
 }
 
 /// The crate's result alias.

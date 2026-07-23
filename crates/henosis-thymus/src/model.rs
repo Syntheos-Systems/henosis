@@ -121,6 +121,8 @@ pub struct Evaluation {
 /// The fields required to record an evaluation. The overall score is computed by the store.
 #[derive(Debug, Clone)]
 pub struct NewEvaluation {
+    /// Tenant the evaluation belongs to.
+    pub tenant: TenantId,
     /// Owner principal (must own the rubric).
     pub principal_id: PrincipalId,
     /// The rubric to score against.
@@ -236,6 +238,7 @@ pub enum DriftType {
     Structural,
 }
 
+/// Storage-token conversion methods for [`DriftType`].
 impl DriftType {
     /// The canonical storage/wire token for this drift type.
     pub fn as_str(&self) -> &'static str {
@@ -277,6 +280,7 @@ pub enum DriftSeverity {
     Critical,
 }
 
+/// Storage-token conversion methods for [`DriftSeverity`].
 impl DriftSeverity {
     /// The canonical storage/wire token for this severity.
     pub fn as_str(&self) -> &'static str {

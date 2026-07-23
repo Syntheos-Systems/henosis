@@ -65,6 +65,7 @@ impl AgentTool for BashTool {
 
         let mut cmd = build_command(&command);
         cmd.current_dir(cwd);
+        restrict_agent_environment(&mut cmd);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
@@ -116,6 +117,11 @@ impl AgentTool for BashTool {
     }
 }
 
+/// Removes credentials that an agent-controlled command must never inherit.
+fn restrict_agent_environment(command: &mut Command) {
+    command.env_remove("PIV_PIN");
+}
+
 #[cfg(target_os = "windows")]
 /// Constructs a Windows command-shell process.
 fn build_command(command: &str) -> Command {
@@ -130,4 +136,20 @@ fn build_command(command: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]);
     cmd
+}
+
+/// Verifies agent shell commands explicitly remove any inherited PIV PIN.
+#[cfg(test)]
+#[test]
+fn agent_shell_removes_piv_pin_from_environment() {
+    use std::ffi::OsStr;
+
+    let mut command = build_command("true");
+    restrict_agent_environment(&mut command);
+    assert!(
+        command
+            .as_std()
+            .get_envs()
+            .any(|(name, value)| name == OsStr::new("PIV_PIN") && value.is_none())
+    );
 }

@@ -18,7 +18,7 @@ use henosis_loom::{
     LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
     StepDef, Workflow,
 };
-use henosis_pistis::{PistisGate, RoomStateSource};
+use henosis_pistis::{PistisGate, RoomStateSource, RoomTrustStore};
 use henosis_plutus::{PlutusGate, PolicyBackend};
 use henosis_rift::{Approver, HumanGate};
 use henosis_soma::{
@@ -150,13 +150,14 @@ pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
     pistis_source: Arc<dyn RoomStateSource>,
+    pistis_trust: Arc<RoomTrustStore>,
     credential_store: Arc<CredentialStore>,
     bus: Arc<AxonBus>,
     human_approver: Arc<dyn Approver>,
     plutus: Arc<dyn PolicyBackend>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     Ok(vec![
-        Box::new(PistisGate::new(pistis_source)),
+        Box::new(PistisGate::new(pistis_source, pistis_trust)),
         // Plutus enforces organization status, RBAC, hard quota, and token-bucket rate limits.
         Box::new(PlutusGate::new(plutus)),
         Box::new(eidolon_gate(policy, thymus)?),
@@ -175,11 +176,12 @@ pub fn public_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
     pistis_source: Arc<dyn RoomStateSource>,
+    pistis_trust: Arc<RoomTrustStore>,
     approvals: Arc<ApprovalStore>,
     plutus: Arc<dyn PolicyBackend>,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     Ok(vec![
-        Box::new(PistisGate::new(pistis_source)),
+        Box::new(PistisGate::new(pistis_source, pistis_trust)),
         Box::new(PlutusGate::new(plutus)),
         Box::new(eidolon_gate(policy, thymus)?),
         Box::new(DurableHumanGate::new(approvals)),
@@ -197,12 +199,14 @@ impl QualitySink for SomaQualitySink {
     /// Apply.
     async fn apply(
         &self,
+        tenant: TenantId,
         agent: PrincipalId,
         quality_score: Option<f64>,
         drift_flags: Option<Vec<String>>,
     ) -> Result<(), String> {
         self.0
             .update_quality(
+                tenant,
                 agent,
                 QualityPatch {
                     quality_score,
@@ -846,10 +850,11 @@ async fn soma_list(
 async fn soma_get(
     State(state): State<AppState>,
     Path(id): Path<PrincipalId>,
+    Query(q): Query<SomaStatsQuery>,
 ) -> Result<Json<AgentPresence>, (StatusCode, String)> {
     state
         .soma
-        .get(id)
+        .get(q.tenant, id)
         .await
         .map_err(soma_error)?
         .map(Json)
@@ -857,8 +862,10 @@ async fn soma_get(
 }
 
 /// Body for [`soma_heartbeat`]: an optional status override riding the liveness signal.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SomaHeartbeatRequest {
+    /// Tenant the agent presence belongs to.
+    pub tenant: TenantId,
     /// When set, the agent's status becomes this value; when absent, `pending`/`offline`
     /// revive to `online` and `error` stays sticky.
     pub status: Option<PresenceStatus>,
@@ -872,15 +879,17 @@ async fn soma_heartbeat(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .soma
-        .heartbeat(id, req.status)
+        .heartbeat(req.tenant, id, req.status)
         .await
         .map(|status| Json(serde_json::json!({ "status": status })))
         .map_err(soma_error)
 }
 
 /// Body for [`soma_quality`]: a partial quality-signal update (at least one field).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SomaQualityRequest {
+    /// Tenant the agent presence belongs to.
+    pub tenant: TenantId,
     /// New quality score.
     pub quality_score: Option<f64>,
     /// Replacement drift-flag set.
@@ -896,6 +905,7 @@ async fn soma_quality(
     state
         .soma
         .update_quality(
+            req.tenant,
             id,
             QualityPatch {
                 quality_score: req.quality_score,
@@ -1408,6 +1418,8 @@ async fn thymus_create_rubric(
 /// Query string asserting the owner principal for Thymus reads.
 #[derive(Debug, Deserialize)]
 pub struct ThymusOwnerQuery {
+    /// The asserted tenant.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
 }
@@ -1419,7 +1431,7 @@ async fn thymus_list_rubrics(
 ) -> Result<Json<Vec<Rubric>>, (StatusCode, String)> {
     state
         .thymus
-        .list_rubrics(q.principal_id)
+        .list_rubrics(q.tenant, q.principal_id)
         .await
         .map(Json)
         .map_err(thymus_error)
@@ -1433,7 +1445,7 @@ async fn thymus_get_rubric(
 ) -> Result<Json<Rubric>, (StatusCode, String)> {
     state
         .thymus
-        .get_rubric(q.principal_id, id)
+        .get_rubric(q.tenant, q.principal_id, id)
         .await
         .map_err(thymus_error)?
         .map(Json)
@@ -1443,6 +1455,8 @@ async fn thymus_get_rubric(
 /// Body for [`thymus_evaluate`].
 #[derive(Debug, Deserialize)]
 pub struct ThymusEvaluate {
+    /// Tenant the evaluation belongs to.
+    pub tenant: TenantId,
     /// Owner principal (must own the rubric).
     pub principal_id: PrincipalId,
     /// The rubric to score against.
@@ -1471,6 +1485,7 @@ async fn thymus_evaluate(
     state
         .thymus
         .evaluate(NewEvaluation {
+            tenant: req.tenant,
             principal_id: req.principal_id,
             rubric_id: req.rubric_id,
             agent: req.agent,
@@ -1489,6 +1504,8 @@ async fn thymus_evaluate(
 /// Query string for [`thymus_list_evaluations`]: the asserted owner plus optional AND-filters.
 #[derive(Debug, Deserialize)]
 pub struct ThymusEvaluationsQuery {
+    /// The asserted tenant.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Only evaluations of this agent.
@@ -1509,6 +1526,7 @@ async fn thymus_list_evaluations(
     state
         .thymus
         .list_evaluations(
+            q.tenant,
             q.principal_id,
             EvaluationFilter {
                 agent: q.agent,
@@ -1530,7 +1548,7 @@ async fn thymus_agent_scores(
 ) -> Result<Json<AgentScores>, (StatusCode, String)> {
     state
         .thymus
-        .agent_scores(q.principal_id, agent)
+        .agent_scores(q.tenant, q.principal_id, agent)
         .await
         .map(Json)
         .map_err(thymus_error)
@@ -1576,6 +1594,8 @@ async fn thymus_record_metric(
 /// Query string for [`thymus_metric_summary`]: one (agent, metric) series.
 #[derive(Debug, Deserialize)]
 pub struct ThymusMetricSummaryQuery {
+    /// The asserted tenant.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// The agent whose series is summarized.
@@ -1591,7 +1611,7 @@ async fn thymus_metric_summary(
 ) -> Result<Json<MetricSummary>, (StatusCode, String)> {
     state
         .thymus
-        .metric_summary(q.principal_id, q.agent, &q.metric)
+        .metric_summary(q.tenant, q.principal_id, q.agent, &q.metric)
         .await
         .map(Json)
         .map_err(thymus_error)
@@ -1640,6 +1660,8 @@ async fn thymus_record_drift(
 /// Query string for [`thymus_list_drift`].
 #[derive(Debug, Deserialize)]
 pub struct ThymusDriftQuery {
+    /// The asserted tenant.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Only events for this agent.
@@ -1655,7 +1677,7 @@ async fn thymus_list_drift(
 ) -> Result<Json<Vec<DriftEvent>>, (StatusCode, String)> {
     state
         .thymus
-        .list_drift_events(q.principal_id, q.agent, q.limit.unwrap_or(100))
+        .list_drift_events(q.tenant, q.principal_id, q.agent, q.limit.unwrap_or(100))
         .await
         .map(Json)
         .map_err(thymus_error)
@@ -1668,7 +1690,7 @@ async fn thymus_stats(
 ) -> Result<Json<ThymusStats>, (StatusCode, String)> {
     state
         .thymus
-        .stats(q.principal_id)
+        .stats(q.tenant, q.principal_id)
         .await
         .map(Json)
         .map_err(thymus_error)
@@ -1678,10 +1700,10 @@ async fn thymus_stats(
 /// Unit tests for this module.
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
-    use syntheos_dispatch::stubs::{stub_gate_chain, EchoExecutor};
+    use syntheos_dispatch::deny::{DenyExecutor, deny_gate_chain};
+    use syntheos_dispatch::stubs::{EchoExecutor, stub_gate_chain};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
@@ -1977,6 +1999,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
             test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
@@ -2004,6 +2027,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus2,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
             test_credential_store(bus2.clone()),
             bus2.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
@@ -2053,6 +2077,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
             test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
@@ -2136,6 +2161,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
             credential_store,
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
@@ -2184,23 +2210,22 @@ mod tests {
         ));
     }
 
-    /// The live Pistis gate passes requests without a capability claim and fails unverifiable
-    /// capability-bearing requests closed before Plutus.
+    /// The live Pistis gate rejects unknown actions and unavailable authority before Plutus.
     #[tokio::test]
-    async fn live_chain_pistis_passes_then_plutus_denies() {
+    async fn live_chain_empty_pistis_authority_denies_before_plutus() {
         use syntheos_contracts::{GateRequest, RequestContext, ToolInvocation};
         use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
-        // MockPolicyBackend::deny_no_org() makes the PlutusGate deny (no org for any tenant),
-        // preserving the test's assertion that the request is denied at the "plutus" gate.
+        // Plutus would deny every request, so a Pistis result proves the request stopped earlier.
         let plutus_backend: Arc<dyn PolicyBackend> =
             Arc::new(henosis_plutus::MockPolicyBackend::deny_no_org());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
             test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
@@ -2224,9 +2249,8 @@ mod tests {
             authority: None,
         };
 
-        // No declared capability -> pistis allows -> the configured Plutus backend denies. The denial landing
-        // at plutus, not pistis, proves the request traversed the real pistis gate.
-        let no_cap = dispatcher
+        // Omitted caller metadata cannot bypass an unknown trusted-policy entry.
+        let unknown_policy = dispatcher
             .dispatch(GateRequest {
                 context: base.clone(),
                 invocation: ToolInvocation {
@@ -2237,24 +2261,24 @@ mod tests {
             })
             .await
             .expect("dispatch");
-        match no_cap {
-            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "plutus"),
-            other => panic!("expected Denied at plutus, got {other:?}"),
+        match unknown_policy {
+            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "pistis"),
+            other => panic!("expected Denied at pistis, got {other:?}"),
         }
 
-        // A declared capability with no materialized room state -> pistis fails closed.
-        let with_cap = dispatcher
+        // A known production action with no materialized room state also fails closed.
+        let unavailable_authority = dispatcher
             .dispatch(GateRequest {
                 context: base,
                 invocation: ToolInvocation {
-                    tool: "synapse".into(),
-                    action: "run".into(),
-                    args: serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
+                    tool: "github".into(),
+                    action: "list_repos".into(),
+                    args: serde_json::json!({}),
                 },
             })
             .await
             .expect("dispatch");
-        match with_cap {
+        match unavailable_authority {
             DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "pistis"),
             other => panic!("expected Denied at pistis, got {other:?}"),
         }
@@ -2705,7 +2729,9 @@ mod tests {
                     .method("POST")
                     .uri(format!("/soma/agents/{agent}/heartbeat"))
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        serde_json::json!({"tenant": tenant}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2723,7 +2749,7 @@ mod tests {
                     .uri(format!("/soma/agents/{agent}/quality"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"quality_score": 0.9}).to_string(),
+                        serde_json::json!({"tenant": tenant, "quality_score": 0.9}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -2734,7 +2760,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/soma/agents/{agent}"))
+                    .uri(format!("/soma/agents/{agent}?tenant={tenant}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2810,6 +2836,7 @@ mod tests {
         let rubric: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
 
         let body = serde_json::json!({
+            "tenant": tenant,
             "principal_id": owner,
             "rubric_id": rubric["id"],
             "agent": agent,
@@ -2839,7 +2866,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/soma/agents/{agent}"))
+                    .uri(format!("/soma/agents/{agent}?tenant={tenant}"))
                     .body(Body::empty())
                     .unwrap(),
             )

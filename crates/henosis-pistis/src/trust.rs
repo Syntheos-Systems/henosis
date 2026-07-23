@@ -10,11 +10,12 @@
 //! 2. Walk attestations targeting the principal in `signed_at` order.
 //! 3. Before each outcome, apply decay toward neutral over elapsed days.
 //! 4. Skip self-attestations.
-//! 5. Effective weight respects a per-attestor cap over a 30-day rolling window.
-//! 6. Asymmetric delta: success raises, failure (harder) lowers, indeterminate
+//! 5. Drop replayed or conflicting attestor-target-event references.
+//! 6. Effective weight respects a per-attestor cap over a 30-day rolling window.
+//! 7. Asymmetric delta: success raises, failure (harder) lowers, indeterminate
 //!    is inert.
-//! 7. After the last outcome, decay to `now`.
-//! 8. Clamp to `[0.0, 1.0]`.
+//! 8. After the last outcome, decay to `now`.
+//! 9. Clamp to `[0.0, 1.0]`.
 
 use std::collections::HashMap;
 
@@ -22,25 +23,51 @@ use syntheos_contracts::PrincipalId;
 use time::{Duration, OffsetDateTime};
 
 use crate::model::{
-    Outcome, OutcomeAttestation, ATTESTOR_CAP, DECAY_RATE_PER_DAY, FAILURE_RATE, NEUTRAL_TRUST,
+    ATTESTOR_CAP, DECAY_RATE_PER_DAY, FAILURE_RATE, NEUTRAL_TRUST, Outcome, OutcomeAttestation,
     SUCCESS_RATE, WEIGHT_NORMALIZATION,
 };
-use crate::room::RoomState;
+use crate::room::VerifiedRoomState;
 
 /// Compute `target`'s trust score from the room's outcome history at `now`.
 ///
 /// Returns `NEUTRAL_TRUST` if the target has no usable history. Pure: identical
 /// inputs always produce identical output; `now` is always supplied by the
 /// caller (never read from the wall clock here).
-pub fn compute_trust(state: &RoomState, target: &PrincipalId, now: OffsetDateTime) -> f64 {
-    let outcomes = match state.outcomes_by_target.get(target) {
+pub fn compute_trust(state: &VerifiedRoomState, target: &PrincipalId, now: OffsetDateTime) -> f64 {
+    let outcomes = match state.outcomes_for(target) {
         Some(v) if !v.is_empty() => v,
         _ => return NEUTRAL_TRUST,
     };
 
-    // Sort by signed_at ascending for deterministic replay without mutating
-    // the underlying storage.
-    let mut sorted: Vec<&OutcomeAttestation> = outcomes.iter().collect();
+    let mut event_counts: HashMap<(PrincipalId, &str), usize> = HashMap::new();
+    for outcome in outcomes {
+        *event_counts
+            .entry((outcome.attestor, outcome.underlying_event_ref.as_str()))
+            .or_default() += 1;
+    }
+
+    // Filter before choosing the replay timeline. An untrusted or replayed
+    // attestation must not affect either score deltas or decay intervals.
+    let mut sorted: Vec<&OutcomeAttestation> = outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome.target == *target
+                && !outcome.is_self_attestation()
+                && outcome.signed_at <= now
+                && event_counts.get(&(outcome.attestor, outcome.underlying_event_ref.as_str()))
+                    == Some(&1)
+                && state
+                    .trusted_admission(&outcome.attestor)
+                    .is_some_and(|admitted| {
+                        outcome
+                            .verify_attestation(state.scope(), &admitted.principal_pubkey)
+                            .is_ok()
+                    })
+        })
+        .collect();
+    if sorted.is_empty() {
+        return NEUTRAL_TRUST;
+    }
     sorted.sort_by_key(|o| o.signed_at);
 
     let mut score: f64 = NEUTRAL_TRUST;
@@ -54,13 +81,7 @@ pub fn compute_trust(state: &RoomState, target: &PrincipalId, now: OffsetDateTim
         apply_decay(&mut score, last_updated, o.signed_at);
         last_updated = o.signed_at;
 
-        // Defense in depth: self-attestations should already be dropped at
-        // receive time, but never rely on that being the only guard.
-        if o.is_self_attestation() {
-            continue;
-        }
-
-        let raw_weight = u32::from(o.clamped_weight());
+        let raw_weight = u32::from(o.weight);
         let window_start = o.signed_at - Duration::days(30);
         let history = attestor_contribution.entry(o.attestor).or_default();
         history.retain(|(t, _)| *t >= window_start);
@@ -103,55 +124,114 @@ fn apply_decay(score: &mut f64, from: OffsetDateTime, to: OffsetDateTime) {
         return;
     }
     let distance = *score - NEUTRAL_TRUST;
-    *score -= distance * DECAY_RATE_PER_DAY * days_elapsed;
+    let progress = (DECAY_RATE_PER_DAY * days_elapsed).min(1.0);
+    *score -= distance * progress;
 }
 
 /// Unit tests for trust scoring, decay, and contribution caps.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AdmittedPrincipal;
-    use crate::room::RoomState;
+    use crate::crypto::SecretKey;
+    use crate::model::{AdmittedPrincipal, OutcomeStatement, RoomPolicy, RoomScope};
+    use crate::room::{RoomState, RoomTrustStore};
+    use std::collections::{BTreeSet, HashMap};
+    use syntheos_contracts::TenantId;
 
-    /// A fresh public key.
-    fn pubkey() -> crate::crypto::PublicKey {
-        crate::crypto::SecretKey::generate().0
+    /// A raw test room, its independent gate trust, and principal signing keys.
+    struct TestRoom {
+        /// Raw source-controlled room snapshot.
+        state: RoomState,
+        /// Independent gate-owned issuer pin.
+        trust: RoomTrustStore,
+        /// Exact scope shared by every signed statement.
+        scope: RoomScope,
+        /// Principal signing keys used by outcome fixtures.
+        keys: HashMap<PrincipalId, SecretKey>,
     }
 
-    /// A room with the listed principals admitted.
-    fn admitted_state(principals: &[PrincipalId]) -> RoomState {
-        let admits = principals
+    /// Verifies test-room snapshots before trust computation.
+    impl TestRoom {
+        /// Produce the only state type accepted by `compute_trust`.
+        fn verified(&self) -> VerifiedRoomState {
+            self.state.verify_for(&self.scope, &self.trust).unwrap()
+        }
+    }
+
+    /// Build a room with independently rooted admissions for the listed principals.
+    fn admitted_state(principals: &[PrincipalId]) -> TestRoom {
+        let scope = RoomScope::new(TenantId::new(), "!trust");
+        let (_, issuer_key) = SecretKey::generate();
+        let (_, root_key) = SecretKey::generate();
+        let mut principals_and_keys = Vec::new();
+        for principal in principals {
+            let (_, principal_key) = SecretKey::generate();
+            principals_and_keys.push((*principal, principal_key));
+        }
+        let admits = principals_and_keys
             .iter()
-            .map(|p| AdmittedPrincipal::new(*p, pubkey(), vec![]))
+            .map(|(principal, key)| {
+                AdmittedPrincipal::new(
+                    scope.clone(),
+                    *principal,
+                    key.public_key(),
+                    &root_key,
+                    vec![],
+                )
+            })
             .collect();
-        RoomState::from_genesis(Default::default(), [pubkey()].into_iter().collect(), admits)
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            1,
+            RoomPolicy::default(),
+            BTreeSet::from([root_key.public_key()]),
+            &issuer_key,
+            admits,
+        )
+        .unwrap();
+        let mut trust = RoomTrustStore::new();
+        trust
+            .pin(scope.clone(), issuer_key.public_key(), 1)
+            .unwrap();
+        TestRoom {
+            state,
+            trust,
+            scope,
+            keys: principals_and_keys.into_iter().collect(),
+        }
     }
 
     /// An outcome attestation with explicit outcome, weight, and timestamp.
     fn outcome(
+        scope: &RoomScope,
         target: PrincipalId,
         attestor: PrincipalId,
         outcome: Outcome,
         weight: u8,
         signed_at: OffsetDateTime,
+        attestor_key: &SecretKey,
     ) -> OutcomeAttestation {
-        OutcomeAttestation {
-            target,
-            attestor,
-            underlying_event_ref: "$evt:host".into(),
-            outcome,
-            weight,
-            context: String::new(),
-            signed_at,
-        }
+        OutcomeAttestation::new(
+            OutcomeStatement {
+                scope: scope.clone(),
+                target,
+                attestor,
+                underlying_event_ref: format!("$evt:{}", signed_at.unix_timestamp_nanos()),
+                outcome,
+                weight,
+                context: String::new(),
+                signed_at,
+            },
+            attestor_key,
+        )
     }
 
     /// No history yields the neutral score.
     #[test]
     fn empty_history_returns_neutral() {
         let target = PrincipalId::new();
-        let s = admitted_state(&[target]);
-        let score = compute_trust(&s, &target, OffsetDateTime::now_utc());
+        let room = admitted_state(&[target]);
+        let score = compute_trust(&room.verified(), &target, OffsetDateTime::now_utc());
         assert!((score - NEUTRAL_TRUST).abs() < 1e-9);
     }
 
@@ -160,9 +240,19 @@ mod tests {
     fn one_success_increases_score() {
         let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[target, attestor]);
-        s.record_outcome(outcome(target, attestor, Outcome::Success, 5, now));
-        assert!(compute_trust(&s, &target, now) > NEUTRAL_TRUST);
+        let mut room = admitted_state(&[target, attestor]);
+        room.state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                5,
+                now,
+                room.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        assert!(compute_trust(&room.verified(), &target, now) > NEUTRAL_TRUST);
     }
 
     /// A single failure lowers the score below neutral.
@@ -170,9 +260,19 @@ mod tests {
     fn one_failure_decreases_score() {
         let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[target, attestor]);
-        s.record_outcome(outcome(target, attestor, Outcome::Failure, 5, now));
-        assert!(compute_trust(&s, &target, now) < NEUTRAL_TRUST);
+        let mut room = admitted_state(&[target, attestor]);
+        room.state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                attestor,
+                Outcome::Failure,
+                5,
+                now,
+                room.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        assert!(compute_trust(&room.verified(), &target, now) < NEUTRAL_TRUST);
     }
 
     /// Failures hurt more than equal-weight successes help (FAILURE_RATE >
@@ -181,12 +281,34 @@ mod tests {
     fn failures_hurt_more_than_successes_help() {
         let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
-        let mut succ = admitted_state(&[target, attestor]);
-        succ.record_outcome(outcome(target, attestor, Outcome::Success, 5, now));
-        let mut fail = admitted_state(&[target, attestor]);
-        fail.record_outcome(outcome(target, attestor, Outcome::Failure, 5, now));
-        let success_delta = compute_trust(&succ, &target, now) - NEUTRAL_TRUST;
-        let failure_delta = NEUTRAL_TRUST - compute_trust(&fail, &target, now);
+        let mut success = admitted_state(&[target, attestor]);
+        success
+            .state
+            .record_outcome(outcome(
+                &success.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                5,
+                now,
+                success.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let mut failure = admitted_state(&[target, attestor]);
+        failure
+            .state
+            .record_outcome(outcome(
+                &failure.scope,
+                target,
+                attestor,
+                Outcome::Failure,
+                5,
+                now,
+                failure.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let success_delta = compute_trust(&success.verified(), &target, now) - NEUTRAL_TRUST;
+        let failure_delta = NEUTRAL_TRUST - compute_trust(&failure.verified(), &target, now);
         assert!(failure_delta > success_delta);
     }
 
@@ -196,11 +318,69 @@ mod tests {
         let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let now = OffsetDateTime::now_utc();
         let then = now - Duration::days(60);
-        let mut s = admitted_state(&[target, attestor]);
-        s.record_outcome(outcome(target, attestor, Outcome::Success, 10, then));
-        let at_event = compute_trust(&s, &target, then);
-        let at_now = compute_trust(&s, &target, now);
+        let mut room = admitted_state(&[target, attestor]);
+        room.state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                10,
+                then,
+                room.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let state = room.verified();
+        let at_event = compute_trust(&state, &target, then);
+        let at_now = compute_trust(&state, &target, now);
         assert!((at_now - NEUTRAL_TRUST).abs() < (at_event - NEUTRAL_TRUST).abs());
+    }
+
+    /// Long decay reaches neutral without crossing to the opposite side.
+    #[test]
+    fn long_decay_never_crosses_neutral() {
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
+        let event_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+        let mut success = admitted_state(&[target, attestor]);
+        success
+            .state
+            .record_outcome(outcome(
+                &success.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                10,
+                event_time,
+                success.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let success_score = compute_trust(
+            &success.verified(),
+            &target,
+            event_time + Duration::days(500),
+        );
+        assert_eq!(success_score, NEUTRAL_TRUST);
+
+        let mut failure = admitted_state(&[target, attestor]);
+        failure
+            .state
+            .record_outcome(outcome(
+                &failure.scope,
+                target,
+                attestor,
+                Outcome::Failure,
+                10,
+                event_time,
+                failure.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let failure_score = compute_trust(
+            &failure.verified(),
+            &target,
+            event_time + Duration::days(500),
+        );
+        assert_eq!(failure_score, NEUTRAL_TRUST);
     }
 
     /// The per-attestor cap bounds a single attestor's contribution: many maxed
@@ -214,31 +394,116 @@ mod tests {
         let mut capped = admitted_state(&[target, attestor]);
         let mut t = base;
         for _ in 0..20 {
-            capped.record_outcome(outcome(target, attestor, Outcome::Success, 10, t));
+            capped
+                .state
+                .record_outcome(outcome(
+                    &capped.scope,
+                    target,
+                    attestor,
+                    Outcome::Success,
+                    10,
+                    t,
+                    capped.keys.get(&attestor).unwrap(),
+                ))
+                .unwrap();
             t += Duration::milliseconds(1);
         }
-        let capped_score = compute_trust(&capped, &target, query);
+        let capped_score = compute_trust(&capped.verified(), &target, query);
 
         let mut single = admitted_state(&[target, attestor]);
-        single.record_outcome(outcome(target, attestor, Outcome::Success, 10, base));
-        let single_score = compute_trust(&single, &target, query);
+        single
+            .state
+            .record_outcome(outcome(
+                &single.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                10,
+                base,
+                single.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let single_score = compute_trust(&single.verified(), &target, query);
 
         assert!(capped_score > single_score);
         assert!(capped_score < 1.0);
     }
 
-    /// A self-attestation pushed directly into storage still moves nothing.
+    /// A self-attestation injected past ingestion cannot become verified state.
     #[test]
-    fn self_attestation_contributes_zero() {
+    fn self_attestation_prevents_verification() {
         let target = PrincipalId::new();
         let now = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[target]);
-        // Bypass record_outcome's drop to prove compute_trust also skips it.
-        s.outcomes_by_target
-            .entry(target)
-            .or_default()
-            .push(outcome(target, target, Outcome::Success, 10, now));
-        assert!((compute_trust(&s, &target, now) - NEUTRAL_TRUST).abs() < 1e-9);
+        let mut room = admitted_state(&[target]);
+        room.state.inject_outcome_for_test(outcome(
+            &room.scope,
+            target,
+            target,
+            Outcome::Success,
+            10,
+            now,
+            room.keys.get(&target).unwrap(),
+        ));
+        assert!(room.state.verify_for(&room.scope, &room.trust).is_err());
+    }
+
+    /// Unadmitted outcomes and admissions under foreign roots are rejected.
+    #[test]
+    fn untrusted_attestors_are_rejected() {
+        let target = PrincipalId::new();
+        let unadmitted = PrincipalId::new();
+        let untrusted = PrincipalId::new();
+        let now = OffsetDateTime::now_utc();
+        let mut room = admitted_state(&[target]);
+        let (_, untrusted_principal_key) = crate::crypto::SecretKey::generate();
+        let (_untrusted_pubkey, untrusted_key) = crate::crypto::SecretKey::generate();
+        assert!(
+            room.state
+                .admit(AdmittedPrincipal::new(
+                    room.scope.clone(),
+                    untrusted,
+                    untrusted_principal_key.public_key(),
+                    &untrusted_key,
+                    vec![],
+                ))
+                .is_err()
+        );
+        assert!(
+            room.state
+                .record_outcome(outcome(
+                    &room.scope,
+                    target,
+                    unadmitted,
+                    Outcome::Success,
+                    10,
+                    now,
+                    &untrusted_key,
+                ))
+                .is_err()
+        );
+        assert_eq!(compute_trust(&room.verified(), &target, now), NEUTRAL_TRUST);
+    }
+
+    /// A future-dated attestation has no effect before its signed instant.
+    #[test]
+    fn future_attestation_does_not_affect_current_trust() {
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut room = admitted_state(&[target, attestor]);
+        room.state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                10,
+                now + Duration::days(1),
+                room.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let state = room.verified();
+        assert_eq!(compute_trust(&state, &target, now), NEUTRAL_TRUST);
+        assert!(compute_trust(&state, &target, now + Duration::days(1)) > NEUTRAL_TRUST);
     }
 
     /// The computation is deterministic across repeated runs.
@@ -246,10 +511,79 @@ mod tests {
     fn deterministic_across_runs() {
         let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
         let t = OffsetDateTime::now_utc();
-        let mut s = admitted_state(&[target, attestor]);
-        s.record_outcome(outcome(target, attestor, Outcome::Success, 5, t));
-        let a = compute_trust(&s, &target, t);
-        let b = compute_trust(&s, &target, t);
+        let mut room = admitted_state(&[target, attestor]);
+        room.state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                attestor,
+                Outcome::Success,
+                5,
+                t,
+                room.keys.get(&attestor).unwrap(),
+            ))
+            .unwrap();
+        let state = room.verified();
+        let a = compute_trust(&state, &target, t);
+        let b = compute_trust(&state, &target, t);
         assert!((a - b).abs() < f64::EPSILON);
+    }
+
+    /// Full-chain verification rejects a forged outcome injected past ingestion.
+    #[test]
+    fn forged_attestation_prevents_verification() {
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
+        let now = OffsetDateTime::now_utc();
+        let mut room = admitted_state(&[target, attestor]);
+        let (_wrong_pubkey, wrong_key) = SecretKey::generate();
+        room.state.inject_outcome_for_test(outcome(
+            &room.scope,
+            target,
+            attestor,
+            Outcome::Success,
+            10,
+            now,
+            &wrong_key,
+        ));
+        assert!(room.state.verify_for(&room.scope, &room.trust).is_err());
+
+        let mut clean_room = admitted_state(&[target, attestor]);
+        let mut tampered = outcome(
+            &clean_room.scope,
+            target,
+            attestor,
+            Outcome::Success,
+            10,
+            now,
+            clean_room.keys.get(&attestor).unwrap(),
+        );
+        tampered.underlying_event_ref.push_str("-forged");
+        clean_room.state.inject_outcome_for_test(tampered);
+        assert!(
+            clean_room
+                .state
+                .verify_for(&clean_room.scope, &clean_room.trust)
+                .is_err()
+        );
+    }
+
+    /// Full-chain verification rejects every ambiguously replayed event.
+    #[test]
+    fn replayed_attestation_prevents_verification() {
+        let (target, attestor) = (PrincipalId::new(), PrincipalId::new());
+        let now = OffsetDateTime::now_utc();
+        let mut room = admitted_state(&[target, attestor]);
+        let signed = outcome(
+            &room.scope,
+            target,
+            attestor,
+            Outcome::Success,
+            10,
+            now,
+            room.keys.get(&attestor).unwrap(),
+        );
+        room.state.inject_outcome_for_test(signed.clone());
+        room.state.inject_outcome_for_test(signed);
+        assert!(room.state.verify_for(&room.scope, &room.trust).is_err());
     }
 }

@@ -3,6 +3,7 @@
 //! OAuth tokens come from OpenCode's auth.json and start with `sk-ant-oat01-`.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -243,11 +244,13 @@ impl AnthropicAuth {
 /// Sends chat requests to Anthropic or an Anthropic-compatible proxy.
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    auth: tokio::sync::RwLock<AnthropicAuth>,
+    auth: Arc<tokio::sync::RwLock<AnthropicAuth>>,
     /// Custom base URL for proxies (e.g. Foundry). None = api.anthropic.com.
     base_url: Option<String>,
     /// Strip eager_input_streaming from tool definitions (Foundry compatibility).
     strip_eager_streaming: bool,
+    /// OAuth token endpoint used to refresh expiring access tokens.
+    token_url: String,
 }
 
 /// Provides constructors, endpoint selection, and authentication helpers.
@@ -256,9 +259,10 @@ impl AnthropicProvider {
     pub fn new(client: reqwest::Client, api_key: String) -> Self {
         Self {
             client,
-            auth: tokio::sync::RwLock::new(AnthropicAuth::from_token(api_key)),
+            auth: Arc::new(tokio::sync::RwLock::new(AnthropicAuth::from_token(api_key))),
             base_url: None,
             strip_eager_streaming: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -271,13 +275,14 @@ impl AnthropicProvider {
     ) -> Self {
         Self {
             client,
-            auth: tokio::sync::RwLock::new(AnthropicAuth::OAuth {
+            auth: Arc::new(tokio::sync::RwLock::new(AnthropicAuth::OAuth {
                 access_token,
                 refresh_token,
                 expires_ms,
-            }),
+            })),
             base_url: None,
             strip_eager_streaming: false,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -285,9 +290,10 @@ impl AnthropicProvider {
     pub fn new_foundry(client: reqwest::Client, base_url: String, token: String) -> Self {
         Self {
             client,
-            auth: tokio::sync::RwLock::new(AnthropicAuth::Bearer(token)),
+            auth: Arc::new(tokio::sync::RwLock::new(AnthropicAuth::Bearer(token))),
             base_url: Some(base_url),
             strip_eager_streaming: true,
+            token_url: ANTHROPIC_TOKEN_URL.to_string(),
         }
     }
 
@@ -330,53 +336,71 @@ impl AnthropicProvider {
 
     /// Refresh the OAuth token if expired.
     async fn maybe_refresh(&self) -> Result<()> {
-        let needs_refresh = {
-            let auth = self.auth.read().await;
-            auth.is_expired()
-        };
+        maybe_refresh_auth(&self.client, &self.auth, &self.token_url).await
+    }
+}
 
-        if !needs_refresh {
-            return Ok(());
-        }
+/// Refreshes shared OAuth state before a request snapshots its bearer token.
+async fn maybe_refresh_auth(
+    client: &reqwest::Client,
+    auth: &tokio::sync::RwLock<AnthropicAuth>,
+    token_url: &str,
+) -> Result<()> {
+    let needs_refresh = {
+        let auth = auth.read().await;
+        auth.is_expired()
+    };
 
-        let mut auth = self.auth.write().await;
-        // Double-check after acquiring write lock
-        if !auth.is_expired() {
-            return Ok(());
-        }
+    if !needs_refresh {
+        return Ok(());
+    }
 
-        if let AnthropicAuth::OAuth {
-            refresh_token: Some(ref refresh),
+    let mut auth = auth.write().await;
+    // Double-check after acquiring the write lock.
+    if !auth.is_expired() {
+        return Ok(());
+    }
+
+    let refresh = match &*auth {
+        AnthropicAuth::OAuth {
+            refresh_token: Some(refresh),
             ..
-        } = *auth
-        {
-            log::info!("refreshing expired Anthropic OAuth token");
-            match refresh_anthropic_token(&self.client, refresh).await {
-                Ok((new_access, new_expires)) => {
-                    *auth = AnthropicAuth::OAuth {
-                        access_token: new_access,
-                        refresh_token: Some(refresh.clone()),
-                        expires_ms: new_expires,
-                    };
-                }
-                Err(e) => {
-                    log::warn!("failed to refresh Anthropic OAuth token: {e}");
-                    // Try to re-read from OpenCode auth.json as fallback
-                    if let Some((access, refresh_tok, expires)) = load_opencode_anthropic_token() {
-                        *auth = AnthropicAuth::OAuth {
-                            access_token: access,
-                            refresh_token: Some(refresh_tok),
-                            expires_ms: expires,
-                        };
-                    } else {
-                        return Err(e);
-                    }
+        } if !refresh.is_empty() => refresh.clone(),
+        AnthropicAuth::OAuth { .. } => {
+            bail!("Anthropic OAuth access token is expired and no refresh token is configured")
+        }
+        _ => return Ok(()),
+    };
+
+    log::info!("refreshing expired Anthropic OAuth token");
+    match refresh_anthropic_token_at(client, &refresh, token_url).await {
+        Ok((new_access, new_expires)) => {
+            *auth = AnthropicAuth::OAuth {
+                access_token: new_access,
+                refresh_token: Some(refresh),
+                expires_ms: new_expires,
+            };
+        }
+        Err(e) => {
+            log::warn!("failed to refresh Anthropic OAuth token: {e}");
+            // Re-read a token only if it is still usable. Replacing a stale bearer
+            // token with a second stale bearer token would silently defeat fail-closed auth.
+            if let Some((access, refresh_token, expires_ms)) = load_opencode_anthropic_token() {
+                let replacement = AnthropicAuth::OAuth {
+                    access_token: access,
+                    refresh_token: Some(refresh_token),
+                    expires_ms,
+                };
+                if !replacement.is_expired() {
+                    *auth = replacement;
+                    return Ok(());
                 }
             }
+            return Err(e.context("Anthropic OAuth token refresh failed with no usable fallback"));
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 /// Implements synchronous and streaming chat requests for Anthropic.
@@ -416,36 +440,9 @@ impl Provider for AnthropicProvider {
         request: &ChatRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
         let client = self.client.clone();
-        // Snapshot auth state before entering the stream.
-        let (auth_header_name, auth_header_value, is_oauth) = {
-            let auth = self.auth.try_read();
-            match auth {
-                Ok(guard) => match &*guard {
-                    AnthropicAuth::ApiKey(key) => ("x-api-key".to_string(), key.clone(), false),
-                    AnthropicAuth::OAuth { access_token, .. } => (
-                        "Authorization".to_string(),
-                        format!("Bearer {access_token}"),
-                        true,
-                    ),
-                    AnthropicAuth::Bearer(token) => (
-                        "Authorization".to_string(),
-                        format!("Bearer {token}"),
-                        false,
-                    ),
-                },
-                Err(_) => {
-                    log::warn!("auth lock contention in send_streaming, falling back to empty key");
-                    ("x-api-key".to_string(), String::new(), false)
-                }
-            }
-        };
-        let url = if let Some(ref base) = self.base_url {
-            format!("{}/messages", base.trim_end_matches('/'))
-        } else if is_oauth {
-            BASE_URL_OAUTH.to_string()
-        } else {
-            BASE_URL.to_string()
-        };
+        let auth = Arc::clone(&self.auth);
+        let token_url = self.token_url.clone();
+        let base_url = self.base_url.clone();
 
         let mut req_owned = request.clone();
         if self.strip_eager_streaming {
@@ -463,6 +460,36 @@ impl Provider for AnthropicProvider {
         }
 
         Box::pin(stream! {
+            if let Err(error) = maybe_refresh_auth(&client, &auth, &token_url).await {
+                yield Err(error);
+                return;
+            }
+
+            // Snapshot only after refresh completes so the request cannot carry a stale bearer.
+            let (auth_header_name, auth_header_value, is_oauth) = {
+                let auth = auth.read().await;
+                match &*auth {
+                    AnthropicAuth::ApiKey(key) => ("x-api-key".to_string(), key.clone(), false),
+                    AnthropicAuth::OAuth { access_token, .. } => (
+                        "Authorization".to_string(),
+                        format!("Bearer {access_token}"),
+                        true,
+                    ),
+                    AnthropicAuth::Bearer(token) => (
+                        "Authorization".to_string(),
+                        format!("Bearer {token}"),
+                        false,
+                    ),
+                }
+            };
+            let url = if let Some(base) = base_url.as_deref() {
+                format!("{}/messages", base.trim_end_matches('/'))
+            } else if is_oauth {
+                BASE_URL_OAUTH.to_string()
+            } else {
+                BASE_URL.to_string()
+            };
+
             let body = match serde_json::to_string(&anth_req_owned) {
                 Ok(b) => b,
                 Err(e) => { yield Err(e.into()); return; }
@@ -614,11 +641,12 @@ pub fn load_claude_code_token() -> Option<(String, String, u64)> {
 
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Refresh an Anthropic OAuth token using the refresh token.
+/// Refreshes an Anthropic OAuth token against the supplied token endpoint.
 /// Uses form-encoded POST matching OpenCode's auth plugin format.
-async fn refresh_anthropic_token(
+async fn refresh_anthropic_token_at(
     client: &reqwest::Client,
     refresh_token: &str,
+    token_url: &str,
 ) -> Result<(String, u64)> {
     /// Deserializes the token endpoint fields used after a refresh.
     #[derive(Deserialize)]
@@ -628,7 +656,7 @@ async fn refresh_anthropic_token(
     }
 
     let resp = client
-        .post(ANTHROPIC_TOKEN_URL)
+        .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&[
             ("grant_type", "refresh_token"),
@@ -686,6 +714,60 @@ fn save_refreshed_token(access: &str, refresh: &str, expires_ms: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChatMessage;
+    use futures::StreamExt;
+    use tokio::sync::oneshot;
+
+    /// Captures the HTTP request received by an in-process test server.
+    #[derive(Debug)]
+    struct CapturedRequest {
+        /// Raw request bytes decoded as UTF-8 for header assertions.
+        raw: String,
+    }
+
+    /// Spawns a one-shot HTTP server that captures a request and returns a fixed response.
+    async fn spawn_http_server(
+        content_type: &'static str,
+        response_body: &'static str,
+    ) -> (String, oneshot::Receiver<CapturedRequest>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 8_192];
+            let bytes_read = socket.read(&mut buffer).await.unwrap();
+            let raw = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+            let _ = sender.send(CapturedRequest { raw });
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// Creates a minimal streaming request for provider transport tests.
+    fn streaming_request() -> ChatRequest {
+        ChatRequest {
+            model: "claude-test".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            }],
+            max_tokens: 16,
+            system: None,
+            tools: None,
+            stream: true,
+        }
+    }
 
     /// Verifies cached tokens are included in normalized input usage.
     #[test]
@@ -708,5 +790,50 @@ mod tests {
         assert_eq!(chat.usage.output_tokens, 5);
         assert_eq!(chat.usage.cache_read_tokens, 80);
         assert_eq!(chat.usage.cache_write_tokens, 12);
+    }
+
+    /// Verifies streaming refreshes an expired OAuth bearer before opening the SSE request.
+    #[tokio::test]
+    async fn streaming_refreshes_expired_oauth_before_sending_bearer() {
+        let (token_url, token_request) = spawn_http_server(
+            "application/json",
+            r#"{"access_token":"fresh-access","expires_in":3600}"#,
+        )
+        .await;
+        let (stream_url, stream_request) = spawn_http_server(
+            "text/event-stream",
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"fresh\"}}\n\n",
+        )
+        .await;
+        let mut provider = AnthropicProvider::new_oauth(
+            reqwest::Client::new(),
+            "stale-access".into(),
+            Some("refresh-secret".into()),
+            1,
+        );
+        provider.token_url = token_url;
+        provider.base_url = Some(stream_url);
+
+        let mut stream = provider.send_streaming(&streaming_request());
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::ContentDelta(text) if text == "fresh"
+        ));
+
+        let token_request = token_request.await.unwrap();
+        let stream_request = stream_request.await.unwrap();
+        assert!(token_request.raw.contains("refresh_token=refresh-secret"));
+        assert!(stream_request.raw.contains("Bearer fresh-access"));
+        assert!(!stream_request.raw.contains("Bearer stale-access"));
+    }
+
+    /// Verifies an expired OAuth token without refresh credentials never opens a stream.
+    #[tokio::test]
+    async fn streaming_rejects_expired_oauth_without_refresh_token() {
+        let provider =
+            AnthropicProvider::new_oauth(reqwest::Client::new(), "stale-access".into(), None, 1);
+        let mut stream = provider.send_streaming(&streaming_request());
+        let error = stream.next().await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("no refresh token"));
     }
 }

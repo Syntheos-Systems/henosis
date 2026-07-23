@@ -10,6 +10,18 @@ use synapse_core::{SessionSnapshot, SessionStatus};
 
 use crate::app::{AppState, Line};
 
+/// Replaces terminal-control characters with a visible replacement glyph.
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\u{0000}'..='\u{0008}' | '\u{000B}'..='\u{001F}' | '\u{007F}'..='\u{009F}' => {
+                '\u{FFFD}'
+            }
+            _ => character,
+        })
+        .collect()
+}
+
 /// Status glyph + color for the session rail.
 fn glyph(status: &SessionStatus) -> (&'static str, Color) {
     match status {
@@ -41,6 +53,7 @@ fn line_to_tlines(line: &Line) -> Vec<TLine<'static>> {
         Line::Error(t) => (Style::default().fg(Color::Red), "", t.as_str()),
         Line::System(t) => (Style::default().fg(Color::Magenta), "", t.as_str()),
     };
+    let text = sanitize_terminal_text(text);
     text.split('\n')
         .enumerate()
         .map(|(i, row)| {
@@ -86,12 +99,13 @@ pub fn render(frame: &mut Frame, app: &AppState) {
     }
 }
 
+/// Renders the rail of active sessions with sanitized metadata.
 fn render_rail(frame: &mut Frame, area: Rect, app: &AppState, snaps: &[SessionSnapshot]) {
     let mut lines: Vec<TLine> = Vec::new();
     for s in snaps {
         let (g, c) = glyph(&s.status);
         let focused = app.focused == Some(s.id);
-        let label = format!("{g} {} {}", s.id, s.label);
+        let label = sanitize_terminal_text(&format!("{g} {} {}", s.id, s.label));
         let style = if focused {
             Style::default()
                 .fg(c)
@@ -111,6 +125,7 @@ fn render_rail(frame: &mut Frame, area: Rect, app: &AppState, snaps: &[SessionSn
     frame.render_widget(p, area);
 }
 
+/// Renders the focused transcript after sanitizing every transcript line.
 fn render_transcript(frame: &mut Frame, area: Rect, app: &AppState) {
     let mut lines: Vec<TLine> = Vec::new();
     if let Some(buf) = app.focused_transcript() {
@@ -140,6 +155,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(p, area);
 }
 
+/// Renders sanitized focused-session metadata in the status HUD.
 fn render_hud(frame: &mut Frame, area: Rect, app: &AppState, snaps: &[SessionSnapshot]) {
     let text = match app.focused.and_then(|id| snaps.iter().find(|s| s.id == id)) {
         Some(s) => {
@@ -164,16 +180,19 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &AppState, snaps: &[SessionSna
         }
         None => "no session selected".into(),
     };
-    let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("state"));
+    let p = Paragraph::new(sanitize_terminal_text(&text))
+        .block(Block::default().borders(Borders::ALL).title("state"));
     frame.render_widget(p, area);
 }
 
+/// Renders the input line without passing control characters to the terminal.
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
-    let p = Paragraph::new(format!("> {}", app.input))
+    let p = Paragraph::new(sanitize_terminal_text(&format!("> {}", app.input)))
         .block(Block::default().borders(Borders::ALL).title("input"));
     frame.render_widget(p, area);
 }
 
+/// Renders the session browser overlay with sanitized search data.
 fn render_browser(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
     let w = area.width * 7 / 10;
@@ -183,7 +202,7 @@ fn render_browser(frame: &mut Frame, app: &AppState) {
     let rect = Rect::new(x, y, w.max(1), h.max(1));
 
     let mut lines: Vec<TLine> = vec![TLine::from(Span::styled(
-        format!("search: {}", app.browser.query),
+        sanitize_terminal_text(&format!("search: {}", app.browser.query)),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -195,7 +214,7 @@ fn render_browser(frame: &mut Frame, app: &AppState) {
             Style::default()
         };
         lines.push(TLine::from(Span::styled(
-            format!("#{} {}", row.session_id, row.snippet),
+            sanitize_terminal_text(&format!("#{} {}", row.session_id, row.snippet)),
             style,
         )));
     }
@@ -216,6 +235,7 @@ fn render_browser(frame: &mut Frame, app: &AppState) {
     frame.render_widget(p, rect);
 }
 
+/// Tests terminal rendering and terminal-control neutralization.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,23 +245,29 @@ mod tests {
     use std::sync::Arc;
     use synapse_core::SessionManager;
 
+    /// Builds an isolated session manager for render tests.
     fn manager() -> Arc<SessionManager> {
         use synapse_core::cost::PricingTable;
         use synapse_core::types::AgentConfig;
         use synapse_provider::Provider;
         use synapse_tools::ToolRegistry;
+        /// Provides the no-op model backend used by render-only tests.
         struct P;
         #[async_trait::async_trait]
+        /// Implements the provider protocol without performing I/O.
         impl Provider for P {
+            /// Returns the fixed test provider name.
             fn name(&self) -> &str {
                 "stub"
             }
+            /// Rejects unexpected non-streaming provider work.
             async fn send(
                 &self,
                 _r: &synapse_provider::ChatRequest,
             ) -> anyhow::Result<synapse_provider::ChatResponse> {
                 unreachable!()
             }
+            /// Returns an empty streaming response for render-only tests.
             fn send_streaming(
                 &self,
                 _r: &synapse_provider::ChatRequest,
@@ -278,7 +304,7 @@ mod tests {
         )
     }
 
-    /// Flatten the test backend buffer to a single string for substring checks.
+    /// Flattens the test backend buffer to a single string for substring checks.
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
         t.backend()
             .buffer()
@@ -288,6 +314,16 @@ mod tests {
             .collect()
     }
 
+    /// Ensures terminal-control characters cannot pass through the render boundary.
+    #[test]
+    fn terminal_controls_are_neutralized() {
+        assert_eq!(
+            sanitize_terminal_text("safe\x1b[31mtext\u{009B}2J\r"),
+            "safe�[31mtext�2J�"
+        );
+    }
+
+    /// Renders a session label and associated HUD.
     #[test]
     fn renders_session_label_and_hud() {
         let mgr = manager();
@@ -305,6 +341,7 @@ mod tests {
         assert!(text.contains("sessions"), "rail title missing");
     }
 
+    /// Renders the empty state without panicking.
     #[test]
     fn renders_empty_state_without_panic() {
         let app = AppState::new(manager());
@@ -313,6 +350,7 @@ mod tests {
         assert!(buffer_text(&term).contains("no sessions"));
     }
 
+    /// Renders the browser overlay when opened.
     #[test]
     fn renders_browser_overlay_when_open() {
         use crate::app::BrowserRow;
@@ -334,6 +372,7 @@ mod tests {
         assert!(text.contains("#7"), "result row missing");
     }
 
+    /// Keeps the newest transcript rows in the visible viewport.
     #[test]
     fn transcript_auto_scrolls_to_newest_rows() {
         use synapse_core::{AgentEvent, SessionEvent};

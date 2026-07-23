@@ -6,6 +6,21 @@
 use crate::context::ConversationContext;
 use synapse_provider::{ChatMessage, ChatRequest, ContentBlock, Provider, Role};
 
+/// Returns the longest prefix whose UTF-8 encoding fits within `max_bytes`.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &value[..end]
+}
+
 /// Configuration for context compression.
 #[derive(Debug, Clone)]
 pub struct CompressionConfig {
@@ -21,7 +36,9 @@ pub struct CompressionConfig {
     pub summary_max_tokens: u32,
 }
 
+/// Provides the default compression policy.
 impl Default for CompressionConfig {
+    /// Constructs the standard compression configuration.
     fn default() -> Self {
         Self {
             threshold_ratio: 0.5,
@@ -33,6 +50,7 @@ impl Default for CompressionConfig {
     }
 }
 
+/// Provides derived values for a compression configuration.
 impl CompressionConfig {
     /// Token threshold that triggers compression.
     pub fn threshold_tokens(&self) -> usize {
@@ -101,7 +119,7 @@ pub async fn maybe_compress(
                     // Truncate large tool inputs
                     let input_str = input.to_string();
                     let truncated = if input_str.len() > 500 {
-                        format!("{}...", &input_str[..500])
+                        format!("{}...", truncate_utf8(&input_str, 500))
                     } else {
                         input_str
                     };
@@ -113,7 +131,7 @@ pub async fn maybe_compress(
                     let prefix = if *is_error { "ERROR" } else { "Result" };
                     // Truncate large tool results
                     let truncated = if content.len() > 1000 {
-                        format!("{}...", &content[..1000])
+                        format!("{}...", truncate_utf8(content, 1000))
                     } else {
                         content.clone()
                     };
@@ -178,10 +196,12 @@ pub async fn maybe_compress(
     }
 }
 
+/// Tests UTF-8-safe compression helpers and state transitions.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Creates a context with deterministic alternating messages.
     fn make_context(n_messages: usize) -> ConversationContext {
         let mut ctx = ConversationContext::new("system".into(), vec![]);
         for i in 0..n_messages {
@@ -199,6 +219,16 @@ mod tests {
         ctx
     }
 
+    /// Ensures a truncated prefix never splits a UTF-8 code point.
+    #[test]
+    fn truncate_utf8_preserves_code_point_boundaries() {
+        let value = format!("{}🦀tail", "a".repeat(499));
+
+        assert_eq!(truncate_utf8(&value, 500), "a".repeat(499));
+        assert_eq!(truncate_utf8(&value, 503), format!("{}🦀", "a".repeat(499)));
+    }
+
+    /// Verifies compression retains the requested recent messages.
     #[test]
     fn replace_with_summary_preserves_recent() {
         let mut ctx = make_context(10);
@@ -222,6 +252,7 @@ mod tests {
         }
     }
 
+    /// Verifies compression leaves short contexts unchanged.
     #[test]
     fn replace_with_summary_noop_when_few_messages() {
         let mut ctx = make_context(3);
@@ -230,6 +261,7 @@ mod tests {
         assert_eq!(ctx.message_count(), 3);
     }
 
+    /// Verifies threshold computation from the configured context window.
     #[test]
     fn threshold_tokens_calculation() {
         let config = CompressionConfig {

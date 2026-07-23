@@ -389,9 +389,9 @@ pub mod henosis {
     use henosis_pistis::authority::{
         CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities,
     };
-    use henosis_pistis::model::ActionKind;
-    use henosis_pistis::{Clock, RoomStateSource, SystemClock};
-    use syntheos_contracts::PrincipalId;
+    use henosis_pistis::model::{ActionKind, RoomScope};
+    use henosis_pistis::{Clock, RoomStateSource, RoomTrustStore, SystemClock};
+    use syntheos_contracts::{PrincipalId, TenantId};
 
     use super::{AuthorizationOutcome, Capability, PistisAuthority, capability_map};
 
@@ -405,6 +405,10 @@ pub mod henosis {
     pub struct HenosisAuthority {
         /// Where materialized room state is obtained.
         source: Arc<dyn RoomStateSource>,
+        /// Gate-owned issuer pins and rollback floors.
+        trust_store: Arc<RoomTrustStore>,
+        /// Tenant whose exact room scope governs this session.
+        tenant: TenantId,
         /// The principal whose admission/trust/capabilities are checked.
         principal: PrincipalId,
         /// The room whose authority state governs this session.
@@ -423,11 +427,15 @@ pub mod henosis {
         /// system clock and [`ActionKind::Message`].
         pub fn new(
             source: Arc<dyn RoomStateSource>,
+            trust_store: Arc<RoomTrustStore>,
+            tenant: TenantId,
             principal: PrincipalId,
             room: impl Into<String>,
         ) -> Self {
             Self {
                 source,
+                trust_store,
+                tenant,
                 principal,
                 room: room.into(),
                 clock: Arc::new(SystemClock),
@@ -463,11 +471,20 @@ pub mod henosis {
                 ));
             };
 
-            let Some(state) = self.source.room_state(&self.room) else {
+            let scope = RoomScope::new(self.tenant, &self.room);
+            let Some(state) = self.source.room_state(&scope) else {
                 return AuthorizationOutcome::Deny(format!(
-                    "no pistis authority state for room {}",
+                    "no pistis authority state for requested tenant and room {}",
                     self.room
                 ));
+            };
+            let verified = match state.verify_for(&scope, &self.trust_store) {
+                Ok(state) => state,
+                Err(error) => {
+                    return AuthorizationOutcome::Deny(format!(
+                        "pistis authority state failed verification: {error}"
+                    ));
+                }
             };
 
             let request = CapabilityCheckRequest {
@@ -481,7 +498,7 @@ pub mod henosis {
                     .collect(),
             };
 
-            let decision = authorize_capabilities(&state, &request, self.clock.now());
+            let decision = authorize_capabilities(&verified, &request, self.clock.now());
             if decision.allowed {
                 AuthorizationOutcome::Allow
             } else {
@@ -642,13 +659,13 @@ mod henosis_tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use henosis_pistis::crypto::{PublicKey, SecretKey};
+    use henosis_pistis::crypto::SecretKey;
     use henosis_pistis::gate::{Clock, InMemoryRoomStateSource};
     use henosis_pistis::model::{
-        ActionKind, AdmittedPrincipal, Capability as PCapability, RoomPolicy,
+        ActionKind, AdmittedPrincipal, Capability as PCapability, RoomPolicy, RoomScope,
     };
-    use henosis_pistis::room::RoomState;
-    use syntheos_contracts::PrincipalId;
+    use henosis_pistis::room::{RoomState, RoomTrustStore};
+    use syntheos_contracts::{PrincipalId, TenantId};
     use time::OffsetDateTime;
 
     /// A fixed clock so the trust math is deterministic.
@@ -661,37 +678,48 @@ mod henosis_tests {
         }
     }
 
-    /// A fresh public key.
-    fn pubkey() -> PublicKey {
-        SecretKey::generate().0
-    }
-
     /// A room admitting `principal` holding the synapse `fs_read` and `bash`
     /// capabilities under `ActionKind::Message`.
-    fn room_with(principal: PrincipalId) -> RoomState {
+    fn room_with(tenant: TenantId, principal: PrincipalId) -> (RoomState, RoomTrustStore) {
+        let scope = RoomScope::new(tenant, "!r");
+        let (_, issuer_key) = SecretKey::generate();
+        let (_, root_key) = SecretKey::generate();
+        let (_, principal_key) = SecretKey::generate();
         let mk = |name: &str| PCapability {
             name: name.to_owned(),
             action_kinds: BTreeSet::from([ActionKind::Message]),
             granted_by: "operator".to_owned(),
             expires_at: None,
         };
-        RoomState::from_genesis(
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            1,
             RoomPolicy::default(),
-            [pubkey()].into_iter().collect(),
+            BTreeSet::from([root_key.public_key()]),
+            &issuer_key,
             vec![AdmittedPrincipal::new(
+                scope.clone(),
                 principal,
-                pubkey(),
+                principal_key.public_key(),
+                &root_key,
                 vec![mk(Capability::FS_READ), mk(Capability::BASH)],
             )],
         )
+        .unwrap();
+        let mut trust = RoomTrustStore::new();
+        trust.pin(scope, issuer_key.public_key(), 1).unwrap();
+        (state, trust)
     }
 
     /// Build a Henosis-backed gate whose room "!r" admits `principal`.
     fn gate_for(principal: PrincipalId) -> PistisGate {
+        let tenant = TenantId::new();
+        let (state, trust) = room_with(tenant, principal);
         let mut source = InMemoryRoomStateSource::new();
-        source.insert("!r", room_with(principal));
-        let authority = HenosisAuthority::new(Arc::new(source), principal, "!r")
-            .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
+        source.insert(state);
+        let authority =
+            HenosisAuthority::new(Arc::new(source), Arc::new(trust), tenant, principal, "!r")
+                .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
         PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate))
     }
 
@@ -732,8 +760,14 @@ mod henosis_tests {
     #[tokio::test]
     async fn henosis_empty_room_state_denies() {
         let p = PrincipalId::new();
-        let authority = HenosisAuthority::new(Arc::new(InMemoryRoomStateSource::new()), p, "!r")
-            .with_clock(Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)));
+        let authority = HenosisAuthority::new(
+            Arc::new(InMemoryRoomStateSource::new()),
+            Arc::new(RoomTrustStore::new()),
+            TenantId::new(),
+            p,
+            "!r",
+        )
+        .with_clock(Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)));
         let gate = PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate));
         let decision = gate
             .before_execute("read", &Value::Null, Path::new("/tmp"))
@@ -749,11 +783,37 @@ mod henosis_tests {
     #[tokio::test]
     async fn henosis_unadmitted_principal_denied() {
         let admitted = PrincipalId::new();
+        let tenant = TenantId::new();
+        let (state, trust) = room_with(tenant, admitted);
         let mut source = InMemoryRoomStateSource::new();
-        source.insert("!r", room_with(admitted));
+        source.insert(state);
         let intruder = PrincipalId::new();
-        let authority = HenosisAuthority::new(Arc::new(source), intruder, "!r")
-            .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
+        let authority =
+            HenosisAuthority::new(Arc::new(source), Arc::new(trust), tenant, intruder, "!r")
+                .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
+        let gate = PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate));
+        let decision = gate
+            .before_execute("read", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+
+    /// The Synapse authority rejects a source snapshot under an unpinned issuer.
+    #[tokio::test]
+    async fn henosis_rejects_source_generated_issuer() {
+        let principal = PrincipalId::new();
+        let tenant = TenantId::new();
+        let (state, _matching_trust) = room_with(tenant, principal);
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert(state);
+        let (_, pinned_issuer) = SecretKey::generate();
+        let mut trust = RoomTrustStore::new();
+        trust
+            .pin(RoomScope::new(tenant, "!r"), pinned_issuer.public_key(), 1)
+            .unwrap();
+        let authority =
+            HenosisAuthority::new(Arc::new(source), Arc::new(trust), tenant, principal, "!r")
+                .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
         let gate = PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate));
         let decision = gate
             .before_execute("read", &Value::Null, Path::new("/tmp"))

@@ -83,6 +83,16 @@ Production requires a managed PostgreSQL authority, protected persistent storage
 
 The full Pistis service is proprietary and is not distributed in this repository. Henosis contains a narrow fail-closed compatibility decision core. Capability-bearing requests remain denied until a deployment supplies trusted room-state integration.
 
+### Integration boundaries
+
+Henosis keeps model selection and capability authorization behind interfaces. Production deployments keep credential brokerage outside those interfaces.
+
+| Boundary | Choices | Deployment contract |
+| --- | --- | --- |
+| Model provider | Anthropic, Ollama, an OpenAI-compatible proxy, OpenCode Zen, OpenAI Codex, Azure OpenAI, Foundry, or Claude Max CLI | Select a provider through `ProviderConfig`. The OpenAI-compatible path supports additional services without a Henosis code change. |
+| Capability authority | Standalone local policy or the feature-gated Henosis room-state adapter | Select an authority through `PistisAuthority`. Restricted tools fail closed when trusted state is absent or invalid. |
+| Proprietary services | `phylaxd` and the full Pistis service | Production credentials require `phylaxd`. Deployments using managed room trust supply trusted room-state integration from the full Pistis service. Neither service ships in this repository. |
+
 Use `containers/compose.production.yml` only after:
 
 1. Copying `containers/production.env.example` to the ignored `containers/.env.production` file and replacing every placeholder.

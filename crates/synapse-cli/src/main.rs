@@ -543,37 +543,6 @@ fn read_line(prompt: &str) -> Option<String> {
     }
 }
 
-/// Resolve PIV_PIN from cred vault if not already in the environment.
-/// Mirrors the zshrc wrapper: `cred exec yubikey piv-pin --env PIV_PIN`.
-fn ensure_piv_pin() {
-    if std::env::var("PIV_PIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
-        return;
-    }
-    let output = std::process::Command::new("cred")
-        .args([
-            "exec",
-            "yubikey",
-            "piv-pin",
-            "--env",
-            "PIV_PIN",
-            "--",
-            "sh",
-            "-c",
-            "echo $PIV_PIN",
-        ])
-        .output();
-    if let Ok(out) = output {
-        let pin = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !pin.is_empty() {
-            unsafe { std::env::set_var("PIV_PIN", &pin) };
-        }
-    }
-}
-
 /// Tighten filesystem permissions on `~/.synapse/` and its known
 /// secrets-bearing files so other users on the host cannot read
 /// transcripts, the SQLite DB, the config (which can hold API keys),
@@ -619,40 +588,10 @@ fn harden_synapse_dir_perms() {
 /// Skip filesystem permission hardening on non-Unix platforms.
 fn harden_synapse_dir_perms() {}
 
-/// Probe the PIV identity at startup and emit a visible warning if the
-/// signer cannot be built. A red warning means no signer at all (Kleos
-/// requests will fall back to KLEOS_API_KEY/phylaxd, which still works but
-/// loses non-repudiation for Broca audit entries). A yellow warning means
-/// the YubiKey wasn't reachable but a file/env key is present.
-///
-/// The YubiKey backend does not expose `not_after`, so this checks signer presence rather than
-/// certificate expiry.
-fn piv_status_warning() {
-    let host = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    match henosis_memory_client::RequestSigner::from_env_or_file(&host, "synapse", "local") {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            eprintln!(
-                "{YELLOW}warning: no PIV identity file/env found -- \
-                 Broca audit entries will be unsigned. \
-                 Run `kleos-cli identity enroll` to fix.{RESET}"
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "{RED}error: PIV signer init failed: {e}.{RESET} \
-                 Kleos requests will use the API key fallback if configured."
-            );
-        }
-    }
-}
-
-/// Build a Kleos client with the same auth cascade as kleos-cli:
-/// PIV YubiKey → KLEOS_API_KEY env → phylaxd bootstrap.
+/// Build a Kleos client with the supported auth cascade: a software identity
+/// key, then KLEOS_API_KEY, then phylaxd bootstrap. It deliberately has no
+/// PIV PIN path because agent tool subprocesses inherit this process environment.
 async fn bootstrap_kleos_client() -> henosis_memory_client::Client {
-    ensure_piv_pin();
     let base_url =
         std::env::var("KLEOS_URL").unwrap_or_else(|_| "http://localhost:4200".to_string());
     let host = hostname::get()
@@ -966,10 +905,6 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var("KLEOS_API_KEY", &kleos_key_cfg);
         }
     }
-
-    // Surface PIV signer status early so the user sees one warning at the
-    // top of the session rather than discovering it mid-tool-call.
-    piv_status_warning();
 
     // Tighten permissions on the persisted state directory so other users
     // on shared machines cannot read transcripts, config, or tokens.
@@ -2997,6 +2932,20 @@ fn assert_openai_codex_provider_aliases_normalize() {
 #[test]
 fn openai_codex_provider_aliases_normalize() {
     assert_openai_codex_provider_aliases_normalize();
+}
+
+/// Prevents future changes from importing a PIV PIN into the agent process.
+#[cfg(test)]
+#[test]
+fn agent_process_never_imports_piv_pin() {
+    let source = include_str!("main.rs");
+    let pin_environment = ["PIV", "PIN"].join("_");
+    let set_pin = format!("set_var(\"{pin_environment}\"");
+    let echo_pin = ["echo $", &pin_environment].concat();
+    let cred_pin_selector = ["\"piv", "-pin\""].concat();
+    assert!(!source.contains(&set_pin));
+    assert!(!source.contains(&echo_pin));
+    assert!(!source.contains(&cred_pin_selector));
 }
 
 /// Covers the small CLI-only OpenAI Codex auth helpers.

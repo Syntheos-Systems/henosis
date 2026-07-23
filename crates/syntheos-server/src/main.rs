@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use henosis_approval::ApprovalStore;
 use henosis_audit::{AuditStore, OriginSigner, WitnessClient, WitnessedAudit};
@@ -20,7 +20,7 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{
     CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor,
 };
-use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
+use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource, RoomTrustStore};
 use henosis_plutus::{LocalPolicyBackend, PlutusStore, PolicyBackend, QuotaTier, Role};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
@@ -33,8 +33,8 @@ use syntheos_server::billing::BillingState;
 use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, InitMode, RunResult};
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{
-    production_router, public_gate_chain, spawn_action_reactor, AppState, HenosisExecutor,
-    SomaQualitySink,
+    AppState, HenosisExecutor, SomaQualitySink, production_router, public_gate_chain,
+    spawn_action_reactor,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -329,11 +329,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // downstream projections required by the kernel definition of done.
     let _action_reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
 
-    // The pistis capability authority is a REAL gate in the pistis slot. Until live Matrix room
-    // materialization lands, its room-state source is empty: a capability-bearing invocation fails
-    // closed (no room state -> deny) while an invocation declaring no capability passes pistis for
-    // the rest of the chain to decide.
+    // The Pistis capability authority is a real gate in the Pistis slot. Until live Matrix room
+    // materialization lands, its room-state source is empty, so every invocation fails closed at
+    // Pistis because no trusted authority state can prove admission and capability.
     let pistis_source: Arc<dyn RoomStateSource> = Arc::new(InMemoryRoomStateSource::new());
+    let pistis_trust = Arc::new(RoomTrustStore::new());
 
     let policy = EidolonPolicy::default();
     let execution_guard = Arc::new(AuditExecutionGuard::new(approvals.clone(), audit.clone()));
@@ -343,6 +343,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 &policy,
                 thymus.clone(),
                 pistis_source,
+                pistis_trust,
                 approvals.clone(),
                 plutus.clone(),
             )?,
@@ -1697,22 +1698,26 @@ mod local_policy_tests {
     #[test]
     fn local_policy_requires_valid_identity() {
         let (_, principal) = local_ids();
-        assert!(validated_local_policy_config(
-            Some("1"),
-            None,
-            "127.0.0.1:8088".parse().unwrap(),
-            None,
-            Some(&principal),
-        )
-        .is_err());
-        assert!(validated_local_policy_config(
-            Some("1"),
-            None,
-            "127.0.0.1:8088".parse().unwrap(),
-            Some("invalid"),
-            Some(&principal),
-        )
-        .is_err());
+        assert!(
+            validated_local_policy_config(
+                Some("1"),
+                None,
+                "127.0.0.1:8088".parse().unwrap(),
+                None,
+                Some(&principal),
+            )
+            .is_err()
+        );
+        assert!(
+            validated_local_policy_config(
+                Some("1"),
+                None,
+                "127.0.0.1:8088".parse().unwrap(),
+                Some("invalid"),
+                Some(&principal),
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1732,7 +1737,7 @@ async fn shutdown_signal() {
     /// Wait for SIGTERM on Unix; an install failure is logged and the arm never resolves.
     #[cfg(unix)]
     async fn sigterm() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => {
                 term.recv().await;

@@ -1,51 +1,48 @@
 //! The `pistis` gate: capability + trust authorization, fail-closed.
 //!
 //! Pistis is the first gate in the canonical dispatcher chain (`pistis ->
-//! plutus -> eidolon -> human -> phylaxd`). It authorizes an invocation that
-//! *declares a capability requirement* against the requesting principal's
-//! admission and trust in the relevant room. An invocation that declares no
-//! capability requirement is not Pistis's concern -- it is allowed for the rest
-//! of the chain to decide, just as the broker gate only acts on its own tool.
+//! plutus -> eidolon -> human -> phylaxd`). It authorizes an invocation against
+//! the requesting principal's admission, trust, and capabilities in the relevant
+//! room.
 //!
-//! Convention: a capability-bearing invocation carries a string `capability`
-//! arg (the requirement name) and a string `action_kind` arg (an [`ActionKind`]
-//! token). The trusted invocation builder sets this requirement rather than the
-//! principal. A malformed requirement -- unknown `action_kind` -- is DENIED.
+//! Requirements come only from a trusted [`ToolActionPolicy`] keyed by the
+//! invocation's tool and action. Invocation arguments are caller-controlled and
+//! never select or suppress the capability check. An unknown tool/action pair is
+//! denied.
 //!
-//! Fail-closed by construction. The only paths to `Allow` are: no capability
-//! requirement declared, or an explicit admitted-and-trusted-and-capable
-//! verdict from [`authorize_capabilities`]. A declared requirement with no room,
-//! or a room with no materialized authority state, is DENIED -- Pistis cannot
-//! verify, so it does not allow. There is NO advisory mode and NO self-approval.
+//! Fail-closed by construction. The only path to `Allow` is an explicit
+//! admitted-and-trusted-and-capable verdict from [`authorize_capabilities`]. An
+//! unknown action, a request with no room, or a room with no materialized
+//! authority state is denied. There is no advisory mode and no self-approval.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest, ToolInvocation};
+use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest};
 use time::OffsetDateTime;
 
-use crate::authority::{authorize_capabilities, CapabilityCheckRequest, CapabilityRequirement};
-use crate::model::ActionKind;
-use crate::room::RoomState;
+use crate::authority::{CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities};
+use crate::model::{ActionKind, RoomScope};
+use crate::room::{RoomState, RoomTrustStore};
 
-/// A source of materialized room state, keyed by room id. The live
+/// A source of materialized room state, keyed by exact tenant and room. The live
 /// implementation materializes the room's signed-event log inside Pistis; tests
 /// supply an in-memory map. `None` means there is no Pistis authority state for
 /// that room (the gate treats this as fail-closed: deny a declared requirement).
 pub trait RoomStateSource: Send + Sync {
-    /// Return the current materialized state for `room`, or `None` if unknown.
-    fn room_state(&self, room: &str) -> Option<RoomState>;
+    /// Return a shared current raw snapshot for `scope`, or `None` if unknown.
+    fn room_state(&self, scope: &RoomScope) -> Option<Arc<RoomState>>;
 }
 
-/// An in-memory [`RoomStateSource`] backed by a room-id map.
+/// An in-memory [`RoomStateSource`] backed by an exact-scope map.
 ///
-/// The default empty source returns `None` for every room, so the gate denies every
-/// capability-bearing request while allowing requests that declare no capability. Deployments
-/// may provide materialized room state.
+/// The default empty source returns `None` for every room, so the gate denies
+/// every canonical action. Deployments may provide materialized room state.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryRoomStateSource {
-    /// Materialized state keyed by room id.
-    rooms: std::collections::HashMap<String, RoomState>,
+    /// Materialized state keyed by exact tenant and room.
+    rooms: HashMap<RoomScope, Arc<RoomState>>,
 }
 
 /// Implements construction and mutation for the in-memory state source.
@@ -55,17 +52,107 @@ impl InMemoryRoomStateSource {
         Self::default()
     }
 
-    /// Insert or replace the materialized state for `room`.
-    pub fn insert(&mut self, room: impl Into<String>, state: RoomState) {
-        self.rooms.insert(room.into(), state);
+    /// Insert or replace a raw snapshot under the scope its manifest claims.
+    pub fn insert(&mut self, state: RoomState) {
+        self.rooms.insert(state.scope().clone(), Arc::new(state));
     }
 }
 
 /// Supplies room state from the in-memory source.
 impl RoomStateSource for InMemoryRoomStateSource {
-    /// Look up the materialized state for `room`.
-    fn room_state(&self, room: &str) -> Option<RoomState> {
-        self.rooms.get(room).cloned()
+    /// Look up the materialized state for an exact tenant and room.
+    fn room_state(&self, scope: &RoomScope) -> Option<Arc<RoomState>> {
+        self.rooms.get(scope).map(Arc::clone)
+    }
+}
+
+/// Trusted capability requirements keyed by an invocation's tool and action.
+///
+/// Policy entries are host-controlled configuration. Invocation arguments never
+/// alter this registry. Missing entries deny by default.
+#[derive(Debug, Clone, Default)]
+pub struct ToolActionPolicy {
+    /// Capability requirements nested under exact tool and action identifiers.
+    requirements: HashMap<String, HashMap<String, Vec<CapabilityRequirement>>>,
+}
+
+/// Builds and queries trusted tool/action capability policy.
+impl ToolActionPolicy {
+    /// Construct an empty policy that denies every action.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct the canonical policy for the production Hermes adapter catalog.
+    pub fn canonical() -> Self {
+        let mut policy = Self::new();
+
+        policy.register("henosis", "probe", "henosis", ActionKind::Message);
+
+        policy.register("gmail", "send", "gmail", ActionKind::Message);
+        policy.register("gmail", "read", "gmail", ActionKind::Message);
+        policy.register("gmail", "search", "gmail", ActionKind::Message);
+        policy.register("gmail", "list_labels", "gmail", ActionKind::Message);
+
+        policy.register("gdrive", "list", "gdrive", ActionKind::Message);
+        policy.register("gdrive", "upload", "gdrive", ActionKind::Commit);
+        policy.register("gdrive", "download", "gdrive", ActionKind::Message);
+        policy.register("gdrive", "get_metadata", "gdrive", ActionKind::Message);
+
+        policy.register("gcal", "list_events", "gcal", ActionKind::Message);
+        policy.register("gcal", "create_event", "gcal", ActionKind::Commit);
+        policy.register("gcal", "update_event", "gcal", ActionKind::Commit);
+        policy.register("gcal", "delete_event", "gcal", ActionKind::Delete);
+
+        policy.register("github", "create_issue", "github", ActionKind::Commit);
+        policy.register("github", "list_issues", "github", ActionKind::Message);
+        policy.register("github", "get_issue", "github", ActionKind::Message);
+        policy.register("github", "create_pr", "github", ActionKind::Commit);
+        policy.register("github", "list_prs", "github", ActionKind::Message);
+        policy.register("github", "merge_pr", "github", ActionKind::Merge);
+        policy.register("github", "search_code", "github", ActionKind::Message);
+        policy.register("github", "list_repos", "github", ActionKind::Message);
+        policy.register("github", "create_webhook", "github", ActionKind::Commit);
+
+        policy.register("slack", "send_message", "slack", ActionKind::Message);
+
+        policy.register("linear", "create_issue", "linear", ActionKind::Commit);
+        policy.register("linear", "list_issues", "linear", ActionKind::Message);
+        policy.register("linear", "update_issue", "linear", ActionKind::Commit);
+        policy.register("linear", "search", "linear", ActionKind::Message);
+        policy.register("linear", "create_webhook", "linear", ActionKind::Commit);
+
+        policy.register("notion", "search", "notion", ActionKind::Message);
+        policy.register("notion", "get_page", "notion", ActionKind::Message);
+        policy.register("notion", "create_page", "notion", ActionKind::Commit);
+        policy.register("notion", "append_blocks", "notion", ActionKind::Commit);
+
+        policy
+    }
+
+    /// Register one capability requirement for an exact tool/action pair.
+    pub fn register(
+        &mut self,
+        tool: impl Into<String>,
+        action: impl Into<String>,
+        capability: impl Into<String>,
+        action_kind: ActionKind,
+    ) {
+        self.requirements.entry(tool.into()).or_default().insert(
+            action.into(),
+            vec![CapabilityRequirement {
+                name: capability.into(),
+                action_kind,
+            }],
+        );
+    }
+
+    /// Return trusted requirements for an exact tool/action pair.
+    pub fn requirements(&self, tool: &str, action: &str) -> Option<&[CapabilityRequirement]> {
+        self.requirements
+            .get(tool)
+            .and_then(|actions| actions.get(action))
+            .map(Vec::as_slice)
     }
 }
 
@@ -91,54 +178,53 @@ impl Clock for SystemClock {
 pub struct PistisGate {
     /// Where the gate obtains materialized room state.
     source: Arc<dyn RoomStateSource>,
+    /// Gate-owned issuer pins and rollback floors.
+    trust_store: Arc<RoomTrustStore>,
+    /// Trusted mapping from tool/action pairs to capability requirements.
+    policy: Arc<ToolActionPolicy>,
     /// The clock that feeds the trust math.
     clock: Arc<dyn Clock>,
 }
 
-/// Implements Pistis gate construction and capability parsing.
+/// Implements Pistis gate construction.
 impl PistisGate {
-    /// Build the gate over a room-state source, using the system clock.
-    pub fn new(source: Arc<dyn RoomStateSource>) -> Self {
+    /// Build the gate over raw room state and independent issuer pins.
+    pub fn new(source: Arc<dyn RoomStateSource>, trust_store: Arc<RoomTrustStore>) -> Self {
         Self {
             source,
+            trust_store,
+            policy: Arc::new(ToolActionPolicy::canonical()),
             clock: Arc::new(SystemClock),
         }
     }
 
-    /// Build the gate with an explicit clock (for deterministic tests).
-    pub fn with_clock(source: Arc<dyn RoomStateSource>, clock: Arc<dyn Clock>) -> Self {
-        Self { source, clock }
+    /// Build the gate with independent issuer pins and an explicit clock.
+    pub fn with_clock(
+        source: Arc<dyn RoomStateSource>,
+        trust_store: Arc<RoomTrustStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            source,
+            trust_store,
+            policy: Arc::new(ToolActionPolicy::canonical()),
+            clock,
+        }
     }
 
-    /// Pull a required string field from the invocation args.
-    fn arg_str<'a>(invocation: &'a ToolInvocation, key: &str) -> Option<&'a str> {
-        invocation.args.get(key).and_then(|v| v.as_str())
-    }
-
-    /// Extract the declared capability requirement, if any.
-    ///
-    /// Returns `Ok(None)` when no `capability` arg is present (nothing to
-    /// enforce), `Ok(Some(req))` for a well-formed requirement, and `Err(reason)`
-    /// when a `capability` is declared but its `action_kind` is missing or
-    /// unknown (a malformed requirement, which the caller denies).
-    fn required_capability(
-        invocation: &ToolInvocation,
-    ) -> std::result::Result<Option<CapabilityRequirement>, String> {
-        let Some(name) = Self::arg_str(invocation, "capability") else {
-            return Ok(None);
-        };
-        let Some(kind_token) = Self::arg_str(invocation, "action_kind") else {
-            return Err(format!(
-                "capability '{name}' declared without an 'action_kind' arg"
-            ));
-        };
-        let Some(action_kind) = ActionKind::parse(kind_token) else {
-            return Err(format!("unknown action_kind '{kind_token}'"));
-        };
-        Ok(Some(CapabilityRequirement {
-            name: name.to_owned(),
-            action_kind,
-        }))
+    /// Build the gate with explicit trusted policy and clock.
+    pub fn with_policy_and_clock(
+        source: Arc<dyn RoomStateSource>,
+        trust_store: Arc<RoomTrustStore>,
+        policy: Arc<ToolActionPolicy>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            source,
+            trust_store,
+            policy,
+            clock,
+        }
     }
 }
 
@@ -150,39 +236,48 @@ impl Gate for PistisGate {
         "pistis"
     }
 
-    /// Authorize a capability-bearing invocation; allow one that declares no
-    /// requirement; deny a malformed or unverifiable one.
+    /// Authorize requirements derived from trusted tool policy.
     async fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
-        // What capability does this invocation require, if any?
-        let requirement = match Self::required_capability(&req.invocation) {
-            Ok(Some(r)) => r,
-            // No capability requirement -- not Pistis's concern.
-            Ok(None) => return Ok(GateDecision::Allow),
-            Err(reason) => return Ok(GateDecision::Deny { reason }),
-        };
-
-        // A capability is required, so the request must be evaluable: it needs a
-        // room, and that room needs materialized authority state. Either gap is
-        // a fail-closed denial.
-        let Some(room) = req.context.room.as_deref() else {
+        let Some(requirements) = self
+            .policy
+            .requirements(&req.invocation.tool, &req.invocation.action)
+        else {
             return Ok(GateDecision::Deny {
                 reason: format!(
-                    "capability '{}' required but request carries no room",
-                    requirement.name
+                    "no pistis capability policy for {}.{}",
+                    req.invocation.tool, req.invocation.action
                 ),
             });
         };
-        let Some(state) = self.source.room_state(room) else {
+
+        let Some(room) = req.context.room.as_deref() else {
             return Ok(GateDecision::Deny {
-                reason: format!("no pistis authority state for room {room}"),
+                reason: format!(
+                    "pistis policy for {}.{} requires a room",
+                    req.invocation.tool, req.invocation.action
+                ),
             });
+        };
+        let scope = RoomScope::new(req.context.tenant, room);
+        let Some(state) = self.source.room_state(&scope) else {
+            return Ok(GateDecision::Deny {
+                reason: format!("no pistis authority state for requested tenant and room {room}"),
+            });
+        };
+        let verified = match state.verify_for(&scope, &self.trust_store) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(GateDecision::Deny {
+                    reason: format!("pistis authority state failed verification: {error}"),
+                });
+            }
         };
 
         let decision = authorize_capabilities(
-            &state,
+            &verified,
             &CapabilityCheckRequest {
                 principal: req.context.principal,
-                required: vec![requirement],
+                required: requirements.to_vec(),
             },
             self.clock.now(),
         );
@@ -203,10 +298,10 @@ impl Gate for PistisGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{PublicKey, SecretKey};
-    use crate::model::{AdmittedPrincipal, Capability, RoomPolicy};
-    use std::collections::{BTreeSet, HashMap};
-    use syntheos_contracts::{PrincipalId, RequestContext, TenantId};
+    use crate::crypto::SecretKey;
+    use crate::model::{AdmittedPrincipal, Capability, RoomPolicy, RoomScope};
+    use std::collections::BTreeSet;
+    use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
 
     /// A fixed clock for deterministic trust evaluation.
     struct FixedClock(OffsetDateTime);
@@ -218,52 +313,69 @@ mod tests {
         }
     }
 
-    /// An in-memory room-state source.
-    #[derive(Default)]
-    struct MapSource(HashMap<String, RoomState>);
-    /// Supplies cloned room state from the test map.
-    impl RoomStateSource for MapSource {
-        /// Returns the configured state for a room.
-        fn room_state(&self, room: &str) -> Option<RoomState> {
-            self.0.get(room).cloned()
-        }
+    /// Return the stable tenant shared by gate fixtures and requests.
+    fn tenant() -> TenantId {
+        "00000000-0000-8000-8000-000000000001".parse().unwrap()
     }
 
-    /// A fresh public key.
-    fn pubkey() -> PublicKey {
-        SecretKey::generate().0
-    }
-
-    /// A room admitting `principal` with a `deploy`/`Deploy` capability.
-    fn room_with(principal: PrincipalId) -> RoomState {
+    /// Build a raw room and independent trust pin for one admitted principal.
+    fn room_with(principal: PrincipalId) -> (RoomState, RoomTrustStore) {
+        let scope = RoomScope::new(tenant(), "!r");
+        let (_, issuer_key) = SecretKey::generate();
+        let (_, root_key) = SecretKey::generate();
+        let (_, principal_key) = SecretKey::generate();
         let cap = Capability {
             name: "deploy".into(),
             action_kinds: BTreeSet::from([ActionKind::Deploy]),
             granted_by: "operator".into(),
             expires_at: None,
         };
-        RoomState::from_genesis(
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            1,
             RoomPolicy::default(),
-            [pubkey()].into_iter().collect(),
-            vec![AdmittedPrincipal::new(principal, pubkey(), vec![cap])],
+            BTreeSet::from([root_key.public_key()]),
+            &issuer_key,
+            vec![AdmittedPrincipal::new(
+                scope.clone(),
+                principal,
+                principal_key.public_key(),
+                &root_key,
+                vec![cap],
+            )],
         )
+        .unwrap();
+        let mut trust = RoomTrustStore::new();
+        trust.pin(scope, issuer_key.public_key(), 1).unwrap();
+        (state, trust)
     }
 
     /// Build a gate whose only known room "!r" admits `principal`.
     fn gate_for(principal: PrincipalId) -> PistisGate {
-        let mut map = MapSource::default();
-        map.0.insert("!r".to_string(), room_with(principal));
-        PistisGate::with_clock(
-            Arc::new(map),
+        let (state, trust) = room_with(principal);
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert(state);
+        let mut policy = ToolActionPolicy::new();
+        policy.register("synapse", "run", "deploy", ActionKind::Deploy);
+        policy.register("synapse", "delete", "delete", ActionKind::Delete);
+        PistisGate::with_policy_and_clock(
+            Arc::new(source),
+            Arc::new(trust),
+            Arc::new(policy),
             Arc::new(FixedClock(OffsetDateTime::now_utc())),
         )
     }
 
     /// Build a gate request.
-    fn request(principal: PrincipalId, room: Option<&str>, args: serde_json::Value) -> GateRequest {
+    fn request(
+        principal: PrincipalId,
+        room: Option<&str>,
+        action: &str,
+        args: serde_json::Value,
+    ) -> GateRequest {
         GateRequest {
             context: RequestContext {
-                tenant: TenantId::new(),
+                tenant: tenant(),
                 principal,
                 persona: None,
                 session: None,
@@ -274,18 +386,18 @@ mod tests {
             },
             invocation: ToolInvocation {
                 tool: "synapse".into(),
-                action: "run".into(),
+                action: action.into(),
                 args,
             },
         }
     }
 
-    /// An invocation declaring no capability requirement is allowed.
+    /// Omitted caller metadata cannot suppress the trusted policy requirement.
     #[tokio::test]
-    async fn no_requirement_allowed() {
+    async fn omitted_metadata_still_authorizes_from_policy() {
         let p = PrincipalId::new();
         let gate = gate_for(p);
-        let req = request(p, Some("!r"), serde_json::json!({}));
+        let req = request(p, Some("!r"), "run", serde_json::json!({}));
         assert_eq!(gate.check(&req).await.unwrap(), GateDecision::Allow);
     }
 
@@ -297,6 +409,7 @@ mod tests {
         let req = request(
             p,
             Some("!r"),
+            "run",
             serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
         );
         assert_eq!(gate.check(&req).await.unwrap(), GateDecision::Allow);
@@ -310,6 +423,7 @@ mod tests {
         let req = request(
             p,
             Some("!r"),
+            "delete",
             serde_json::json!({"capability": "delete", "action_kind": "delete"}),
         );
         assert!(matches!(
@@ -326,6 +440,7 @@ mod tests {
         let req = request(
             p,
             None,
+            "run",
             serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
         );
         assert!(matches!(
@@ -343,6 +458,7 @@ mod tests {
         let req = request(
             p,
             Some("!unknown"),
+            "run",
             serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
         );
         assert!(matches!(
@@ -351,20 +467,64 @@ mod tests {
         ));
     }
 
-    /// A malformed requirement (unknown action_kind) is denied, never allowed.
+    /// A room snapshot from one tenant cannot authorize the same room id in another tenant.
     #[tokio::test]
-    async fn malformed_action_kind_denied() {
+    async fn cross_tenant_room_lookup_is_denied() {
+        let principal = PrincipalId::new();
+        let gate = gate_for(principal);
+        let mut req = request(principal, Some("!r"), "run", serde_json::json!({}));
+        req.context.tenant = TenantId::new();
+        assert!(matches!(
+            gate.check(&req).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    /// Caller-provided metadata cannot change the trusted policy requirement.
+    #[tokio::test]
+    async fn caller_metadata_cannot_override_policy() {
         let p = PrincipalId::new();
         let gate = gate_for(p);
         let req = request(
             p,
             Some("!r"),
-            serde_json::json!({"capability": "deploy", "action_kind": "teleport"}),
+            "run",
+            serde_json::json!({"capability": "delete", "action_kind": "teleport"}),
         );
-        assert!(matches!(
-            gate.check(&req).await.unwrap(),
-            GateDecision::Deny { .. }
-        ));
+        assert_eq!(gate.check(&req).await.unwrap(), GateDecision::Allow);
+    }
+
+    /// An action missing from trusted policy is denied before room lookup.
+    #[tokio::test]
+    async fn unknown_action_policy_denied() {
+        let p = PrincipalId::new();
+        let gate = gate_for(p);
+        let req = request(p, Some("!r"), "unknown", serde_json::json!({}));
+        let decision = gate.check(&req).await.unwrap();
+        assert!(matches!(decision, GateDecision::Deny { .. }));
+    }
+
+    /// The canonical production catalog assigns high-risk actions explicitly.
+    #[test]
+    fn canonical_policy_maps_production_actions() {
+        let policy = ToolActionPolicy::canonical();
+        let merge = [CapabilityRequirement {
+            name: "github".to_owned(),
+            action_kind: ActionKind::Merge,
+        }];
+        let delete = [CapabilityRequirement {
+            name: "gcal".to_owned(),
+            action_kind: ActionKind::Delete,
+        }];
+        assert_eq!(
+            policy.requirements("github", "merge_pr"),
+            Some(merge.as_slice())
+        );
+        assert_eq!(
+            policy.requirements("gcal", "delete_event"),
+            Some(delete.as_slice())
+        );
+        assert!(policy.requirements("github", "unknown").is_none());
     }
 
     /// An unadmitted principal is denied even with a well-formed requirement.
@@ -376,12 +536,67 @@ mod tests {
         let req = request(
             intruder,
             Some("!r"),
+            "run",
             serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
         );
         assert!(matches!(
             gate.check(&req).await.unwrap(),
             GateDecision::Deny { .. }
         ));
+    }
+
+    /// A source-controlled issuer cannot replace the independent gate trust pin.
+    #[tokio::test]
+    async fn source_generated_issuer_is_denied() {
+        let principal = PrincipalId::new();
+        let scope = RoomScope::new(tenant(), "!r");
+        let (_, pinned_issuer) = SecretKey::generate();
+        let (_, source_issuer) = SecretKey::generate();
+        let (_, root_key) = SecretKey::generate();
+        let (_, principal_key) = SecretKey::generate();
+        let capability = Capability {
+            name: "deploy".into(),
+            action_kinds: BTreeSet::from([ActionKind::Deploy]),
+            granted_by: "operator".into(),
+            expires_at: None,
+        };
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            1,
+            RoomPolicy::default(),
+            BTreeSet::from([root_key.public_key()]),
+            &source_issuer,
+            vec![AdmittedPrincipal::new(
+                scope.clone(),
+                principal,
+                principal_key.public_key(),
+                &root_key,
+                vec![capability],
+            )],
+        )
+        .unwrap();
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert(state);
+        let mut trust = RoomTrustStore::new();
+        trust.pin(scope, pinned_issuer.public_key(), 1).unwrap();
+        let mut policy = ToolActionPolicy::new();
+        policy.register("synapse", "run", "deploy", ActionKind::Deploy);
+        let gate = PistisGate::with_policy_and_clock(
+            Arc::new(source),
+            Arc::new(trust),
+            Arc::new(policy),
+            Arc::new(FixedClock(OffsetDateTime::now_utc())),
+        );
+        let decision = gate
+            .check(&request(
+                principal,
+                Some("!r"),
+                "run",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(decision, GateDecision::Deny { .. }));
     }
 
     /// The real gate, in the pistis slot of the canonical chain, denies a
@@ -410,6 +625,7 @@ mod tests {
             .dispatch(request(
                 p,
                 Some("!r"),
+                "delete",
                 serde_json::json!({"capability": "delete", "action_kind": "delete"}),
             ))
             .await
@@ -424,6 +640,7 @@ mod tests {
             .dispatch(request(
                 p,
                 Some("!r"),
+                "run",
                 serde_json::json!({"capability": "deploy", "action_kind": "deploy"}),
             ))
             .await
@@ -436,8 +653,8 @@ mod tests {
 
     /// Security invariant: an unavailable backing authority must
     /// produce a `Deny`, never an `Allow`. Property: for any principal, room,
-    /// capability name, and (well-formed) action kind, a capability-bearing
-    /// request evaluated against an *empty* room-state source -- the authority
+    /// arbitrary caller metadata, a request evaluated against an *empty*
+    /// room-state source -- the authority
     /// has no state to verify against -- never returns `Allow`.
     use proptest::prelude::*;
 
@@ -455,13 +672,18 @@ mod tests {
             room in "![a-z]{1,10}",
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            let gate = PistisGate::with_clock(
+            let mut policy = ToolActionPolicy::new();
+            policy.register("synapse", "run", "deploy", ActionKind::Deploy);
+            let gate = PistisGate::with_policy_and_clock(
                 Arc::new(InMemoryRoomStateSource::new()),
+                Arc::new(RoomTrustStore::new()),
+                Arc::new(policy),
                 Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)),
             );
             let req = request(
                 PrincipalId::new(),
                 Some(&room),
+                "run",
                 serde_json::json!({"capability": name, "action_kind": kind}),
             );
             let decision = rt.block_on(gate.check(&req)).expect("gate check is total");

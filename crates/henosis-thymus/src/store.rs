@@ -44,6 +44,7 @@ pub trait QualitySink: Send + Sync {
     /// Apply a quality update for `agent`: a new rolling score and/or replacement drift flags.
     async fn apply(
         &self,
+        tenant: TenantId,
         agent: PrincipalId,
         quality_score: Option<f64>,
         drift_flags: Option<Vec<String>>,
@@ -332,13 +333,19 @@ impl ThymusStore {
     /// Propagate to the sink, fire-and-forget (a failure is a warning; the row is the record).
     async fn propagate(
         &self,
+        tenant: TenantId,
         agent: PrincipalId,
         quality_score: Option<f64>,
         drift_flags: Option<Vec<String>>,
     ) {
         if let Some(sink) = &self.sink {
-            if let Err(e) = sink.apply(agent, quality_score, drift_flags).await {
-                tracing::warn!(error = %e, agent = %agent, "quality sink propagation failed");
+            if let Err(e) = sink.apply(tenant, agent, quality_score, drift_flags).await {
+                tracing::warn!(
+                    error = %e,
+                    tenant = %tenant,
+                    agent = %agent,
+                    "quality sink propagation failed"
+                );
             }
         }
     }
@@ -388,19 +395,21 @@ impl ThymusStore {
         })
     }
 
-    /// Look up an owned rubric by id. `Ok(None)` if absent or owned by another principal.
+    /// Look up a tenant-owned rubric by id. `Ok(None)` if absent or outside the scope.
     pub async fn get_rubric(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: i64,
     ) -> Result<Option<Rubric>, ThymusError> {
         let conn = self.lock();
-        Self::get_rubric_in(&conn, principal, id)
+        Self::get_rubric_in(&conn, tenant, principal, id)
     }
 
-    /// Owner-scoped rubric lookup against an arbitrary connection.
+    /// Tenant-and-owner-scoped rubric lookup against an arbitrary connection.
     fn get_rubric_in(
         conn: &Connection,
+        tenant: TenantId,
         principal: PrincipalId,
         id: i64,
     ) -> Result<Option<Rubric>, ThymusError> {
@@ -408,9 +417,9 @@ impl ThymusStore {
             .query_row(
                 &format!(
                     "SELECT {RUBRIC_COLUMNS} FROM thymus_rubrics \
-                     WHERE id = ?1 AND principal_id = ?2"
+                     WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3"
                 ),
-                rusqlite::params![id, principal.to_string()],
+                rusqlite::params![id, tenant.to_string(), principal.to_string()],
                 read_raw_rubric,
             )
             .optional()
@@ -418,17 +427,24 @@ impl ThymusStore {
         raw.map(RawRubric::into_rubric).transpose()
     }
 
-    /// List a principal's rubrics, newest-updated first.
-    pub async fn list_rubrics(&self, principal: PrincipalId) -> Result<Vec<Rubric>, ThymusError> {
+    /// List a principal's rubrics within one tenant, newest-updated first.
+    pub async fn list_rubrics(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<Vec<Rubric>, ThymusError> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {RUBRIC_COLUMNS} FROM thymus_rubrics \
-                 WHERE principal_id = ?1 ORDER BY updated_at DESC"
+                 WHERE tenant = ?1 AND principal_id = ?2 ORDER BY updated_at DESC"
             ))
             .map_err(berr)?;
         let rows = stmt
-            .query_map(rusqlite::params![principal.to_string()], read_raw_rubric)
+            .query_map(
+                rusqlite::params![tenant.to_string(), principal.to_string()],
+                read_raw_rubric,
+            )
             .map_err(berr)?;
         let mut out = Vec::new();
         for row in rows {
@@ -440,6 +456,7 @@ impl ThymusStore {
     /// Apply a partial update to an owned rubric (replacement criteria re-validated).
     pub async fn update_rubric(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: i64,
         patch: RubricPatch,
@@ -448,8 +465,8 @@ impl ThymusStore {
             validate_criteria(criteria)?;
         }
         let conn = self.lock();
-        let mut rubric =
-            Self::get_rubric_in(&conn, principal, id)?.ok_or(ThymusError::RubricNotFound(id))?;
+        let mut rubric = Self::get_rubric_in(&conn, tenant, principal, id)?
+            .ok_or(ThymusError::RubricNotFound(id))?;
         if let Some(name) = patch.name {
             rubric.name = name;
         }
@@ -462,7 +479,7 @@ impl ThymusStore {
         rubric.updated_at = Timestamp::now();
         conn.execute(
             "UPDATE thymus_rubrics SET name = ?1, description = ?2, criteria = ?3, updated_at = ?4 \
-             WHERE id = ?5 AND principal_id = ?6",
+             WHERE id = ?5 AND tenant = ?6 AND principal_id = ?7",
             rusqlite::params![
                 &rubric.name,
                 &rubric.description,
@@ -470,6 +487,7 @@ impl ThymusStore {
                     .map_err(|e| ThymusError::Backend(format!("criteria serialize: {e}")))?,
                 ts_to_db(&rubric.updated_at)?,
                 id,
+                tenant.to_string(),
                 principal.to_string(),
             ],
         )
@@ -481,13 +499,14 @@ impl ThymusStore {
     /// [`ThymusError::RubricInUse`] if evaluations reference it (they are the audit record).
     pub async fn delete_rubric(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: i64,
     ) -> Result<bool, ThymusError> {
         let conn = self.lock();
         conn.execute(
-            "DELETE FROM thymus_rubrics WHERE id = ?1 AND principal_id = ?2",
-            rusqlite::params![id, principal.to_string()],
+            "DELETE FROM thymus_rubrics WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3",
+            rusqlite::params![id, tenant.to_string(), principal.to_string()],
         )
         .map(|n| n > 0)
         .map_err(|e| match &e {
@@ -507,7 +526,7 @@ impl ThymusStore {
         let now = Timestamp::now();
         let (evaluation, rolling_avg) = {
             let conn = self.lock();
-            let rubric = Self::get_rubric_in(&conn, new.principal_id, new.rubric_id)?
+            let rubric = Self::get_rubric_in(&conn, new.tenant, new.principal_id, new.rubric_id)?
                 .ok_or(ThymusError::RubricNotFound(new.rubric_id))?;
             let overall_score = compute_weighted_score(&rubric.criteria, &new.scores)?;
             let input = new.input.unwrap_or_else(|| serde_json::json!({}));
@@ -519,7 +538,7 @@ impl ThymusStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     new.rubric_id,
-                    rubric.tenant.to_string(),
+                    new.tenant.to_string(),
                     new.principal_id.to_string(),
                     new.agent.to_string(),
                     new.evaluator.to_string(),
@@ -537,7 +556,7 @@ impl ThymusStore {
             let evaluation = Evaluation {
                 id: conn.last_insert_rowid(),
                 rubric_id: new.rubric_id,
-                tenant: rubric.tenant,
+                tenant: new.tenant,
                 principal_id: new.principal_id,
                 agent: new.agent,
                 evaluator: new.evaluator,
@@ -552,8 +571,9 @@ impl ThymusStore {
             let rolling_avg: f64 = conn
                 .query_row(
                     "SELECT AVG(overall_score) FROM thymus_evaluations \
-                     WHERE principal_id = ?1 AND agent = ?2",
+                     WHERE tenant = ?1 AND principal_id = ?2 AND agent = ?3",
                     rusqlite::params![
+                        evaluation.tenant.to_string(),
                         evaluation.principal_id.to_string(),
                         evaluation.agent.to_string()
                     ],
@@ -573,7 +593,7 @@ impl ThymusStore {
             evaluation.tenant,
             evaluation.principal_id,
         );
-        self.propagate(evaluation.agent, Some(rolling_avg), None)
+        self.propagate(evaluation.tenant, evaluation.agent, Some(rolling_avg), None)
             .await;
         Ok(evaluation)
     }
@@ -581,6 +601,7 @@ impl ThymusStore {
     /// Look up an owned evaluation by id.
     pub async fn get_evaluation(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: i64,
     ) -> Result<Option<Evaluation>, ThymusError> {
@@ -589,9 +610,9 @@ impl ThymusStore {
             .query_row(
                 &format!(
                     "SELECT {EVALUATION_COLUMNS} FROM thymus_evaluations \
-                     WHERE id = ?1 AND principal_id = ?2"
+                     WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3"
                 ),
-                rusqlite::params![id, principal.to_string()],
+                rusqlite::params![id, tenant.to_string(), principal.to_string()],
                 read_raw_evaluation,
             )
             .optional()
@@ -602,13 +623,17 @@ impl ThymusStore {
     /// List a principal's evaluations, newest first, AND-filtered by [`EvaluationFilter`].
     pub async fn list_evaluations(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         filter: EvaluationFilter,
     ) -> Result<Vec<Evaluation>, ThymusError> {
-        let mut sql =
-            format!("SELECT {EVALUATION_COLUMNS} FROM thymus_evaluations WHERE principal_id = ?1");
-        let mut args: Vec<rusqlite::types::Value> = vec![principal.to_string().into()];
-        let mut n = 1;
+        let mut sql = format!(
+            "SELECT {EVALUATION_COLUMNS} FROM thymus_evaluations \
+             WHERE tenant = ?1 AND principal_id = ?2"
+        );
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![tenant.to_string().into(), principal.to_string().into()];
+        let mut n = 2;
         if let Some(agent) = &filter.agent {
             n += 1;
             sql.push_str(&format!(" AND agent = ?{n}"));
@@ -642,11 +667,13 @@ impl ThymusStore {
     /// averages (computed in Rust from the stored score objects).
     pub async fn agent_scores(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         agent: PrincipalId,
     ) -> Result<AgentScores, ThymusError> {
         let evaluations = self
             .list_evaluations(
+                tenant,
                 principal,
                 EvaluationFilter {
                     agent: Some(agent),
@@ -737,6 +764,7 @@ impl ThymusStore {
     /// Summarize one (agent, metric) series for a principal.
     pub async fn metric_summary(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         agent: PrincipalId,
         metric: &str,
@@ -745,8 +773,13 @@ impl ThymusStore {
         conn.query_row(
             "SELECT COUNT(*), COALESCE(AVG(value), 0), COALESCE(MIN(value), 0), \
              COALESCE(MAX(value), 0) FROM thymus_metrics \
-             WHERE principal_id = ?1 AND agent = ?2 AND metric = ?3",
-            rusqlite::params![principal.to_string(), agent.to_string(), metric],
+             WHERE tenant = ?1 AND principal_id = ?2 AND agent = ?3 AND metric = ?4",
+            rusqlite::params![
+                tenant.to_string(),
+                principal.to_string(),
+                agent.to_string(),
+                metric
+            ],
             |r| {
                 Ok(MetricSummary {
                     count: r.get(0)?,
@@ -796,12 +829,17 @@ impl ThymusStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT DISTINCT drift_type FROM thymus_drift_events \
-                     WHERE principal_id = ?1 AND agent = ?2 ORDER BY drift_type",
+                     WHERE tenant = ?1 AND principal_id = ?2 AND agent = ?3 \
+                     ORDER BY drift_type",
                 )
                 .map_err(berr)?;
             let rows = stmt
                 .query_map(
-                    rusqlite::params![event.principal_id.to_string(), event.agent.to_string()],
+                    rusqlite::params![
+                        event.tenant.to_string(),
+                        event.principal_id.to_string(),
+                        event.agent.to_string()
+                    ],
                     |r| r.get::<_, String>(0),
                 )
                 .map_err(berr)?;
@@ -820,7 +858,8 @@ impl ThymusStore {
             event.tenant,
             event.principal_id,
         );
-        self.propagate(event.agent, None, Some(flags)).await;
+        self.propagate(event.tenant, event.agent, None, Some(flags))
+            .await;
         Ok(event)
     }
 
@@ -828,16 +867,19 @@ impl ThymusStore {
     /// capped at `limit`.
     pub async fn list_drift_events(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         agent: Option<PrincipalId>,
         limit: usize,
     ) -> Result<Vec<DriftEvent>, ThymusError> {
         let mut sql = "SELECT id, tenant, principal_id, agent, session, drift_type, severity, \
-                       signal, created_at FROM thymus_drift_events WHERE principal_id = ?1"
+                       signal, created_at FROM thymus_drift_events \
+                       WHERE tenant = ?1 AND principal_id = ?2"
             .to_string();
-        let mut args: Vec<rusqlite::types::Value> = vec![principal.to_string().into()];
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![tenant.to_string().into(), principal.to_string().into()];
         if let Some(agent) = agent {
-            sql.push_str(" AND agent = ?2");
+            sql.push_str(" AND agent = ?3");
             args.push(agent.to_string().into());
         }
         sql.push_str(&format!(" ORDER BY id DESC LIMIT {limit}"));
@@ -911,27 +953,41 @@ impl ThymusStore {
         Ok(flags)
     }
 
-    /// Aggregate quality counts for a principal.
-    pub async fn stats(&self, principal: PrincipalId) -> Result<ThymusStats, ThymusError> {
+    /// Aggregate quality counts for a principal within one tenant.
+    pub async fn stats(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<ThymusStats, ThymusError> {
         let conn = self.lock();
         let one = |sql: &str| -> Result<i64, ThymusError> {
-            conn.query_row(sql, rusqlite::params![principal.to_string()], |r| r.get(0))
-                .map_err(berr)
+            conn.query_row(
+                sql,
+                rusqlite::params![tenant.to_string(), principal.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(berr)
         };
-        let rubrics = one("SELECT COUNT(*) FROM thymus_rubrics WHERE principal_id = ?1")?;
-        let evaluations = one("SELECT COUNT(*) FROM thymus_evaluations WHERE principal_id = ?1")?;
-        let metrics = one("SELECT COUNT(*) FROM thymus_metrics WHERE principal_id = ?1")?;
-        let drift_events = one("SELECT COUNT(*) FROM thymus_drift_events WHERE principal_id = ?1")?;
+        let rubrics =
+            one("SELECT COUNT(*) FROM thymus_rubrics WHERE tenant = ?1 AND principal_id = ?2")?;
+        let evaluations =
+            one("SELECT COUNT(*) FROM thymus_evaluations WHERE tenant = ?1 AND principal_id = ?2")?;
+        let metrics =
+            one("SELECT COUNT(*) FROM thymus_metrics WHERE tenant = ?1 AND principal_id = ?2")?;
+        let drift_events = one(
+            "SELECT COUNT(*) FROM thymus_drift_events WHERE tenant = ?1 AND principal_id = ?2",
+        )?;
         let mut stmt = conn
             .prepare(
                 "SELECT drift_type || '/' || severity, COUNT(*) FROM thymus_drift_events \
-                 WHERE principal_id = ?1 GROUP BY drift_type, severity",
+                 WHERE tenant = ?1 AND principal_id = ?2 GROUP BY drift_type, severity",
             )
             .map_err(berr)?;
         let rows = stmt
-            .query_map(rusqlite::params![principal.to_string()], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_map(
+                rusqlite::params![tenant.to_string(), principal.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
             .map_err(berr)?;
         let mut drift_by_type = BTreeMap::new();
         for row in rows {
@@ -973,8 +1029,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// One recorded sink propagation: (agent, score, flags).
-    type SinkCall = (PrincipalId, Option<f64>, Option<Vec<String>>);
+    /// One recorded sink propagation: (tenant, agent, score, flags).
+    type SinkCall = (TenantId, PrincipalId, Option<f64>, Option<Vec<String>>);
 
     /// A recording sink capturing every propagation.
     #[derive(Default)]
@@ -989,6 +1045,7 @@ mod tests {
         /// Record one quality-sink update for test assertions.
         async fn apply(
             &self,
+            tenant: TenantId,
             agent: PrincipalId,
             quality_score: Option<f64>,
             drift_flags: Option<Vec<String>>,
@@ -996,7 +1053,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push((agent, quality_score, drift_flags));
+                .push((tenant, agent, quality_score, drift_flags));
             Ok(())
         }
     }
@@ -1012,10 +1069,10 @@ mod tests {
     }
 
     /// A two-criterion rubric: quality (weight 2, scale 0-10) + speed (weight 1, scale 0-5).
-    async fn rubric(store: &ThymusStore, principal: PrincipalId) -> Rubric {
+    async fn rubric(store: &ThymusStore, tenant: TenantId, principal: PrincipalId) -> Rubric {
         store
             .create_rubric(NewRubric {
-                tenant: TenantId::new(),
+                tenant,
                 principal_id: principal,
                 name: format!("code-review-{principal}"),
                 description: None,
@@ -1061,17 +1118,18 @@ mod tests {
     #[tokio::test]
     async fn rubric_crud_and_validation() {
         let (store, _sink, _bus) = store_with_sink();
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
-        let r = rubric(&store, principal).await;
+        let r = rubric(&store, tenant, principal).await;
         let got = store
-            .get_rubric(principal, r.id)
+            .get_rubric(tenant, principal, r.id)
             .await
             .expect("get")
             .expect("present");
         assert_eq!(got, r);
         assert!(
             store
-                .get_rubric(PrincipalId::new(), r.id)
+                .get_rubric(tenant, PrincipalId::new(), r.id)
                 .await
                 .expect("get")
                 .is_none()
@@ -1125,6 +1183,7 @@ mod tests {
 
         let updated = store
             .update_rubric(
+                tenant,
                 principal,
                 r.id,
                 RubricPatch {
@@ -1135,8 +1194,20 @@ mod tests {
             .await
             .expect("update");
         assert_eq!(updated.description.as_deref(), Some("desc"));
-        assert_eq!(store.list_rubrics(principal).await.expect("list").len(), 1);
-        assert!(store.delete_rubric(principal, r.id).await.expect("delete"));
+        assert_eq!(
+            store
+                .list_rubrics(tenant, principal)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .delete_rubric(tenant, principal, r.id)
+                .await
+                .expect("delete")
+        );
     }
 
     /// Verifies weighted evaluation scores and propagation to the quality sink.
@@ -1144,13 +1215,15 @@ mod tests {
     async fn evaluate_computes_weighted_score_and_propagates() {
         let (store, sink, bus) = store_with_sink();
         let mut rx = bus.subscribe("quality");
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let agent = PrincipalId::new();
-        let r = rubric(&store, principal).await;
+        let r = rubric(&store, tenant, principal).await;
 
         // quality 5/10 (norm 0.5, weight 2) + speed 5/5 (norm 1.0, weight 1) -> 2/3.
         let evaluation = store
             .evaluate(NewEvaluation {
+                tenant,
                 principal_id: principal,
                 rubric_id: r.id,
                 agent,
@@ -1169,13 +1242,15 @@ mod tests {
         {
             let calls = sink.calls.lock().unwrap();
             assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0, agent);
-            assert!((calls[0].1.expect("score") - 2.0 / 3.0).abs() < 1e-9);
+            assert_eq!(calls[0].0, tenant);
+            assert_eq!(calls[0].1, agent);
+            assert!((calls[0].2.expect("score") - 2.0 / 3.0).abs() < 1e-9);
         }
 
         // A second evaluation moves the rolling average.
         store
             .evaluate(NewEvaluation {
+                tenant,
                 principal_id: principal,
                 rubric_id: r.id,
                 agent,
@@ -1193,12 +1268,13 @@ mod tests {
         {
             let calls = sink.calls.lock().unwrap();
             let expected_avg = (2.0 / 3.0 + 1.0) / 2.0;
-            assert!((calls[1].1.expect("score") - expected_avg).abs() < 1e-9);
+            assert!((calls[1].2.expect("score") - expected_avg).abs() < 1e-9);
         }
 
         // Missing criterion score is rejected.
         let err = store
             .evaluate(NewEvaluation {
+                tenant,
                 principal_id: principal,
                 rubric_id: r.id,
                 agent,
@@ -1218,10 +1294,12 @@ mod tests {
     #[tokio::test]
     async fn rubric_with_evaluations_cannot_be_deleted() {
         let (store, _sink, _bus) = store_with_sink();
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
-        let r = rubric(&store, principal).await;
+        let r = rubric(&store, tenant, principal).await;
         store
             .evaluate(NewEvaluation {
+                tenant,
                 principal_id: principal,
                 rubric_id: r.id,
                 agent: PrincipalId::new(),
@@ -1235,7 +1313,7 @@ mod tests {
             .await
             .expect("evaluate");
         let err = store
-            .delete_rubric(principal, r.id)
+            .delete_rubric(tenant, principal, r.id)
             .await
             .expect_err("in use");
         assert!(matches!(err, ThymusError::RubricInUse(_)));
@@ -1245,12 +1323,14 @@ mod tests {
     #[tokio::test]
     async fn list_and_agent_scores_aggregate() {
         let (store, _sink, _bus) = store_with_sink();
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let agent = PrincipalId::new();
-        let r = rubric(&store, principal).await;
+        let r = rubric(&store, tenant, principal).await;
         for (q, s) in [(5.0, 5.0), (10.0, 0.0)] {
             store
                 .evaluate(NewEvaluation {
+                    tenant,
                     principal_id: principal,
                     rubric_id: r.id,
                     agent,
@@ -1266,6 +1346,7 @@ mod tests {
         }
         let mine = store
             .list_evaluations(
+                tenant,
                 principal,
                 EvaluationFilter {
                     agent: Some(agent),
@@ -1277,13 +1358,16 @@ mod tests {
         assert_eq!(mine.len(), 2);
         assert!(
             store
-                .list_evaluations(PrincipalId::new(), EvaluationFilter::default())
+                .list_evaluations(tenant, PrincipalId::new(), EvaluationFilter::default(),)
                 .await
                 .expect("list")
                 .is_empty()
         );
 
-        let summary = store.agent_scores(principal, agent).await.expect("scores");
+        let summary = store
+            .agent_scores(tenant, principal, agent)
+            .await
+            .expect("scores");
         assert_eq!(summary.evaluation_count, 2);
         // overall: (2/3 + 2/3) / 2 -- second eval: quality 10/10 (1.0*2) + speed 0/5 (0) / 3 = 2/3.
         assert!((summary.overall_avg - 2.0 / 3.0).abs() < 1e-9);
@@ -1314,7 +1398,7 @@ mod tests {
         }
         assert_eq!(drain_kinds(&mut rx), vec!["metric.recorded"; 3]);
         let summary = store
-            .metric_summary(principal, agent, "latency_ms")
+            .metric_summary(tenant, principal, agent, "latency_ms")
             .await
             .expect("summary");
         assert_eq!(summary.count, 3);
@@ -1374,21 +1458,249 @@ mod tests {
             let calls = sink.calls.lock().unwrap();
             assert_eq!(calls.len(), 3);
             assert_eq!(
-                calls[2].2.as_deref(),
+                calls[2].3.as_deref(),
                 Some(["priority".to_string(), "safety".to_string()].as_slice())
             );
         }
 
         let events = store
-            .list_drift_events(principal, Some(agent), 10)
+            .list_drift_events(tenant, principal, Some(agent), 10)
             .await
             .expect("list");
         assert_eq!(events.len(), 3);
 
-        let stats = store.stats(principal).await.expect("stats");
+        let stats = store.stats(tenant, principal).await.expect("stats");
         assert_eq!(stats.drift_events, 3);
         assert_eq!(stats.drift_by_type.get("priority/medium"), Some(&2));
         assert_eq!(stats.drift_by_type.get("safety/medium"), Some(&1));
+    }
+
+    /// Principal-scoped reads, mutations, rolling values, and aggregates isolate tenants.
+    #[tokio::test]
+    async fn principal_operations_and_aggregates_are_tenant_scoped() {
+        let (store, sink, _bus) = store_with_sink();
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let principal = PrincipalId::new();
+        let agent = PrincipalId::new();
+        let rubric_a = rubric(&store, tenant_a, principal).await;
+        let rubric_b = store
+            .create_rubric(NewRubric {
+                tenant: tenant_b,
+                principal_id: principal,
+                name: format!("tenant-b-{principal}"),
+                description: None,
+                criteria: rubric_a.criteria.clone(),
+            })
+            .await
+            .expect("tenant B rubric");
+
+        assert!(
+            store
+                .get_rubric(tenant_b, principal, rubric_a.id)
+                .await
+                .expect("foreign rubric read")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .update_rubric(tenant_b, principal, rubric_a.id, RubricPatch::default())
+                .await,
+            Err(ThymusError::RubricNotFound(id)) if id == rubric_a.id
+        ));
+        assert!(
+            !store
+                .delete_rubric(tenant_b, principal, rubric_a.id)
+                .await
+                .expect("foreign rubric delete")
+        );
+        assert!(matches!(
+            store
+                .evaluate(NewEvaluation {
+                    tenant: tenant_b,
+                    principal_id: principal,
+                    rubric_id: rubric_a.id,
+                    agent,
+                    evaluator: principal,
+                    subject: "foreign rubric".to_string(),
+                    input: None,
+                    output: None,
+                    scores: scores(10.0, 5.0),
+                    notes: None,
+                })
+                .await,
+            Err(ThymusError::RubricNotFound(id)) if id == rubric_a.id
+        ));
+
+        let evaluation_a = store
+            .evaluate(NewEvaluation {
+                tenant: tenant_a,
+                principal_id: principal,
+                rubric_id: rubric_a.id,
+                agent,
+                evaluator: principal,
+                subject: "tenant A".to_string(),
+                input: None,
+                output: None,
+                scores: scores(0.0, 0.0),
+                notes: None,
+            })
+            .await
+            .expect("tenant A evaluation");
+        let evaluation_b = store
+            .evaluate(NewEvaluation {
+                tenant: tenant_b,
+                principal_id: principal,
+                rubric_id: rubric_b.id,
+                agent,
+                evaluator: principal,
+                subject: "tenant B".to_string(),
+                input: None,
+                output: None,
+                scores: scores(10.0, 5.0),
+                notes: None,
+            })
+            .await
+            .expect("tenant B evaluation");
+
+        assert!(
+            store
+                .get_evaluation(tenant_b, principal, evaluation_a.id)
+                .await
+                .expect("foreign evaluation read")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_evaluations(tenant_a, principal, EvaluationFilter::default())
+                .await
+                .expect("tenant A evaluations"),
+            vec![evaluation_a.clone()]
+        );
+        assert_eq!(
+            store
+                .list_evaluations(tenant_b, principal, EvaluationFilter::default())
+                .await
+                .expect("tenant B evaluations"),
+            vec![evaluation_b.clone()]
+        );
+        assert_eq!(
+            store
+                .agent_scores(tenant_a, principal, agent)
+                .await
+                .expect("tenant A scores")
+                .overall_avg,
+            0.0
+        );
+        assert_eq!(
+            store
+                .agent_scores(tenant_b, principal, agent)
+                .await
+                .expect("tenant B scores")
+                .overall_avg,
+            1.0
+        );
+        {
+            let calls = sink.calls.lock().unwrap();
+            assert_eq!(calls[0].0, tenant_a);
+            assert_eq!(calls[0].2, Some(0.0));
+            assert_eq!(calls[1].0, tenant_b);
+            assert_eq!(calls[1].2, Some(1.0));
+        }
+
+        for (tenant, value) in [(tenant_a, 10.0), (tenant_b, 100.0)] {
+            store
+                .record_metric(NewMetric {
+                    tenant,
+                    principal_id: principal,
+                    agent,
+                    metric: "latency".to_string(),
+                    value,
+                    tags: None,
+                })
+                .await
+                .expect("metric");
+        }
+        assert_eq!(
+            store
+                .metric_summary(tenant_a, principal, agent, "latency")
+                .await
+                .expect("tenant A metric")
+                .avg,
+            10.0
+        );
+        assert_eq!(
+            store
+                .metric_summary(tenant_b, principal, agent, "latency")
+                .await
+                .expect("tenant B metric")
+                .avg,
+            100.0
+        );
+
+        for (tenant, drift_type) in [
+            (tenant_a, DriftType::Priority),
+            (tenant_b, DriftType::Safety),
+        ] {
+            store
+                .record_drift_event(NewDriftEvent {
+                    tenant,
+                    principal_id: principal,
+                    agent,
+                    session: None,
+                    drift_type,
+                    severity: None,
+                    signal: "tenant signal".to_string(),
+                })
+                .await
+                .expect("drift");
+        }
+        let drift_a = store
+            .list_drift_events(tenant_a, principal, Some(agent), 10)
+            .await
+            .expect("tenant A drift");
+        let drift_b = store
+            .list_drift_events(tenant_b, principal, Some(agent), 10)
+            .await
+            .expect("tenant B drift");
+        assert_eq!(drift_a.len(), 1);
+        assert_eq!(drift_a[0].drift_type, DriftType::Priority);
+        assert_eq!(drift_b.len(), 1);
+        assert_eq!(drift_b[0].drift_type, DriftType::Safety);
+        {
+            let calls = sink.calls.lock().unwrap();
+            assert_eq!(calls[2].0, tenant_a);
+            assert_eq!(calls[2].3, Some(vec!["priority".to_string()]));
+            assert_eq!(calls[3].0, tenant_b);
+            assert_eq!(calls[3].3, Some(vec!["safety".to_string()]));
+        }
+
+        let stats_a = store
+            .stats(tenant_a, principal)
+            .await
+            .expect("tenant A stats");
+        let stats_b = store
+            .stats(tenant_b, principal)
+            .await
+            .expect("tenant B stats");
+        assert_eq!(
+            (
+                stats_a.rubrics,
+                stats_a.evaluations,
+                stats_a.metrics,
+                stats_a.drift_events,
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            (
+                stats_b.rubrics,
+                stats_b.evaluations,
+                stats_b.metrics,
+                stats_b.drift_events,
+            ),
+            (1, 1, 1, 1)
+        );
     }
 
     /// Verifies persisted quality data survives reopening the SQLite store.
@@ -1396,13 +1708,14 @@ mod tests {
     async fn quality_persists_across_reopen() {
         let tmp =
             std::env::temp_dir().join(format!("henosis-thymus-{}.sqlite", PrincipalId::new()));
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let rubric_id;
         {
             let store = ThymusStore::open(&tmp, Arc::new(AxonBus::new())).expect("open");
             rubric_id = store
                 .create_rubric(NewRubric {
-                    tenant: TenantId::new(),
+                    tenant,
                     principal_id: principal,
                     name: "durable".to_string(),
                     description: None,
@@ -1420,7 +1733,7 @@ mod tests {
         {
             let store = ThymusStore::open(&tmp, Arc::new(AxonBus::new())).expect("reopen");
             let got = store
-                .get_rubric(principal, rubric_id)
+                .get_rubric(tenant, principal, rubric_id)
                 .await
                 .expect("get")
                 .expect("present after reopen");

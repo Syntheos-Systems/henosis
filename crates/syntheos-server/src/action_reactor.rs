@@ -5,7 +5,7 @@ use std::sync::Arc;
 use henosis_broca::{BrocaStore, LogAction};
 use henosis_chiasm::ChiasmStore;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{TaskId, ACTION_CHANNEL};
+use syntheos_contracts::{ACTION_CHANNEL, TaskId};
 use tokio::sync::broadcast::error::RecvError;
 
 /// Subscribe to the action channel and project each lifecycle envelope into downstream stores.
@@ -78,12 +78,15 @@ pub fn spawn_action_reactor(
 /// Tests for the action projection loop.
 mod tests {
     use super::*;
-    use crate::{live_gate_chain, HenosisExecutor};
+    use std::collections::BTreeSet;
+
+    use crate::{HenosisExecutor, live_gate_chain};
     use henosis_broca::ActionFilter;
     use henosis_chiasm::{NewTask, TaskStatus};
     use henosis_credential_store::CredentialStore;
     use henosis_eidolon::EidolonPolicy;
     use henosis_hermes::{
+        AppState as HermesState,
         audit::AuditTrail,
         axon::AxonPublisher,
         build_registry,
@@ -92,9 +95,12 @@ mod tests {
         phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
-        AppState as HermesState,
     };
-    use henosis_pistis::InMemoryRoomStateSource;
+    use henosis_pistis::crypto::SecretKey;
+    use henosis_pistis::{
+        ActionKind, AdmittedPrincipal, Capability, InMemoryRoomStateSource, RoomPolicy, RoomScope,
+        RoomState, RoomStateSource, RoomTrustStore,
+    };
     use henosis_plutus::{LocalPolicyBackend, MockPolicyBackend, PolicyBackend, QuotaTier, Role};
     use henosis_rift::RegistryApprover;
     use henosis_thymus::ThymusStore;
@@ -103,6 +109,46 @@ mod tests {
         TenantId, ToolInvocation,
     };
     use syntheos_dispatch::{DispatchOutcome, Dispatcher};
+
+    /// Room id used by authorized dispatcher integration tests.
+    const AUTHORIZED_ROOM: &str = "!authorized:local";
+
+    /// Build trusted Pistis room state that authorizes the bundled readiness probe.
+    fn authorized_probe_authority(
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> (Arc<dyn RoomStateSource>, Arc<RoomTrustStore>) {
+        let scope = RoomScope::new(tenant, AUTHORIZED_ROOM);
+        let (_, issuer_key) = SecretKey::generate();
+        let (_, root_key) = SecretKey::generate();
+        let (_, principal_key) = SecretKey::generate();
+        let capability = Capability {
+            name: "henosis".to_string(),
+            action_kinds: BTreeSet::from([ActionKind::Message]),
+            granted_by: "test-operator".to_string(),
+            expires_at: None,
+        };
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            1,
+            RoomPolicy::default(),
+            BTreeSet::from([root_key.public_key()]),
+            &issuer_key,
+            vec![AdmittedPrincipal::new(
+                scope.clone(),
+                principal,
+                principal_key.public_key(),
+                &root_key,
+                vec![capability],
+            )],
+        )
+        .unwrap();
+        let mut source = InMemoryRoomStateSource::new();
+        source.insert(state);
+        let mut trust = RoomTrustStore::new();
+        trust.pin(scope, issuer_key.public_key(), 1).unwrap();
+        (Arc::new(source), Arc::new(trust))
+    }
 
     /// One Axon action stream reaches both downstream projections.
     #[tokio::test]
@@ -229,10 +275,12 @@ mod tests {
             .expect("task");
         let reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
         let plutus: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::with_role(Role::Admin));
+        let (pistis_source, pistis_trust) = authorized_probe_authority(tenant, principal);
         let gates = live_gate_chain(
             &EidolonPolicy::default(),
             thymus,
-            Arc::new(InMemoryRoomStateSource::new()),
+            pistis_source,
+            pistis_trust,
             credential_store.clone(),
             bus.clone(),
             Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
@@ -263,7 +311,7 @@ mod tests {
                     principal,
                     persona: None,
                     session: None,
-                    room: None,
+                    room: Some(AUTHORIZED_ROOM.to_string()),
                     task: Some(TaskRef {
                         id: task.id,
                         tenant,
@@ -353,10 +401,12 @@ mod tests {
             Role::Owner,
             QuotaTier::Free,
         ));
+        let (pistis_source, pistis_trust) = authorized_probe_authority(tenant, principal);
         let gates = live_gate_chain(
             &EidolonPolicy::default(),
             thymus,
-            Arc::new(InMemoryRoomStateSource::new()),
+            pistis_source,
+            pistis_trust,
             credential_store.clone(),
             bus.clone(),
             Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
@@ -384,7 +434,7 @@ mod tests {
             principal,
             persona: None,
             session: Some("governed-mission-test".to_string()),
-            room: None,
+            room: Some(AUTHORIZED_ROOM.to_string()),
             task: Some(TaskRef {
                 id: task.id,
                 tenant,

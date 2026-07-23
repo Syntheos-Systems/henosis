@@ -5,22 +5,28 @@ use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
+use tokio::process::Command;
 
 // ─── Diagnostics ────────────────────────────────────────────────────────────
 
+/// Runs language-specific diagnostics for a requested source file.
 pub struct LspDiagnosticsTool;
 
+/// Implements the agent tool contract for language diagnostics.
 #[async_trait::async_trait]
 impl AgentTool for LspDiagnosticsTool {
+    /// Returns the diagnostics tool's stable registry name.
     fn name(&self) -> &str {
         "lsp_diagnostics"
     }
 
+    /// Describes the language diagnostics capability.
     fn description(&self) -> &str {
         "Get compiler/linter diagnostics for a file. Returns errors, warnings, and hints \
          from rust-analyzer, typescript, etc. Uses `cargo check` for Rust or language-specific commands."
     }
 
+    /// Returns the accepted file and optional language parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -32,6 +38,7 @@ impl AgentTool for LspDiagnosticsTool {
         })
     }
 
+    /// Runs the selected diagnostics command with private signing secrets removed.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let file = match params.get("file").and_then(|v| v.as_str()) {
             Some(f) => f,
@@ -75,7 +82,7 @@ impl AgentTool for LspDiagnosticsTool {
             }
         };
 
-        let output = tokio::process::Command::new(cmd)
+        let output = restricted_command(cmd)
             .args(&args)
             .current_dir(cwd)
             .output()
@@ -140,19 +147,24 @@ impl AgentTool for LspDiagnosticsTool {
 
 // ─── Symbol Search ──────────────────────────────────────────────────────────
 
+/// Searches project sources for symbol declarations.
 pub struct LspSymbolSearchTool;
 
+/// Implements the agent tool contract for symbol search.
 #[async_trait::async_trait]
 impl AgentTool for LspSymbolSearchTool {
+    /// Returns the symbol-search tool's stable registry name.
     fn name(&self) -> &str {
         "lsp_symbol_search"
     }
 
+    /// Describes the project symbol-search capability.
     fn description(&self) -> &str {
         "Search for symbol definitions across the project. For Rust uses `cargo doc` metadata \
          or grep-based fallback. Finds structs, functions, traits, types."
     }
 
+    /// Returns the accepted symbol and optional declaration-kind parameters.
     fn schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -164,6 +176,7 @@ impl AgentTool for LspSymbolSearchTool {
         })
     }
 
+    /// Searches source files with a restricted child-process environment.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
         let symbol = match params.get("symbol").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -190,7 +203,7 @@ impl AgentTool for LspSymbolSearchTool {
             )
         };
 
-        let output = tokio::process::Command::new("rg")
+        let output = restricted_command("rg")
             .args([
                 "--line-number",
                 "--no-heading",
@@ -229,6 +242,14 @@ impl AgentTool for LspSymbolSearchTool {
     }
 }
 
+/// Constructs an agent-controlled command without inherited private signing secrets.
+fn restricted_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove("PIV_PIN");
+    command
+}
+
+/// Detects the diagnostics language from a source-file extension.
 fn detect_language(file: &str) -> String {
     if file.ends_with(".rs") {
         "rust".into()
@@ -240,5 +261,24 @@ fn detect_language(file: &str) -> String {
         "go".into()
     } else {
         "unknown".into()
+    }
+}
+
+/// Tests restrictions applied to agent-controlled LSP child processes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// Verifies LSP children explicitly remove any inherited PIV PIN.
+    #[test]
+    fn restricted_commands_remove_piv_pin_from_environment() {
+        let command = restricted_command("cargo");
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, value)| name == OsStr::new("PIV_PIN") && value.is_none())
+        );
     }
 }

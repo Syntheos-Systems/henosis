@@ -34,9 +34,9 @@ fn extract_memory_id(value: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// Lazily-initialised Kleos client with the same auth cascade as kleos-cli:
-/// PIV YubiKey → KLEOS_API_KEY env → phylaxd bootstrap.
-/// Expects PIV_PIN to already be in the env (set by main.rs ensure_piv_pin).
+/// Lazily-initialised Kleos client with the supported auth cascade: software
+/// identity key, KLEOS_API_KEY environment value, then phylaxd bootstrap.
+/// It never uses a PIV PIN because these tools execute inside the agent process.
 pub(crate) async fn client() -> anyhow::Result<&'static henosis_memory_client::Client> {
     static CLIENT: OnceCell<henosis_memory_client::Client> = OnceCell::const_new();
     Ok(CLIENT

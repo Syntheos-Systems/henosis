@@ -1,6 +1,9 @@
 //! Cron scheduler: manages job definitions, persistence, and tick-based execution.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -44,6 +47,68 @@ fn default_max_turns() -> usize {
 /// Returns the default enabled state for a cron job.
 fn default_true() -> bool {
     true
+}
+
+/// Monotonically distinguishes temporary state files created by this process.
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// Serialized scheduler state stored in `jobs.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedJob {
+    /// The durable job configuration.
+    config: JobConfig,
+    /// The most recent successful scheduling decision, in Unix seconds.
+    #[serde(default)]
+    last_run: Option<i64>,
+    /// The durable count of scheduling decisions made for this job.
+    #[serde(default)]
+    run_count: u64,
+}
+
+/// Accepts the former configuration-only file format while writing full runtime state.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredJobs {
+    /// Current format with both configuration and runtime state.
+    Stateful(Vec<PersistedJob>),
+    /// Legacy format containing configuration only.
+    Legacy(Vec<JobConfig>),
+}
+
+/// Writes complete scheduler state to a same-directory temporary file before replacing `path`.
+fn write_state_atomically(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().context("jobs path has no parent")?;
+    fs::create_dir_all(parent).context("create cron dir")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("jobs path has no file name")?;
+    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .context("create temporary jobs state")?;
+    file.write_all(contents.as_bytes())
+        .context("write temporary jobs state")?;
+    file.sync_all().context("sync temporary jobs state")?;
+    drop(file);
+
+    fs::rename(&temporary, path).context("replace jobs state")?;
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .context("open cron state directory")?
+            .sync_all()
+            .context("sync cron state directory")?;
+    }
+    Ok(())
 }
 
 /// A cron job with parsed schedule and runtime state.
@@ -123,25 +188,36 @@ impl CronScheduler {
             return Ok(());
         }
 
-        let data = std::fs::read_to_string(&self.jobs_path).context("read jobs.json")?;
-        let configs: Vec<JobConfig> = serde_json::from_str(&data).context("parse jobs.json")?;
+        let data = fs::read_to_string(&self.jobs_path).context("read jobs.json")?;
+        let stored: StoredJobs = serde_json::from_str(&data).context("parse jobs.json")?;
+        let jobs = match stored {
+            StoredJobs::Stateful(jobs) => jobs,
+            StoredJobs::Legacy(configs) => configs
+                .into_iter()
+                .map(|config| PersistedJob {
+                    config,
+                    last_run: None,
+                    run_count: 0,
+                })
+                .collect(),
+        };
 
         self.jobs.clear();
-        for config in configs {
-            match config.schedule.parse::<Schedule>() {
+        for persisted in jobs {
+            match persisted.config.schedule.parse::<Schedule>() {
                 Ok(schedule) => {
                     self.jobs.push(CronJob {
-                        config,
+                        config: persisted.config,
                         schedule,
-                        last_run: None,
-                        run_count: 0,
+                        last_run: persisted.last_run,
+                        run_count: persisted.run_count,
                     });
                 }
                 Err(e) => {
                     log::warn!(
                         "invalid cron expression '{}' for job '{}': {e}",
-                        config.schedule,
-                        config.id
+                        persisted.config.schedule,
+                        persisted.config.id
                     );
                 }
             }
@@ -152,12 +228,17 @@ impl CronScheduler {
 
     /// Save jobs to disk.
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.jobs_path.parent() {
-            std::fs::create_dir_all(parent).context("create cron dir")?;
-        }
-        let configs: Vec<&JobConfig> = self.jobs.iter().map(|j| &j.config).collect();
-        let json = serde_json::to_string_pretty(&configs).context("serialize jobs")?;
-        std::fs::write(&self.jobs_path, json).context("write jobs.json")?;
+        let jobs: Vec<PersistedJob> = self
+            .jobs
+            .iter()
+            .map(|job| PersistedJob {
+                config: job.config.clone(),
+                last_run: job.last_run,
+                run_count: job.run_count,
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&jobs).context("serialize jobs")?;
+        write_state_atomically(&self.jobs_path, &json)?;
         Ok(())
     }
 
@@ -203,8 +284,10 @@ impl CronScheduler {
     /// Check which jobs are due to run right now.
     ///
     /// Returns job configs for all enabled jobs whose next scheduled time
-    /// is at or before the current time.
-    pub fn tick(&mut self) -> Vec<JobConfig> {
+    /// is at or before the current time. Runtime state is persisted before due
+    /// jobs are returned, so a persistence failure prevents their execution.
+    pub fn tick(&mut self) -> Result<Vec<JobConfig>> {
+        let prior_jobs = self.jobs.clone();
         let now = Utc::now();
         let mut due = Vec::new();
 
@@ -230,7 +313,14 @@ impl CronScheduler {
             }
         }
 
-        due
+        if !due.is_empty() {
+            if let Err(error) = self.save() {
+                self.jobs = prior_jobs;
+                return Err(error);
+            }
+        }
+
+        Ok(due)
     }
 
     /// Record a job result.
@@ -238,11 +328,10 @@ impl CronScheduler {
         // Append to results file (JSONL format)
         let line = serde_json::to_string(result).context("serialize result")?;
 
-        use std::io::Write;
         if let Some(parent) = self.results_path.parent() {
-            std::fs::create_dir_all(parent).context("create cron dir")?;
+            fs::create_dir_all(parent).context("create cron dir")?;
         }
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.results_path)
@@ -278,6 +367,7 @@ impl CronScheduler {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Tests scheduler persistence and due-job behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,12 +520,46 @@ mod tests {
             })
             .unwrap();
 
-        let due = sched.tick();
+        let due = sched.tick().unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, "every-second");
 
         // Second tick should NOT return the same job (just ran)
         // (in practice it depends on timing, but the last_run was just set)
+    }
+
+    /// Verifies the durable runtime state survives a scheduler restart.
+    #[test]
+    fn tick_state_persists_across_reopen() {
+        let dir = unique_test_dir("synapse-cron-runtime-state");
+        let _ = fs::remove_dir_all(&dir);
+
+        let (last_run, run_count) = {
+            let mut sched = CronScheduler::open(&dir).unwrap();
+            sched
+                .add_job(JobConfig {
+                    id: "durable-state".into(),
+                    schedule: "* * * * * *".into(),
+                    task: "persist state".into(),
+                    cwd: None,
+                    model: None,
+                    provider: None,
+                    max_turns: 5,
+                    enabled: true,
+                })
+                .unwrap();
+
+            assert_eq!(sched.tick().unwrap().len(), 1);
+            let job = sched.get_job("durable-state").unwrap();
+            (job.last_run, job.run_count)
+        };
+
+        let reopened = CronScheduler::open(&dir).unwrap();
+        let job = reopened.get_job("durable-state").unwrap();
+        assert_eq!(job.last_run, last_run);
+        assert_eq!(job.run_count, run_count);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Verifies job results are appended and read back in recent-first order.

@@ -267,7 +267,8 @@ impl SomaStore {
                  ON CONFLICT (principal_id) DO UPDATE SET \
                      name = excluded.name, agent_type = excluded.agent_type, \
                      description = excluded.description, capabilities = excluded.capabilities, \
-                     config = excluded.config, updated_at = excluded.updated_at",
+                     config = excluded.config, updated_at = excluded.updated_at \
+                 WHERE soma_presence.tenant = excluded.tenant",
                 rusqlite::params![
                     req.principal_id.to_string(),
                     req.tenant.to_string(),
@@ -289,8 +290,8 @@ impl SomaStore {
                 }
                 _ => berr(e),
             })?;
-            Self::get_in(&conn, req.principal_id)?
-                .ok_or_else(|| SomaError::Backend("upserted row missing".to_string()))?
+            Self::get_in(&conn, req.tenant, req.principal_id)?
+                .ok_or(SomaError::NotFound(req.principal_id))?
         };
         self.emit(
             &AgentRegistered {
@@ -304,21 +305,29 @@ impl SomaStore {
         Ok(presence)
     }
 
-    /// Look up an agent's presence by its principal id. `Ok(None)` if never registered.
-    pub async fn get(&self, principal: PrincipalId) -> Result<Option<AgentPresence>, SomaError> {
+    /// Look up an agent's presence within `tenant`. `Ok(None)` if it is not registered there.
+    pub async fn get(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<Option<AgentPresence>, SomaError> {
         let conn = self.lock();
-        Self::get_in(&conn, principal)
+        Self::get_in(&conn, tenant, principal)
     }
 
     /// Presence lookup against an arbitrary connection (also used inside register/update paths).
     fn get_in(
         conn: &Connection,
+        tenant: TenantId,
         principal: PrincipalId,
     ) -> Result<Option<AgentPresence>, SomaError> {
         let raw = conn
             .query_row(
-                &format!("SELECT {PRESENCE_COLUMNS} FROM soma_presence WHERE principal_id = ?1"),
-                rusqlite::params![principal.to_string()],
+                &format!(
+                    "SELECT {PRESENCE_COLUMNS} FROM soma_presence \
+                     WHERE tenant = ?1 AND principal_id = ?2"
+                ),
+                rusqlite::params![tenant.to_string(), principal.to_string()],
                 read_raw,
             )
             .optional()
@@ -398,39 +407,42 @@ impl SomaStore {
     /// heartbeat. [`SomaError::NotFound`] if the principal was never registered.
     pub async fn heartbeat(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         status_override: Option<PresenceStatus>,
     ) -> Result<PresenceStatus, SomaError> {
         let now = ts_to_db(&Timestamp::now())?;
         let result = {
             let conn = self.lock();
-            let token: Option<(String, String)> = match status_override {
+            let token: Option<String> = match status_override {
                 Some(status) => conn.query_row(
-                    "UPDATE soma_presence SET heartbeat_at = ?1, updated_at = ?1, status = ?3 \
-                     WHERE principal_id = ?2 RETURNING status, tenant",
-                    rusqlite::params![now, principal.to_string(), status.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    "UPDATE soma_presence SET heartbeat_at = ?1, updated_at = ?1, status = ?4 \
+                     WHERE tenant = ?2 AND principal_id = ?3 RETURNING status",
+                    rusqlite::params![
+                        now,
+                        tenant.to_string(),
+                        principal.to_string(),
+                        status.as_str()
+                    ],
+                    |r| r.get(0),
                 ),
                 None => conn.query_row(
                     "UPDATE soma_presence SET heartbeat_at = ?1, updated_at = ?1, \
                      status = CASE WHEN status IN ('pending', 'offline') THEN 'online' \
                                    ELSE status END \
-                     WHERE principal_id = ?2 RETURNING status, tenant",
-                    rusqlite::params![now, principal.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                     WHERE tenant = ?2 AND principal_id = ?3 RETURNING status",
+                    rusqlite::params![now, tenant.to_string(), principal.to_string()],
+                    |r| r.get(0),
                 ),
             }
             .optional()
             .map_err(berr)?;
             token
         };
-        let Some((status, tenant)) = result else {
+        let Some(status) = result else {
             return Err(SomaError::NotFound(principal));
         };
         let status = PresenceStatus::parse(&status)?;
-        let tenant = tenant
-            .parse::<TenantId>()
-            .map_err(|e| SomaError::Backend(format!("corrupt tenant {tenant:?}: {e}")))?;
         self.emit(
             &AgentHeartbeat {
                 principal_id: principal.to_string(),
@@ -446,27 +458,28 @@ impl SomaStore {
     /// [`SomaError::NotFound`] if the principal was never registered.
     pub async fn set_status(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         status: PresenceStatus,
     ) -> Result<(), SomaError> {
         let now = ts_to_db(&Timestamp::now())?;
-        let tenant: Option<String> = {
+        let updated = {
             let conn = self.lock();
-            conn.query_row(
+            conn.execute(
                 "UPDATE soma_presence SET status = ?1, updated_at = ?2 \
-                 WHERE principal_id = ?3 RETURNING tenant",
-                rusqlite::params![status.as_str(), now, principal.to_string()],
-                |r| r.get(0),
+                 WHERE tenant = ?3 AND principal_id = ?4",
+                rusqlite::params![
+                    status.as_str(),
+                    now,
+                    tenant.to_string(),
+                    principal.to_string()
+                ],
             )
-            .optional()
             .map_err(berr)?
         };
-        let Some(tenant) = tenant else {
+        if updated == 0 {
             return Err(SomaError::NotFound(principal));
-        };
-        let tenant = tenant
-            .parse::<TenantId>()
-            .map_err(|e| SomaError::Backend(format!("corrupt tenant {tenant:?}: {e}")))?;
+        }
         self.emit(
             &AgentStatusChanged {
                 principal_id: principal.to_string(),
@@ -482,16 +495,20 @@ impl SomaStore {
     /// `agent.deregistered` on a real removal. The canonical principal is NOT touched --
     /// deleting a projection never cascades into the directory (projection convention
     /// section 4).
-    pub async fn delete(&self, principal: PrincipalId) -> Result<bool, SomaError> {
+    pub async fn delete(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<bool, SomaError> {
         // Fetch first so the event can carry the row's tenant.
-        let Some(presence) = self.get(principal).await? else {
+        let Some(presence) = self.get(tenant, principal).await? else {
             return Ok(false);
         };
         let removed = {
             let conn = self.lock();
             conn.execute(
-                "DELETE FROM soma_presence WHERE principal_id = ?1",
-                rusqlite::params![principal.to_string()],
+                "DELETE FROM soma_presence WHERE tenant = ?1 AND principal_id = ?2",
+                rusqlite::params![tenant.to_string(), principal.to_string()],
             )
             .map_err(berr)?
         };
@@ -588,6 +605,7 @@ impl SomaStore {
     /// never registered. Returns the updated presence.
     pub async fn update_quality(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         patch: QualityPatch,
     ) -> Result<AgentPresence, SomaError> {
@@ -601,7 +619,7 @@ impl SomaStore {
             let mut conn = self.lock();
             let tx = conn.transaction().map_err(berr)?;
             let mut presence =
-                Self::get_in(&tx, principal)?.ok_or(SomaError::NotFound(principal))?;
+                Self::get_in(&tx, tenant, principal)?.ok_or(SomaError::NotFound(principal))?;
             if let Some(score) = patch.quality_score {
                 presence.quality_score = Some(score);
             }
@@ -611,12 +629,13 @@ impl SomaStore {
             presence.updated_at = ts_from_db(&now)?;
             tx.execute(
                 "UPDATE soma_presence SET quality_score = ?1, drift_flags = ?2, updated_at = ?3 \
-                 WHERE principal_id = ?4",
+                 WHERE tenant = ?4 AND principal_id = ?5",
                 rusqlite::params![
                     presence.quality_score,
                     serde_json::to_string(&presence.drift_flags)
                         .map_err(|e| SomaError::Backend(format!("drift_flags serialize: {e}")))?,
                     now,
+                    tenant.to_string(),
                     principal.to_string(),
                 ],
             )
@@ -752,7 +771,7 @@ mod tests {
         assert!(made.drift_flags.is_empty());
         assert!(made.heartbeat_at.is_none());
         let got = store
-            .get(req.principal_id)
+            .get(tenant, req.principal_id)
             .await
             .expect("get")
             .expect("present");
@@ -788,11 +807,12 @@ mod tests {
 
         // Mark it online with a heartbeat and give it a score.
         store
-            .heartbeat(req.principal_id, None)
+            .heartbeat(tenant, req.principal_id, None)
             .await
             .expect("heartbeat");
         store
             .update_quality(
+                tenant,
                 req.principal_id,
                 QualityPatch {
                     quality_score: Some(0.9),
@@ -867,33 +887,42 @@ mod tests {
         let _ = drain_kinds(&mut rx);
 
         // Pending -> online on first heartbeat (the Kleos wart, fixed).
-        let status = store.heartbeat(principal, None).await.expect("heartbeat");
+        let status = store
+            .heartbeat(tenant, principal, None)
+            .await
+            .expect("heartbeat");
         assert_eq!(status, PresenceStatus::Online);
         assert_eq!(drain_kinds(&mut rx), ["agent.heartbeat"]);
 
         // Offline -> online.
         store
-            .set_status(principal, PresenceStatus::Offline)
+            .set_status(tenant, principal, PresenceStatus::Offline)
             .await
             .expect("offline");
         assert_eq!(
-            store.heartbeat(principal, None).await.expect("heartbeat"),
+            store
+                .heartbeat(tenant, principal, None)
+                .await
+                .expect("heartbeat"),
             PresenceStatus::Online
         );
 
         // Error is sticky under a bare heartbeat...
         store
-            .set_status(principal, PresenceStatus::Error)
+            .set_status(tenant, principal, PresenceStatus::Error)
             .await
             .expect("error");
         assert_eq!(
-            store.heartbeat(principal, None).await.expect("heartbeat"),
+            store
+                .heartbeat(tenant, principal, None)
+                .await
+                .expect("heartbeat"),
             PresenceStatus::Error
         );
         // ...until an explicit override clears it.
         assert_eq!(
             store
-                .heartbeat(principal, Some(PresenceStatus::Online))
+                .heartbeat(tenant, principal, Some(PresenceStatus::Online))
                 .await
                 .expect("heartbeat"),
             PresenceStatus::Online
@@ -902,7 +931,7 @@ mod tests {
         // Unknown principal is NotFound.
         assert!(matches!(
             store
-                .heartbeat(PrincipalId::new(), None)
+                .heartbeat(tenant, PrincipalId::new(), None)
                 .await
                 .expect_err("unknown"),
             SomaError::NotFound(_)
@@ -921,16 +950,20 @@ mod tests {
         let _ = drain_kinds(&mut rx);
 
         store
-            .set_status(principal, PresenceStatus::Online)
+            .set_status(tenant, principal, PresenceStatus::Online)
             .await
             .expect("set");
         assert_eq!(drain_kinds(&mut rx), ["agent.status_changed"]);
-        let got = store.get(principal).await.expect("get").expect("present");
+        let got = store
+            .get(tenant, principal)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(got.status, PresenceStatus::Online);
 
         assert!(matches!(
             store
-                .set_status(PrincipalId::new(), PresenceStatus::Online)
+                .set_status(tenant, PrincipalId::new(), PresenceStatus::Online)
                 .await
                 .expect_err("unknown"),
             SomaError::NotFound(_)
@@ -948,7 +981,7 @@ mod tests {
         cli.agent_type = "cli".to_string();
         store.register(cli.clone()).await.expect("register");
         store
-            .heartbeat(cli.principal_id, None)
+            .heartbeat(tenant, cli.principal_id, None)
             .await
             .expect("heartbeat");
 
@@ -1027,6 +1060,74 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Principal-scoped reads and mutations reject a foreign tenant without changing the row.
+    async fn principal_operations_are_tenant_scoped() {
+        let (store, bus, directory) = store();
+        let mut rx = bus.subscribe("agent");
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let mut req = enrolled_agent(&directory, tenant_a, "tenant-a-agent").await;
+        let principal = req.principal_id;
+        store.register(req.clone()).await.expect("register");
+        let _ = drain_kinds(&mut rx);
+
+        assert!(
+            store
+                .get(tenant_b, principal)
+                .await
+                .expect("foreign get")
+                .is_none()
+        );
+        assert!(matches!(
+            store.heartbeat(tenant_b, principal, None).await,
+            Err(SomaError::NotFound(id)) if id == principal
+        ));
+        assert!(matches!(
+            store
+                .set_status(tenant_b, principal, PresenceStatus::Online)
+                .await,
+            Err(SomaError::NotFound(id)) if id == principal
+        ));
+        assert!(matches!(
+            store
+                .update_quality(
+                    tenant_b,
+                    principal,
+                    QualityPatch {
+                        quality_score: Some(0.9),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            Err(SomaError::NotFound(id)) if id == principal
+        ));
+        assert!(
+            !store
+                .delete(tenant_b, principal)
+                .await
+                .expect("foreign delete")
+        );
+
+        req.tenant = tenant_b;
+        req.name = "foreign-rename".to_string();
+        assert!(matches!(
+            store.register(req).await,
+            Err(SomaError::NotFound(id)) if id == principal
+        ));
+        assert!(drain_kinds(&mut rx).is_empty());
+
+        let unchanged = store
+            .get(tenant_a, principal)
+            .await
+            .expect("owner get")
+            .expect("owner row");
+        assert_eq!(unchanged.tenant, tenant_a);
+        assert_eq!(unchanged.name, "tenant-a-agent");
+        assert_eq!(unchanged.status, PresenceStatus::Pending);
+        assert_eq!(unchanged.quality_score, None);
+    }
+
+    #[tokio::test]
     /// Get by name finds within tenant.
     async fn get_by_name_finds_within_tenant() {
         let (store, _bus, directory) = store();
@@ -1040,11 +1141,13 @@ mod tests {
             .expect("present");
         assert_eq!(got.principal_id, req.principal_id);
         // The label does not resolve in a different tenant.
-        assert!(store
-            .get_by_name(TenantId::new(), "lookup-me")
-            .await
-            .expect("get")
-            .is_none());
+        assert!(
+            store
+                .get_by_name(TenantId::new(), "lookup-me")
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1058,13 +1161,13 @@ mod tests {
         store.register(req).await.expect("register");
         let _ = drain_kinds(&mut rx);
 
-        assert!(store.delete(principal).await.expect("delete"));
+        assert!(store.delete(tenant, principal).await.expect("delete"));
         assert_eq!(drain_kinds(&mut rx), ["agent.deregistered"]);
-        assert!(store.get(principal).await.expect("get").is_none());
+        assert!(store.get(tenant, principal).await.expect("get").is_none());
         // The canonical principal survives projection deletion (convention section 4).
         assert!(directory.lookup(principal).await.expect("lookup").is_some());
         // Idempotent: a second delete is a no-op, no event.
-        assert!(!store.delete(principal).await.expect("delete"));
+        assert!(!store.delete(tenant, principal).await.expect("delete"));
         assert!(drain_kinds(&mut rx).is_empty());
     }
 
@@ -1076,7 +1179,7 @@ mod tests {
         let beating = enrolled_agent(&directory, tenant, "beating").await;
         store.register(beating.clone()).await.expect("register");
         store
-            .heartbeat(beating.principal_id, None)
+            .heartbeat(tenant, beating.principal_id, None)
             .await
             .expect("heartbeat");
         let pending = enrolled_agent(&directory, tenant, "never-beat").await;
@@ -1133,6 +1236,7 @@ mod tests {
         // Score only.
         let p = store
             .update_quality(
+                tenant,
                 principal,
                 QualityPatch {
                     quality_score: Some(0.8),
@@ -1147,6 +1251,7 @@ mod tests {
         // Drift flags only; the score survives.
         let p = store
             .update_quality(
+                tenant,
                 principal,
                 QualityPatch {
                     drift_flags: Some(vec!["persona-drift".to_string()]),
@@ -1161,7 +1266,7 @@ mod tests {
         // An empty patch is rejected; an unknown principal is NotFound.
         assert!(matches!(
             store
-                .update_quality(principal, QualityPatch::default())
+                .update_quality(tenant, principal, QualityPatch::default())
                 .await
                 .expect_err("empty patch"),
             SomaError::InvalidInput(_)
@@ -1169,6 +1274,7 @@ mod tests {
         assert!(matches!(
             store
                 .update_quality(
+                    tenant,
                     PrincipalId::new(),
                     QualityPatch {
                         quality_score: Some(0.1),
@@ -1190,7 +1296,7 @@ mod tests {
         let a = enrolled_agent(&directory, tenant, "a").await;
         store.register(a.clone()).await.expect("register");
         store
-            .heartbeat(a.principal_id, None)
+            .heartbeat(tenant, a.principal_id, None)
             .await
             .expect("heartbeat");
         let mut b = enrolled_agent(&directory, tenant, "b").await;
@@ -1229,7 +1335,7 @@ mod tests {
         {
             let store = SomaStore::open(&tmp, Arc::new(AxonBus::new()), directory).expect("reopen");
             let got = store
-                .get(principal)
+                .get(tenant, principal)
                 .await
                 .expect("get")
                 .expect("present after reopen");

@@ -8,7 +8,7 @@
 //! directly -- sidestepping the rand_core 0.6/0.9 trait-version mismatch that
 //! `SigningKey::generate(&mut OsRng)` would otherwise force on the workspace.
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -32,17 +32,23 @@ impl PublicKey {
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<()> {
         let vk = VerifyingKey::from_bytes(&self.bytes)
             .map_err(|e| PistisError::SignatureInvalid(format!("bad pubkey: {e}")))?;
-        let s = ed25519_dalek::Signature::from_bytes(&sig.bytes);
-        vk.verify(msg, &s)
+        let signature_bytes: [u8; 64] = sig.bytes.as_slice().try_into().map_err(|_| {
+            PistisError::SignatureInvalid(format!(
+                "expected 64 signature bytes, got {}",
+                sig.bytes.len()
+            ))
+        })?;
+        let s = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+        vk.verify_strict(msg, &s)
             .map_err(|_| PistisError::SignatureInvalid("verification failed".into()))
     }
 }
 
-/// Ed25519 signature (64 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Ed25519 signature encoded as exactly 64 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
-    /// Raw 64-byte signature.
-    pub bytes: [u8; 64],
+    /// Raw signature bytes; verification rejects any length other than 64.
+    pub bytes: Vec<u8>,
 }
 
 /// Private signing key. The 32 secret bytes live in a `Zeroizing` wrapper that
@@ -73,13 +79,13 @@ impl SecretKey {
         (public, SecretKey { inner: owned })
     }
 
-    /// Reconstruct a `SecretKey` from raw bytes (e.g. loaded from a vault). The
-    /// input array is zeroized before return; callers must not reuse it.
-    pub fn from_bytes(mut bytes: [u8; 32]) -> SecretKey {
+    /// Reconstruct a `SecretKey` from caller-owned raw bytes.
+    ///
+    /// The referenced input array is zeroized before return.
+    pub fn from_bytes(bytes: &mut [u8; 32]) -> SecretKey {
         let secret = SecretKey {
-            inner: Zeroizing::new(bytes),
+            inner: Zeroizing::new(*bytes),
         };
-        // `Zeroizing::new` copied the bytes; wipe the caller's array too.
         bytes.zeroize();
         secret
     }
@@ -89,7 +95,7 @@ impl SecretKey {
         let signing = SigningKey::from_bytes(&self.inner);
         let sig = signing.sign(msg);
         Signature {
-            bytes: sig.to_bytes(),
+            bytes: sig.to_bytes().to_vec(),
         }
     }
 
@@ -139,6 +145,17 @@ mod tests {
         ));
     }
 
+    /// Verification rejects a serialized signature with the wrong byte length.
+    #[test]
+    fn verify_rejects_wrong_signature_length() {
+        let (pk, _sk) = SecretKey::generate();
+        let malformed = Signature { bytes: vec![0; 63] };
+        assert!(matches!(
+            pk.verify(b"msg", &malformed),
+            Err(PistisError::SignatureInvalid(_))
+        ));
+    }
+
     /// The derived public key matches the one returned at generation.
     #[test]
     fn derived_public_key_matches_generated() {
@@ -150,9 +167,10 @@ mod tests {
     /// signs verifiably.
     #[test]
     fn from_bytes_reconstructs_signing_key() {
-        let raw: [u8; 32] = rand::random();
+        let mut raw: [u8; 32] = rand::random();
         let expected = SigningKey::from_bytes(&raw).verifying_key().to_bytes();
-        let sk = SecretKey::from_bytes(raw);
+        let sk = SecretKey::from_bytes(&mut raw);
+        assert_eq!(raw, [0; 32]);
         assert_eq!(sk.public_key().bytes, expected);
         let sig = sk.sign(b"hello");
         sk.public_key().verify(b"hello", &sig).unwrap();

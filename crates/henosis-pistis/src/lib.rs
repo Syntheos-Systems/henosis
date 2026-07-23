@@ -26,12 +26,15 @@ pub mod room;
 pub mod trust;
 
 pub use authority::{
-    authorize_capabilities, CapabilityCheckDecision, CapabilityCheckRequest, CapabilityRequirement,
+    CapabilityCheckDecision, CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities,
 };
 pub use error::{PistisError, Result};
-pub use gate::{Clock, InMemoryRoomStateSource, PistisGate, RoomStateSource, SystemClock};
-pub use model::{
-    ActionKind, AdmittedPrincipal, Capability, Outcome, OutcomeAttestation, RoomPolicy,
+pub use gate::{
+    Clock, InMemoryRoomStateSource, PistisGate, RoomStateSource, SystemClock, ToolActionPolicy,
 };
-pub use room::RoomState;
+pub use model::{
+    ActionKind, AdmittedPrincipal, Capability, Outcome, OutcomeAttestation, OutcomeStatement,
+    RoomManifest, RoomPolicy, RoomScope,
+};
+pub use room::{RoomState, RoomTrustStore, VerifiedRoomState};
 pub use trust::compute_trust;
