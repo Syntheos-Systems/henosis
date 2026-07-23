@@ -6,16 +6,14 @@
 //! and never published. All HMAC comparisons use the `hmac` crate's
 //! constant-time [`Mac::verify_slice`], never a byte-by-byte `==` on the digest.
 
-use std::collections::HashMap;
-
-use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::Json;
 use hmac::{Hmac, Mac};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Sha256;
 use tracing::warn;
 
@@ -36,7 +34,7 @@ pub enum Provider {
     Slack,
     /// Linear (`Linear-Signature`, HMAC-SHA256).
     Linear,
-    /// Notion (no signature; IP allowlist, handled by the caller).
+    /// Notion (`X-Notion-Signature`, HMAC-SHA256).
     Notion,
 }
 
@@ -93,6 +91,15 @@ fn decode_hex_sig(header: &str, prefix: &str) -> Option<Vec<u8>> {
 /// Verify a GitHub webhook: `X-Hub-Signature-256: sha256=<hex>` over the raw
 /// body under the shared secret.
 pub fn verify_github(secret: &[u8], body: &[u8], signature_header: &str) -> bool {
+    match decode_hex_sig(signature_header, "sha256=") {
+        Some(expected) => hmac_matches(secret, body, &expected),
+        None => false,
+    }
+}
+
+/// Verify a Notion webhook: `X-Notion-Signature: sha256=<hex>` over the raw
+/// body under the subscription verification token.
+pub fn verify_notion(secret: &[u8], body: &[u8], signature_header: &str) -> bool {
     match decode_hex_sig(signature_header, "sha256=") {
         Some(expected) => hmac_matches(secret, body, &expected),
         None => false,
@@ -185,6 +192,24 @@ fn event_type(provider: Provider, headers: &HeaderMap, body: &Value) -> String {
     }
 }
 
+/// Normalize one verified provider payload without accepting unsigned tenant
+/// attribution from the public request URL.
+fn normalize_event(
+    provider: Provider,
+    headers: &HeaderMap,
+    raw_event: Value,
+    verified: bool,
+) -> WebhookEvent {
+    WebhookEvent {
+        provider: provider.as_str().to_string(),
+        event_type: event_type(provider, headers, &raw_event),
+        raw_event,
+        tenant_id: None,
+        received_at: now_rfc3339(),
+        verified,
+    }
+}
+
 /// `POST /webhooks/{provider}`: verify, normalize, and publish an inbound
 /// webhook. The raw body is read before parsing so the signature is checked
 /// over the exact bytes the provider signed. An invalid signature is rejected
@@ -193,7 +218,6 @@ fn event_type(provider: Provider, headers: &HeaderMap, body: &Value) -> String {
 pub async fn ingest(
     State(state): State<AppState>,
     Path(provider_str): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -218,15 +242,8 @@ pub async fn ingest(
     };
 
     let raw_event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let evt_type = event_type(provider, &headers, &raw_event);
-    let event = WebhookEvent {
-        provider: provider.as_str().to_string(),
-        event_type: evt_type.clone(),
-        raw_event,
-        tenant_id: params.get("tenant_id").cloned(),
-        received_at: now_rfc3339(),
-        verified,
-    };
+    let event = normalize_event(provider, &headers, raw_event, verified);
+    let evt_type = event.event_type.clone();
 
     let channel = format!("hermes.webhook.{}.{}", provider.as_str(), evt_type);
     state.axon.publish(
@@ -242,22 +259,15 @@ pub async fn ingest(
         .into_response()
 }
 
-/// Verify an inbound webhook per provider. Returns `Ok(verified)` -- `true` when
-/// a signature checked out, `false` for the unsigned Notion path -- or
-/// `Err(reason)` when a signed provider failed verification or its secret could
-/// not be resolved (fail closed).
+/// Verify an inbound webhook per provider. Returns `Ok(true)` when its
+/// signature checked out, or `Err(reason)` when verification failed or its
+/// secret could not be resolved.
 async fn verify_inbound(
     state: &AppState,
     provider: Provider,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<bool, String> {
-    // Notion does not sign webhooks; an IP allowlist (optional) is the only
-    // control. With no allowlist configured we accept but mark unverified.
-    if provider == Provider::Notion {
-        return Ok(false);
-    }
-
     let secret = state
         .phylaxd
         .fetch_raw_secret("webhooks", &format!("{}-secret", provider.as_str()))
@@ -280,7 +290,10 @@ async fn verify_inbound(
                 .ok_or("missing X-Slack-Request-Timestamp")?;
             verify_slack(secret.as_bytes(), body, ts, sig, now_unix())
         }
-        Provider::Notion => unreachable!("notion handled above"),
+        Provider::Notion => {
+            let sig = header(headers, "x-notion-signature").ok_or("missing X-Notion-Signature")?;
+            verify_notion(secret.as_bytes(), body, sig)
+        }
     };
 
     if ok {
@@ -337,6 +350,30 @@ mod tests {
         assert!(!verify_linear(b"wrong", BODY, &sig));
         assert!(!verify_linear(SECRET, b"other", &sig));
         assert!(!verify_linear(SECRET, BODY, "zzzz"));
+    }
+
+    /// Notion uses a sha256-prefixed HMAC and rejects altered payloads.
+    #[test]
+    fn notion_roundtrip_and_tamper() {
+        let sig = format!("sha256={}", hex::encode(hmac_sha256(SECRET, BODY)));
+        assert!(verify_notion(SECRET, BODY, &sig));
+        assert!(!verify_notion(b"wrong", BODY, &sig));
+        assert!(!verify_notion(SECRET, b"other", &sig));
+        assert!(!verify_notion(SECRET, BODY, "sha256=zz"));
+    }
+
+    /// Normalization never trusts tenant attribution from an unsigned URL.
+    #[test]
+    fn normalized_event_has_no_caller_selected_tenant() {
+        let event = normalize_event(
+            Provider::Notion,
+            &HeaderMap::new(),
+            json!({"type": "page.content_updated"}),
+            true,
+        );
+        assert_eq!(event.event_type, "page.content_updated");
+        assert!(event.tenant_id.is_none());
+        assert!(event.verified);
     }
 
     /// Slack verifies a correctly-signed, in-window request and rejects

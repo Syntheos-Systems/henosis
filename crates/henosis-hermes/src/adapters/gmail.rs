@@ -5,7 +5,7 @@
 //! it before posting to the Gmail API.
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -183,25 +183,46 @@ fn parse_args(args: &Value) -> Result<GmailArgs, String> {
         .as_object()
         .ok_or_else(|| "args must be a JSON object".to_string())?;
     let pull_required = |k: &str| -> Result<String, String> {
-        obj.get(k)
+        let value = obj
+            .get(k)
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("'{k}' is required and must be a non-empty string"))
+            .ok_or_else(|| format!("'{k}' is required and must be a non-empty string"))?;
+        validate_header_value(k, value)
     };
-    let pull_optional = |k: &str| -> Option<String> {
-        obj.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    let pull_optional = |k: &str| -> Result<Option<String>, String> {
+        match obj.get(k).and_then(|v| v.as_str()) {
+            Some(value) => validate_header_value(k, value).map(Some),
+            None => Ok(None),
+        }
     };
     Ok(GmailArgs {
         to: pull_required("to")?,
         subject: pull_required("subject")?,
-        body: pull_required("body")?,
-        cc: pull_optional("cc"),
-        bcc: pull_optional("bcc"),
+        body: obj
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| "'body' is required and must be a non-empty string".to_string())?,
+        cc: pull_optional("cc")?,
+        bcc: pull_optional("bcc")?,
     })
+}
+
+/// Validate and normalize a value before it is interpolated into one MIME
+/// header line.
+fn validate_header_value(name: &str, value: &str) -> Result<String, String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("'{name}' contains an unsafe control character"));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "'{name}' is required and must be a non-empty string"
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Build an RFC2822 MIME message string from the parsed args.
@@ -223,13 +244,13 @@ fn build_mime(a: &GmailArgs) -> String {
     out
 }
 
-/// Encode the subject as plain ASCII when possible, or as RFC2047
-/// base64url when it contains non-ASCII characters.
+/// Encode the subject as plain ASCII when possible, or as an RFC 2047
+/// standard-Base64 encoded word when it contains non-ASCII characters.
 fn encode_subject(s: &str) -> String {
     if s.is_ascii() {
         s.to_string()
     } else {
-        format!("=?UTF-8?B?{}?=", URL_SAFE_NO_PAD.encode(s.as_bytes()))
+        format!("=?UTF-8?B?{}?=", STANDARD.encode(s.as_bytes()))
     }
 }
 
@@ -866,13 +887,52 @@ mod tests {
         assert!(args.bcc.is_none());
     }
 
+    /// Every MIME header field rejects control characters before construction.
+    #[test]
+    fn parse_args_rejects_mime_header_injection() {
+        for (field, value) in [
+            ("to", "a@b.test\r\nBcc: attacker@example.test"),
+            ("subject", "hello\nX-Injected: true"),
+            ("cc", "copy@example.test\0hidden"),
+            ("bcc", "blind@example.test\tX-Injected: true"),
+        ] {
+            let mut input = json!({
+                "to": "a@b.test",
+                "subject": "safe",
+                "body": "body",
+                "cc": "copy@example.test",
+                "bcc": "blind@example.test"
+            });
+            input
+                .as_object_mut()
+                .expect("test input is an object")
+                .insert(field.to_string(), Value::String(value.to_string()));
+            let error = match parse_args(&input) {
+                Err(error) => error,
+                Ok(_) => panic!("control character must be rejected"),
+            };
+            assert!(error.contains("unsafe control character"));
+        }
+    }
+
+    /// Printable Unicode remains valid in MIME header values.
+    #[test]
+    fn parse_args_accepts_printable_unicode_headers() {
+        let input = json!({
+            "to": "récepteur@example.test",
+            "subject": "Résumé ✓",
+            "body": "body"
+        });
+        let args = parse_args(&input).expect("printable Unicode is safe");
+        assert_eq!(args.subject, "Résumé ✓");
+    }
+
     #[test]
     /// Verifies subject encodes non ascii.
     fn subject_encodes_non_ascii() {
         assert_eq!(encode_subject("hello"), "hello");
         let utf8 = encode_subject("héllo");
-        assert!(utf8.starts_with("=?UTF-8?B?"));
-        assert!(utf8.ends_with("?="));
+        assert_eq!(utf8, "=?UTF-8?B?aMOpbGxv?=");
     }
 
     #[test]
