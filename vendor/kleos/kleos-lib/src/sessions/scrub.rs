@@ -7,9 +7,12 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::cred::PhylaxdClient;
 use crate::db::Database;
-use crate::gate::scrub_output;
 use crate::Result;
 use tracing::warn;
+
+/// Minimum secret length for encoded redaction variants, avoiding generic
+/// short base64 or percent-encoded fragments that would cause false positives.
+const MIN_ENCODED_SCRUB_LEN: usize = 8;
 
 #[derive(Debug, Clone)]
 /// Stores a cached secret list and the time it was loaded.
@@ -74,6 +77,71 @@ pub async fn scrub_message(
 /// Replaces every known secret in a message with a redaction marker.
 pub fn apply_scrub(message: &str, secrets: &[String]) -> String {
     scrub_output(message, secrets)
+}
+
+/// Scrubs known secret values from arbitrary output with raw, base64, and
+/// percent-encoded redaction markers.
+pub fn scrub_output(output: &str, known_secrets: &[String]) -> String {
+    use base64::Engine;
+
+    let mut result = output.to_string();
+    for secret in known_secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        result = result.replace(secret.as_str(), "[REDACTED]");
+
+        if secret.len() >= MIN_ENCODED_SCRUB_LEN {
+            let b64_std = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+            if result.contains(&b64_std) {
+                result = result.replace(&b64_std, "[REDACTED:b64]");
+            }
+
+            let b64_url = base64::engine::general_purpose::URL_SAFE.encode(secret.as_bytes());
+            if b64_url != b64_std && result.contains(&b64_url) {
+                result = result.replace(&b64_url, "[REDACTED:b64]");
+            }
+
+            let b64_nopad =
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(secret.as_bytes());
+            if b64_nopad != b64_std && result.contains(&b64_nopad) {
+                result = result.replace(&b64_nopad, "[REDACTED:b64]");
+            }
+
+            let pct = percent_encode_secret(secret);
+            if pct != *secret && result.contains(&pct) {
+                result = result.replace(&pct, "[REDACTED:pct]");
+            }
+        }
+    }
+    result
+}
+
+/// Percent-encodes a string while preserving RFC 3986 unreserved characters.
+fn percent_encode_secret(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(hex_nibble(byte >> 4));
+                encoded.push(hex_nibble(byte & 0x0F));
+            }
+        }
+    }
+    encoded
+}
+
+/// Converts a four-bit value into its uppercase hexadecimal character.
+fn hex_nibble(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + nibble - 10) as char,
+        _ => unreachable!(),
+    }
 }
 
 /// Loads scrub secrets from the authority or a valid cached fallback.
@@ -156,7 +224,7 @@ pub(crate) fn reset_scrub_cache() {
 #[cfg(test)]
 /// Tests message scrubbing behavior.
 mod tests {
-    use super::{apply_scrub, reset_scrub_cache};
+    use super::{apply_scrub, reset_scrub_cache, scrub_output};
 
     #[test]
     /// Verifies known secret text is redacted.
@@ -190,6 +258,47 @@ mod tests {
         for sample in corpus {
             assert_eq!(apply_scrub(sample, &["alpha-secret".to_string()]), sample);
         }
+    }
+
+    #[test]
+    /// Verifies raw secret values are redacted by the feature-independent helper.
+    fn raw_secret_is_redacted() {
+        let known = vec!["my-api-key-12345".to_string()];
+        let result = scrub_output("the key is my-api-key-12345 here", &known);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("my-api-key-12345"));
+    }
+
+    #[test]
+    /// Verifies base64-encoded secret values are redacted without the gate feature.
+    fn base64_secret_is_redacted() {
+        use base64::Engine;
+
+        let secret = "SuperSecretAPIKey123".to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+        let result = scrub_output(&format!("encoded: {b64}"), &[secret]);
+        assert!(result.contains("[REDACTED:b64]"));
+        assert!(!result.contains(&b64));
+    }
+
+    #[test]
+    /// Verifies percent-encoded secret values are redacted without the gate feature.
+    fn percent_encoded_secret_is_redacted() {
+        let secret = "key=value&secret+data".to_string();
+        let encoded = "key%3Dvalue%26secret%2Bdata";
+        let result = scrub_output(&format!("url param: {encoded}"), &[secret]);
+        assert!(result.contains("[REDACTED:pct]"));
+        assert!(!result.contains(encoded));
+    }
+
+    #[test]
+    /// Verifies short secrets do not redact generic base64 fragments.
+    fn short_secret_skips_encoded_redaction() {
+        use base64::Engine;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"short");
+        let result = scrub_output(&format!("has {encoded} in it"), &["short".to_string()]);
+        assert!(!result.contains("[REDACTED:b64]"));
     }
 
     // A TTL-expired cache entry is no longer served as a fresh hit, but the

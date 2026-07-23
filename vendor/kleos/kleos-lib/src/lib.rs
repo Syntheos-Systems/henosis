@@ -25,8 +25,12 @@ pub mod facts;
 pub mod forge;
 pub mod frameshift_growth;
 pub mod fsrs;
+/// Generic command-policy and approval gate APIs for standalone Kleos builds.
+#[cfg(feature = "gate")]
 pub mod gate;
 pub mod graph;
+/// Grounding client and local tool-execution APIs for standalone Kleos builds.
+#[cfg(feature = "grounding")]
 pub mod grounding;
 pub mod handoffs;
 pub mod inbox;

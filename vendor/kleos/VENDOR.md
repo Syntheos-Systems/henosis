@@ -3,7 +3,7 @@
 Mode: PATCHED
 Pin: 4c7206bbbc661d936c46ae05a839118e905257d4
 Upstream: kleos
-Content-SHA256: a9d3c07d659df0e44ec2c28f557b679320fde4c1d0999fc713463b30259bd707
+Content-SHA256: 08be87fe13559006697496fd88cc2033e1c93c338cdfd1c248e92404028ea450
 Ref: origin/main
 Mirror: kleos-config=kleos-config
 Mirror: kleos-lib=kleos-lib
@@ -26,6 +26,11 @@ workspace. The crates build against their own vendored workspace root
 - Henosis maintains a narrow phylaxd naming patch in `kleos-lib`: the raw feature, bootstrap
   environment variables and default bind, compatibility diagnostics, and retired auto-tag
   mapping use current terminology while retaining the deployed HTTP and ECDH protocol values.
+- Henosis feature-slices `kleos-lib` for the cognition facade: the standalone default feature
+  set retains `gate` and `grounding`, while `henosis-cognition` disables default features and
+  enables only `brain_hopfield` and `ml`. Session output scrubbing lives in `sessions::scrub`
+  and `gate::scrub_output` re-exports it to preserve the default standalone API. Minimal
+  no-default consumers must now select any execution modules they use.
 - `vendor/kleos/Cargo.toml` remains a hand-maintained trimmed workspace root. Its
   `[workspace.dependencies]` table is copied verbatim from the upstream Kleos root and must
   stay in sync on every pull.

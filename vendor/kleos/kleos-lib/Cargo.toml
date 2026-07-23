@@ -13,7 +13,13 @@ readme = "../README.md"
 name = "kleos_lib"
 
 [features]
-default = ["brain_hopfield", "ml"]
+# Keep the generic execution modules in ordinary standalone builds. Minimal
+# consumers must explicitly select each optional module they use.
+default = ["brain_hopfield", "ml", "gate", "grounding"]
+# Compile the generic command-policy and approval gate API.
+gate = []
+# Compile the grounding client and local shell execution API.
+grounding = []
 brain_hopfield = ["dep:ndarray"]
 # Local ML inference stack: ONNX embedder + cross-encoder reranker
 # (ort/tokenizers) and the LanceDB ANN index (lancedb/arrow). Default-on;
