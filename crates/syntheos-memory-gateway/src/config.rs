@@ -4,6 +4,14 @@
 use std::env;
 use std::net::SocketAddr;
 
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+/// Minimum entropy-bearing length accepted for the inbound bearer token.
+const MIN_API_TOKEN_BYTES: usize = 32;
+/// Maximum inbound bearer-token length retained long enough to hash at startup.
+const MAX_API_TOKEN_BYTES: usize = 512;
+
 /// Resolved gateway configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -17,15 +25,17 @@ pub struct Config {
     pub signing_agent: String,
     /// Model label embedded in the identity hash and request headers.
     pub signing_model: String,
+    /// SHA-256 digest of the bearer token accepted from gateway clients.
+    pub inbound_token_digest: [u8; 32],
 }
 
 /// Configuration loading from environment variables.
 impl Config {
     /// Build configuration from environment variables, applying localhost
-    /// defaults that are safe to commit to a public repository.  The real
-    /// Kleos endpoint and signing key are supplied via the environment at
-    /// runtime.
-    pub fn from_env() -> Self {
+    /// defaults that are safe to commit to a public repository. The real
+    /// Kleos endpoint, signing key, and inbound token are supplied via the
+    /// environment at runtime.
+    pub fn from_env() -> Result<Self, String> {
         let bind_addr =
             env::var("SYNTHEOS_GATEWAY_ADDR").unwrap_or_else(|_| "127.0.0.1:4510".to_string());
         let kleos_base_url = env::var("KLEOS_BASE_URL")
@@ -39,14 +49,45 @@ impl Config {
         let signing_agent =
             env::var("SYNTHEOS_AGENT_LABEL").unwrap_or_else(|_| "syntheos-gateway".to_string());
         let signing_model = env::var("SYNTHEOS_MODEL_LABEL").unwrap_or_else(|_| "none".to_string());
-        Self {
+        let inbound_token =
+            Zeroizing::new(env::var("SYNTHEOS_GATEWAY_API_TOKEN").map_err(|_| {
+                "SYNTHEOS_GATEWAY_API_TOKEN is required; inject it through cred at startup"
+                    .to_string()
+            })?);
+        let inbound_token_digest = validate_and_digest_api_token(inbound_token.as_str())?;
+        Ok(Self {
             bind_addr,
             kleos_base_url,
             signing_host,
             signing_agent,
             signing_model,
-        }
+            inbound_token_digest,
+        })
     }
+}
+
+/// Validate one configured bearer token and retain only its SHA-256 digest.
+fn validate_and_digest_api_token(token: &str) -> Result<[u8; 32], String> {
+    if token.len() < MIN_API_TOKEN_BYTES {
+        return Err(format!(
+            "SYNTHEOS_GATEWAY_API_TOKEN must contain at least {MIN_API_TOKEN_BYTES} bytes"
+        ));
+    }
+    if token.len() > MAX_API_TOKEN_BYTES {
+        return Err(format!(
+            "SYNTHEOS_GATEWAY_API_TOKEN must contain at most {MAX_API_TOKEN_BYTES} bytes"
+        ));
+    }
+    if !token.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+    }) {
+        return Err(
+            "SYNTHEOS_GATEWAY_API_TOKEN contains characters outside the bearer-token alphabet"
+                .to_string(),
+        );
+    }
+    Ok(Sha256::digest(token.as_bytes()).into())
 }
 
 /// Query the OS for the machine hostname, returning "unknown" on failure.
@@ -81,7 +122,34 @@ pub fn validated_bind_addr(
 #[cfg(test)]
 /// Exercises fail-closed validation of gateway bind addresses.
 mod tests {
-    use super::validated_bind_addr;
+    use super::{validate_and_digest_api_token, validated_bind_addr, MAX_API_TOKEN_BYTES};
+
+    /// A high-entropy header-safe token is reduced to a deterministic digest.
+    #[test]
+    fn api_token_validation_accepts_safe_input() {
+        let token = "gateway-token-that-is-at-least-thirty-two-bytes";
+        let first = validate_and_digest_api_token(token).expect("valid token");
+        let second = validate_and_digest_api_token(token).expect("valid token");
+        assert_eq!(first, second);
+        assert_ne!(first, [0; 32]);
+    }
+
+    /// Missing entropy, ambiguous whitespace, controls, and excess length fail closed.
+    #[test]
+    fn api_token_validation_rejects_unsafe_input() {
+        for invalid in [
+            "",
+            "too-short",
+            "gateway token that contains whitespace and is long enough",
+            "gateway-token-with-a-control-byte-\n-and-padding",
+        ] {
+            assert!(
+                validate_and_digest_api_token(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert!(validate_and_digest_api_token(&"a".repeat(MAX_API_TOKEN_BYTES + 1)).is_err());
+    }
 
     /// IPv4 and IPv6 loopback addresses are safe without an override.
     #[test]

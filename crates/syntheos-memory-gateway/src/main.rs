@@ -26,7 +26,7 @@ async fn main() {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env().unwrap_or_else(|error| panic!("{error}"));
     let bind_addr = config::validated_bind_addr(
         &config.bind_addr,
         std::env::var("SYNTHEOS_GATEWAY_ALLOW_INSECURE_REMOTE")
@@ -67,7 +67,7 @@ async fn main() {
     };
 
     let client = KleosClient::new(&config, signer);
-    let app = routes::router(client);
+    let app = routes::router(client, config.inbound_token_digest);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
