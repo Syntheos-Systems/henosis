@@ -17,12 +17,26 @@ Native release archives contain one launch executable: `henosis`. The installers
 platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account,
 run `henosis init --quick`, and restore the prior executable if initialization fails.
 
-The copy-and-paste installer commands are published only after the first signed release is
-immutable. They pin the reviewed installer script to its full Git commit while selecting the
-release version separately, so a moved tag cannot replace code before verification. Before
-downloading a binary, the installer requires GitHub to report that release as published and
-immutable. Set `HENOSIS_VERSION`, `HENOSIS_RELEASE_BASE`, `HENOSIS_RELEASE_API`, or
-`HENOSIS_INSTALL_DIR` to override installer defaults.
+Install on Linux or macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.sh \
+  | sh -s -- --version v0.1.0-alpha.1
+```
+
+Install from PowerShell on Windows:
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1'))) `
+  -Version 'v0.1.0-alpha.1'
+```
+
+Both commands pin the reviewed installer script to its full Git commit while selecting the release
+version separately, so a moved tag cannot replace code before verification. Before downloading a
+binary, the installer requires GitHub to report that release as published and immutable. Set
+`HENOSIS_VERSION`, `HENOSIS_RELEASE_BASE`, `HENOSIS_RELEASE_API`, or `HENOSIS_INSTALL_DIR` to
+override installer defaults.
 
 The installer creates private local configuration without asking for or generating a user password. Start the loopback service:
 

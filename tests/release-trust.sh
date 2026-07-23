@@ -8,6 +8,7 @@ WORKFLOW="$REPOSITORY_DIR/.github/workflows/ci.yml"
 README="$REPOSITORY_DIR/README.md"
 ALLOWED_SIGNERS="$REPOSITORY_DIR/security/release-allowed-signers"
 EXPECTED_SIGNER='ghostframe@girbox.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA8RT1QrONYawdO9XOD1sjgy0cOewtktEBm7gZniJ0/o'
+BOOTSTRAP_COMMIT=1a9ff0730f36e9a3af537e09177d36e3be204229
 
 # Stop the release trust contract with a diagnostic.
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -45,9 +46,16 @@ require_line "$WORKFLOW" 'git ls-remote --exit-code --tags origin "refs/tags/$GI
 require_line "$WORKFLOW" '--jq .immutable'
 require_line "$REPOSITORY_DIR/install.sh" 'release_metadata_fields'
 require_line "$REPOSITORY_DIR/install.ps1" '$metadata.immutable -ne $true'
+require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.sh"
+require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.ps1"
+require_line "$README" '| sh -s -- --version v0.1.0-alpha.1'
+require_line "$README" "-Version 'v0.1.0-alpha.1'"
 if sed -n 's/.*uses:[[:space:]]*[^@]*@\([^ #]*\).*/\1/p' "$WORKFLOW" |
     grep -Ev '^[0-9a-f]{40}$' >/dev/null; then
     fail 'workflow contains an action that is not pinned to a full commit'
+fi
+if [ "$(grep -Ec 'raw\.githubusercontent\.com/Syntheos-Systems/henosis/[0-9a-f]{40}/install\.(sh|ps1)' "$README")" -ne 2 ]; then
+    fail 'README must contain exactly one full-commit bootstrap URL per installer'
 fi
 if grep -E 'raw\.githubusercontent\.com/Syntheos-Systems/henosis/[^/]+/install\.(sh|ps1)' "$README" |
     grep -Ev 'raw\.githubusercontent\.com/Syntheos-Systems/henosis/[0-9a-f]{40}/install\.(sh|ps1)' >/dev/null; then
