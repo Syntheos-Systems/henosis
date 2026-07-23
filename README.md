@@ -1,12 +1,17 @@
 # Henosis
 
-Henosis is an operating system for persistent autonomous agents. It keeps identity, memory,
-trust, coordination, execution, policy, and credentials in one runtime so an agent can retain
-continuity across model calls, process restarts, and work sessions.
+Henosis is a governed operating system for persistent autonomous agents. One principal carries an
+agent's identity, trust, credentials, tasks, memory, and quality history across model calls,
+process restarts, and work sessions.
 
 Each agent has one principal identity. Soma records its presence, Pistis evaluates its trust and
 capabilities, `phylaxd` brokers its credentials, Kleos holds its memory, and Axon carries its
 actions to the rest of the system. The agent does not need a separate identity for each subsystem.
+
+Every action crosses an ordered authority chain before execution. Henosis records the decision and
+projects the outcome into task state, presence, narration, workflows, and quality measurements.
+This gives operators a durable answer to four questions: who acted, why policy allowed it, which
+credential boundary it crossed, and what changed afterward.
 
 > **Status:** Henosis is under active development. The integrated server runs, the source installer
 > produces a persistent user service, and the core authorities fail closed. APIs, database schemas,
@@ -43,6 +48,25 @@ lifecycle events through Axon.
 This structure gives one agent a continuous record of who it is, what it has done, which
 capabilities it has earned, and which work remains after a restart.
 
+## Product focus
+
+Agent runtimes often compete on model, tool, and chat-channel counts. Henosis concentrates on the
+control plane required after agents receive durable access and unattended work:
+
+| Requirement | Henosis mechanism |
+|---|---|
+| Stable identity | One principal shared across the runtime |
+| Action authorization | Pistis trust, Plutus RBAC and quota, Eidolon policy, human approval, and credential policy |
+| Credential containment | `cred` through `phylaxd`, with policy checks before use |
+| Durable coordination | Chiasm tasks, Soma presence, Loom workflows, and Axon lifecycle events |
+| Operational history | Broca action records and restart-safe service stores |
+| Quality feedback | Thymus evaluations and drift signals feed later decisions |
+| Model independence | Runtime-selected providers and OpenAI-compatible endpoints |
+
+Henosis aims to make long-running agents governable. Provider and adapter breadth remains useful,
+but each new integration must enter through the same identity, policy, credential, event, and
+quality boundaries.
+
 ## What is in the workspace
 
 | Area | Components | Responsibility |
@@ -60,8 +84,28 @@ The default `syntheos-server` build excludes the vendored Kleos machine-learning
 
 ## Quick start
 
-The installer supports Linux and installs `syntheos-server` as a systemd user service. A source
-install needs:
+The installer supports Linux and installs `syntheos-server` as a systemd user service. Start a
+loopback-only development runtime without PostgreSQL:
+
+```sh
+git clone https://github.com/Syntheos-Systems/henosis.git
+cd henosis
+./install.sh --local
+```
+
+The local path runs the real Plutus gate with one generated owner identity, Free-tier daily quotas,
+and a token-bucket rate limit. Its policy counters reset with the process. Identity, tasks,
+presence, workflows, action records, quality data, and credentials remain in the private SQLite
+files under `~/.local/share/henosis/`.
+
+Check the installed service:
+
+```sh
+systemctl --user status henosis
+curl http://127.0.0.1:8088/health
+```
+
+A production or multi-tenant source install needs:
 
 - Git, Rust 1.88 or newer, Cargo, OpenSSL, and ripgrep
 - Rust 1.94 or newer when building the optional `cognition` feature
@@ -69,11 +113,9 @@ install needs:
 - `curl` or `wget` for the startup health check
 - A systemd user manager, unless you pass `--no-service`
 
-Clone the repository and run the installer:
+Run the installer without `--local` and provide PostgreSQL when prompted:
 
 ```sh
-git clone https://github.com/Syntheos-Systems/henosis.git
-cd henosis
 ./install.sh
 ```
 
@@ -208,6 +250,9 @@ cargo test --locked --workspace
 
 ## Active-development limits
 
+- Local policy mode supports one generated owner on loopback. Its quota and rate-limit counters
+  reset on restart, it does not support Stripe billing or operator-account bootstrap, and it is not
+  a production or multi-tenant backend.
 - Kernel APIs use caller-asserted tenant and principal IDs. Keep the integrated server on loopback;
   non-loopback binds require an explicit insecure-development override and an authenticated private
   boundary.

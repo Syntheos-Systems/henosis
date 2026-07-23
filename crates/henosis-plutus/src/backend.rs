@@ -1,16 +1,19 @@
 //! The `PolicyBackend` trait: the four reads `PlutusGate` needs from a policy authority.
 //!
-//! `PlutusStore` (Postgres) is the production implementation. `MockPolicyBackend`
-//! (available under the `test-helpers` feature or in `#[cfg(test)]` contexts) is
-//! a configurable in-process implementation that lets gate tests run without a
-//! live Postgres connection -- satisfying D1 rule 6.
+//! `PlutusStore` (Postgres) is the production implementation. `LocalPolicyBackend`
+//! provides a bounded single-operator development authority. `MockPolicyBackend`
+//! (available under the `test-helpers` feature or in `#[cfg(test)]` contexts) lets
+//! gate tests run without a live Postgres connection -- satisfying D1 rule 6.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use syntheos_contracts::{PrincipalId, TenantId};
 
-use crate::quota::{QuotaDimension, QuotaOutcome};
+use crate::quota::{QuotaConfig, QuotaDimension, QuotaOutcome, QuotaTier};
 use crate::rbac::Role;
-use crate::Result;
+use crate::{PlutusError, Result};
 
 /// The lifecycle status of an org.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,7 @@ impl std::fmt::Display for OrgStatus {
 /// The policy reads `PlutusGate` and the operator login flow need from a policy authority.
 ///
 /// Production impl: `PlutusStore` over Postgres.
+/// Local development impl: `LocalPolicyBackend` for one operator on loopback.
 /// Test impl: `MockPolicyBackend` (no live DB required).
 ///
 /// Every method returns `Result<_>` so the gate can distinguish "policy says no"
@@ -103,6 +107,132 @@ pub trait PolicyBackend: Send + Sync {
         tenant: TenantId,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool>;
+}
+
+/// A loopback-only, single-operator policy authority for local development.
+///
+/// This backend preserves the same org, membership, RBAC, quota, and token-bucket reads used by
+/// [`crate::PlutusGate`] without requiring PostgreSQL. Its counters live in process memory, so
+/// production and multi-tenant deployments must use [`crate::PlutusStore`]. The server owns the
+/// loopback and billing restrictions that keep this backend inside its development boundary.
+pub struct LocalPolicyBackend {
+    /// The only tenant recognized by this local authority.
+    tenant: TenantId,
+    /// The only principal recognized as a member of the local tenant.
+    principal: PrincipalId,
+    /// The local principal's role within the tenant.
+    role: Role,
+    /// Quota and rate-limit values selected from the configured tier.
+    quota: QuotaConfig,
+    /// Daily counters keyed by stable quota dimension and UTC date.
+    usage: Mutex<HashMap<(String, String), i64>>,
+    /// Token-bucket state initialized on the first request.
+    rate_bucket: Mutex<Option<LocalRateBucket>>,
+}
+
+/// Mutable token-bucket state protected by [`LocalPolicyBackend::rate_bucket`].
+struct LocalRateBucket {
+    /// Tokens available after the most recent request.
+    tokens: f64,
+    /// UTC instant used as the refill baseline.
+    last_refill: chrono::DateTime<chrono::Utc>,
+}
+
+/// Constructs the bounded local authority used by explicit development installs.
+impl LocalPolicyBackend {
+    /// Create a local authority for one tenant and principal.
+    pub fn new(tenant: TenantId, principal: PrincipalId, role: Role, tier: QuotaTier) -> Self {
+        Self {
+            tenant,
+            principal,
+            role,
+            quota: tier.defaults(),
+            usage: Mutex::new(HashMap::new()),
+            rate_bucket: Mutex::new(None),
+        }
+    }
+
+    /// Reject policy mutations for an unknown tenant before touching local counters.
+    fn require_tenant(&self, tenant: TenantId) -> Result<()> {
+        if tenant == self.tenant {
+            Ok(())
+        } else {
+            Err(PlutusError::Config(
+                "local policy received an unknown tenant".to_string(),
+            ))
+        }
+    }
+}
+
+/// Supplies real single-tenant policy decisions without an external database.
+#[async_trait]
+impl PolicyBackend for LocalPolicyBackend {
+    /// Return an active org only for the configured local tenant.
+    async fn org_status(&self, tenant: TenantId) -> Result<Option<OrgStatus>> {
+        Ok((tenant == self.tenant).then_some(OrgStatus::Active))
+    }
+
+    /// Return the configured role only for the exact tenant and principal pair.
+    async fn member_role(&self, tenant: TenantId, principal: PrincipalId) -> Result<Option<Role>> {
+        Ok((tenant == self.tenant && principal == self.principal).then_some(self.role))
+    }
+
+    /// Resolve the configured tenant only for the configured local principal.
+    async fn tenant_for_principal(&self, principal: PrincipalId) -> Result<Option<TenantId>> {
+        Ok((principal == self.principal).then_some(self.tenant))
+    }
+
+    /// Increment one daily quota counter under a mutex and return the enforced limit.
+    async fn check_and_increment(
+        &self,
+        tenant: TenantId,
+        dim: QuotaDimension,
+        amount: i64,
+        today: &str,
+    ) -> Result<QuotaOutcome> {
+        self.require_tenant(tenant)?;
+        let limit = dim.limit_from_config(&self.quota);
+        let key = (dim.as_str().to_string(), today.to_string());
+        let mut usage = self
+            .usage
+            .lock()
+            .map_err(|_| PlutusError::Store("local usage lock poisoned".to_string()))?;
+        let used = usage.entry(key).or_insert(0);
+        *used = used
+            .checked_add(amount)
+            .ok_or_else(|| PlutusError::Store("local usage counter overflow".to_string()))?;
+        Ok(QuotaOutcome {
+            allowed: *used <= limit,
+            used: *used,
+            limit,
+        })
+    }
+
+    /// Refill and consume the single local token bucket under a mutex.
+    async fn rate_limit_ok(
+        &self,
+        tenant: TenantId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        self.require_tenant(tenant)?;
+        let rpm = self.quota.rate_limit_rpm as f64;
+        let mut bucket = self
+            .rate_bucket
+            .lock()
+            .map_err(|_| PlutusError::Store("local rate-limit lock poisoned".to_string()))?;
+        let state = bucket.get_or_insert(LocalRateBucket {
+            tokens: rpm,
+            last_refill: now,
+        });
+        let elapsed = (now - state.last_refill).num_milliseconds().max(0) as f64 / 1000.0;
+        state.tokens = (state.tokens + elapsed * rpm / 60.0).min(rpm);
+        state.last_refill = now;
+        if state.tokens < 1.0 {
+            return Ok(false);
+        }
+        state.tokens -= 1.0;
+        Ok(true)
+    }
 }
 
 /// A configurable mock implementation of `PolicyBackend` for use in tests.
@@ -300,6 +430,7 @@ impl PolicyBackend for MockPolicyBackend {
 }
 
 #[cfg(test)]
+/// Unit tests for policy status parsing and in-process backend enforcement.
 mod tests {
     use super::*;
 
@@ -321,5 +452,83 @@ mod tests {
     #[test]
     fn org_status_parse_rejects_unknown() {
         assert!("pending".parse::<OrgStatus>().is_err());
+    }
+
+    /// Local policy recognizes only its configured tenant and principal.
+    #[tokio::test]
+    async fn local_policy_scopes_membership_to_one_identity() {
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let backend = LocalPolicyBackend::new(tenant, principal, Role::Owner, QuotaTier::Free);
+
+        assert_eq!(
+            backend.org_status(tenant).await.unwrap(),
+            Some(OrgStatus::Active)
+        );
+        assert_eq!(
+            backend.member_role(tenant, principal).await.unwrap(),
+            Some(Role::Owner)
+        );
+        assert_eq!(
+            backend.tenant_for_principal(principal).await.unwrap(),
+            Some(tenant)
+        );
+        assert_eq!(backend.org_status(TenantId::new()).await.unwrap(), None);
+        assert_eq!(
+            backend
+                .member_role(tenant, PrincipalId::new())
+                .await
+                .unwrap(),
+            None
+        );
+        let unknown_tenant = TenantId::new();
+        assert!(backend
+            .check_and_increment(unknown_tenant, QuotaDimension::Tasks, 1, "2026-07-22")
+            .await
+            .is_err());
+        assert!(backend
+            .rate_limit_ok(unknown_tenant, chrono::Utc::now())
+            .await
+            .is_err());
+    }
+
+    /// Local policy applies the selected tier's daily hard quota.
+    #[tokio::test]
+    async fn local_policy_enforces_daily_quota() {
+        let tenant = TenantId::new();
+        let backend =
+            LocalPolicyBackend::new(tenant, PrincipalId::new(), Role::Owner, QuotaTier::Free);
+
+        for expected in 1..=10 {
+            let outcome = backend
+                .check_and_increment(tenant, QuotaDimension::Tasks, 1, "2026-07-22")
+                .await
+                .unwrap();
+            assert!(outcome.allowed);
+            assert_eq!(outcome.used, expected);
+        }
+        let denied = backend
+            .check_and_increment(tenant, QuotaDimension::Tasks, 1, "2026-07-22")
+            .await
+            .unwrap();
+        assert!(!denied.allowed);
+        assert_eq!(denied.used, 11);
+        assert_eq!(denied.limit, 10);
+    }
+
+    /// Local policy applies the selected tier's token-bucket rate limit.
+    #[tokio::test]
+    async fn local_policy_enforces_rate_limit() {
+        let tenant = TenantId::new();
+        let backend =
+            LocalPolicyBackend::new(tenant, PrincipalId::new(), Role::Owner, QuotaTier::Free);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        for _ in 0..10 {
+            assert!(backend.rate_limit_ok(tenant, now).await.unwrap());
+        }
+        assert!(!backend.rate_limit_ok(tenant, now).await.unwrap());
     }
 }

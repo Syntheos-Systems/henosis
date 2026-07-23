@@ -116,6 +116,72 @@ test_upgrade_preserves_config() {
     [ "$backups" -eq 1 ] || fail "upgrade did not retain exactly one prior binary"
 }
 
+# Verify local development mode needs no Postgres and writes the bounded policy selection.
+test_local_policy_install() {
+    case_root="$TEST_ROOT/local policy"
+    fixture="$case_root/fixture-server"
+    mkdir -p "$case_root"
+    make_fixture_binary "$fixture"
+    "$REPO_DIR/install.sh" \
+        --local \
+        --binary "$fixture" \
+        --install-dir "$case_root/bin" \
+        --config-dir "$case_root/config" \
+        --data-dir "$case_root/data" \
+        --no-service > "$case_root/output.log" 2>&1
+
+    assert_contains "$case_root/config/henosis.env" 'SYNTHEOS_LOCAL_POLICY=1'
+    if grep -F 'SYNTHEOS_PLUTUS_DB=' "$case_root/config/henosis.env" >/dev/null; then
+        fail "local policy configuration contains a Postgres setting"
+    fi
+    assert_contains "$case_root/config/henosis.env" 'SYNTHEOS_PLUTUS_OPERATOR_TENANT='
+    assert_contains "$case_root/config/henosis.env" 'SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL='
+    assert_contains "$case_root/output.log" 'installation complete'
+
+    before="$case_root/config.before"
+    cp "$case_root/config/henosis.env" "$before"
+    "$REPO_DIR/install.sh" \
+        --local \
+        --binary "$fixture" \
+        --install-dir "$case_root/bin" \
+        --config-dir "$case_root/config" \
+        --data-dir "$case_root/ignored" \
+        --no-service > "$case_root/upgrade.log" 2>&1
+    cmp -s "$before" "$case_root/config/henosis.env" \
+        || fail "local policy upgrade changed configuration"
+}
+
+# Verify local mode rejects ambiguous backend selection, remote exposure, and mode changes.
+test_local_policy_validation() {
+    case_root="$TEST_ROOT/local validation"
+    mkdir -p "$case_root"
+    make_fixture_binary "$case_root/server"
+
+    assert_fails "$REPO_DIR/install.sh" \
+        --local \
+        --postgres-url 'postgres://example.invalid/henosis' \
+        --binary "$case_root/server" \
+        --config-dir "$case_root/conflict" \
+        --no-service > "$case_root/conflict.log" 2>&1
+    assert_contains "$case_root/conflict.log" 'mutually exclusive'
+
+    assert_fails "$REPO_DIR/install.sh" \
+        --local \
+        --bind 0.0.0.0:8088 \
+        --binary "$case_root/server" \
+        --config-dir "$case_root/remote" \
+        --no-service > "$case_root/remote.log" 2>&1
+    assert_contains "$case_root/remote.log" 'requires a loopback'
+
+    assert_fails "$REPO_DIR/install.sh" \
+        --postgres-url 'postgres://example.invalid/henosis' \
+        --binary "$case_root/server" \
+        --install-dir "$TEST_ROOT/local policy/bin" \
+        --config-dir "$TEST_ROOT/local policy/config" \
+        --no-service > "$case_root/mode-change.log" 2>&1
+    assert_contains "$case_root/mode-change.log" 'existing configuration uses local policy'
+}
+
 # Verify input failures are nonzero and redact the supplied database URL.
 test_validation_failures() {
     case_root="$TEST_ROOT/validation"
@@ -186,6 +252,8 @@ EOF
 trap cleanup EXIT HUP INT TERM
 test_fresh_install
 test_upgrade_preserves_config
+test_local_policy_install
+test_local_policy_validation
 test_validation_failures
 test_health_failure
 test_single_cargo_build

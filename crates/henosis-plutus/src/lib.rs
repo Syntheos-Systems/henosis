@@ -25,7 +25,7 @@ pub mod store;
 pub use action_map::{map_invocation, ActionClass};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use backend::MockPolicyBackend;
-pub use backend::{OrgStatus, PolicyBackend};
+pub use backend::{LocalPolicyBackend, OrgStatus, PolicyBackend};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use billing::sign_stripe_payload;
 pub use billing::{

@@ -17,7 +17,7 @@ use henosis_loom::{
 };
 use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
-use henosis_plutus::{PlutusStore, PolicyBackend, QuotaTier};
+use henosis_plutus::{LocalPolicyBackend, PlutusStore, PolicyBackend, QuotaTier, Role};
 use henosis_rift::{Approver, RegistryApprover};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
@@ -126,6 +126,15 @@ const DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 /// Largest accepted Plutus acquisition timeout, preventing an accidental unbounded boot stall.
 const MAX_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
+/// Validated identity pair for the explicit loopback-only policy backend.
+#[derive(Debug)]
+struct LocalPolicyConfig {
+    /// Tenant recognized by the local policy authority.
+    tenant: TenantId,
+    /// Principal granted owner membership in the local tenant.
+    principal: syntheos_contracts::PrincipalId,
+}
+
 #[tokio::main]
 /// Initialize every kernel authority and serve the unified Syntheos API.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -134,6 +143,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Resolve the bind before selecting a policy backend. Local policy has a stricter boundary
+    // than the general development override and may never listen beyond loopback.
+    let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
+    let insecure_remote = std::env::var("SYNTHEOS_ALLOW_INSECURE_REMOTE").ok();
+    let addr = validated_bind_addr(&raw_addr, insecure_remote.as_deref())?;
 
     // Wire the foundation: bus and directory first, stores next, then the dispatcher (its
     // eidolon gate reads drift from the Thymus store, so Thymus must exist first).
@@ -188,35 +203,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(path = %thymus_db, "thymus quality store open");
 
-    // The Plutus policy authority (Story 6.x / row 1): a real gate replacing the last deny-stub.
-    // Org/role/quota state persists in Postgres at SYNTHEOS_PLUTUS_DB (required). On first boot
-    // the operator principal is bootstrapped into a default org so the dispatch path is usable;
-    // subsequent orgs/members are managed through Plutus APIs.
-    // SYNTHEOS_PLUTUS_OPERATOR_TENANT + SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL are required for
-    // the bootstrap. If the org already exists, bootstrap is a no-op.
-    let plutus_url = std::env::var("SYNTHEOS_PLUTUS_DB").map_err(|_| {
-        "SYNTHEOS_PLUTUS_DB is required: set to a Postgres connection URL (e.g. postgres://user:pw@host/plutus)"
-    })?;
-    let plutus_acquire_timeout = plutus_acquire_timeout_from_env()?;
-    // Wrap PlutusStore in Arc before the trait-object coercion so the concrete handle
-    // remains available for the operator bootstrap (create_org, add_member).
-    let plutus_store = Arc::new(
-        PlutusStore::open_with_acquire_timeout(&plutus_url, plutus_acquire_timeout)
-            .await
-            .map_err(|e| format!("plutus store open failed: {e}"))?,
-    );
-    plutus_store
-        .bootstrap_operator_org_if_absent()
-        .await
-        .map_err(|e| format!("plutus operator bootstrap: {e}"))?;
-    let plutus: Arc<dyn PolicyBackend> = plutus_store.clone();
-    // Log the redacted form only -- the raw URL carries the Postgres password in its userinfo
-    // and must never reach the log stream (info-level logs routinely end up in aggregators/disk
-    // with looser access control than the secret itself).
-    tracing::info!(
-        url = %redact_postgres_password(&plutus_url),
-        "plutus policy authority open (real gate in plutus slot)"
-    );
+    // Select exactly one real Plutus policy backend. Production uses PostgreSQL. An explicit
+    // local install uses a single-operator backend with real RBAC, quota, and rate-limit checks.
+    let plutus_url = optional_env("SYNTHEOS_PLUTUS_DB")?;
+    let local_config = validated_local_policy_config(
+        optional_env("SYNTHEOS_LOCAL_POLICY")?.as_deref(),
+        plutus_url.as_deref(),
+        addr,
+        optional_env("SYNTHEOS_PLUTUS_OPERATOR_TENANT")?.as_deref(),
+        optional_env("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL")?.as_deref(),
+    )?;
+    let (plutus, plutus_store): (Arc<dyn PolicyBackend>, Option<Arc<PlutusStore>>) =
+        if let Some(config) = local_config {
+            tracing::info!(
+                tenant = %config.tenant,
+                principal = %config.principal,
+                "local Plutus policy authority enabled (single operator, loopback only)"
+            );
+            (
+                Arc::new(LocalPolicyBackend::new(
+                    config.tenant,
+                    config.principal,
+                    Role::Owner,
+                    QuotaTier::Free,
+                )),
+                None,
+            )
+        } else {
+            let plutus_url = plutus_url
+                .ok_or("SYNTHEOS_PLUTUS_DB is required unless SYNTHEOS_LOCAL_POLICY=1")?;
+            let plutus_acquire_timeout = plutus_acquire_timeout_from_env()?;
+            let store = Arc::new(
+                PlutusStore::open_with_acquire_timeout(&plutus_url, plutus_acquire_timeout)
+                    .await
+                    .map_err(|e| format!("plutus store open failed: {e}"))?,
+            );
+            store
+                .bootstrap_operator_org_if_absent()
+                .await
+                .map_err(|e| format!("plutus operator bootstrap: {e}"))?;
+            tracing::info!(
+                url = %redact_postgres_password(&plutus_url),
+                "PostgreSQL Plutus policy authority open"
+            );
+            (store.clone(), Some(store))
+        };
 
     // The dispatcher gate chain: all five slots run real authorities. Phylax is required rather
     // than replaced by a deny-shaped placeholder when its key is missing.
@@ -255,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 phylax.clone(),
                 bus.clone(),
                 human_approver,
-                plutus,
+                plutus.clone(),
             )?,
             Box::new(HenosisExecutor::from_env(phylax)),
             bus.clone(),
@@ -319,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A set-but-invalid secret is a hard boot error so misconfiguration is never silent.
     if let Some(op_state) = operator_state_from_env(
         directory_store.clone(),
-        plutus_store.clone(),
+        plutus.clone(),
         soma.clone(),
         chiasm.clone(),
         broca.clone(),
@@ -330,7 +361,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     {
         // Bootstrap the first operator account when the bootstrap env vars are set.
-        bootstrap_operator_if_configured(&directory_store, &plutus_store).await?;
+        let store = plutus_store.as_deref().ok_or(
+            "operator account bootstrap requires the PostgreSQL policy backend; unset operator bootstrap variables in local policy mode",
+        )?;
+        bootstrap_operator_if_configured(&directory_store, store).await?;
         state = state.with_operator(op_state);
         tracing::info!("operator surface enabled: /api/auth/*, /api/dashboard, /ws");
     }
@@ -352,9 +386,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
-    let insecure_remote = std::env::var("SYNTHEOS_ALLOW_INSECURE_REMOTE").ok();
-    let addr = validated_bind_addr(&raw_addr, insecure_remote.as_deref())?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "syntheos-server listening (five real gates, in-process Hermes/Phylax executor, action projections live)");
 
@@ -376,6 +407,47 @@ fn validated_bind_addr(raw: &str, insecure_remote: Option<&str>) -> Result<Socke
         ));
     }
     Ok(addr)
+}
+
+/// Read an optional Unicode environment value without treating malformed data as absent.
+fn optional_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{name}: {error}")),
+    }
+}
+
+/// Validate the explicit local policy selection and its single-operator identity.
+fn validated_local_policy_config(
+    local_policy: Option<&str>,
+    postgres_url: Option<&str>,
+    addr: SocketAddr,
+    tenant: Option<&str>,
+    principal: Option<&str>,
+) -> Result<Option<LocalPolicyConfig>, String> {
+    match local_policy {
+        None => return Ok(None),
+        Some("1") => {}
+        Some(_) => return Err("SYNTHEOS_LOCAL_POLICY must be exactly 1 when enabled".to_string()),
+    }
+    if postgres_url.is_some_and(|value| !value.is_empty()) {
+        return Err(
+            "SYNTHEOS_LOCAL_POLICY and SYNTHEOS_PLUTUS_DB are mutually exclusive".to_string(),
+        );
+    }
+    if !addr.ip().is_loopback() {
+        return Err("local policy mode requires a loopback SYNTHEOS_ADDR".to_string());
+    }
+    let tenant = tenant
+        .ok_or("SYNTHEOS_PLUTUS_OPERATOR_TENANT is required in local policy mode")?
+        .parse::<TenantId>()
+        .map_err(|error| format!("SYNTHEOS_PLUTUS_OPERATOR_TENANT: {error}"))?;
+    let principal = principal
+        .ok_or("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL is required in local policy mode")?
+        .parse::<syntheos_contracts::PrincipalId>()
+        .map_err(|error| format!("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL: {error}"))?;
+    Ok(Some(LocalPolicyConfig { tenant, principal }))
 }
 
 /// Open the required Phylax credential store from its configured master key.
@@ -493,14 +565,22 @@ fn validated_webhook_secret(raw: Option<String>) -> Result<Option<String>, Strin
 /// is a hard error rather than a silent "unset", so a mangled secret can never leave the webhook
 /// quietly unmounted when an operator intended it enabled.
 fn billing_state_from_env(
-    plutus_store: Arc<PlutusStore>,
+    plutus_store: Option<Arc<PlutusStore>>,
 ) -> Result<Option<BillingState>, Box<dyn std::error::Error>> {
     let raw = match std::env::var("SYNTHEOS_STRIPE_WEBHOOK_SECRET") {
         Ok(secret) => Some(secret),
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("SYNTHEOS_STRIPE_WEBHOOK_SECRET: {e}").into()),
     };
-    Ok(validated_webhook_secret(raw)?.map(|secret| BillingState::new(plutus_store, secret)))
+    match validated_webhook_secret(raw)? {
+        None => Ok(None),
+        Some(secret) => {
+            let store = plutus_store.ok_or(
+                "Stripe billing requires the PostgreSQL policy backend; disable local policy mode",
+            )?;
+            Ok(Some(BillingState::new(store, secret)))
+        }
+    }
 }
 
 /// Build an [`OperatorState`] from the environment when
@@ -519,7 +599,7 @@ fn billing_state_from_env(
 #[allow(clippy::too_many_arguments)]
 async fn operator_state_from_env(
     directory_store: Arc<SqliteDirectory>,
-    plutus_store: Arc<PlutusStore>,
+    plutus_store: Arc<dyn PolicyBackend>,
     soma: Arc<SomaStore>,
     chiasm: Arc<ChiasmStore>,
     broca: Arc<BrocaStore>,
@@ -880,6 +960,103 @@ mod bind_policy_tests {
     fn malformed_address_is_rejected() {
         let error = validated_bind_addr("localhost:8088", None).expect_err("hostname must fail");
         assert!(error.contains("must be an IP socket address"));
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the explicit local Plutus policy boundary.
+mod local_policy_tests {
+    use super::*;
+
+    /// Build valid local identity strings for pure configuration tests.
+    fn local_ids() -> (String, String) {
+        (
+            TenantId::new().to_string(),
+            syntheos_contracts::PrincipalId::new().to_string(),
+        )
+    }
+
+    /// An absent opt-in leaves the production PostgreSQL selection untouched.
+    #[test]
+    fn absent_local_flag_selects_no_local_backend() {
+        let result = validated_local_policy_config(
+            None,
+            Some("postgres://db/henosis"),
+            "127.0.0.1:8088".parse().unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    /// A valid identity pair enables local policy on loopback without PostgreSQL.
+    #[test]
+    fn exact_local_flag_accepts_loopback_identity() {
+        let (tenant, principal) = local_ids();
+        let config = validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            Some(&tenant),
+            Some(&principal),
+        )
+        .unwrap()
+        .expect("local config");
+        assert_eq!(config.tenant.to_string(), tenant);
+        assert_eq!(config.principal.to_string(), principal);
+    }
+
+    /// Local policy and PostgreSQL cannot both claim the Plutus slot.
+    #[test]
+    fn local_and_postgres_are_mutually_exclusive() {
+        let (tenant, principal) = local_ids();
+        let error = validated_local_policy_config(
+            Some("1"),
+            Some("postgres://db/henosis"),
+            "127.0.0.1:8088".parse().unwrap(),
+            Some(&tenant),
+            Some(&principal),
+        )
+        .expect_err("dual backend selection must fail");
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    /// The general remote-development override cannot expose local policy mode.
+    #[test]
+    fn local_policy_rejects_non_loopback_bind() {
+        let (tenant, principal) = local_ids();
+        let error = validated_local_policy_config(
+            Some("1"),
+            None,
+            "192.0.2.1:8088".parse().unwrap(),
+            Some(&tenant),
+            Some(&principal),
+        )
+        .expect_err("local policy must remain loopback-only");
+        assert!(error.contains("loopback"));
+    }
+
+    /// Local policy rejects missing and malformed identity values.
+    #[test]
+    fn local_policy_requires_valid_identity() {
+        let (_, principal) = local_ids();
+        assert!(validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            None,
+            Some(&principal),
+        )
+        .is_err());
+        assert!(validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            Some("invalid"),
+            Some(&principal),
+        )
+        .is_err());
     }
 }
 
