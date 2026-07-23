@@ -30,6 +30,8 @@ const MAX_POLICY_VERSION_BYTES: usize = 128;
 const MAX_DECISION_ACTOR_BYTES: usize = 256;
 /// Maximum byte length accepted for an optional decision reason.
 const MAX_DECISION_REASON_BYTES: usize = 1024;
+/// Maximum nested JSON value depth accepted by canonical request hashing.
+pub const MAX_CANONICAL_JSON_DEPTH: usize = 128;
 
 /// An approval-store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -241,6 +243,29 @@ fn parse_hash(value: Vec<u8>) -> Result<RequestHash, ApprovalError> {
         .map_err(|_| ApprovalError::Corrupt("request hash is not 32 bytes".into()))
 }
 
+/// Convert one approval to its read-time status without mutating durable terminal states.
+fn effective_status(status: ApprovalStatus, expires_at: i64, now: i64) -> ApprovalStatus {
+    if matches!(status, ApprovalStatus::Pending | ApprovalStatus::Approved) && expires_at <= now {
+        ApprovalStatus::Expired
+    } else {
+        status
+    }
+}
+
+/// Apply read-time expiry to one approval returned to callers.
+fn with_effective_status(mut approval: Approval, now: i64) -> Approval {
+    approval.status = effective_status(approval.status, approval.expires_at, now);
+    approval
+}
+
+/// Return the current Unix timestamp in seconds for read-time expiry evaluation.
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
 /// Reconstruct an approval from the stable select column ordering used by this module.
 fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
     let convert = |error: ApprovalError| {
@@ -276,8 +301,17 @@ fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
 /// Stable column selection used for all approval reads.
 const APPROVAL_COLUMNS: &str = "id, tenant_id, principal_id, token_identity, tool, action, request_hash, prompt, policy_version, status, created_at, expires_at, decided_at, consumed_at, decision_actor, decision_reason";
 
-/// Append a canonical JSON representation to `output`, sorting each object by UTF-8 key bytes.
-fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), ApprovalError> {
+/// Append a depth-bounded canonical JSON representation sorted by UTF-8 object key bytes.
+fn write_canonical_json(
+    value: &Value,
+    output: &mut String,
+    depth: usize,
+) -> Result<(), ApprovalError> {
+    if depth > MAX_CANONICAL_JSON_DEPTH {
+        return Err(ApprovalError::InvalidInput(format!(
+            "JSON request envelope exceeds maximum depth {MAX_CANONICAL_JSON_DEPTH}"
+        )));
+    }
     match value {
         Value::Null => output.push_str("null"),
         Value::Bool(boolean) => output.push_str(if *boolean { "true" } else { "false" }),
@@ -299,7 +333,7 @@ fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), Approv
                 if index != 0 {
                     output.push(',');
                 }
-                write_canonical_json(item, output)?;
+                write_canonical_json(item, output, depth + 1)?;
             }
             output.push(']');
         }
@@ -315,7 +349,7 @@ fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), Approv
                     ApprovalError::InvalidInput(format!("invalid object key: {error}"))
                 })?);
                 output.push(':');
-                write_canonical_json(item, output)?;
+                write_canonical_json(item, output, depth + 1)?;
             }
             output.push('}');
         }
@@ -326,7 +360,7 @@ fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), Approv
 /// Compute a SHA-256 hash over a recursively canonicalized server-built JSON envelope.
 pub fn canonical_request_hash(envelope: &Value) -> Result<RequestHash, ApprovalError> {
     let mut canonical = String::new();
-    write_canonical_json(envelope, &mut canonical)?;
+    write_canonical_json(envelope, &mut canonical, 0)?;
     Ok(Sha256::digest(canonical.as_bytes()).into())
 }
 
@@ -411,8 +445,8 @@ impl ApprovalStore {
         let mut connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         let transaction = connection.transaction().map_err(storage)?;
         transaction.execute(
-            "UPDATE approval SET status = 'expired' WHERE status IN ('pending', 'approved') AND expires_at <= ?1",
-            rusqlite::params![now],
+            "UPDATE approval SET status = 'expired' WHERE tenant_id = ?1 AND status IN ('pending', 'approved') AND expires_at <= ?2",
+            rusqlite::params![request.tenant.to_string(), now],
         ).map_err(storage)?;
         let token_identity = canonical_token_identity(&request.token_identity)?;
         let select = format!("SELECT {APPROVAL_COLUMNS} FROM approval WHERE tenant_id = ?1 AND principal_id = ?2 AND token_identity = ?3 AND tool = ?4 AND action = ?5 AND request_hash = ?6 AND policy_version = ?7 ORDER BY created_at DESC, id DESC LIMIT 1");
@@ -502,6 +536,9 @@ impl ApprovalStore {
                 approval_from_row,
             )
             .optional()
+            .map(|approval| {
+                approval.map(|approval| with_effective_status(approval, unix_seconds()))
+            })
             .map_err(storage)
     }
 
@@ -515,7 +552,10 @@ impl ApprovalStore {
         let rows = prepared
             .query_map(rusqlite::params![tenant.to_string()], approval_from_row)
             .map_err(storage)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+        let now = unix_seconds();
+        rows.map(|row| row.map(|approval| with_effective_status(approval, now)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)
     }
 
     /// Apply one decision only to a still-pending, non-expired record in the supplied tenant.
@@ -563,8 +603,8 @@ impl ApprovalStore {
         if approval.expires_at <= now {
             transaction
                 .execute(
-                    "UPDATE approval SET status = 'expired' WHERE id = ?1 AND status = 'pending'",
-                    rusqlite::params![id.to_string()],
+                    "UPDATE approval SET status = 'expired' WHERE tenant_id = ?1 AND id = ?2 AND status = 'pending'",
+                    rusqlite::params![tenant.to_string(), id.to_string()],
                 )
                 .map_err(storage)?;
             transaction.commit().map_err(storage)?;
@@ -574,7 +614,7 @@ impl ApprovalStore {
             ApprovalDecision::Approve => ApprovalStatus::Approved,
             ApprovalDecision::Deny => ApprovalStatus::Denied,
         };
-        let changed = transaction.execute("UPDATE approval SET status = ?1, decided_at = ?2, decision_actor = ?3, decision_reason = ?4 WHERE id = ?5 AND status = 'pending'", rusqlite::params![status.as_db(), now, actor, reason, id.to_string()]).map_err(storage)?;
+        let changed = transaction.execute("UPDATE approval SET status = ?1, decided_at = ?2, decision_actor = ?3, decision_reason = ?4 WHERE tenant_id = ?5 AND id = ?6 AND status = 'pending'", rusqlite::params![status.as_db(), now, actor, reason, tenant.to_string(), id.to_string()]).map_err(storage)?;
         if changed != 1 {
             return Ok(None);
         }
@@ -627,12 +667,12 @@ impl ApprovalStore {
             && approval.policy_version == policy_version;
         if !exact_match {
             if approval.status == ApprovalStatus::Approved && approval.expires_at <= now {
-                transaction.execute("UPDATE approval SET status = 'expired' WHERE id = ?1 AND status = 'approved'", rusqlite::params![id.to_string()]).map_err(storage)?;
+                transaction.execute("UPDATE approval SET status = 'expired' WHERE tenant_id = ?1 AND id = ?2 AND status = 'approved'", rusqlite::params![tenant.to_string(), id.to_string()]).map_err(storage)?;
                 transaction.commit().map_err(storage)?;
             }
             return Ok(None);
         }
-        let changed = transaction.execute("UPDATE approval SET status = 'consumed', consumed_at = ?1 WHERE id = ?2 AND status = 'approved' AND expires_at > ?1", rusqlite::params![now, id.to_string()]).map_err(storage)?;
+        let changed = transaction.execute("UPDATE approval SET status = 'consumed', consumed_at = ?1 WHERE tenant_id = ?2 AND id = ?3 AND status = 'approved' AND expires_at > ?1", rusqlite::params![now, tenant.to_string(), id.to_string()]).map_err(storage)?;
         if changed != 1 {
             return Ok(None);
         }
@@ -668,6 +708,54 @@ mod tests {
         }
     }
 
+    /// Build a JSON array nested exactly `depth` levels around a null leaf.
+    fn nested_array(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    /// Build a JSON object nested exactly `depth` levels around a null leaf.
+    fn nested_object(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 0..depth {
+            let mut entries = serde_json::Map::new();
+            entries.insert("child".into(), value);
+            value = Value::Object(entries);
+        }
+        value
+    }
+
+    /// Return true when canonical hashing rejects an input as invalid.
+    fn is_invalid_input(result: Result<RequestHash, ApprovalError>) -> bool {
+        matches!(result, Err(ApprovalError::InvalidInput(_)))
+    }
+
+    /// Read the durable status token for one approval without applying read-time expiry.
+    fn stored_status(store: &ApprovalStore, id: Uuid) -> ApprovalStatus {
+        let connection = store.conn.lock().unwrap_or_else(|error| error.into_inner());
+        connection
+            .query_row(
+                "SELECT status FROM approval WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| {
+                    ApprovalStatus::from_db(&row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error.to_string(),
+                            )),
+                        )
+                    })
+                },
+            )
+            .expect("stored status")
+    }
+
     /// Object key order cannot alter the request fingerprint, while a semantic mutation does.
     #[test]
     fn canonical_hash_sorts_keys_and_detects_semantic_mutation() {
@@ -684,6 +772,24 @@ mod tests {
         assert_ne!(left, mutated);
     }
 
+    /// Array canonicalization accepts the maximum documented depth and rejects one more level.
+    #[test]
+    fn canonical_hash_bounds_nested_arrays() {
+        assert!(canonical_request_hash(&nested_array(MAX_CANONICAL_JSON_DEPTH)).is_ok());
+        assert!(is_invalid_input(canonical_request_hash(&nested_array(
+            MAX_CANONICAL_JSON_DEPTH + 1
+        ))));
+    }
+
+    /// Object canonicalization accepts the maximum documented depth and rejects one more level.
+    #[test]
+    fn canonical_hash_bounds_nested_objects() {
+        assert!(canonical_request_hash(&nested_object(MAX_CANONICAL_JSON_DEPTH)).is_ok());
+        assert!(is_invalid_input(canonical_request_hash(&nested_object(
+            MAX_CANONICAL_JSON_DEPTH + 1
+        ))));
+    }
+
     /// A decision is tenant-scoped and cannot be found by another tenant.
     #[test]
     fn cross_tenant_lookup_is_rejected() {
@@ -696,6 +802,84 @@ mod tests {
             .get(TenantId::new(), approval.id)
             .expect("get")
             .is_none());
+    }
+
+    /// Creating a fresh approval in one tenant cannot mutate another tenant's expired row.
+    #[test]
+    fn lazy_expiry_is_scoped_to_the_request_tenant() {
+        let store = ApprovalStore::open_in_memory().expect("open");
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let principal = PrincipalId::new();
+        let stale = store
+            .create_or_get_pending(request(tenant_b, principal, [13; 32]), 101)
+            .expect("create stale tenant b approval");
+        let mut fresh_request = request(tenant_a, principal, [14; 32]);
+        fresh_request.created_at = 201;
+        fresh_request.expires_at = 301;
+        store
+            .create_or_get_pending(fresh_request, 201)
+            .expect("create tenant a approval");
+
+        assert_eq!(stored_status(&store, stale.id), ApprovalStatus::Pending);
+        assert_eq!(
+            store
+                .get(tenant_b, stale.id)
+                .expect("read tenant b approval")
+                .expect("tenant b approval")
+                .status,
+            ApprovalStatus::Expired
+        );
+    }
+
+    /// Pending and approved records past their expiry read as expired.
+    #[test]
+    fn stale_pending_and_approved_records_read_as_expired() {
+        let store = ApprovalStore::open_in_memory().expect("open");
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let pending = store
+            .create_or_get_pending(request(tenant, principal, [15; 32]), 101)
+            .expect("create stale pending approval");
+        let approved = store
+            .create_or_get_pending(request(tenant, principal, [16; 32]), 101)
+            .expect("create stale approved approval");
+        store
+            .decide(
+                tenant,
+                approved.id,
+                ApprovalDecision::Approve,
+                "operator",
+                None,
+                110,
+            )
+            .expect("approve stale approval");
+
+        assert_eq!(
+            store
+                .get(tenant, pending.id)
+                .expect("read pending")
+                .expect("pending")
+                .status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(
+            store
+                .get(tenant, approved.id)
+                .expect("read approved")
+                .expect("approved")
+                .status,
+            ApprovalStatus::Expired
+        );
+        assert!(
+            store
+                .list(tenant)
+                .expect("list")
+                .into_iter()
+                .filter(|approval| approval.status == ApprovalStatus::Expired)
+                .count()
+                >= 2
+        );
     }
 
     /// Consumption refuses another principal even after a valid approval decision.
