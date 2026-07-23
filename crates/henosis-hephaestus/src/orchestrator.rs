@@ -25,7 +25,7 @@ use tracing::warn;
 use crate::anthropic_auth::CLAUDE_CODE_IDENTITY;
 use crate::checkpoint::Checkpoint;
 use crate::config::Config;
-use crate::gate::GateClient;
+use crate::gate::{GateClient, GateVerdict};
 use crate::hermes_client::{HermesClient, ToolDef, ToolResult};
 use crate::provider::{ChatMessage, ChatRequest, ContentBlock, Provider, Role, StopReason};
 use crate::services::Services;
@@ -39,6 +39,22 @@ pub enum OrchestratorError {
     /// Provider call failed (network, 4xx/5xx, parse error, etc.).
     #[error("provider error: {0}")]
     Provider(String),
+    /// Eidolon explicitly denied an action before it could proceed.
+    #[error("gate denied {action}: {reason}")]
+    GateDenied {
+        /// Name of the denied action.
+        action: String,
+        /// Human-readable policy reason supplied by Eidolon.
+        reason: String,
+    },
+    /// Eidolon could not produce a valid authorization verdict.
+    #[error("gate check failed for {action}: {reason}")]
+    GateError {
+        /// Name of the action that could not be authorized.
+        action: String,
+        /// Operational or protocol failure detail from the gate client.
+        reason: String,
+    },
     /// The tool-use loop ran for more than `max_turns` iterations.
     #[error("tool-use loop exceeded max_turns ({0})")]
     LoopExhausted(usize),
@@ -203,9 +219,10 @@ async fn loop_inner(
             services.kleos_store_checkpoint(&cp).await;
         }
 
-        // Gate check before LLM call (best-effort).
+        // Gate check before LLM call. No provider request may run unless the
+        // gate explicitly permits it.
         let gate_ctx = json!({ "turn": step, "action": "llm.call" });
-        gate.check("llm.call", &gate_ctx).await;
+        require_gate_allow("llm.call", gate.check("llm.call", &gate_ctx).await)?;
 
         // Build the generic ChatRequest. System prompt is provider-agnostic:
         // we include the Hephaestus claude-code identity block alongside any
@@ -303,9 +320,29 @@ async fn loop_inner(
                     .to_string();
 
                 // If we have partial results from earlier tools in this turn,
-                // append them as a user message so the conversation stays
-                // structurally consistent.
+                // only append them after an explicit gate authorization so
+                // the conversation never carries denied tool results.
                 if !result_blocks.is_empty() {
+                    let gate_ctx = json!({
+                        "action": "tool.results",
+                        "tool_count": result_blocks.len(),
+                    });
+                    require_gate_allow(
+                        "tool.results",
+                        gate.check("tool.results", &gate_ctx).await,
+                    )?;
+                    if let Some(s) = stream {
+                        for result in &result_blocks {
+                            s.emit(StreamEventEnvelope::ToolResult {
+                                id: result["tool_use_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                content: result["content"].as_str().unwrap_or_default().to_string(),
+                                is_error: result["is_error"].as_bool().unwrap_or(false),
+                            });
+                        }
+                    }
                     messages.push(json!({ "role": "user", "content": result_blocks }));
                 }
 
@@ -349,15 +386,6 @@ async fn loop_inner(
                     .await
             };
 
-            // Mirror the tool_result to any attached stream subscriber.
-            if let Some(s) = stream {
-                s.emit(StreamEventEnvelope::ToolResult {
-                    id: result.tool_use_id.clone(),
-                    content: result.content.clone(),
-                    is_error: result.is_error,
-                });
-            }
-
             result_blocks.push(json!({
                 "type": "tool_result",
                 "tool_use_id": result.tool_use_id,
@@ -366,9 +394,24 @@ async fn loop_inner(
             }));
         }
 
-        // Post-tool gate check (best-effort).
+        // Post-tool gate check. Tool results are not streamed or appended to
+        // the next provider request unless the gate explicitly permits them.
         let gate_ctx = json!({ "action": "tool.results", "tool_count": result_blocks.len() });
-        gate.check("tool.results", &gate_ctx).await;
+        require_gate_allow("tool.results", gate.check("tool.results", &gate_ctx).await)?;
+
+        // Mirror approved tool results to any attached stream subscriber.
+        if let Some(s) = stream {
+            for result in &result_blocks {
+                s.emit(StreamEventEnvelope::ToolResult {
+                    id: result["tool_use_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: result["content"].as_str().unwrap_or_default().to_string(),
+                    is_error: result["is_error"].as_bool().unwrap_or(false),
+                });
+            }
+        }
 
         // Append tool results as a user turn and continue the loop.
         messages.push(json!({ "role": "user", "content": result_blocks }));
@@ -376,6 +419,21 @@ async fn loop_inner(
 
     warn!(turns = max_turns, "orchestrator loop exhausted");
     Err(OrchestratorError::LoopExhausted(max_turns))
+}
+
+/// Convert an Eidolon verdict into the typed error that stops orchestration.
+fn require_gate_allow(action: &str, verdict: GateVerdict) -> Result<(), OrchestratorError> {
+    match verdict {
+        GateVerdict::Allow => Ok(()),
+        GateVerdict::Deny(reason) => Err(OrchestratorError::GateDenied {
+            action: action.to_string(),
+            reason,
+        }),
+        GateVerdict::Error(reason) => Err(OrchestratorError::GateError {
+            action: action.to_string(),
+            reason,
+        }),
+    }
 }
 
 /// Build the system prompt string passed in `ChatRequest.system`. Always

@@ -49,6 +49,22 @@ pub enum ClientError {
     /// Token resolution failed.
     #[error(transparent)]
     Auth(#[from] AuthError),
+    /// Eidolon explicitly denied the action before it reached a provider or
+    /// received its tool results.
+    #[error("gate denied {action}: {reason}")]
+    GateDenied {
+        /// Name of the denied action.
+        action: String,
+        /// Human-readable policy reason supplied by Eidolon.
+        reason: String,
+    },
+    /// Eidolon could not authorize the action because its response was
+    /// unavailable or invalid.
+    #[error("gate check failed for {action}")]
+    GateError {
+        /// Name of the action that could not be authorized.
+        action: String,
+    },
     /// Generic message from the orchestrator (loop exhaustion, internal
     /// bug, tool-dispatch parse failure, etc.).
     #[error("{0}")]
@@ -65,6 +81,10 @@ impl From<OrchestratorError> for ClientError {
                 status: 0,
                 body: msg,
             },
+            OrchestratorError::GateDenied { action, reason } => {
+                ClientError::GateDenied { action, reason }
+            }
+            OrchestratorError::GateError { action, .. } => ClientError::GateError { action },
             OrchestratorError::LoopExhausted(_) => ClientError::Other(value.to_string()),
         }
     }
@@ -298,5 +318,25 @@ impl Clients {
             stream,
         )
         .await?)
+    }
+}
+
+#[cfg(test)]
+/// Focused client-facing error sanitization tests.
+mod tests {
+    use super::{ClientError, OrchestratorError};
+
+    /// Operational gate detail remains internal when converted for task APIs.
+    #[test]
+    fn gate_error_does_not_expose_internal_detail() {
+        let error = ClientError::from(OrchestratorError::GateError {
+            action: "llm.call".to_string(),
+            reason: "http://internal-gate:3900 secret diagnostic".to_string(),
+        });
+        let rendered = error.to_string();
+
+        assert_eq!(rendered, "gate check failed for llm.call");
+        assert!(!rendered.contains("internal-gate"));
+        assert!(!rendered.contains("secret diagnostic"));
     }
 }

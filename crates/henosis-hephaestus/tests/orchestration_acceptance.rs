@@ -19,7 +19,7 @@ use henosis_hephaestus::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Service credential used by the isolated HTTP acceptance server.
@@ -217,6 +217,18 @@ async fn poll_status(
     None
 }
 
+/// Count provider requests sent through the mocked Anthropic endpoint.
+async fn provider_request_count(mocks: &Mocks) -> usize {
+    mocks
+        .anthropic
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/messages")
+        .count()
+}
+
 /// Build a wiremock response body simulating an Anthropic assistant turn that
 /// calls one tool before stopping.
 fn assistant_with_tool(tool_name: &str, tool_input: Value) -> Value {
@@ -295,15 +307,156 @@ async fn in_process_task_executes_once() {
     .unwrap();
     assert_eq!(record.status, TaskStatus::Completed);
 
-    let provider_calls = mocks
-        .anthropic
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|request| request.url.path() == "/v1/messages")
-        .count();
+    let provider_calls = provider_request_count(&mocks).await;
     assert_eq!(provider_calls, 1);
+}
+
+/// A gate denial prevents the first provider request and fails the task.
+#[tokio::test]
+async fn gate_denial_prevents_provider_request() {
+    let mocks = Mocks::new().await;
+    mocks.eidolon.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/gate/check"))
+        .and(body_json(json!({
+            "action": "llm.call",
+            "context": {"turn": 0, "action": "llm.call"},
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"allow": false, "reason": "policy blocked"})),
+        )
+        .mount(&mocks.eidolon)
+        .await;
+
+    let record = run_task_to_completion(
+        build_state(mocks.config()),
+        CreateTaskBody {
+            agent: None,
+            project: None,
+            title: Some("denied-before-provider".to_string()),
+            tenant_id: None,
+            system: None,
+            input: "must not reach provider".to_string(),
+            verify_command: None,
+        },
+    )
+    .await
+    .expect("task record");
+
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("gate denied llm.call"),
+        "unexpected gate failure: {:?}",
+        record.error,
+    );
+    assert_eq!(provider_request_count(&mocks).await, 0);
+}
+
+/// An unavailable gate prevents the first provider request and fails closed.
+#[tokio::test]
+async fn gate_error_prevents_provider_request() {
+    let mocks = Mocks::new().await;
+    mocks.eidolon.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/gate/check"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&mocks.eidolon)
+        .await;
+
+    let record = run_task_to_completion(
+        build_state(mocks.config()),
+        CreateTaskBody {
+            agent: None,
+            project: None,
+            title: Some("gate-error-before-provider".to_string()),
+            tenant_id: None,
+            system: None,
+            input: "must not reach provider".to_string(),
+            verify_command: None,
+        },
+    )
+    .await
+    .expect("task record");
+
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("gate check failed for llm.call"),
+        "unexpected gate failure: {:?}",
+        record.error,
+    );
+    assert_eq!(provider_request_count(&mocks).await, 0);
+}
+
+/// A denial after tool execution prevents tool results from reaching a second provider turn.
+#[tokio::test]
+async fn post_tool_gate_denial_prevents_followup_provider_request() {
+    let mocks = Mocks::new().await;
+    mocks.eidolon.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/gate/check"))
+        .and(body_json(json!({
+            "action": "llm.call",
+            "context": {"turn": 0, "action": "llm.call"},
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"allow": true})))
+        .mount(&mocks.eidolon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/gate/check"))
+        .and(body_json(json!({
+            "action": "tool.results",
+            "context": {"action": "tool.results", "tool_count": 1},
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"allow": false, "reason": "results blocked"})),
+        )
+        .mount(&mocks.eidolon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(assistant_with_tool("fake_tool", json!({"q": "hi"}))),
+        )
+        .mount(&mocks.anthropic)
+        .await;
+
+    let record = run_task_to_completion(
+        build_state(mocks.config()),
+        CreateTaskBody {
+            agent: None,
+            project: None,
+            title: Some("denied-tool-results".to_string()),
+            tenant_id: None,
+            system: None,
+            input: "tool result must not continue".to_string(),
+            verify_command: None,
+        },
+    )
+    .await
+    .expect("task record");
+
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("gate denied tool.results"),
+        "unexpected gate failure: {:?}",
+        record.error,
+    );
+    assert_eq!(provider_request_count(&mocks).await, 1);
 }
 
 // -- Test 1: 3-step loop -----------------------------------------------------

@@ -752,7 +752,7 @@ async fn run_task_loop(
                 // Create a Chiasm task to alert the operator (skipped on
                 // crash-resume so we don't double-alert).
                 if !skip_initial_chiasm {
-                    let hitl_title = format!("HITL: {}", &question[..question.len().min(80)]);
+                    let hitl_title = hitl_title(&question);
                     let hitl_summary = format!("task_id={id}\n\n{question}");
                     clients
                         .chiasm_create_task(&hitl_title, &hitl_summary, &project)
@@ -832,6 +832,25 @@ async fn run_task_loop(
             }
         }
     }
+}
+
+#[cfg(test)]
+/// Focused task presentation tests.
+mod tests {
+    /// HITL titles truncate by Unicode scalar value rather than byte offset.
+    #[test]
+    fn hitl_title_truncates_unicode_without_panicking() {
+        let question = format!("{}x", "💥".repeat(80));
+        let title = super::hitl_title(&question);
+
+        assert_eq!(title, format!("HITL: {}", "💥".repeat(80)));
+        assert_eq!(title.chars().count(), 86);
+    }
+}
+
+/// Build a short, Unicode-safe title for a human-in-the-loop alert.
+fn hitl_title(question: &str) -> String {
+    format!("HITL: {}", question.chars().take(80).collect::<String>())
 }
 
 /// Convenience: fetch the current record and mirror it to Kleos.
