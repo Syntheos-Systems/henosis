@@ -262,20 +262,32 @@ impl StepExecutor for CompositeStepExecutor {
 
 /// Replace `{{path}}` placeholders in `template` with values resolved from `vars` (strings
 /// verbatim, `Null` as empty, anything else via its JSON text).
+///
+/// The scan runs once over the original template. Replacement text is appended literally and
+/// never scanned again, so self-referential values terminate. An unclosed placeholder and its
+/// remainder are preserved verbatim.
 pub fn interpolate(template: &str, vars: &serde_json::Value) -> String {
-    let mut result = template.to_string();
-    while let Some(start) = result.find("{{") {
-        let Some(end_offset) = result[start..].find("}}") else {
+    let mut result = String::with_capacity(template.len());
+    let mut rest = template;
+    loop {
+        let Some(start) = rest.find("{{") else {
+            result.push_str(rest);
             break;
         };
-        let path = result[start + 2..start + end_offset].trim().to_string();
-        let val = resolve_dot_path(vars, &path);
-        let replacement = match &val {
-            serde_json::Value::String(s) => s.clone(),
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            result.push_str(&rest[start..]);
+            break;
+        };
+        let path = after_open[..end].trim();
+        let replacement = match resolve_dot_path(vars, path) {
+            serde_json::Value::String(s) => s,
             serde_json::Value::Null => String::new(),
             other => other.to_string(),
         };
-        result.replace_range(start..start + end_offset + 2, &replacement);
+        result.push_str(&replacement);
+        rest = &after_open[end + 2..];
     }
     result
 }
@@ -311,6 +323,32 @@ mod tests {
         assert_eq!(
             interpolate("hi {{who}} x{{n}} ({{gone}})", &vars),
             "hi loom x3 ()"
+        );
+    }
+
+    /// Self-referential replacement text is emitted literally instead of being rescanned.
+    #[test]
+    fn interpolate_self_reference_is_literal() {
+        let vars = serde_json::json!({"x": "{{x}}"});
+        assert_eq!(interpolate("{{x}}", &vars), "{{x}}");
+    }
+
+    /// Replacement text containing another placeholder is not interpreted a second time.
+    #[test]
+    fn interpolate_does_not_rescan_replacement() {
+        let vars = serde_json::json!({"a": "{{b}}", "b": "B"});
+        assert_eq!(interpolate("{{a}}", &vars), "{{b}}");
+    }
+
+    /// Unclosed placeholder text stays literal and an empty path resolves to empty.
+    #[test]
+    fn interpolate_handles_unclosed_and_empty_placeholders() {
+        let vars = serde_json::json!({"who": "loom"});
+        assert_eq!(interpolate("hi {{who", &vars), "hi {{who");
+        assert_eq!(interpolate("[{{}}]", &vars), "[]");
+        assert_eq!(
+            interpolate("a {{who}} b {{missing", &vars),
+            "a loom b {{missing"
         );
     }
 

@@ -11,12 +11,12 @@
 //! runs the types it claims inline (the built-in [`crate::TransformExecutor`] covers pure-JSON
 //! steps); every other started step waits for external completion via [`LoomStore::complete_step`].
 //!
-//! Definitions are validated as DAGs at write time, `create_run` advances immediately, and
-//! [`LoomStore::sweep_timeouts`] enforces `timeout_ms`.
+//! Definitions are validated as DAGs when written and again before a persisted definition starts
+//! a run. `create_run` advances immediately, and [`LoomStore::sweep_timeouts`] enforces
+//! `timeout_ms`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension};
@@ -30,7 +30,8 @@ use crate::events::{
 use crate::executor::{StepContext, StepExecutor};
 use crate::model::{
     LogEntry, LogLevel, LoomStats, NewWorkflow, Run, RunFilter, RunStatus, Step, StepDef,
-    StepStatus, StepType, Workflow, WorkflowPatch,
+    StepStatus, StepType, Workflow, WorkflowPatch, MAX_STEP_RETRIES, MAX_STEP_TIMEOUT_MS,
+    MAX_WORKFLOW_DEPTH,
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
@@ -79,8 +80,7 @@ fn ts_from_db(s: &str) -> Result<Timestamp, LoomError> {
         .map_err(|e| LoomError::Backend(format!("timestamp parse {s:?}: {e}")))
 }
 
-/// Validate a workflow definition: unique step names, dependencies that exist, and no cycles.
-/// Caught at write time so a run can never deadlock on an unsatisfiable graph.
+/// Validate a workflow definition for unique names, resolvable dependencies, and acyclicity.
 fn validate_steps(steps: &[StepDef]) -> Result<(), LoomError> {
     let mut names = HashSet::new();
     for step in steps {
@@ -135,6 +135,86 @@ fn validate_steps(steps: &[StepDef]) -> Result<(), LoomError> {
         ));
     }
     Ok(())
+}
+
+/// Enforce workflow execution limits before a definition is persisted or instantiated.
+///
+/// Assumes [`validate_steps`] already established that every dependency exists and the graph is
+/// acyclic.
+fn validate_limits(steps: &[StepDef]) -> Result<(), LoomError> {
+    for step in steps {
+        if let Some(retries) = step.max_retries {
+            if retries < 0 {
+                return Err(LoomError::InvalidInput(format!(
+                    "step {:?} max_retries must be >= 0",
+                    step.name
+                )));
+            }
+            if retries > MAX_STEP_RETRIES {
+                return Err(LoomError::InvalidInput(format!(
+                    "step {:?} max_retries {retries} exceeds limit {MAX_STEP_RETRIES}",
+                    step.name
+                )));
+            }
+        }
+        if let Some(timeout_ms) = step.timeout_ms {
+            if timeout_ms < 0 {
+                return Err(LoomError::InvalidInput(format!(
+                    "step {:?} timeout_ms must be >= 0",
+                    step.name
+                )));
+            }
+            if timeout_ms > MAX_STEP_TIMEOUT_MS {
+                return Err(LoomError::InvalidInput(format!(
+                    "step {:?} timeout_ms {timeout_ms} exceeds limit {MAX_STEP_TIMEOUT_MS}",
+                    step.name
+                )));
+            }
+        }
+    }
+    let depth = longest_chain_depth(steps);
+    if depth > MAX_WORKFLOW_DEPTH {
+        return Err(LoomError::InvalidInput(format!(
+            "workflow dependency depth {depth} exceeds limit {MAX_WORKFLOW_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
+/// Compute the longest dependency chain iteratively for a validated workflow DAG.
+fn longest_chain_depth(steps: &[StepDef]) -> usize {
+    let mut depth: HashMap<&str, usize> = steps.iter().map(|s| (s.name.as_str(), 1)).collect();
+    let mut indegree: HashMap<&str, usize> = steps.iter().map(|s| (s.name.as_str(), 0)).collect();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for step in steps {
+        for dep in step.depends_on.iter().flatten() {
+            *indegree.get_mut(step.name.as_str()).expect("known name") += 1;
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(step.name.as_str());
+        }
+    }
+    let mut queue: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(name, _)| *name)
+        .collect();
+    let mut max_depth = 0;
+    while let Some(name) = queue.pop() {
+        let current_depth = depth[name];
+        max_depth = max_depth.max(current_depth);
+        for &child in dependents.get(name).into_iter().flatten() {
+            let child_depth = depth.get_mut(child).expect("known name");
+            *child_depth = (*child_depth).max(current_depth + 1);
+            let remaining = indegree.get_mut(child).expect("known name");
+            *remaining -= 1;
+            if *remaining == 0 {
+                queue.push(child);
+            }
+        }
+    }
+    max_depth
 }
 
 /// The raw column values of one `loom_workflows` row.
@@ -441,6 +521,7 @@ impl LoomStore {
             ));
         }
         validate_steps(&new.steps)?;
+        validate_limits(&new.steps)?;
         let now = Timestamp::now();
         let workflow = Workflow {
             id: WorkflowId::new(),
@@ -563,6 +644,7 @@ impl LoomStore {
     ) -> Result<Workflow, LoomError> {
         if let Some(steps) = &patch.steps {
             validate_steps(steps)?;
+            validate_limits(steps)?;
         }
         let conn = self.lock();
         let mut workflow =
@@ -614,7 +696,8 @@ impl LoomStore {
     /// Start a run of an owned workflow: instantiate its steps, emit `workflow.run.created`,
     /// and advance immediately (a deviation from Kleos, which left runs pending until an
     /// external nudge -- a self-starting engine is what "the step graph runs" means here).
-    /// A workflow with no steps cannot run.
+    /// Persisted definitions are revalidated against current structure and safety limits before
+    /// any run rows are written. A workflow with no steps cannot run.
     pub async fn create_run(
         &self,
         principal: PrincipalId,
@@ -633,6 +716,8 @@ impl LoomStore {
             let tx = conn.transaction().map_err(berr)?;
             let workflow = Self::get_workflow_in(&tx, principal, workflow_id)?
                 .ok_or(LoomError::WorkflowNotFound(workflow_id))?;
+            validate_steps(&workflow.steps)?;
+            validate_limits(&workflow.steps)?;
             if workflow.steps.is_empty() {
                 return Err(LoomError::InvalidInput("workflow has no steps".to_string()));
             }
@@ -707,7 +792,7 @@ impl LoomStore {
             run.tenant,
             run.principal_id,
         );
-        self.advance_boxed(run.id).await?;
+        self.advance_inner(run.id).await?;
         // Re-read: the advance pass may have started (or even completed) the run.
         self.get_run(principal, run.id)
             .await?
@@ -903,7 +988,7 @@ impl LoomStore {
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
         self.complete_step_inner(&step, &run, output).await?;
-        self.advance_boxed(step.run_id).await?;
+        self.advance_inner(step.run_id).await?;
         self.read_step(step_id)
     }
 
@@ -921,6 +1006,7 @@ impl LoomStore {
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
         self.fail_step_inner(&step, &run, error).await?;
+        self.advance_inner(step.run_id).await?;
         self.read_step(step_id)
     }
 
@@ -932,8 +1018,7 @@ impl LoomStore {
             .ok_or(LoomError::StepNotFound(step_id))
     }
 
-    /// Mark a running step completed and log it. Does NOT advance -- callers do, so the inline
-    /// execution loop controls recursion.
+    /// Mark a running step completed and log it without advancing the scheduler.
     async fn complete_step_inner(
         &self,
         step: &Step,
@@ -990,8 +1075,7 @@ impl LoomStore {
         Ok(())
     }
 
-    /// Fail a step attempt: within budget it resets to pending (and the run re-advances so it
-    /// restarts); past budget the step and the run fail, emitting `workflow.run.failed`.
+    /// Fail a step attempt: reset it to pending within budget or fail the step and run.
     async fn fail_step_inner(&self, step: &Step, run: &Run, error: &str) -> Result<(), LoomError> {
         let will_retry = step.retry_count < step.max_retries;
         {
@@ -1046,6 +1130,12 @@ impl LoomStore {
                     )));
                 }
                 conn.execute(
+                    "UPDATE loom_steps SET status = 'skipped', completed_at = ?1 \
+                     WHERE run_id = ?2 AND id != ?3 AND status IN ('pending', 'running')",
+                    rusqlite::params![now, step.run_id.to_string(), step.id],
+                )
+                .map_err(berr)?;
+                conn.execute(
                     "UPDATE loom_runs SET status = 'failed', error = ?1, completed_at = ?2, \
                      updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![error, now, step.run_id.to_string()],
@@ -1072,9 +1162,7 @@ impl LoomStore {
             run.tenant,
             run.principal_id,
         );
-        if will_retry {
-            self.advance_boxed(step.run_id).await?;
-        } else {
+        if !will_retry {
             self.emit(
                 &RunFailed {
                     run_id: step.run_id.to_string(),
@@ -1100,187 +1188,194 @@ impl LoomStore {
                 .filter(|r| r.principal_id == principal)
                 .ok_or(LoomError::RunNotFound(run_id))?;
         }
-        self.advance_boxed(run_id).await
+        self.advance_inner(run_id).await
     }
 
-    /// Boxed recursion point: advance -> inline execute -> complete/fail -> advance.
-    fn advance_boxed(
-        &self,
-        run_id: RunId,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), LoomError>> + Send + '_>> {
-        Box::pin(self.advance_inner(run_id))
-    }
-
-    /// One advance pass (the Kleos algorithm): start every pending step whose dependencies are
-    /// all completed (input = run input overlaid with dependency outputs), run inline whatever
-    /// the executor claims, and complete the run when no step is pending or running.
+    /// Iteratively advance a run until it becomes terminal or waits on external work.
+    ///
+    /// Every pass claims ready steps under the database lock and executes claimed inline work
+    /// after releasing it. The loop repeats only after inline execution persisted progress, so
+    /// dependency chains and retries reuse one async frame.
     async fn advance_inner(&self, run_id: RunId) -> Result<(), LoomError> {
-        // Phase A (under the lock): read state, transition run/steps, collect ready steps.
-        let (run, ready) = {
-            let conn = self.lock();
-            let Some(run) = Self::get_run_any(&conn, run_id)? else {
-                return Err(LoomError::RunNotFound(run_id));
-            };
-            if run.status.is_terminal() {
-                return Ok(());
-            }
-            if run.status == RunStatus::Pending {
-                conn.execute(
-                    "UPDATE loom_runs SET status = 'running', started_at = ?2, updated_at = ?2 \
-                     WHERE id = ?1",
-                    rusqlite::params![run_id.to_string(), ts_to_db(&Timestamp::now())?],
-                )
-                .map_err(berr)?;
-            }
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {STEP_COLUMNS} FROM loom_steps WHERE run_id = ?1 ORDER BY id ASC"
-                ))
-                .map_err(berr)?;
-            let rows = stmt
-                .query_map(rusqlite::params![run_id.to_string()], read_raw_step)
-                .map_err(berr)?;
-            let mut steps = Vec::new();
-            for row in rows {
-                steps.push(row.map_err(berr)?.into_step()?);
-            }
-            drop(stmt);
+        loop {
+            let (run, ready) = {
+                let conn = self.lock();
+                let Some(run) = Self::get_run_any(&conn, run_id)? else {
+                    return Err(LoomError::RunNotFound(run_id));
+                };
+                if run.status.is_terminal() {
+                    return Ok(());
+                }
+                if run.status == RunStatus::Pending {
+                    conn.execute(
+                        "UPDATE loom_runs SET status = 'running', started_at = ?2, updated_at = ?2 \
+                         WHERE id = ?1 AND status = 'pending'",
+                        rusqlite::params![run_id.to_string(), ts_to_db(&Timestamp::now())?],
+                    )
+                    .map_err(berr)?;
+                }
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {STEP_COLUMNS} FROM loom_steps WHERE run_id = ?1 ORDER BY id ASC"
+                    ))
+                    .map_err(berr)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![run_id.to_string()], read_raw_step)
+                    .map_err(berr)?;
+                let mut steps = Vec::new();
+                for row in rows {
+                    steps.push(row.map_err(berr)?.into_step()?);
+                }
+                drop(stmt);
 
-            let by_name: HashMap<&str, &Step> =
-                steps.iter().map(|s| (s.name.as_str(), s)).collect();
-            let all_done = steps
-                .iter()
-                .all(|s| !matches!(s.status, StepStatus::Pending | StepStatus::Running));
-            if all_done {
-                // Merge completed outputs, later steps overwriting earlier keys (Kleos parity).
-                let mut merged = serde_json::Map::new();
-                for step in steps.iter().filter(|s| s.status == StepStatus::Completed) {
-                    if let serde_json::Value::Object(map) = &step.output {
-                        for (k, v) in map {
-                            merged.insert(k.clone(), v.clone());
+                let by_name: HashMap<&str, &Step> = steps
+                    .iter()
+                    .map(|step| (step.name.as_str(), step))
+                    .collect();
+                let all_done = steps
+                    .iter()
+                    .all(|step| !matches!(step.status, StepStatus::Pending | StepStatus::Running));
+                if all_done {
+                    let mut merged = serde_json::Map::new();
+                    for step in steps
+                        .iter()
+                        .filter(|step| step.status == StepStatus::Completed)
+                    {
+                        if let serde_json::Value::Object(map) = &step.output {
+                            for (key, value) in map {
+                                merged.insert(key.clone(), value.clone());
+                            }
                         }
                     }
+                    let now = ts_to_db(&Timestamp::now())?;
+                    let affected = conn
+                        .execute(
+                            "UPDATE loom_runs SET status = 'completed', output = ?1, \
+                             completed_at = ?2, updated_at = ?2 \
+                             WHERE id = ?3 AND status IN ('pending', 'running')",
+                            rusqlite::params![
+                                serde_json::Value::Object(merged).to_string(),
+                                now,
+                                run_id.to_string()
+                            ],
+                        )
+                        .map_err(berr)?;
+                    if affected == 0 {
+                        continue;
+                    }
+                    Self::add_log(&conn, run_id, None, LogLevel::Info, "run completed", None)?;
+                    drop(conn);
+                    self.emit(
+                        &RunCompleted {
+                            run_id: run_id.to_string(),
+                        },
+                        run.tenant,
+                        run.principal_id,
+                    );
+                    return Ok(());
                 }
-                let now = ts_to_db(&Timestamp::now())?;
-                conn.execute(
-                    "UPDATE loom_runs SET status = 'completed', output = ?1, completed_at = ?2, \
-                     updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![
-                        serde_json::Value::Object(merged).to_string(),
-                        now,
-                        run_id.to_string()
-                    ],
-                )
-                .map_err(berr)?;
-                Self::add_log(&conn, run_id, None, LogLevel::Info, "run completed", None)?;
-                drop(conn);
+
+                let mut ready = Vec::new();
+                for step in &steps {
+                    if step.status != StepStatus::Pending {
+                        continue;
+                    }
+                    let deps_met = step.depends_on.iter().all(|dependency| {
+                        by_name
+                            .get(dependency.as_str())
+                            .is_some_and(|candidate| candidate.status == StepStatus::Completed)
+                    });
+                    if !deps_met {
+                        continue;
+                    }
+                    let mut merged = serde_json::Map::new();
+                    if let serde_json::Value::Object(map) = &run.input {
+                        for (key, value) in map {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    }
+                    for dependency in &step.depends_on {
+                        if let Some(dependency_step) = by_name.get(dependency.as_str()) {
+                            if let serde_json::Value::Object(map) = &dependency_step.output {
+                                for (key, value) in map {
+                                    merged.insert(key.clone(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                    let mut started = step.clone();
+                    started.input = serde_json::Value::Object(merged);
+                    started.status = StepStatus::Running;
+                    let affected = conn
+                        .execute(
+                            "UPDATE loom_steps SET status = 'running', input = ?1, started_at = ?2 \
+                             WHERE id = ?3 AND status = 'pending'",
+                            rusqlite::params![
+                                started.input.to_string(),
+                                ts_to_db(&Timestamp::now())?,
+                                step.id
+                            ],
+                        )
+                        .map_err(berr)?;
+                    if affected == 0 {
+                        continue;
+                    }
+                    Self::add_log(
+                        &conn,
+                        run_id,
+                        Some(step.id),
+                        LogLevel::Info,
+                        &format!("step {:?} started", step.name),
+                        None,
+                    )?;
+                    ready.push(started);
+                }
+                (run, ready)
+            };
+
+            let mut made_inline_progress = false;
+            for step in ready {
                 self.emit(
-                    &RunCompleted {
+                    &StepStarted {
                         run_id: run_id.to_string(),
+                        step_id: step.id,
+                        step: step.name.clone(),
                     },
                     run.tenant,
                     run.principal_id,
                 );
-                return Ok(());
-            }
-
-            // Ready = pending with every dependency completed.
-            let mut ready: Vec<Step> = Vec::new();
-            for step in &steps {
-                if step.status != StepStatus::Pending {
+                let Some(executor) = &self.executor else {
+                    continue;
+                };
+                if !executor.handles(step.step_type) {
                     continue;
                 }
-                let deps_met = step.depends_on.iter().all(|dep| {
-                    by_name
-                        .get(dep.as_str())
-                        .is_some_and(|d| d.status == StepStatus::Completed)
-                });
-                if !deps_met {
-                    continue;
-                }
-                // Input = run input overlaid with dependency outputs.
-                let mut merged = serde_json::Map::new();
-                if let serde_json::Value::Object(map) = &run.input {
-                    for (k, v) in map {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                }
-                for dep in &step.depends_on {
-                    if let Some(dep_step) = by_name.get(dep.as_str()) {
-                        if let serde_json::Value::Object(map) = &dep_step.output {
-                            for (k, v) in map {
-                                merged.insert(k.clone(), v.clone());
-                            }
+                made_inline_progress = true;
+                let result = executor
+                    .execute(StepContext {
+                        run_id,
+                        step_id: step.id,
+                        name: &step.name,
+                        step_type: step.step_type,
+                        config: &step.config,
+                        input: &step.input,
+                        timeout_ms: step.timeout_ms,
+                    })
+                    .await;
+                match result {
+                    Ok(output) => self.complete_step_inner(&step, &run, output).await?,
+                    Err(message) => {
+                        self.fail_step_inner(&step, &run, &message).await?;
+                        if step.retry_count >= step.max_retries {
+                            return Ok(());
                         }
                     }
                 }
-                let mut started = step.clone();
-                started.input = serde_json::Value::Object(merged);
-                started.status = StepStatus::Running;
-                conn.execute(
-                    "UPDATE loom_steps SET status = 'running', input = ?1, started_at = ?2 \
-                     WHERE id = ?3",
-                    rusqlite::params![
-                        started.input.to_string(),
-                        ts_to_db(&Timestamp::now())?,
-                        step.id
-                    ],
-                )
-                .map_err(berr)?;
-                Self::add_log(
-                    &conn,
-                    run_id,
-                    Some(step.id),
-                    LogLevel::Info,
-                    &format!("step {:?} started", step.name),
-                    None,
-                )?;
-                ready.push(started);
             }
-            (run, ready)
-        };
-
-        // Phase B (no lock held): emit start events and run inline executions, which re-enter
-        // complete/fail and recurse into the next advance pass.
-        for step in ready {
-            self.emit(
-                &StepStarted {
-                    run_id: run_id.to_string(),
-                    step_id: step.id,
-                    step: step.name.clone(),
-                },
-                run.tenant,
-                run.principal_id,
-            );
-            let Some(executor) = &self.executor else {
-                continue;
-            };
-            if !executor.handles(step.step_type) {
-                continue;
-            }
-            let result = executor
-                .execute(StepContext {
-                    run_id,
-                    step_id: step.id,
-                    name: &step.name,
-                    step_type: step.step_type,
-                    config: &step.config,
-                    input: &step.input,
-                    timeout_ms: step.timeout_ms,
-                })
-                .await;
-            match result {
-                Ok(output) => {
-                    self.complete_step_inner(&step, &run, output).await?;
-                    self.advance_boxed(run_id).await?;
-                }
-                Err(message) => {
-                    // fail_step_inner re-advances on retry itself.
-                    self.fail_step_inner(&step, &run, &message).await?;
-                }
+            if !made_inline_progress {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// System-wide sweep (NOT owner-scoped -- a maintenance task) that fails every running
@@ -1324,12 +1419,16 @@ impl LoomStore {
             if elapsed_ns <= step.timeout_ms as i128 * 1_000_000 {
                 continue;
             }
+            if self.read_step(step.id)?.status != StepStatus::Running {
+                continue;
+            }
             self.fail_step_inner(
                 &step,
                 &run,
                 &format!("step timed out after {}ms", step.timeout_ms),
             )
             .await?;
+            self.advance_inner(step.run_id).await?;
             timed_out.push(self.read_step(step.id)?);
         }
         Ok(timed_out)
@@ -1562,18 +1661,14 @@ mod tests {
             store.list_workflows(principal).await.expect("list").len(),
             1
         );
-        assert!(
-            store
-                .delete_workflow(principal, wf.id)
-                .await
-                .expect("delete")
-        );
-        assert!(
-            !store
-                .delete_workflow(principal, wf.id)
-                .await
-                .expect("delete")
-        );
+        assert!(store
+            .delete_workflow(principal, wf.id)
+            .await
+            .expect("delete"));
+        assert!(!store
+            .delete_workflow(principal, wf.id)
+            .await
+            .expect("delete"));
     }
 
     #[tokio::test]
@@ -1606,6 +1701,164 @@ mod tests {
             .await
             .expect_err("cycle");
         assert!(matches!(err, LoomError::InvalidDefinition(_)));
+    }
+
+    #[tokio::test]
+    /// Retry and timeout budgets accept their boundaries and reject invalid values.
+    async fn step_retry_and_timeout_limits_are_enforced() {
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let workflow = |steps: Vec<StepDef>| NewWorkflow {
+            tenant: TenantId::new(),
+            principal_id: principal,
+            name: format!("wf-{}", WorkflowId::new()),
+            description: None,
+            steps,
+        };
+        let retries = |max_retries| StepDef {
+            name: "step".to_string(),
+            step_type: StepType::Action,
+            config: None,
+            depends_on: None,
+            max_retries: Some(max_retries),
+            timeout_ms: None,
+        };
+        let timeout = |timeout_ms| StepDef {
+            name: "step".to_string(),
+            step_type: StepType::Action,
+            config: None,
+            depends_on: None,
+            max_retries: None,
+            timeout_ms: Some(timeout_ms),
+        };
+
+        store
+            .create_workflow(workflow(vec![retries(0)]))
+            .await
+            .expect("zero retries");
+        store
+            .create_workflow(workflow(vec![retries(MAX_STEP_RETRIES)]))
+            .await
+            .expect("maximum retries");
+        assert!(matches!(
+            store
+                .create_workflow(workflow(vec![retries(-1)]))
+                .await
+                .expect_err("negative retries"),
+            LoomError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            store
+                .create_workflow(workflow(vec![retries(MAX_STEP_RETRIES + 1)]))
+                .await
+                .expect_err("excessive retries"),
+            LoomError::InvalidInput(_)
+        ));
+
+        store
+            .create_workflow(workflow(vec![timeout(0)]))
+            .await
+            .expect("zero timeout");
+        store
+            .create_workflow(workflow(vec![timeout(MAX_STEP_TIMEOUT_MS)]))
+            .await
+            .expect("maximum timeout");
+        assert!(matches!(
+            store
+                .create_workflow(workflow(vec![timeout(-1)]))
+                .await
+                .expect_err("negative timeout"),
+            LoomError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            store
+                .create_workflow(workflow(vec![timeout(MAX_STEP_TIMEOUT_MS + 1)]))
+                .await
+                .expect_err("excessive timeout"),
+            LoomError::InvalidInput(_)
+        ));
+    }
+
+    #[tokio::test]
+    /// A chain at the depth limit is accepted and a deeper chain is rejected.
+    async fn dependency_depth_limit_is_enforced() {
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let chain = |length: usize| {
+            (0..length)
+                .map(|index| StepDef {
+                    name: format!("s{index}"),
+                    step_type: StepType::Action,
+                    config: None,
+                    depends_on: (index > 0).then(|| vec![format!("s{}", index - 1)]),
+                    max_retries: Some(0),
+                    timeout_ms: None,
+                })
+                .collect()
+        };
+        let workflow = |steps| NewWorkflow {
+            tenant: TenantId::new(),
+            principal_id: principal,
+            name: format!("wf-{}", WorkflowId::new()),
+            description: None,
+            steps,
+        };
+
+        store
+            .create_workflow(workflow(chain(MAX_WORKFLOW_DEPTH)))
+            .await
+            .expect("depth boundary");
+        assert!(matches!(
+            store
+                .create_workflow(workflow(chain(MAX_WORKFLOW_DEPTH + 1)))
+                .await
+                .expect_err("excessive depth"),
+            LoomError::InvalidInput(_)
+        ));
+    }
+
+    #[tokio::test]
+    /// Run creation rejects legacy definitions before persisting any run state.
+    async fn create_run_revalidates_legacy_definitions() {
+        let (store, _bus) = store();
+        let (principal, workflow) = workflow_with(&store, vec![action("valid", &[])]).await;
+        let oversized = vec![StepDef {
+            name: "legacy".to_string(),
+            step_type: StepType::Action,
+            config: None,
+            depends_on: None,
+            max_retries: Some(MAX_STEP_RETRIES + 1),
+            timeout_ms: None,
+        }];
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE loom_workflows SET steps = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&oversized).expect("serialize oversized definition"),
+                    workflow.id.to_string()
+                ],
+            )
+            .expect("persist legacy definition");
+        }
+
+        assert!(matches!(
+            store
+                .create_run(principal, workflow.id, None)
+                .await
+                .expect_err("legacy definition"),
+            LoomError::InvalidInput(_)
+        ));
+        let run_count: i64 = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM loom_runs WHERE workflow_id = ?1",
+                rusqlite::params![workflow.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count runs")
+        };
+        assert_eq!(run_count, 0);
     }
 
     #[tokio::test]
@@ -1740,6 +1993,178 @@ mod tests {
         async fn execute(&self, _ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
             Err("boom".to_string())
         }
+    }
+
+    /// An executor that consumes the full retry budget before succeeding.
+    struct BoundaryRetryExecutor {
+        /// Attempt count keyed by step name.
+        attempts: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    #[async_trait]
+    /// Implements deterministic retry-boundary execution for transform steps.
+    impl StepExecutor for BoundaryRetryExecutor {
+        /// Claim transform steps used by the boundary test.
+        fn handles(&self, step_type: StepType) -> bool {
+            step_type == StepType::Transform
+        }
+
+        /// Fail the first maximum-budget attempts for each step, then succeed.
+        async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
+            let attempt = {
+                let mut attempts = self
+                    .attempts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let count = attempts.entry(ctx.name.to_string()).or_default();
+                *count += 1;
+                *count
+            };
+            let retry_limit =
+                usize::try_from(MAX_STEP_RETRIES).expect("retry limit must be non-negative");
+            if attempt <= retry_limit {
+                Err(format!("boundary retry {attempt}"))
+            } else {
+                Ok(serde_json::json!({ "completed_step": ctx.name }))
+            }
+        }
+    }
+
+    /// An executor that records names and fails the first ready step.
+    struct FailFirstExecutor {
+        /// Names passed to execution, in order.
+        executed: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    /// Implements deterministic terminal-batch behavior for transform steps.
+    impl StepExecutor for FailFirstExecutor {
+        /// Claim transform steps used by the terminal-batch test.
+        fn handles(&self, step_type: StepType) -> bool {
+            step_type == StepType::Transform
+        }
+
+        /// Record the step and fail only the step named `fail`.
+        async fn execute(&self, ctx: StepContext<'_>) -> Result<serde_json::Value, String> {
+            self.executed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(ctx.name.to_string());
+            if ctx.name == "fail" {
+                Err("terminal failure".to_string())
+            } else {
+                Ok(serde_json::json!({ "unexpected": ctx.name }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    /// Iterative advancement completes the exact maximum depth and retry boundaries.
+    async fn iterative_advance_handles_maximum_depth_and_retries() {
+        let bus = Arc::new(AxonBus::new());
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let store = LoomStore::open_in_memory(bus)
+            .expect("open")
+            .with_executor(Box::new(BoundaryRetryExecutor {
+                attempts: attempts.clone(),
+            }));
+        let principal = PrincipalId::new();
+        let steps = (0..MAX_WORKFLOW_DEPTH)
+            .map(|index| StepDef {
+                name: format!("s{index}"),
+                step_type: StepType::Transform,
+                config: None,
+                depends_on: (index > 0).then(|| vec![format!("s{}", index - 1)]),
+                max_retries: Some(MAX_STEP_RETRIES),
+                timeout_ms: None,
+            })
+            .collect();
+        let workflow = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "boundary-workflow".to_string(),
+                description: None,
+                steps,
+            })
+            .await
+            .expect("create workflow");
+
+        let run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("execute workflow");
+        assert_eq!(run.status, RunStatus::Completed);
+        let persisted = store
+            .get_steps(principal, run.id)
+            .await
+            .expect("read steps");
+        assert!(persisted.iter().all(|step| {
+            step.status == StepStatus::Completed && step.retry_count == MAX_STEP_RETRIES
+        }));
+        let attempts = attempts.lock().unwrap_or_else(|error| error.into_inner());
+        let expected =
+            usize::try_from(MAX_STEP_RETRIES).expect("retry limit must be non-negative") + 1;
+        assert_eq!(
+            attempts.values().sum::<usize>(),
+            MAX_WORKFLOW_DEPTH * expected
+        );
+    }
+
+    #[tokio::test]
+    /// A terminal inline failure prevents later ready work from executing.
+    async fn terminal_failure_stops_ready_batch() {
+        let bus = Arc::new(AxonBus::new());
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let store = LoomStore::open_in_memory(bus)
+            .expect("open")
+            .with_executor(Box::new(FailFirstExecutor {
+                executed: executed.clone(),
+            }));
+        let principal = PrincipalId::new();
+        let workflow = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "terminal-batch".to_string(),
+                description: None,
+                steps: vec![
+                    StepDef {
+                        name: "fail".to_string(),
+                        step_type: StepType::Transform,
+                        config: None,
+                        depends_on: None,
+                        max_retries: Some(0),
+                        timeout_ms: None,
+                    },
+                    StepDef {
+                        name: "must-not-run".to_string(),
+                        step_type: StepType::Transform,
+                        config: None,
+                        depends_on: None,
+                        max_retries: Some(0),
+                        timeout_ms: None,
+                    },
+                ],
+            })
+            .await
+            .expect("create workflow");
+
+        let run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("execute workflow");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            *executed.lock().unwrap_or_else(|error| error.into_inner()),
+            vec!["fail".to_string()]
+        );
+        let steps = store
+            .get_steps(principal, run.id)
+            .await
+            .expect("read steps");
+        assert_eq!(steps[0].status, StepStatus::Failed);
+        assert_eq!(steps[1].status, StepStatus::Skipped);
     }
 
     #[tokio::test]
@@ -1895,12 +2320,11 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(
-            run.error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("timed out")
-        );
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("timed out"));
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
     }
@@ -1930,13 +2354,11 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(cancelled.len(), 1);
-        assert!(
-            store
-                .list_runs(PrincipalId::new(), RunFilter::default())
-                .await
-                .expect("list")
-                .is_empty()
-        );
+        assert!(store
+            .list_runs(PrincipalId::new(), RunFilter::default())
+            .await
+            .expect("list")
+            .is_empty());
 
         let stats = store.stats(principal).await.expect("stats");
         assert_eq!(stats.workflows, 1);

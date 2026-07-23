@@ -14,6 +14,23 @@ use syntheos_contracts::{PrincipalId, RunId, TenantId, Timestamp, WorkflowId};
 
 use crate::error::LoomError;
 
+/// The maximum dependency-chain depth a workflow definition may declare.
+///
+/// A finite graph-height budget limits the amount of inline scheduler work triggered by one
+/// workflow while remaining far above realistic orchestration chains.
+pub const MAX_WORKFLOW_DEPTH: usize = 64;
+
+/// The maximum retry budget a single step may declare.
+///
+/// Zero is valid and gives the step one attempt. Negative budgets are rejected by validation.
+pub const MAX_STEP_RETRIES: i32 = 100;
+
+/// The maximum per-attempt timeout a single step may declare, in milliseconds.
+///
+/// The 24-hour ceiling prevents nonsensical persisted deadlines. Zero is valid and makes any
+/// elapsed time overdue.
+pub const MAX_STEP_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// The kind of work a step performs.
 ///
 /// Serializes snake_case, matching the Kleos type strings. `Transform` runs inline via the
@@ -140,7 +157,7 @@ pub enum StepStatus {
     Completed,
     /// Exhausted its retries.
     Failed,
-    /// Abandoned because the run was cancelled.
+    /// Abandoned because the run was cancelled or another step failed the run.
     Skipped,
 }
 
