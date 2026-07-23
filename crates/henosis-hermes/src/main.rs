@@ -19,7 +19,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-use henosis_hermes::{config::Config, mcp_bridge, routes, webhooks, AppState};
+use henosis_hermes::{
+    auth::AuthenticatedTenant, config::Config, mcp_bridge, routes, webhooks, AppState,
+};
 
 /// Service name embedded in health and version responses.
 const SERVICE: &str = "hermes";
@@ -29,6 +31,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// HMAC type used to compare inbound API tokens without ordinary string equality.
 type HmacSha256 = Hmac<Sha256>;
+
+/// One standalone Bearer credential and its immutable tenant binding.
+struct ApiCredential {
+    /// Secret presented in the HTTP Authorization header.
+    token: Zeroizing<String>,
+    /// Tenant identity granted when the secret matches.
+    tenant: AuthenticatedTenant,
+}
 
 /// Entry point: initialize tracing, load config, build state, and serve.
 #[tokio::main]
@@ -56,7 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let app = build_router(state, server.api_token, mcp_bridge::is_enabled());
+    let app = build_router(
+        state,
+        ApiCredential {
+            token: server.api_token,
+            tenant: server.tenant,
+        },
+        mcp_bridge::is_enabled(),
+    );
 
     let addr = server.listen_addr;
     let listener = TcpListener::bind(addr)
@@ -75,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build the standalone HTTP router with a narrow public surface and one
 /// fail-closed authorization layer around every sensitive route.
-fn build_router(state: AppState, api_token: Zeroizing<String>, mcp_enabled: bool) -> Router {
+fn build_router(state: AppState, credential: ApiCredential, mcp_enabled: bool) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -105,7 +122,7 @@ fn build_router(state: AppState, api_token: Zeroizing<String>, mcp_enabled: bool
         protected = protected.route("/mcp", post(mcp_bridge::jsonrpc_handler));
     }
     let protected = protected.route_layer(middleware::from_fn_with_state(
-        Arc::new(api_token),
+        Arc::new(credential),
         require_api_token,
     ));
 
@@ -115,11 +132,12 @@ fn build_router(state: AppState, api_token: Zeroizing<String>, mcp_enabled: bool
 /// Reject requests whose Authorization header does not carry the configured
 /// standalone Hermes service token.
 async fn require_api_token(
-    State(expected): State<Arc<Zeroizing<String>>>,
-    request: Request,
+    State(expected): State<Arc<ApiCredential>>,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    if authorize_api_token(request.headers(), expected.as_str()) {
+    if authorize_api_token(request.headers(), expected.token.as_str()) {
+        request.extensions_mut().insert(expected.tenant.clone());
         return next.run(request).await;
     }
 
@@ -195,6 +213,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
     use henosis_hermes::audit::AuditTrail;
     use henosis_hermes::axon::AxonPublisher;
     use henosis_hermes::circuit::CircuitRegistry;
@@ -202,13 +221,53 @@ mod tests {
     use henosis_hermes::phylaxd_client::PhylaxdClient;
     use henosis_hermes::rate_limit::{RateLimitConfig, RateLimiter};
     use henosis_hermes::tenant_config::TenantConfigStore;
-    use henosis_hermes::ToolRegistry;
+    use henosis_hermes::{
+        InvokeContext, InvokeRequest, InvokeResponse, Tool, ToolRegistry, ToolSchema,
+    };
+
+    /// Deterministic tool that returns the tenant authority reaching dispatch.
+    struct TenantEchoTool;
+
+    #[async_trait]
+    /// Implements a tenant-observing adapter for transport-boundary tests.
+    impl Tool for TenantEchoTool {
+        /// Describe the test-only tenant echo tool.
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool_id: "test.tenant".to_string(),
+                name: "Tenant echo".to_string(),
+                description: "Return the dispatched tenant".to_string(),
+                input_schema: json!({"type": "object"}),
+                output_schema: json!({"type": "object"}),
+                category: "test".to_string(),
+                requires_auth: false,
+            }
+        }
+
+        /// Return the trusted tenant carried by the invocation request.
+        async fn invoke(&self, _context: &InvokeContext, request: InvokeRequest) -> InvokeResponse {
+            InvokeResponse {
+                tool_id: "test.tenant".to_string(),
+                success: true,
+                result: Some(json!({ "tenant_id": request.tenant_id })),
+                error: None,
+                duration_ms: 0,
+            }
+        }
+
+        /// Keep the test tool under an isolated provider policy key.
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+    }
 
     /// Build isolated state for transport-boundary tests.
     fn test_state() -> AppState {
         let axon = AxonPublisher::from_env();
+        let mut registry = ToolRegistry::new();
+        registry.register(TenantEchoTool);
         AppState {
-            registry: Arc::new(ToolRegistry::new()),
+            registry: Arc::new(registry),
             phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             circuits: Arc::new(CircuitRegistry::new()),
@@ -217,6 +276,14 @@ mod tests {
             axon,
             tenant_config: Arc::new(TenantConfigStore::new()),
             public_url: None,
+        }
+    }
+
+    /// Build the test credential bound to `tenant-a`.
+    fn test_credential(token: &str) -> ApiCredential {
+        ApiCredential {
+            token: Zeroizing::new(token.to_string()),
+            tenant: AuthenticatedTenant::parse("tenant-a").expect("valid tenant"),
         }
     }
 
@@ -256,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn router_protects_sensitive_routes() {
         let token = "hermes-api-token-that-is-at-least-32-bytes";
-        let app = build_router(test_state(), Zeroizing::new(token.to_string()), true);
+        let app = build_router(test_state(), test_credential(token), true);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -292,6 +359,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
+
+        let omitted_claim = client
+            .post(format!("http://{addr}/tools/test.tenant/invoke"))
+            .bearer_auth(token)
+            .json(&json!({ "args": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(omitted_claim.status(), StatusCode::OK);
+        let omitted_body: serde_json::Value = omitted_claim.json().await.unwrap();
+        assert_eq!(omitted_body["result"]["tenant_id"], "tenant-a");
+
+        let foreign_claim = client
+            .post(format!("http://{addr}/tools/test.tenant/invoke"))
+            .bearer_auth(token)
+            .json(&json!({ "tenant_id": "tenant-b", "args": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_claim.status(), StatusCode::FORBIDDEN);
+
+        let foreign_admin = client
+            .get(format!("http://{addr}/admin/tenants/tenant-b/adapters"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_admin.status(), StatusCode::FORBIDDEN);
+
+        let foreign_audit = client
+            .get(format!("http://{addr}/audit?tenant_id=tenant-b"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_audit.status(), StatusCode::FORBIDDEN);
 
         let webhook = client
             .post(format!("http://{addr}/webhooks/unknown"))

@@ -30,12 +30,13 @@ pub struct ToolSchema {
     pub requires_auth: bool,
 }
 
-/// Caller-supplied invocation request: optional tenant context and free-form
-/// JSON arguments.
+/// Invocation request carrying trusted in-process tenant context and free-form
+/// JSON arguments. Standalone HTTP and MCP transports overwrite this tenant
+/// from authenticated state after rejecting any conflicting caller assertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvokeRequest {
-    /// Tenant on whose behalf the call runs. Used to resolve OAuth tokens from
-    /// phylaxd and to key the rate-limiter bucket. `None` routes as `_anon`.
+    /// Tenant on whose behalf the call runs. Trusted in-process callers set it
+    /// directly; standalone transports bind it to their authenticated tenant.
     pub tenant_id: Option<String>,
     /// Tool-specific arguments, validated against `ToolSchema::input_schema`
     /// before the adapter sees them.

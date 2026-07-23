@@ -27,6 +27,9 @@ pub mod adapters;
 /// in batches, queryable via `GET /audit`.
 pub mod audit;
 
+/// Tenant identity established by standalone HTTP Bearer authentication.
+pub mod auth;
+
 /// Best-effort Axon event publisher used by the audit trail, circuit breaker,
 /// rate limiter, and tool dispatch to emit observability events.
 pub mod axon;

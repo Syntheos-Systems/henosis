@@ -9,23 +9,25 @@
 //!   - tools/list             -- enumerate the registry
 //!   - tools/call             -- invoke a tool by id
 //!
-//! Tenant binding: MCP clients have no concept of multi-tenancy, so the
-//! bridge looks for `params.arguments._tenant_id` (or `_tenant`) on
-//! tools/call. If absent, requests are routed under `_anon` -- the same
-//! tenant the rate limiter uses for unauthenticated invokes.
+//! Tenant binding: MCP clients have no native tenant identity, so the bridge
+//! uses the tenant bound to the authenticated HTTP Bearer credential. Legacy
+//! `_tenant_id` and `_tenant` arguments are stripped and accepted only when
+//! they assert that same tenant.
 //!
 //! Gated by HERMES_MCP_ENABLED=true; off by default.
 
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::auth::AuthenticatedTenant;
 use crate::circuit::invoke_with_circuit;
 use crate::rate_limit::CheckOutcome;
+use crate::routes::bind_authenticated_tenant;
 use crate::tool::{InvokeContext, InvokeRequest};
 use crate::AppState;
 
@@ -46,6 +48,7 @@ pub fn is_enabled() -> bool {
 /// `POST /mcp`: JSON-RPC 2.0 dispatcher. Routes `initialize`, `tools/list`,
 /// `tools/call`, and `ping`; all other methods return a `-32601` error.
 pub async fn jsonrpc_handler(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
@@ -59,7 +62,7 @@ pub async fn jsonrpc_handler(
     let result = match method {
         "initialize" => handle_initialize(),
         "tools/list" => handle_tools_list(&state),
-        "tools/call" => handle_tools_call(&state, &params).await,
+        "tools/call" => handle_tools_call(&state, &authenticated_tenant, &params).await,
         "ping" => Ok(json!({})),
         other => Err(JsonRpcError::method_not_found(other)),
     };
@@ -133,7 +136,11 @@ fn handle_tools_list(state: &AppState) -> Result<Value, JsonRpcError> {
 /// Handle `tools/call`: look up the tool by name, apply tenant config and
 /// rate limiting, dispatch through the circuit breaker, and map the result
 /// to MCP's `content` shape.
-async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, JsonRpcError> {
+async fn handle_tools_call(
+    state: &AppState,
+    authenticated_tenant: &AuthenticatedTenant,
+    params: &Value,
+) -> Result<Value, JsonRpcError> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -148,19 +155,15 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
         .get(name)
         .ok_or_else(|| JsonRpcError::invalid_params(&format!("tool '{name}' not found")))?;
 
-    // MCP has no native tenant concept; allow callers to inject one via
-    // either `_tenant_id` or `_tenant` and strip it before dispatch.
+    // MCP has no native tenant concept. Strip both legacy aliases and treat
+    // them only as assertions about the identity established by middleware.
     let mut args_obj = match arguments {
         Value::Object(m) => m,
         _ => {
             return Err(JsonRpcError::invalid_params("arguments must be an object"));
         }
     };
-    let tenant_id = args_obj
-        .remove("_tenant_id")
-        .or_else(|| args_obj.remove("_tenant"))
-        .and_then(|v| v.as_str().map(String::from))
-        .filter(|s| !s.is_empty());
+    validate_and_strip_tenant_claims(authenticated_tenant, &mut args_obj)?;
 
     let provider = state.registry.provider_of(name).unwrap_or("unknown");
 
@@ -168,7 +171,7 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
     // default args (request wins) before dispatch -- parity with the HTTP path.
     let cfg = state
         .tenant_config
-        .get(tenant_id.as_deref().unwrap_or("_anon"), provider);
+        .get(authenticated_tenant.as_str(), provider);
     if !cfg.enabled {
         return Err(JsonRpcError {
             code: -32001,
@@ -190,7 +193,7 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
         }
     };
 
-    let tenant_for_limit = tenant_id.as_deref().unwrap_or("_anon");
+    let tenant_for_limit = authenticated_tenant.as_str();
     if let CheckOutcome::Throttled { retry_after_secs } = state
         .rate_limiter
         .check_with_capacity(tenant_for_limit, name, cfg.rate_limit_override)
@@ -206,10 +209,13 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
         });
     }
 
-    let invoke = InvokeRequest {
-        tenant_id: tenant_id.clone(),
+    let mut invoke = InvokeRequest {
+        tenant_id: None,
         args: Value::Object(args_obj),
     };
+    bind_authenticated_tenant(authenticated_tenant, name, &mut invoke)
+        .map_err(|_| JsonRpcError::tenant_mismatch())?;
+    let tenant_id = invoke.tenant_id.clone();
     // Hash args before dispatch consumes the request (never store the args).
     let args_digest = crate::audit::args_hash(&invoke.args);
     let ctx = InvokeContext {
@@ -279,6 +285,28 @@ async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, Js
     Ok(payload)
 }
 
+/// Remove legacy MCP tenant aliases after verifying every supplied claim
+/// matches the identity established by HTTP authentication.
+fn validate_and_strip_tenant_claims(
+    authenticated_tenant: &AuthenticatedTenant,
+    arguments: &mut serde_json::Map<String, Value>,
+) -> Result<(), JsonRpcError> {
+    for alias in ["_tenant_id", "_tenant"] {
+        let Some(claim) = arguments.remove(alias) else {
+            continue;
+        };
+        let Value::String(claim) = claim else {
+            return Err(JsonRpcError::invalid_params(&format!(
+                "{alias} must be a string"
+            )));
+        };
+        if !claim.is_empty() && !authenticated_tenant.matches_claim(Some(&claim)) {
+            return Err(JsonRpcError::tenant_mismatch());
+        }
+    }
+    Ok(())
+}
+
 /// A JSON-RPC 2.0 error envelope.
 #[derive(Debug)]
 struct JsonRpcError {
@@ -309,6 +337,15 @@ impl JsonRpcError {
             data: None,
         }
     }
+
+    /// Server-defined authorization error for a foreign tenant assertion.
+    fn tenant_mismatch() -> Self {
+        Self {
+            code: -32003,
+            message: "request tenant does not match the authenticated credential".to_string(),
+            data: Some(json!({ "code": "tenant_mismatch" })),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +372,36 @@ mod tests {
         std::env::set_var("HERMES_MCP_ENABLED", "false");
         assert!(!is_enabled());
         std::env::remove_var("HERMES_MCP_ENABLED");
+    }
+
+    /// Both legacy aliases are stripped and cannot select a foreign tenant.
+    #[test]
+    fn tenant_aliases_are_assertions_not_authority() {
+        let authenticated = AuthenticatedTenant::parse("tenant-a").expect("valid tenant");
+        let mut matching = serde_json::Map::from_iter([
+            ("_tenant_id".to_string(), json!("tenant-a")),
+            ("_tenant".to_string(), json!("tenant-a")),
+            ("query".to_string(), json!("safe")),
+        ]);
+        validate_and_strip_tenant_claims(&authenticated, &mut matching)
+            .expect("matching assertions");
+        assert!(!matching.contains_key("_tenant_id"));
+        assert!(!matching.contains_key("_tenant"));
+        assert_eq!(matching.get("query"), Some(&json!("safe")));
+
+        let mut foreign = serde_json::Map::from_iter([("_tenant".to_string(), json!("tenant-b"))]);
+        let error = validate_and_strip_tenant_claims(&authenticated, &mut foreign)
+            .expect_err("foreign assertion");
+        assert_eq!(error.code, -32003);
+    }
+
+    /// Non-string tenant aliases fail validation instead of being ignored.
+    #[test]
+    fn tenant_alias_requires_string_value() {
+        let authenticated = AuthenticatedTenant::parse("tenant-a").expect("valid tenant");
+        let mut arguments = serde_json::Map::from_iter([("_tenant_id".to_string(), json!(42))]);
+        let error = validate_and_strip_tenant_claims(&authenticated, &mut arguments)
+            .expect_err("non-string assertion");
+        assert_eq!(error.code, -32602);
     }
 }

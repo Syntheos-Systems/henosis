@@ -8,17 +8,18 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::json;
 
-use crate::AppState;
+use crate::auth::AuthenticatedTenant;
 use crate::circuit::invoke_with_circuit;
 use crate::metrics::Outcome;
 use crate::rate_limit::CheckOutcome;
-use crate::tool::{InvokeContext, InvokeRequest, InvokeResponse, err, error_response};
+use crate::tool::{err, error_response, InvokeContext, InvokeRequest, InvokeResponse};
+use crate::AppState;
 
 /// A controlled Hermes invocation plus the HTTP transport metadata needed by
 /// the gateway wrapper.
@@ -41,10 +42,14 @@ pub async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
 /// body. Applies tenant config, rate limiting, circuit checking, validation,
 /// and audit before dispatching to the adapter.
 pub async fn invoke_tool(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     Path(tool_id): Path<String>,
-    Json(req): Json<InvokeRequest>,
+    Json(mut req): Json<InvokeRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = bind_authenticated_tenant(&authenticated_tenant, &tool_id, &mut req) {
+        return (StatusCode::FORBIDDEN, Json(response)).into_response();
+    }
     let outcome = invoke_controlled(&state, &tool_id, req).await;
     if let Some(retry_after_secs) = outcome.retry_after_secs {
         return (
@@ -58,6 +63,25 @@ pub async fn invoke_tool(
             .into_response();
     }
     (outcome.status, Json(outcome.response)).into_response()
+}
+
+/// Bind a transport invocation to authenticated state and reject a conflicting
+/// compatibility claim before any tenant-scoped policy or adapter executes.
+pub(crate) fn bind_authenticated_tenant(
+    authenticated_tenant: &AuthenticatedTenant,
+    tool_id: &str,
+    request: &mut InvokeRequest,
+) -> Result<(), InvokeResponse> {
+    if !authenticated_tenant.matches_claim(request.tenant_id.as_deref()) {
+        return Err(error_response(
+            tool_id,
+            "tenant_mismatch",
+            "request tenant does not match the authenticated credential",
+            None,
+        ));
+    }
+    request.tenant_id = Some(authenticated_tenant.as_str().to_string());
+    Ok(())
 }
 
 /// Invoke one Hermes tool through the complete shared control path.
@@ -248,22 +272,31 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 /// `GET /admin/tenants/{tenant_id}/adapters`: configured adapter overrides for
 /// a tenant.
 pub async fn list_tenant_adapters(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
+    if tenant_id != authenticated_tenant.as_str() {
+        return tenant_scope_rejection();
+    }
     Json(json!({
         "tenant_id": tenant_id,
         "adapters": state.tenant_config.list(&tenant_id),
     }))
+    .into_response()
 }
 
 /// `PUT /admin/tenants/{tenant_id}/adapters/{provider}`: set a tenant's adapter
 /// config.
 pub async fn set_tenant_adapter(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     Path((tenant_id, provider)): Path<(String, String)>,
     Json(config): Json<crate::tenant_config::TenantAdapterConfig>,
-) -> impl IntoResponse {
+) -> Response {
+    if tenant_id != authenticated_tenant.as_str() {
+        return tenant_scope_rejection();
+    }
     state.tenant_config.set(&tenant_id, &provider, config);
     (
         StatusCode::OK,
@@ -273,27 +306,54 @@ pub async fn set_tenant_adapter(
             "config": state.tenant_config.get(&tenant_id, &provider),
         })),
     )
+        .into_response()
 }
 
 /// `PUT /admin/tenants/{tenant_id}/adapters/{provider}/disable`: shortcut to
 /// disable a provider for a tenant.
 pub async fn disable_tenant_adapter(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     Path((tenant_id, provider)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
+    if tenant_id != authenticated_tenant.as_str() {
+        return tenant_scope_rejection();
+    }
     state.tenant_config.disable(&tenant_id, &provider);
     (
         StatusCode::OK,
         Json(json!({ "tenant_id": tenant_id, "provider": provider, "enabled": false })),
     )
+        .into_response()
+}
+
+/// Return a uniform rejection for a foreign tenant path or query claim.
+fn tenant_scope_rejection() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": {
+                "code": "tenant_mismatch",
+                "message": "requested tenant does not match the authenticated credential"
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /audit`: recent audit records, newest first, filterable by
 /// `tenant_id`, `tool_id`, `outcome`, `since`/`until` (RFC3339), and `limit`.
 pub async fn audit(
+    Extension(authenticated_tenant): Extension<AuthenticatedTenant>,
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Response {
+    if params
+        .get("tenant_id")
+        .is_some_and(|tenant_id| tenant_id != authenticated_tenant.as_str())
+    {
+        return tenant_scope_rejection();
+    }
     let parse_ts = |k: &str| {
         params
             .get(k)
@@ -301,7 +361,7 @@ pub async fn audit(
             .map(|d| d.with_timezone(&chrono::Utc))
     };
     let query = crate::audit::AuditQuery {
-        tenant_id: params.get("tenant_id").cloned(),
+        tenant_id: Some(authenticated_tenant.as_str().to_string()),
         tool_id: params.get("tool_id").cloned(),
         outcome: params.get("outcome").cloned(),
         since: parse_ts("since"),
@@ -309,7 +369,7 @@ pub async fn audit(
         limit: params.get("limit").and_then(|v| v.parse().ok()),
     };
     let records = state.audit.query(&query);
-    Json(json!({ "count": records.len(), "records": records }))
+    Json(json!({ "count": records.len(), "records": records })).into_response()
 }
 
 /// `GET /tools/{tool_id}/health`: passive health for a single tool -- provider
@@ -377,13 +437,12 @@ pub async fn adapters_health(State(state): State<AppState>) -> impl IntoResponse
 /// Tests for the transport-independent controlled invocation path.
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::ToolRegistry;
     use crate::audit::{AuditQuery, AuditTrail};
     use crate::axon::AxonPublisher;
     use crate::circuit::CircuitRegistry;
@@ -392,6 +451,7 @@ mod tests {
     use crate::rate_limit::{RateLimitConfig, RateLimiter};
     use crate::tenant_config::{TenantAdapterConfig, TenantConfigStore};
     use crate::tool::{Tool, ToolSchema};
+    use crate::ToolRegistry;
 
     /// A deterministic adapter that records how often Hermes reaches it.
     struct EchoTool {
@@ -536,5 +596,33 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let metrics = state.metrics.snapshot(state.circuits.open_count());
         assert_eq!(metrics["providers"]["test"]["rate_limited_count"], 1);
+    }
+
+    /// Transport binding overwrites omitted claims and rejects foreign claims.
+    #[test]
+    fn authenticated_tenant_binding_never_trusts_request_authority() {
+        let authenticated = AuthenticatedTenant::parse("tenant-a").expect("valid tenant");
+        let mut omitted = InvokeRequest {
+            tenant_id: None,
+            args: json!({}),
+        };
+        bind_authenticated_tenant(&authenticated, "test.echo", &mut omitted)
+            .expect("omitted claim binds to authenticated tenant");
+        assert_eq!(omitted.tenant_id.as_deref(), Some("tenant-a"));
+
+        let mut foreign = InvokeRequest {
+            tenant_id: Some("tenant-b".to_string()),
+            args: json!({}),
+        };
+        let response = bind_authenticated_tenant(&authenticated, "test.echo", &mut foreign)
+            .expect_err("foreign claim must fail");
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error["code"].as_str()),
+            Some("tenant_mismatch")
+        );
+        assert_eq!(foreign.tenant_id.as_deref(), Some("tenant-b"));
     }
 }

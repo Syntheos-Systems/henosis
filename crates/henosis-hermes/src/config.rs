@@ -1,6 +1,10 @@
+//! Runtime configuration and standalone-server security validation.
+
 use std::{fmt, net::SocketAddr};
 
 use zeroize::Zeroizing;
+
+use crate::auth::AuthenticatedTenant;
 
 /// Runtime configuration for the Hermes tool gateway, loaded from environment
 /// variables with sensible defaults.
@@ -28,6 +32,8 @@ pub struct Config {
     pub listen_addr: Option<String>,
     /// Dedicated Bearer token accepted by protected standalone HTTP routes.
     pub api_token: Option<Zeroizing<String>>,
+    /// Tenant bound 1:1 to `HERMES_API_TOKEN` by `HERMES_TENANT_ID`.
+    pub tenant_id: Option<String>,
     /// Exact acknowledgement required before the standalone server binds to a
     /// non-loopback address without providing its own TLS termination.
     pub allow_insecure_remote: bool,
@@ -39,6 +45,8 @@ pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     /// Dedicated Bearer token protecting every non-public route.
     pub api_token: Zeroizing<String>,
+    /// Tenant identity established whenever the dedicated Bearer token matches.
+    pub tenant: AuthenticatedTenant,
 }
 
 /// Formats validated server configuration without disclosing its bearer token.
@@ -49,6 +57,7 @@ impl fmt::Debug for ServerConfig {
             .debug_struct("ServerConfig")
             .field("listen_addr", &self.listen_addr)
             .field("api_token", &"[REDACTED]")
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -80,6 +89,9 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(Zeroizing::new),
+            tenant_id: std::env::var("HERMES_TENANT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
             allow_insecure_remote: std::env::var("HERMES_ALLOW_INSECURE_REMOTE").as_deref()
                 == Ok("1"),
         }
@@ -116,10 +128,17 @@ impl Config {
         if self.phylaxd_token.as_ref().map(|token| token.as_str()) == Some(api_token) {
             return Err("HERMES_API_TOKEN must be distinct from HERMES_PHYLAXD_TOKEN".to_string());
         }
+        let tenant_id = self
+            .tenant_id
+            .as_deref()
+            .ok_or_else(|| "HERMES_TENANT_ID is required for the standalone server".to_string())?;
+        let tenant = AuthenticatedTenant::parse(tenant_id)
+            .map_err(|error| format!("invalid HERMES_TENANT_ID: {error}"))?;
 
         Ok(ServerConfig {
             listen_addr,
             api_token: Zeroizing::new(api_token.to_string()),
+            tenant,
         })
     }
 }
@@ -149,6 +168,7 @@ mod tests {
             api_token: Some(Zeroizing::new(
                 "hermes-api-token-that-is-at-least-32-bytes".to_string(),
             )),
+            tenant_id: Some("tenant-a".to_string()),
             allow_insecure_remote: false,
         }
     }
@@ -194,5 +214,18 @@ mod tests {
 
         config.api_token = config.phylaxd_token.clone();
         assert!(config.validate_server().is_err());
+    }
+
+    /// Missing or ambiguous tenant bindings are rejected before socket startup.
+    #[test]
+    fn rejects_invalid_tenant_binding() {
+        let mut config = valid_config();
+        config.tenant_id = None;
+        assert!(config.validate_server().is_err());
+
+        for invalid in ["", "tenant other", "tenant\nother"] {
+            config.tenant_id = Some(invalid.to_string());
+            assert!(config.validate_server().is_err(), "{invalid:?}");
+        }
     }
 }
