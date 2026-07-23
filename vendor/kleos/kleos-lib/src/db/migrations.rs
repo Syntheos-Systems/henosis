@@ -1267,7 +1267,7 @@ fn run_migration_cred_tables(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Migration 83: add attribution columns used by Phylax audit events.
+/// Migration 83: add attribution columns used by credential audit events.
 ///
 /// Columns are nullable so old audit rows stay valid and insert paths that do
 /// not provide attribution information keep working.
@@ -5590,7 +5590,7 @@ fn run_migration_mcp_tokens(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Migration 82: Phylax agent-native credential tables.
+/// Migration 82: agent-native credential tables with legacy `phylax_*` identifiers.
 ///
 /// Creates tables for approval workflows, single-use leases, access policies,
 /// PIV public key enrollment, and SSH key settings.
@@ -5669,7 +5669,7 @@ fn run_migration_phylax_tables(conn: &rusqlite::Connection) -> Result<()> {
         );",
     )
     .map_err(|e| EngError::DatabaseMessage(format!("migration 82 phylax_tables: {e}")))?;
-    info!("Migration 82 complete: phylax tables created");
+    info!("Migration 82 complete: credential tables created");
     Ok(())
 }
 

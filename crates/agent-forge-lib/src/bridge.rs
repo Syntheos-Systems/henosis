@@ -43,7 +43,7 @@ pub trait SkillsBridge: Send + Sync {
 }
 
 /// Blocking HTTP [`SkillsBridge`] against the Kleos skills API (the upstream `KleosClient`,
-/// re-homed behind the seam). Auth is `KLEOS_API_KEY` env only -- the phylax-broker keyless
+/// re-homed behind the seam). Auth is `KLEOS_API_KEY` env only -- the phylaxd keyless
 /// fallback stays in the Kleos repo's binary, keeping that cross-repo dependency out of this
 /// workspace.
 #[cfg(feature = "http-bridge")]
@@ -63,6 +63,7 @@ pub mod http {
         api_key: Option<String>,
     }
 
+    /// Constructs authenticated requests and handles JSON responses for the skills API.
     impl HttpSkillsBridge {
         /// Build from the environment. `Err` only when the HTTP client itself cannot be
         /// constructed; an unset URL falls back to localhost (the upstream behavior).
@@ -122,7 +123,9 @@ pub mod http {
         }
     }
 
+    /// Implements every skills operation through the blocking HTTP transport.
     impl SkillsBridge for HttpSkillsBridge {
+        /// Search the remote skills catalog.
         fn search_skills(&self, query: &str, limit: Option<usize>) -> Result<Value, String> {
             let mut body = json!({ "query": query });
             if let Some(l) = limit {
@@ -131,6 +134,7 @@ pub mod http {
             self.post("/skills/search", body)
         }
 
+        /// Capture a new skill from a natural-language description.
         fn capture_skill(&self, description: &str, agent: Option<&str>) -> Result<Value, String> {
             let mut body = json!({ "description": description });
             if let Some(a) = agent {
@@ -139,6 +143,7 @@ pub mod http {
             self.post("/skills/capture", body)
         }
 
+        /// Record whether a skill execution succeeded and how long it took.
         fn record_execution(
             &self,
             skill_id: i64,
@@ -160,6 +165,7 @@ pub mod http {
             self.post(&format!("/skills/{skill_id}/execute"), body)
         }
 
+        /// Request a repair pass for an existing skill.
         fn fix_skill(&self, skill_id: i64, hint: Option<&str>) -> Result<Value, String> {
             let mut body = json!({});
             if let Some(h) = hint {
@@ -168,6 +174,7 @@ pub mod http {
             self.post(&format!("/skills/{skill_id}/fix"), body)
         }
 
+        /// Derive a new skill from one or more parent skills.
         fn derive_skill(
             &self,
             parent_ids: &[i64],
@@ -181,6 +188,7 @@ pub mod http {
             self.post("/skills/derive", body)
         }
 
+        /// Fetch the ancestry and descendants of a skill.
         fn get_lineage(&self, skill_id: i64) -> Result<Value, String> {
             self.get(&format!("/skills/{skill_id}/lineage"))
         }

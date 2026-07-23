@@ -1,13 +1,8 @@
-//! Field-level secret encryption: AES-256-GCM, copy-and-owned from `kleos-cred`.
+//! Field-level secret encryption with AES-256-GCM.
 //!
-//! Each secret value is encrypted on its own; the SQLite file itself is plaintext (the kernel
-//! db convention: encryption is a per-secret concern, not a whole-DB one). The 32-byte master
-//! key is supplied at [`crate::PhylaxStore`] construction -- the server sources it from the
-//! environment in v1, and a YubiKey-derived key later, the same path the Kleos ops plan takes.
-//!
-//! The YubiKey/passphrase/recovery key-derivation paths from kleos-cred are deliberately NOT
-//! ported: a Henosis caller supplies an already-derived key. Only raw-bytes encrypt/decrypt and
-//! key generation come across.
+//! Each secret value is encrypted independently. The caller supplies an already-derived 32-byte
+//! master key when constructing [`crate::CredentialStore`]. This module only owns raw-byte
+//! encryption, decryption, and test-key generation.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -17,7 +12,7 @@ use rand::rngs::OsRng;
 use rand::TryRngCore;
 use zeroize::Zeroizing;
 
-use crate::error::PhylaxError;
+use crate::error::CredentialStoreError;
 
 /// AES-256-GCM nonce size (96 bits).
 pub const NONCE_SIZE: usize = 12;
@@ -32,9 +27,9 @@ const TAG_SIZE: usize = 16;
 ///
 /// A fresh random nonce is drawn per call, so encrypting identical plaintext twice yields
 /// distinct blobs.
-pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, PhylaxError> {
+pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, CredentialStoreError> {
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| PhylaxError::Encryption(format!("invalid key: {e}")))?;
+        .map_err(|e| CredentialStoreError::Encryption(format!("invalid key: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng
@@ -44,7 +39,7 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, Phylax
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|e| PhylaxError::Encryption(format!("encryption failed: {e}")))?;
+        .map_err(|e| CredentialStoreError::Encryption(format!("encryption failed: {e}")))?;
 
     let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -57,12 +52,17 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, Phylax
 /// The returned plaintext is wrapped in [`Zeroizing`] so it is scrubbed from the heap on drop.
 /// The error is intentionally opaque: it distinguishes nothing about why authentication failed
 /// and never echoes key or plaintext material.
-pub fn decrypt(key: &[u8; KEY_SIZE], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, PhylaxError> {
+pub fn decrypt(
+    key: &[u8; KEY_SIZE],
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CredentialStoreError> {
     if blob.len() < NONCE_SIZE + TAG_SIZE {
-        return Err(PhylaxError::Decryption("ciphertext too short".into()));
+        return Err(CredentialStoreError::Decryption(
+            "ciphertext too short".into(),
+        ));
     }
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| PhylaxError::Decryption(format!("invalid key: {e}")))?;
+        .map_err(|e| CredentialStoreError::Decryption(format!("invalid key: {e}")))?;
 
     let nonce = Nonce::from_slice(&blob[..NONCE_SIZE]);
     let ciphertext = &blob[NONCE_SIZE..];
@@ -70,7 +70,7 @@ pub fn decrypt(key: &[u8; KEY_SIZE], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, 
     cipher
         .decrypt(nonce, ciphertext)
         .map(Zeroizing::new)
-        .map_err(|_| PhylaxError::Decryption("authentication failed".into()))
+        .map_err(|_| CredentialStoreError::Decryption("authentication failed".into()))
 }
 
 /// Generate a fresh random 256-bit master key. Used by tests and by the (future) provisioning

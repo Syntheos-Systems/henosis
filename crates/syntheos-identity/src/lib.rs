@@ -19,7 +19,7 @@
 //!
 //! Not transport/request authentication -- KLEOSv1 request signing (Ed25519 + PIV P-256) lives in
 //! `syntheos-memory-gateway` and maps a signed request to a principal; this is the principal model
-//! it maps onto. Not tenancy, roles, quota, grants, or scopes (Plutus / Pistis / Phylax own
+//! it maps onto. Not tenancy, roles, quota, grants, or scopes (Plutus, Pistis, and the credential broker own
 //! those). No update, delete, or revocation yet.
 
 pub mod accounts;

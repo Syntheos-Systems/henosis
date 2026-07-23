@@ -32,7 +32,7 @@ pub mod cli;
 /// Projects dispatcher lifecycle events into Broca and task-scoped Chiasm activity.
 pub mod action_reactor;
 
-/// Production dispatcher executor for Hermes tools and Phylax operations.
+/// Production dispatcher executor for Hermes tools and phylaxd operations.
 pub mod henosis_executor;
 
 /// The optional Stripe billing webhook at `POST /billing/stripe/webhook`.

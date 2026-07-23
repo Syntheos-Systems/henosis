@@ -1,6 +1,6 @@
 -- V2: capability policies governing the use-without-holding resolve modes.
--- Absorbed from kleos-phylax phylax_access_policies onto the principal model: the Kleos
--- `user_id INTEGER` owner key is GONE; scope is `tenant` plus an optional `principal_id`.
+-- The phylax_* identifiers remain unchanged for compatibility with existing databases.
+-- Scope is `tenant` plus an optional `principal_id`.
 -- The four resolve modes (sign/verify/derive/exec) are DENY-BY-DEFAULT: a request is
 -- permitted only when a matching policy names the mode in allowed_modes (and, for exec, the
 -- argv[0] is on exec_allowlist). Append-only migration: never edit; add a V3 for any change.

@@ -1,13 +1,13 @@
-//! The Phylax error type.
+//! Errors returned by the embedded credential store.
 
-/// A Phylax credential operation failed.
+/// An embedded credential-store operation failed.
 ///
-/// `#[non_exhaustive]`: variants grow as the resolve modes and the gate land in later slices.
+/// The enum is non-exhaustive so additional storage and resolution errors can be added safely.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum PhylaxError {
+pub enum CredentialStoreError {
     /// A storage backend operation failed.
-    #[error("phylax backend error: {0}")]
+    #[error("credential store backend error: {0}")]
     Backend(String),
 
     /// No secret with this (tenant, category, name) exists.
@@ -35,8 +35,8 @@ pub enum PhylaxError {
 
     /// The requested operation is not permitted: no policy allows it, the
     /// resolve mode is not in the matched policy's allowed set, or an exec
-    /// argv[0] is not on the allowlist. Distinct from a [`PhylaxError`] that
-    /// could-not-decide -- this is a definitive deny.
+    /// executable is not on the allowlist. This is a definitive policy denial, not an
+    /// infrastructure error that prevented a decision.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 }

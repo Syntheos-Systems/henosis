@@ -1,9 +1,7 @@
-//! Phylax domain types: the secret payload shapes and the resolve-mode enum.
+//! Secret payloads, capability policies, and credential resolution modes.
 //!
-//! [`SecretData`] is copy-and-owned from `kleos-cred`'s secret types: the same six shapes a
-//! credential can take. It is the plaintext that gets AES-256-GCM encrypted before it touches
-//! disk (see [`crate::crypto`]); it never appears in a stored row in the clear and never crosses
-//! the agent boundary through the gate-reachable surface.
+//! [`SecretData`] is encrypted with AES-256-GCM before it reaches storage. Plaintext never appears
+//! in a stored row and never crosses the gate-reachable agent boundary.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

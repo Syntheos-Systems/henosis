@@ -13,7 +13,7 @@ description = "Agent-Forge as a library: the structured-reasoning gate tools (sp
 # and inject their own SkillsBridge.
 default = ["http-bridge"]
 # Blocking reqwest implementation of SkillsBridge against the Kleos skills API (KLEOS_URL +
-# KLEOS_API_KEY env). The phylax-broker keyless fallback stays in the Kleos repo's binary;
+# KLEOS_API_KEY env). The phylaxd keyless fallback stays in the Kleos repo's binary;
 # this workspace copy deliberately drops that cross-repo dependency.
 http-bridge = ["dep:reqwest"]
 

@@ -1,25 +1,25 @@
 //! Capability-policy storage and matching for the resolve modes.
 //!
-//! Policies are deny-by-default: a resolve mode is permitted only when [`PhylaxStore::match_policy`]
-//! finds a policy that names the mode (and, for exec, lists the argv[0]). Matching is by
-//! specificity, mirroring the absorbed Kleos rule: a principal-specific policy beats a
-//! tenant-wide one, a category+name policy beats a category-only one, which beats a
-//! namespace-only one.
+//! Policies are deny-by-default: a resolve mode is permitted only when
+//! [`CredentialStore::match_policy`] finds a policy that names the mode and, for command
+//! execution, lists the executable. Matching is by specificity: a principal-specific policy
+//! beats a tenant-wide one, while a category-and-name policy beats category-only and
+//! namespace-only policies.
 
 use rusqlite::OptionalExtension;
 use syntheos_contracts::{PrincipalId, TenantId};
 
-use crate::error::PhylaxError;
+use crate::error::CredentialStoreError;
 use crate::model::{Policy, ResolveMode};
-use crate::store::{berr, now_string, PhylaxStore};
+use crate::store::{berr, now_string, CredentialStore};
 
 /// Validate that an exec allowlist contains only absolute paths. A relative entry would resolve
 /// against the daemon's working directory rather than a policy decision.
-fn validate_exec_allowlist(allowlist: Option<&[String]>) -> Result<(), PhylaxError> {
+fn validate_exec_allowlist(allowlist: Option<&[String]>) -> Result<(), CredentialStoreError> {
     if let Some(paths) = allowlist {
         for p in paths {
             if !p.starts_with('/') {
-                return Err(PhylaxError::InvalidInput(format!(
+                return Err(CredentialStoreError::InvalidInput(format!(
                     "exec allowlist entry '{p}' must be an absolute path"
                 )));
             }
@@ -29,7 +29,7 @@ fn validate_exec_allowlist(allowlist: Option<&[String]>) -> Result<(), PhylaxErr
 }
 
 /// Manages durable capability policies for the embedded credential store.
-impl PhylaxStore {
+impl CredentialStore {
     /// Create a capability policy. Returns the stored policy with its assigned id.
     ///
     /// `principal` scopes the policy to one principal, or `None` for any principal in the tenant.
@@ -43,14 +43,14 @@ impl PhylaxStore {
         secret_name: Option<&str>,
         allowed_modes: &[ResolveMode],
         exec_allowlist: Option<&[String]>,
-    ) -> Result<Policy, PhylaxError> {
+    ) -> Result<Policy, CredentialStoreError> {
         validate_exec_allowlist(exec_allowlist)?;
         let modes_json = serde_json::to_string(allowed_modes)
-            .map_err(|e| PhylaxError::Backend(e.to_string()))?;
+            .map_err(|e| CredentialStoreError::Backend(e.to_string()))?;
         let exec_json = exec_allowlist
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| PhylaxError::Backend(e.to_string()))?;
+            .map_err(|e| CredentialStoreError::Backend(e.to_string()))?;
         let principal_s = principal.map(|p| p.to_string());
         let now = now_string()?;
 
@@ -86,7 +86,7 @@ impl PhylaxStore {
     }
 
     /// Delete a policy by id. Errors if it does not exist in this tenant.
-    pub fn delete_policy(&self, tenant: &TenantId, id: i64) -> Result<(), PhylaxError> {
+    pub fn delete_policy(&self, tenant: &TenantId, id: i64) -> Result<(), CredentialStoreError> {
         let affected = {
             let conn = self.lock_conn();
             conn.execute(
@@ -96,13 +96,15 @@ impl PhylaxStore {
             .map_err(berr)?
         };
         if affected == 0 {
-            return Err(PhylaxError::Backend(format!("policy {id} not found")));
+            return Err(CredentialStoreError::Backend(format!(
+                "policy {id} not found"
+            )));
         }
         Ok(())
     }
 
     /// List every policy in a tenant, most specific first.
-    pub fn list_policies(&self, tenant: &TenantId) -> Result<Vec<Policy>, PhylaxError> {
+    pub fn list_policies(&self, tenant: &TenantId) -> Result<Vec<Policy>, CredentialStoreError> {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
@@ -133,7 +135,7 @@ impl PhylaxStore {
         principal: &PrincipalId,
         category: &str,
         name: &str,
-    ) -> Result<Option<Policy>, PhylaxError> {
+    ) -> Result<Option<Policy>, CredentialStoreError> {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(

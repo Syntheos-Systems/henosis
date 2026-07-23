@@ -23,7 +23,7 @@
 //! `user_id -> PrincipalId` legacy absorption backfill ([`backfill`], with the `chiasm-backfill`
 //! CLI behind the `backfill-cli` feature). Agent bearer keys (`keys.rs` in Kleos) are
 //! deliberately NOT ported here -- they are an authentication artifact that belongs to the security
-//! authorities (Pistis/Phylax), not the task service. LLM plan generation defers to the Broca
+//! authorities (Pistis and the credential broker), not the task service. LLM plan generation defers to the Broca
 //! extraction.
 
 pub mod backfill;

@@ -1,5 +1,5 @@
 //! The input-authorization gate interface. The dispatcher runs a chain of gates
-//! (Pistis, Plutus, Eidolon-input, Human, Phylax) against each request.
+//! (Pistis, Plutus, Eidolon-input, Human, phylaxd) against each request.
 //!
 //! Output redaction/transform is handled by a separate `OutputFilter` interface
 //! and is deliberately not modeled here.

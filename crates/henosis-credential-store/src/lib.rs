@@ -1,21 +1,18 @@
-//! Phylax: the credential authority absorbed from Kleos onto the Henosis principal model.
+//! Embedded credential compatibility storage for local Henosis integrations.
 //!
-//! Phylax holds secrets encrypted at rest and lets an authorized principal USE a secret without
-//! ever holding it -- signing, verifying, deriving, or running an allowlisted command with the
-//! secret injected -- so credential material never crosses the agent boundary. It backs the
-//! dispatcher's `phylax` gate slot.
+//! The store encrypts secrets at rest and lets an authorized principal use a secret without ever
+//! holding it. Supported operations include signing, verification, derivation, and allowlisted
+//! command execution with injected secret material.
 //!
-//! Henosis owns this credential-policy implementation locally while upstream Kleos remains
-//! unchanged. This crate is a snapshot reworked onto the principal model
-//! (ownership is a [`syntheos_contracts::TenantId`], not a `user_id: i64`), with its own
-//! field-level encryption, typed Axon events instead of an audit table, and the phylaxd auth /
-//! approval-flow / SSH-CA machinery deliberately left behind (authn is the dispatcher's job;
-//! human-in-the-loop is the Human gate's).
+//! This crate supports loopback integrations and tests. Production credential operations cross
+//! the authenticated `phylaxd` broker boundary instead. Ownership is scoped by
+//! [`syntheos_contracts::TenantId`], events are typed, authentication belongs to the dispatcher,
+//! and approval policy belongs to the Human gate.
 //!
 //! The crate has three layers: the field-encrypted secret store with its owner-tier
 //! administration surface ([`store`]), the capability policies and the four use-without-holding
 //! resolve modes ([`policy_store`], [`resolve`]), and the fail-closed
-//! [`Gate`](syntheos_contracts::Gate) impl for the dispatcher's phylax slot ([`gate`]).
+//! [`Gate`](syntheos_contracts::Gate) implementation for the broker slot ([`gate`]).
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -28,7 +25,7 @@ pub mod policy_store;
 pub mod resolve;
 pub mod store;
 
-pub use error::PhylaxError;
-pub use gate::PhylaxGate;
+pub use error::CredentialStoreError;
+pub use gate::CredentialStoreGate;
 pub use model::{ExecOutcome, Policy, ResolveMode, SecretData, SignAlgo};
-pub use store::PhylaxStore;
+pub use store::CredentialStore;

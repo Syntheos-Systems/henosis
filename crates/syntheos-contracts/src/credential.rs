@@ -1,14 +1,14 @@
-//! An opaque reference to a Phylax-held secret. This is never the secret value
-//! itself; only a handle that authorized callers can resolve through Phylax.
+//! An opaque reference to a credential-broker secret. This is never the secret value itself;
+//! only a handle that authorized callers can resolve through the broker.
 
 use serde::{Deserialize, Serialize};
 
-/// A reference to a secret held by Phylax. Carries no secret material.
+/// A reference to a broker-held secret that carries no secret material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialHandle {
     /// Opaque identifier of the credential. A `String` rather than a typed UUID
-    /// newtype because Phylax owns the credential namespace and its identifier
+    /// newtype because the broker owns the credential namespace and its identifier
     /// format is not the substrate's to define.
     pub id: String,
     /// The scope the credential is valid for (e.g. `kleos:write`).

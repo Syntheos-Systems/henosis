@@ -1,7 +1,7 @@
--- V1: the Phylax credential store, absorbed from kleos-phylax/kleos-cred onto the Henosis
--- principal model. The Kleos `user_id INTEGER` owner key is GONE; ownership is `tenant` (a
--- TenantId UUID string). Secret values are AES-256-GCM encrypted at the field level before
--- insert (see src/crypto.rs); the column holds nonce||ciphertext+tag, never plaintext.
+-- V1: embedded credential-store secrets.
+-- The phylax_* identifiers remain unchanged for compatibility with existing databases.
+-- Ownership is scoped by tenant. Secret values are AES-256-GCM encrypted before insert;
+-- the storage column holds nonce||ciphertext+tag, never plaintext.
 -- Append-only migration: never edit; add a V2 file for any schema change.
 
 CREATE TABLE phylax_secrets (

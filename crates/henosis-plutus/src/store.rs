@@ -205,7 +205,7 @@ impl PlutusStore {
     /// the operator is not rate-limited during initial setup.
     ///
     /// Fails loudly (returns `Err`) when either env var is missing, malformed, or the insert
-    /// errors unexpectedly -- same fail-loud posture as the phylax/supervisor boot path.
+    /// errors unexpectedly -- the same fail-loud posture used by the broker and supervisor.
     /// If the org already exists, returns `Ok(())` without touching it.
     pub async fn bootstrap_operator_org_if_absent(&self) -> Result<()> {
         let tenant_str = std::env::var("SYNTHEOS_PLUTUS_OPERATOR_TENANT").map_err(|_| {

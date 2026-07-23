@@ -31,25 +31,24 @@ henosis-thymus = { path = "../henosis-thymus" }
 henosis-eidolon = { path = "../henosis-eidolon" }
 # The pistis authority: the real gate in the pistis slot (Story 3.3).
 henosis-pistis = { path = "../henosis-pistis" }
-# The phylax authority: the real gate in the phylax slot (Story 3.6).
-henosis-phylax = { package = "henosis-credential-store", path = "../henosis-credential-store" }
+# Embedded credential compatibility store used by loopback integrations and tests.
+henosis-credential-store = { path = "../henosis-credential-store" }
 # The human-in-the-loop authority: the real gate in the human slot (Story 4.6).
 henosis-rift = { path = "../henosis-rift" }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
 # The Plutus policy authority: the real gate in the plutus slot (Story 6.x / row 1).
 henosis-plutus = { path = "../henosis-plutus" }
-# The cognitive core facade over vendored kleos-lib (Wave 2). OPTIONAL: only the
-# `cognition` feature pulls it -- and with it the heavy ML stack -- in, so the
-# default Henosis build stays free of ort/tokenizers/lancedb. Additive wiring.
+# Optional cognitive-core facade over vendored kleos-lib. Only the `cognition` feature pulls in
+# the heavy ML stack, so the default Henosis build excludes ort, tokenizers, and LanceDB.
 henosis-cognition = { path = "../henosis-cognition", optional = true }
 # JWT session tokens for the operator API surface (HS256 via pure-Rust crypto).
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 # Structured error types for the operator surface.
 thiserror.workspace = true
-# Decoding the SYNTHEOS_PHYLAX_KEY hex master key at boot.
+# Decoding credential material represented as hexadecimal.
 hex.workspace = true
-# Phylax signatures, derived bytes, and scrubbed exec output use base64 on the wire.
+# Credential signatures, derived bytes, and scrubbed command output use base64 on the wire.
 base64.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true

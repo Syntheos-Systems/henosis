@@ -1,5 +1,5 @@
 //! The canonical actor: one per human, agent, service account, or integration.
-//! Per-service projections (Soma presence, Pistis grants, Phylax scopes) stay in
+//! Per-service projections (Soma presence, Pistis grants, credential-broker scopes) stay in
 //! those services. This is only the shared key, kind, and display name.
 
 use serde::{Deserialize, Serialize};

@@ -79,15 +79,13 @@ rusqlite = { version = "0.31" }
 # crates inherit one pinned version; unused until the first Postgres crate lands.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid"] }
 zeroize = { version = "1", features = ["derive"] }
-# Field-level secret encryption for the absorbed Phylax credential store (Story 3.6). AES-256-GCM,
-# matching the kleos-cred crypto this was copy-and-owned from. Whole-DB SQLCipher was rejected in
-# favor of per-secret encryption (the kernel db convention opens plaintext SQLite).
+# Field-level AES-256-GCM encryption for the embedded credential compatibility store.
 aes-gcm = "0.10"
-# Phylax sign/verify: keyed-MAC over a stored secret.
+# Credential signing and verification with a keyed MAC.
 hmac = "0.12"
-# Phylax verify: constant-time MAC comparison.
+# Constant-time MAC comparison during credential verification.
 subtle = "2.5"
-# Phylax ed25519 sign/verify parses stored OpenSSH private keys.
+# Ed25519 credential signing and verification over stored OpenSSH private keys.
 ssh-key = { version = "0.6", features = ["ed25519"] }
 # Property testing for security-critical invariants (the EidolonGate fail-closed proofs). Dev-only.
 proptest = "1"

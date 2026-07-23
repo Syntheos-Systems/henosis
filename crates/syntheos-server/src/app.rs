@@ -12,12 +12,12 @@ use henosis_broca::{ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStor
 use henosis_chiasm::{
     ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
 };
+use henosis_credential_store::{CredentialStore, CredentialStoreGate};
 use henosis_eidolon::{DriftFlag, DriftSignal, EidolonError, EidolonGate, EidolonPolicy};
 use henosis_loom::{
     LogEntry, LoomError, LoomStats, LoomStore, NewWorkflow, Run, RunFilter, RunStatus, Step,
     StepDef, Workflow,
 };
-use henosis_phylax::{PhylaxGate, PhylaxStore};
 use henosis_pistis::{PistisGate, RoomStateSource};
 use henosis_plutus::{PlutusGate, PolicyBackend};
 use henosis_rift::{Approver, HumanGate};
@@ -142,7 +142,7 @@ pub fn eidolon_gate(
 ///   tests: a [`henosis_plutus::MockPolicyBackend`]).
 /// - `eidolon`: [`EidolonGate`] -- prompt-injection, scope-violation, persona-drift policy.
 /// - `human`:   [`HumanGate`] -- human-in-the-loop approvals over Rift.
-/// - `phylaxd`: the legacy compatibility gate over an in-process [`PhylaxGate`] store.
+/// - `phylaxd`: the compatibility gate over an in-process [`CredentialStore`] implementation.
 ///
 /// Public production dispatch uses [`public_gate_chain`] and the external authenticated
 /// `phylaxd` broker. `Dispatcher::new` validates gate order at construction.
@@ -150,7 +150,7 @@ pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
     pistis_source: Arc<dyn RoomStateSource>,
-    phylax: Arc<PhylaxStore>,
+    credential_store: Arc<CredentialStore>,
     bus: Arc<AxonBus>,
     human_approver: Arc<dyn Approver>,
     plutus: Arc<dyn PolicyBackend>,
@@ -162,7 +162,7 @@ pub fn live_gate_chain(
         Box::new(eidolon_gate(policy, thymus)?),
         // The embedded human gate blocks approval-required work until a decision or timeout.
         Box::new(HumanGate::new(human_approver, bus)),
-        Box::new(PhylaxGate::new(phylax)),
+        Box::new(CredentialStoreGate::new(credential_store)),
     ])
 }
 
@@ -1661,11 +1661,11 @@ mod tests {
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
-    /// Build the real Phylax authority over an isolated in-memory store.
-    fn test_phylax(bus: Arc<AxonBus>) -> Arc<PhylaxStore> {
+    /// Build an isolated in-memory credential store for compatibility-chain tests.
+    fn test_credential_store(bus: Arc<AxonBus>) -> Arc<CredentialStore> {
         Arc::new(
-            PhylaxStore::open_in_memory(bus, *henosis_phylax::crypto::generate_key())
-                .expect("phylax store"),
+            CredentialStore::open_in_memory(bus, *henosis_credential_store::crypto::generate_key())
+                .expect("credential store"),
         )
     }
 
@@ -1955,7 +1955,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            test_phylax(bus.clone()),
+            test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -1982,7 +1982,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus2,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            test_phylax(bus2.clone()),
+            test_credential_store(bus2.clone()),
             bus2.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -2033,7 +2033,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            test_phylax(bus.clone()),
+            test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
@@ -2068,23 +2068,26 @@ mod tests {
         );
     }
 
-    /// With a configured phylax store the chain is still canonical, and the phylax slot is the
-    /// REAL gate: a credential invocation the principal's policy permits is allowed by it (the
-    /// other gates are not part of this gate-level assertion).
+    /// The compatibility chain remains canonical with an embedded credential store.
+    ///
+    /// Its final broker slot allows an operation explicitly permitted by the principal's policy.
     #[tokio::test]
-    async fn live_gate_chain_uses_real_phylax_when_configured() {
-        use henosis_phylax::{ResolveMode, SecretData};
+    async fn live_gate_chain_uses_embedded_credential_store() {
+        use henosis_credential_store::{ResolveMode, SecretData};
         use syntheos_contracts::{GateDecision, GateRequest, RequestContext, ToolInvocation};
 
         let bus = Arc::new(AxonBus::new());
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus store"));
-        let phylax = Arc::new(
-            PhylaxStore::open_in_memory(bus.clone(), *henosis_phylax::crypto::generate_key())
-                .expect("phylax store"),
+        let credential_store = Arc::new(
+            CredentialStore::open_in_memory(
+                bus.clone(),
+                *henosis_credential_store::crypto::generate_key(),
+            )
+            .expect("credential store"),
         );
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
-        phylax
+        credential_store
             .store_secret(
                 &tenant,
                 &principal,
@@ -2095,7 +2098,7 @@ mod tests {
                 },
             )
             .expect("store secret");
-        phylax
+        credential_store
             .create_policy(
                 &tenant,
                 Some(&principal),
@@ -2110,18 +2113,18 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            phylax,
+            credential_store,
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),
             )),
-            // Use allow_all so the plutus slot does not interfere; we're testing phylax here.
+            // Use allow_all so the Plutus slot does not interfere with the broker-slot test.
             Arc::new(henosis_plutus::MockPolicyBackend::allow_all()),
         )
         .expect("valid default policy");
-        // The phylax slot is last; assert it is the real gate by exercising it.
-        let phylax_slot = chain.last().expect("phylax slot");
-        assert_eq!(phylax_slot.name(), "phylaxd");
+        // The broker slot is last; exercise its real embedded policy implementation.
+        let broker_slot = chain.last().expect("phylaxd slot");
+        assert_eq!(broker_slot.name(), "phylaxd");
         let req = GateRequest {
             context: RequestContext {
                 tenant,
@@ -2134,17 +2137,17 @@ mod tests {
                 authority: None,
             },
             invocation: ToolInvocation {
-                tool: "phylax".into(),
+                tool: "phylaxd".into(),
                 action: "sign".into(),
                 args: serde_json::json!({"category": "prod", "name": "db"}),
             },
         };
-        assert_eq!(phylax_slot.check(&req).await.unwrap(), GateDecision::Allow);
+        assert_eq!(broker_slot.check(&req).await.unwrap(), GateDecision::Allow);
 
         // A deny-stub would have denied this same request; the real gate allowing it proves the
-        // slot is wired to PhylaxGate.
+        // slot is wired to CredentialStoreGate.
         let denied = ToolInvocation {
-            tool: "phylax".into(),
+            tool: "phylaxd".into(),
             action: "derive".into(),
             args: serde_json::json!({"category": "prod", "name": "db"}),
         };
@@ -2153,7 +2156,7 @@ mod tests {
             ..req
         };
         assert!(matches!(
-            phylax_slot.check(&denied_req).await.unwrap(),
+            broker_slot.check(&denied_req).await.unwrap(),
             GateDecision::Deny { .. }
         ));
     }
@@ -2177,7 +2180,7 @@ mod tests {
             &henosis_eidolon::EidolonPolicy::default(),
             thymus,
             Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            test_phylax(bus.clone()),
+            test_credential_store(bus.clone()),
             bus.clone(),
             Arc::new(henosis_rift::RegistryApprover::new(
                 std::time::Duration::from_millis(5),

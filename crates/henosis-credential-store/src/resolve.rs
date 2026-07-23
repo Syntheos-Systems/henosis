@@ -2,11 +2,10 @@
 //!
 //! Each loads the secret in-process, performs a cryptographic operation, and returns only the
 //! result -- the secret never crosses the boundary. Every mode is fail-closed and deny-by-default:
-//! it re-checks the capability policy itself ([`PhylaxStore::match_policy`]) before touching the
-//! secret, so the methods are safe regardless of caller (defense in depth behind the gate).
+//! it re-checks the capability policy itself ([`CredentialStore::match_policy`]) before touching
+//! the secret, so the methods are safe regardless of caller.
 //!
-//! Ported from the Kleos `kleos-phylax` resolve_modes handlers (the freshly built + property-tested
-//! 2026-06 implementation), reworked off HTTP onto the principal model.
+//! The implementation is transport-independent and scoped to the Henosis principal model.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -18,9 +17,9 @@ use subtle::ConstantTimeEq;
 use syntheos_contracts::{PrincipalId, TenantId};
 use zeroize::Zeroizing;
 
-use crate::error::PhylaxError;
+use crate::error::CredentialStoreError;
 use crate::model::{ResolveMode, SecretData, SignAlgo};
-use crate::store::PhylaxStore;
+use crate::store::CredentialStore;
 
 /// Maximum derivable key length in bytes.
 const MAX_DERIVE_LEN: usize = 64;
@@ -35,11 +34,11 @@ const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Authorizes and executes non-command credential resolution modes.
-impl PhylaxStore {
+impl CredentialStore {
     /// Confirm a policy permits `mode` for (tenant, principal, category, name) without performing
-    /// the operation. This is the [`crate::gate::PhylaxGate`]'s decision point: `Ok(())` means
-    /// allowed, [`PhylaxError::PermissionDenied`] means denied, and a [`PhylaxError::Backend`]
-    /// means the authority could not decide (the gate turns that into a fail-closed `GateError`).
+    /// the operation. This is the [`crate::gate::CredentialStoreGate`]'s decision point: `Ok(())`
+    /// means allowed, [`CredentialStoreError::PermissionDenied`] means denied, and
+    /// [`CredentialStoreError::Backend`] means the authority could not decide.
     pub fn authorize_mode(
         &self,
         tenant: &TenantId,
@@ -47,14 +46,14 @@ impl PhylaxStore {
         category: &str,
         name: &str,
         mode: ResolveMode,
-    ) -> Result<(), PhylaxError> {
+    ) -> Result<(), CredentialStoreError> {
         self.authorize(tenant, principal, category, name, mode)
             .map(|_| ())
     }
 
     /// Confirm a policy permits `mode` for (tenant, principal, category, name), returning the
     /// matched policy. Fail-closed: no matching policy, or a policy that does not name the mode,
-    /// is a [`PhylaxError::PermissionDenied`].
+    /// is a [`CredentialStoreError::PermissionDenied`].
     fn authorize(
         &self,
         tenant: &TenantId,
@@ -62,17 +61,17 @@ impl PhylaxStore {
         category: &str,
         name: &str,
         mode: ResolveMode,
-    ) -> Result<crate::model::Policy, PhylaxError> {
+    ) -> Result<crate::model::Policy, CredentialStoreError> {
         let policy = self
             .match_policy(tenant, principal, category, name)?
             .ok_or_else(|| {
-                PhylaxError::PermissionDenied(format!(
+                CredentialStoreError::PermissionDenied(format!(
                     "no policy permits '{}' on {category}/{name}",
                     mode.as_token()
                 ))
             })?;
         if !policy.allows(mode) {
-            return Err(PhylaxError::PermissionDenied(format!(
+            return Err(CredentialStoreError::PermissionDenied(format!(
                 "policy does not allow '{}' on {category}/{name}",
                 mode.as_token()
             )));
@@ -80,18 +79,18 @@ impl PhylaxStore {
         Ok(policy)
     }
 
-    /// The canonical secret key bytes, or a [`PhylaxError::InvalidInput`] for a secret type with
-    /// no single key value (Environment). The bytes are zeroized on drop.
+    /// The canonical secret key bytes, or a [`CredentialStoreError::InvalidInput`] for a secret
+    /// type with no single key value. The bytes are zeroized on drop.
     fn key_bytes(
         &self,
         tenant: &TenantId,
         category: &str,
         name: &str,
-    ) -> Result<Zeroizing<Vec<u8>>, PhylaxError> {
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreError> {
         let data = self.load_secret(tenant, category, name)?;
         match data.key_value() {
             Some(v) => Ok(Zeroizing::new(v.as_bytes().to_vec())),
-            None => Err(PhylaxError::InvalidInput(
+            None => Err(CredentialStoreError::InvalidInput(
                 "secret type has no single key value".into(),
             )),
         }
@@ -107,7 +106,7 @@ impl PhylaxStore {
         name: &str,
         payload: &[u8],
         algo: SignAlgo,
-    ) -> Result<Vec<u8>, PhylaxError> {
+    ) -> Result<Vec<u8>, CredentialStoreError> {
         self.authorize(tenant, principal, category, name, ResolveMode::Sign)?;
         match algo {
             SignAlgo::HmacSha256 => {
@@ -137,7 +136,7 @@ impl PhylaxStore {
         payload: &[u8],
         signature: &[u8],
         algo: SignAlgo,
-    ) -> Result<bool, PhylaxError> {
+    ) -> Result<bool, CredentialStoreError> {
         self.authorize(tenant, principal, category, name, ResolveMode::Verify)?;
         match algo {
             SignAlgo::HmacSha256 => {
@@ -170,14 +169,14 @@ impl PhylaxStore {
         name: &str,
         purpose: &str,
         length: usize,
-    ) -> Result<Vec<u8>, PhylaxError> {
+    ) -> Result<Vec<u8>, CredentialStoreError> {
         if purpose.is_empty() {
-            return Err(PhylaxError::InvalidInput(
+            return Err(CredentialStoreError::InvalidInput(
                 "purpose must be non-empty".into(),
             ));
         }
         if length == 0 || length > MAX_DERIVE_LEN {
-            return Err(PhylaxError::InvalidInput(format!(
+            return Err(CredentialStoreError::InvalidInput(format!(
                 "length must be 1..={MAX_DERIVE_LEN}"
             )));
         }
@@ -185,8 +184,11 @@ impl PhylaxStore {
         let key = self.key_bytes(tenant, category, name)?;
         let hk = Hkdf::<Sha256>::new(None, &key);
         let mut okm = vec![0u8; length];
-        hk.expand(format!("phylax-derive:{purpose}").as_bytes(), &mut okm)
-            .map_err(|_| PhylaxError::InvalidInput("derive length invalid".into()))?;
+        hk.expand(
+            format!("credential-store-derive:{purpose}").as_bytes(),
+            &mut okm,
+        )
+        .map_err(|_| CredentialStoreError::InvalidInput("derive length invalid".into()))?;
         Ok(okm)
     }
 
@@ -196,19 +198,19 @@ impl PhylaxStore {
         tenant: &TenantId,
         category: &str,
         name: &str,
-    ) -> Result<ed25519_dalek::SigningKey, PhylaxError> {
+    ) -> Result<ed25519_dalek::SigningKey, CredentialStoreError> {
         let data = self.load_secret(tenant, category, name)?;
         let SecretData::SshKey { private_key, .. } = data else {
-            return Err(PhylaxError::InvalidInput(
+            return Err(CredentialStoreError::InvalidInput(
                 "ed25519 requires an ssh_key-type secret".into(),
             ));
         };
-        let key = ssh_key::PrivateKey::from_openssh(private_key.as_bytes())
-            .map_err(|_| PhylaxError::InvalidInput("stored key is not OpenSSH-format".into()))?;
-        let pair = key
-            .key_data()
-            .ed25519()
-            .ok_or_else(|| PhylaxError::InvalidInput("stored key is not ed25519".into()))?;
+        let key = ssh_key::PrivateKey::from_openssh(private_key.as_bytes()).map_err(|_| {
+            CredentialStoreError::InvalidInput("stored key is not OpenSSH-format".into())
+        })?;
+        let pair = key.key_data().ed25519().ok_or_else(|| {
+            CredentialStoreError::InvalidInput("stored key is not ed25519".into())
+        })?;
         Ok(ed25519_dalek::SigningKey::from_bytes(
             &pair.private.to_bytes(),
         ))
@@ -260,7 +262,7 @@ fn valid_env_var_name(name: &str) -> bool {
 }
 
 /// Executes allowlisted commands without returning the underlying credential.
-impl PhylaxStore {
+impl CredentialStore {
     /// Run an allowlisted command with the secret injected as `env_var`. The agent receives the
     /// command's scrubbed output and exit code, never the secret.
     ///
@@ -274,17 +276,21 @@ impl PhylaxStore {
         name: &str,
         argv: &[String],
         env_var: &str,
-    ) -> Result<crate::model::ExecOutcome, PhylaxError> {
+    ) -> Result<crate::model::ExecOutcome, CredentialStoreError> {
         let Some(argv0) = argv.first() else {
-            return Err(PhylaxError::InvalidInput("argv must be non-empty".into()));
+            return Err(CredentialStoreError::InvalidInput(
+                "argv must be non-empty".into(),
+            ));
         };
         if !argv0.starts_with('/') {
-            return Err(PhylaxError::InvalidInput(
+            return Err(CredentialStoreError::InvalidInput(
                 "argv[0] must be an absolute path".into(),
             ));
         }
         if !valid_env_var_name(env_var) {
-            return Err(PhylaxError::InvalidInput("invalid env_var name".into()));
+            return Err(CredentialStoreError::InvalidInput(
+                "invalid env_var name".into(),
+            ));
         }
 
         let policy = self.authorize(tenant, principal, category, name, ResolveMode::Exec)?;
@@ -293,7 +299,7 @@ impl PhylaxStore {
             .as_ref()
             .is_some_and(|list| list.iter().any(|p| p == argv0));
         if !allowlisted {
-            return Err(PhylaxError::PermissionDenied(
+            return Err(CredentialStoreError::PermissionDenied(
                 "argv[0] is not on the policy's exec allowlist".into(),
             ));
         }
@@ -315,7 +321,7 @@ impl PhylaxStore {
             .spawn()
             .map_err(|e| {
                 tracing::error!(error = %e, "exec spawn failed");
-                PhylaxError::InvalidInput("command could not be started".into())
+                CredentialStoreError::InvalidInput("command could not be started".into())
             })?;
 
         let output = match tokio::time::timeout(
@@ -327,7 +333,9 @@ impl PhylaxStore {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "exec wait failed");
-                return Err(PhylaxError::Backend("command execution failed".into()));
+                return Err(CredentialStoreError::Backend(
+                    "command execution failed".into(),
+                ));
             }
             Err(_) => {
                 // Deadline exceeded: the dropped future kills the child (kill_on_drop).
@@ -363,15 +371,15 @@ mod functional_tests {
     use syntheos_axon::AxonBus;
 
     /// In-memory store with a random key.
-    fn store() -> PhylaxStore {
-        PhylaxStore::open_in_memory(Arc::new(AxonBus::new()), *crate::crypto::generate_key())
+    fn store() -> CredentialStore {
+        CredentialStore::open_in_memory(Arc::new(AxonBus::new()), *crate::crypto::generate_key())
             .expect("store")
     }
 
     /// Store a Note secret and a policy permitting `modes` (and `exec_allowlist`). Returns
     /// (tenant, principal).
     fn fixture(
-        s: &PhylaxStore,
+        s: &CredentialStore,
         modes: &[ResolveMode],
         exec_allowlist: Option<&[String]>,
     ) -> (TenantId, PrincipalId) {
@@ -441,11 +449,11 @@ mod functional_tests {
         let (t, p) = fixture(&s, &[ResolveMode::Derive], None);
         assert!(matches!(
             s.resolve_derive(&t, &p, "prod", "db", "", 32),
-            Err(PhylaxError::InvalidInput(_))
+            Err(CredentialStoreError::InvalidInput(_))
         ));
         assert!(matches!(
             s.resolve_derive(&t, &p, "prod", "db", "x", 65),
-            Err(PhylaxError::InvalidInput(_))
+            Err(CredentialStoreError::InvalidInput(_))
         ));
     }
 
@@ -456,7 +464,7 @@ mod functional_tests {
         let (t, p) = fixture(&s, &[ResolveMode::Sign], None);
         assert!(matches!(
             s.resolve_derive(&t, &p, "prod", "db", "x", 16),
-            Err(PhylaxError::PermissionDenied(_))
+            Err(CredentialStoreError::PermissionDenied(_))
         ));
     }
 
@@ -485,7 +493,7 @@ mod functional_tests {
                 b"x",
                 SignAlgo::HmacSha256
             ),
-            Err(PhylaxError::PermissionDenied(_))
+            Err(CredentialStoreError::PermissionDenied(_))
         ));
     }
 
@@ -497,7 +505,7 @@ mod functional_tests {
         let intruder = PrincipalId::new();
         assert!(matches!(
             s.resolve_sign(&t, &intruder, "prod", "db", b"x", SignAlgo::HmacSha256),
-            Err(PhylaxError::PermissionDenied(_))
+            Err(CredentialStoreError::PermissionDenied(_))
         ));
     }
 
@@ -542,7 +550,7 @@ mod functional_tests {
         let r = s
             .resolve_exec(&t, &p, "prod", "db", &["/bin/cat".to_string()], "X")
             .await;
-        assert!(matches!(r, Err(PhylaxError::PermissionDenied(_))));
+        assert!(matches!(r, Err(CredentialStoreError::PermissionDenied(_))));
     }
 
     /// An exec policy with no allowlist forbids exec entirely.
@@ -553,7 +561,7 @@ mod functional_tests {
         let r = s
             .resolve_exec(&t, &p, "prod", "db", &["/usr/bin/env".to_string()], "X")
             .await;
-        assert!(matches!(r, Err(PhylaxError::PermissionDenied(_))));
+        assert!(matches!(r, Err(CredentialStoreError::PermissionDenied(_))));
     }
 
     /// Relative argv[0] and bad env var names are input errors.
@@ -565,7 +573,7 @@ mod functional_tests {
         assert!(matches!(
             s.resolve_exec(&t, &p, "prod", "db", &["env".to_string()], "X")
                 .await,
-            Err(PhylaxError::InvalidInput(_))
+            Err(CredentialStoreError::InvalidInput(_))
         ));
         assert!(matches!(
             s.resolve_exec(
@@ -577,7 +585,7 @@ mod functional_tests {
                 "BAD;VAR"
             )
             .await,
-            Err(PhylaxError::InvalidInput(_))
+            Err(CredentialStoreError::InvalidInput(_))
         ));
     }
 
@@ -594,7 +602,7 @@ mod functional_tests {
             &[ResolveMode::Exec],
             Some(&["env".to_string()]),
         );
-        assert!(matches!(r, Err(PhylaxError::InvalidInput(_))));
+        assert!(matches!(r, Err(CredentialStoreError::InvalidInput(_))));
     }
 
     /// ed25519 sign/verify over a stored SSH key round-trips.

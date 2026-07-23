@@ -115,14 +115,14 @@ test_success() {
 # Verify a denial from the wrong authority fails the mission.
 test_wrong_gate_fails() {
     tools_dir="$TEST_ROOT/tools"
-    if CURL_LOG="$TEST_ROOT/wrong-gate-curl.log" FAKE_DENIED_GATE=phylax \
+    if CURL_LOG="$TEST_ROOT/wrong-gate-curl.log" FAKE_DENIED_GATE=phylaxd \
         PATH="$tools_dir:$ORIGINAL_PATH" "$REPO_DIR/scripts/demo-governed-mission.sh" \
         --base-url http://127.0.0.1:8088 \
         --tenant "$TENANT" \
         --principal "$PRINCIPAL" > "$TEST_ROOT/wrong-gate.log" 2>&1; then
         fail "mission accepted a denial from the wrong authority"
     fi
-    assert_contains "$TEST_ROOT/wrong-gate.log" "denied by 'phylax', expected 'eidolon'"
+    assert_contains "$TEST_ROOT/wrong-gate.log" "denied by 'phylaxd', expected 'eidolon'"
 }
 
 # Verify the mission rejects targets outside its loopback route boundary before any request.

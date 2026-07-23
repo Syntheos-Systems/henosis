@@ -1,7 +1,7 @@
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-/// Default URL for the local credential authority during the Phylax transition.
+/// Default URL for the local phylaxd credential authority.
 pub const DEFAULT_CREDENTIAL_AUTHORITY_URL: &str = "http://127.0.0.1:4400";
 
 /// Shim: for every `KLEOS_X` env var found, set `ENGRAM_X` if not already set.

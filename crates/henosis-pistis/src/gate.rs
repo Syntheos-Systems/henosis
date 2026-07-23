@@ -5,8 +5,7 @@
 //! *declares a capability requirement* against the requesting principal's
 //! admission and trust in the relevant room. An invocation that declares no
 //! capability requirement is not Pistis's concern -- it is allowed for the rest
-//! of the chain to decide (mirroring how `PhylaxGate` only acts on its own
-//! tool).
+//! of the chain to decide, just as the broker gate only acts on its own tool.
 //!
 //! Convention: a capability-bearing invocation carries a string `capability`
 //! arg (the requirement name) and a string `action_kind` arg (an [`ActionKind`]

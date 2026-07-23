@@ -1,7 +1,7 @@
 //! Fail-closed defaults for the live binary: a deny-everything gate chain and an executor that
 //! refuses to run anything.
 //!
-//! Until the real authorities (Pistis, Plutus, Eidolon, Human, Phylax) land, the live server
+//! Until the real authorities (Pistis, Plutus, Eidolon, Human, phylaxd) land, the live server
 //! wires [`deny_gate_chain`] so every dispatched action is denied at the first gate. This is the
 //! correct Phase 0 posture for a running system: deny by default, swap in real gates by trait
 //! object as each authority ships. Allow-all placeholders live in [`crate::stubs`] behind the

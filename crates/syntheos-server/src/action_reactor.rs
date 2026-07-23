@@ -81,6 +81,7 @@ mod tests {
     use crate::{live_gate_chain, HenosisExecutor};
     use henosis_broca::ActionFilter;
     use henosis_chiasm::{NewTask, TaskStatus};
+    use henosis_credential_store::CredentialStore;
     use henosis_eidolon::EidolonPolicy;
     use henosis_hermes::{
         audit::AuditTrail,
@@ -93,7 +94,6 @@ mod tests {
         tenant_config::TenantConfigStore,
         AppState as HermesState,
     };
-    use henosis_phylax::PhylaxStore;
     use henosis_pistis::InMemoryRoomStateSource;
     use henosis_plutus::{LocalPolicyBackend, MockPolicyBackend, PolicyBackend, QuotaTier, Role};
     use henosis_rift::RegistryApprover;
@@ -203,9 +203,12 @@ mod tests {
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm"));
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca"));
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus"));
-        let phylax = Arc::new(
-            PhylaxStore::open_in_memory(bus.clone(), *henosis_phylax::crypto::generate_key())
-                .expect("phylax"),
+        let credential_store = Arc::new(
+            CredentialStore::open_in_memory(
+                bus.clone(),
+                *henosis_credential_store::crypto::generate_key(),
+            )
+            .expect("credential store"),
         );
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
@@ -230,7 +233,7 @@ mod tests {
             &EidolonPolicy::default(),
             thymus,
             Arc::new(InMemoryRoomStateSource::new()),
-            phylax.clone(),
+            credential_store.clone(),
             bus.clone(),
             Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
             plutus,
@@ -319,9 +322,12 @@ mod tests {
         let chiasm = Arc::new(ChiasmStore::open_in_memory(bus.clone()).expect("chiasm"));
         let broca = Arc::new(BrocaStore::open_in_memory(bus.clone()).expect("broca"));
         let thymus = Arc::new(ThymusStore::open_in_memory(bus.clone()).expect("thymus"));
-        let phylax = Arc::new(
-            PhylaxStore::open_in_memory(bus.clone(), *henosis_phylax::crypto::generate_key())
-                .expect("phylax"),
+        let credential_store = Arc::new(
+            CredentialStore::open_in_memory(
+                bus.clone(),
+                *henosis_credential_store::crypto::generate_key(),
+            )
+            .expect("credential store"),
         );
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
@@ -351,7 +357,7 @@ mod tests {
             &EidolonPolicy::default(),
             thymus,
             Arc::new(InMemoryRoomStateSource::new()),
-            phylax.clone(),
+            credential_store.clone(),
             bus.clone(),
             Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
             plutus,

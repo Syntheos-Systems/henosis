@@ -1,9 +1,8 @@
-//! The SQLite-backed Phylax credential store.
+//! The SQLite-backed embedded credential store.
 //!
-//! Absorbed from `kleos-phylax`/`kleos-cred` onto the Henosis substrate: ownership is a
-//! [`TenantId`] (every read/write scopes on it, replacing the Kleos `WHERE user_id = ?`
-//! predicate), secret values are AES-256-GCM encrypted at the field level before they touch
-//! disk, and lifecycle events are typed and published to the in-process [`AxonBus`].
+//! Every read and write is scoped by [`TenantId`]. Secret values are encrypted with AES-256-GCM
+//! before they reach disk, and lifecycle events are typed and published to the in-process
+//! [`AxonBus`].
 //!
 //! This module owns the secret table and its owner-tier administration surface: store, read (the
 //! ONLY plaintext path, named loudly and never reachable through the gate), delete, and
@@ -19,35 +18,37 @@ use syntheos_contracts::{PrincipalId, TenantId, Timestamp, TypedEvent};
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, KEY_SIZE};
-use crate::error::PhylaxError;
+use crate::error::CredentialStoreError;
 use crate::events::{SecretDeleted, SecretStored};
 use crate::model::SecretData;
 
-/// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
+/// Ordered append-only schema migrations applied by `PRAGMA user_version`.
+///
+/// Migration filenames and `phylax_*` SQL identifiers are retained for database compatibility.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__phylax.sql")),
     (2, include_str!("../migrations/V2__phylax_policies.sql")),
 ];
 
 /// Map a generic rusqlite error to an opaque backend error.
-pub(crate) fn berr(e: impl std::fmt::Display) -> PhylaxError {
-    PhylaxError::Backend(e.to_string())
+pub(crate) fn berr(e: impl std::fmt::Display) -> CredentialStoreError {
+    CredentialStoreError::Backend(e.to_string())
 }
 
 /// The current time as its stored RFC3339-UTC string (via the contracts wire form -- `Timestamp`
 /// has no `Display`, only a serde representation).
-pub(crate) fn now_string() -> Result<String, PhylaxError> {
+pub(crate) fn now_string() -> Result<String, CredentialStoreError> {
     serde_json::to_value(Timestamp::now())
         .ok()
         .and_then(|v| v.as_str().map(String::from))
-        .ok_or_else(|| PhylaxError::Backend("timestamp serialize".into()))
+        .ok_or_else(|| CredentialStoreError::Backend("timestamp serialize".into()))
 }
 
 /// The credential store.
 ///
-/// Share it as `Arc<PhylaxStore>`; all methods take `&self`. The master key is held for the
+/// Share it as `Arc<CredentialStore>`; all methods take `&self`. The master key is held for the
 /// store's lifetime and zeroized on drop.
-pub struct PhylaxStore {
+pub struct CredentialStore {
     /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send`, not `Sync`).
     conn: Mutex<Connection>,
     /// The bus secret/policy lifecycle events are published onto.
@@ -57,13 +58,13 @@ pub struct PhylaxStore {
 }
 
 /// Opens the credential store and manages encrypted secret records.
-impl PhylaxStore {
+impl CredentialStore {
     /// Open (or create) a store at `path` under `master_key`.
     pub fn open(
         path: impl AsRef<Path>,
         bus: Arc<AxonBus>,
         master_key: [u8; KEY_SIZE],
-    ) -> Result<Self, PhylaxError> {
+    ) -> Result<Self, CredentialStoreError> {
         let conn = Connection::open(path).map_err(berr)?;
         Self::from_conn(conn, bus, master_key)
     }
@@ -72,7 +73,7 @@ impl PhylaxStore {
     pub fn open_in_memory(
         bus: Arc<AxonBus>,
         master_key: [u8; KEY_SIZE],
-    ) -> Result<Self, PhylaxError> {
+    ) -> Result<Self, CredentialStoreError> {
         let conn = Connection::open_in_memory().map_err(berr)?;
         Self::from_conn(conn, bus, master_key)
     }
@@ -82,7 +83,7 @@ impl PhylaxStore {
         mut conn: Connection,
         bus: Arc<AxonBus>,
         master_key: [u8; KEY_SIZE],
-    ) -> Result<Self, PhylaxError> {
+    ) -> Result<Self, CredentialStoreError> {
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -102,11 +103,11 @@ impl PhylaxStore {
         &self.master_key
     }
 
-    /// Publish a phylax event, fire-and-forget. A publish failure is logged, never fatal --
+    /// Publish a credential lifecycle event. A publish failure is logged but never fatal because
     /// telemetry must not change a credential operation's outcome.
     fn emit<E: TypedEvent>(&self, event: &E, tenant: TenantId, principal: PrincipalId) {
         if let Err(e) = self.bus.publish_event(event, tenant, principal) {
-            tracing::warn!(error = %e, kind = E::KIND, "failed to publish phylax event");
+            tracing::warn!(error = %e, kind = E::KIND, "failed to publish credential event");
         }
     }
 
@@ -121,10 +122,11 @@ impl PhylaxStore {
         category: &str,
         name: &str,
         data: &SecretData,
-    ) -> Result<(), PhylaxError> {
+    ) -> Result<(), CredentialStoreError> {
         // Serialize then encrypt; the plaintext JSON is zeroized on drop.
         let plaintext = Zeroizing::new(
-            serde_json::to_vec(data).map_err(|e| PhylaxError::Encryption(e.to_string()))?,
+            serde_json::to_vec(data)
+                .map_err(|e| CredentialStoreError::Encryption(e.to_string()))?,
         );
         let blob = crypto::encrypt(&self.master_key, &plaintext)?;
         let now = now_string()?;
@@ -164,13 +166,14 @@ impl PhylaxStore {
         tenant: &TenantId,
         category: &str,
         name: &str,
-    ) -> Result<SecretData, PhylaxError> {
+    ) -> Result<SecretData, CredentialStoreError> {
         let blob = self.load_ciphertext(tenant, category, name)?;
         let plaintext = crypto::decrypt(&self.master_key, &blob)?;
-        serde_json::from_slice(&plaintext).map_err(|e| PhylaxError::Decryption(e.to_string()))
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| CredentialStoreError::Decryption(e.to_string()))
     }
 
-    /// Fetch a secret's raw ciphertext blob, or a [`PhylaxError::SecretNotFound`].
+    /// Fetch a secret's raw ciphertext blob, or a [`CredentialStoreError::SecretNotFound`].
     ///
     /// Crate-internal: the resolve modes (later slice) use this to decrypt in-process without
     /// exposing a plaintext read on the public surface.
@@ -179,7 +182,7 @@ impl PhylaxStore {
         tenant: &TenantId,
         category: &str,
         name: &str,
-    ) -> Result<Vec<u8>, PhylaxError> {
+    ) -> Result<Vec<u8>, CredentialStoreError> {
         let conn = self.lock_conn();
         conn.query_row(
             "SELECT secret_ciphertext FROM phylax_secrets
@@ -189,7 +192,7 @@ impl PhylaxStore {
         )
         .optional()
         .map_err(berr)?
-        .ok_or_else(|| PhylaxError::SecretNotFound {
+        .ok_or_else(|| CredentialStoreError::SecretNotFound {
             category: category.to_string(),
             name: name.to_string(),
         })
@@ -202,10 +205,11 @@ impl PhylaxStore {
         tenant: &TenantId,
         category: &str,
         name: &str,
-    ) -> Result<SecretData, PhylaxError> {
+    ) -> Result<SecretData, CredentialStoreError> {
         let blob = self.load_ciphertext(tenant, category, name)?;
         let plaintext = crypto::decrypt(self.master_key(), &blob)?;
-        serde_json::from_slice(&plaintext).map_err(|e| PhylaxError::Decryption(e.to_string()))
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| CredentialStoreError::Decryption(e.to_string()))
     }
 
     /// Delete a secret. Owner-tier administration. Errors if it does not exist.
@@ -215,7 +219,7 @@ impl PhylaxStore {
         actor: &PrincipalId,
         category: &str,
         name: &str,
-    ) -> Result<(), PhylaxError> {
+    ) -> Result<(), CredentialStoreError> {
         let affected = {
             let conn = self.lock_conn();
             conn.execute(
@@ -225,7 +229,7 @@ impl PhylaxStore {
             .map_err(berr)?
         };
         if affected == 0 {
-            return Err(PhylaxError::SecretNotFound {
+            return Err(CredentialStoreError::SecretNotFound {
                 category: category.to_string(),
                 name: name.to_string(),
             });
@@ -245,7 +249,7 @@ impl PhylaxStore {
     pub fn list_secret_names(
         &self,
         tenant: &TenantId,
-    ) -> Result<Vec<(String, String)>, PhylaxError> {
+    ) -> Result<Vec<(String, String)>, CredentialStoreError> {
         let conn = self.lock_conn();
         let mut stmt = conn
             .prepare(
@@ -264,15 +268,16 @@ impl PhylaxStore {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own
 /// transaction, bumping `user_version` as it goes. Idempotent.
-fn apply_migrations(conn: &mut Connection) -> Result<(), PhylaxError> {
+fn apply_migrations(conn: &mut Connection) -> Result<(), CredentialStoreError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
     for (v, sql) in MIGRATIONS {
         if *v > version {
             let tx = conn.transaction().map_err(berr)?;
-            tx.execute_batch(sql)
-                .map_err(|e| PhylaxError::Backend(format!("migration V{v} failed: {e}")))?;
+            tx.execute_batch(sql).map_err(|e| {
+                CredentialStoreError::Backend(format!("migration V{v} failed: {e}"))
+            })?;
             tx.pragma_update(None, "user_version", *v).map_err(berr)?;
             tx.commit().map_err(berr)?;
             version = *v;
@@ -287,8 +292,8 @@ mod tests {
     use super::*;
 
     /// Build an in-memory store with a random key.
-    fn store() -> PhylaxStore {
-        PhylaxStore::open_in_memory(Arc::new(AxonBus::new()), *crypto::generate_key())
+    fn store() -> CredentialStore {
+        CredentialStore::open_in_memory(Arc::new(AxonBus::new()), *crypto::generate_key())
             .expect("open store")
     }
 
@@ -384,7 +389,7 @@ mod tests {
         .expect("store");
         assert!(matches!(
             s.read_secret_admin(&other, "prod", "db"),
-            Err(PhylaxError::SecretNotFound { .. })
+            Err(CredentialStoreError::SecretNotFound { .. })
         ));
         assert!(s.list_secret_names(&other).expect("list").is_empty());
     }
@@ -409,7 +414,7 @@ mod tests {
             .expect("delete");
         assert!(matches!(
             s.delete_secret(&tenant, &actor, "prod", "db"),
-            Err(PhylaxError::SecretNotFound { .. })
+            Err(CredentialStoreError::SecretNotFound { .. })
         ));
         assert!(s.list_secret_names(&tenant).expect("list").is_empty());
     }
@@ -424,11 +429,11 @@ mod tests {
         let actor = PrincipalId::new();
 
         // Write under key_a into a temp file, then reopen the same file under key_b.
-        let dir = std::env::temp_dir().join(format!("phylax-test-{}", tenant.as_uuid()));
+        let dir = std::env::temp_dir().join(format!("credential-store-test-{}", tenant.as_uuid()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("phylax.db");
+        let path = dir.join("credential-store.db");
         {
-            let a = PhylaxStore::open(&path, bus.clone(), key_a).expect("open a");
+            let a = CredentialStore::open(&path, bus.clone(), key_a).expect("open a");
             a.store_secret(
                 &tenant,
                 &actor,
@@ -441,10 +446,10 @@ mod tests {
             .expect("store");
         }
         let key_b = *crypto::generate_key();
-        let b = PhylaxStore::open(&path, bus, key_b).expect("open b");
+        let b = CredentialStore::open(&path, bus, key_b).expect("open b");
         assert!(matches!(
             b.read_secret_admin(&tenant, "prod", "db"),
-            Err(PhylaxError::Decryption(_))
+            Err(CredentialStoreError::Decryption(_))
         ));
         std::fs::remove_dir_all(&dir).ok();
     }

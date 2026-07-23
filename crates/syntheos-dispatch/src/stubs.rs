@@ -3,7 +3,7 @@
 //! This module is feature-gated behind the non-default `stubs` cargo feature (and this crate's
 //! own `cfg(test)`), so the allow-all chain can never compile into a default or release build.
 //! The live binary's fail-closed defaults live in [`crate::deny`]. Real authorities (Pistis,
-//! Plutus, Eidolon, Human, Phylax) and real executors (Hermes, Synapse) replace both by trait
+//! Plutus, Eidolon, Human, phylaxd) and real executors (Hermes, Synapse) replace both by trait
 //! object as they land.
 
 use async_trait::async_trait;

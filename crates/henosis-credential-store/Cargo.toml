@@ -10,7 +10,7 @@ description = "Embedded credential compatibility store with field-encrypted secr
 [dependencies]
 # Gate/GateDecision/GateRequest contract plus PrincipalId/TenantId/Timestamp/TypedEvent.
 syntheos-contracts = { path = "../syntheos-contracts" }
-# The in-process bus phylax publishes secret/policy/resolve events onto.
+# The in-process bus for credential lifecycle events.
 syntheos-axon = { path = "../syntheos-axon" }
 # Object-safe async Gate impl.
 async-trait.workspace = true
@@ -20,9 +20,9 @@ rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 # SecretData JSON is the plaintext that gets encrypted; policy allowed_modes/exec_allowlist are JSON.
 serde_json.workspace = true
-# PhylaxError.
+# Error derivations.
 thiserror.workspace = true
-# Field-level secret encryption (AES-256-GCM, ported from kleos-cred).
+# Field-level secret encryption with AES-256-GCM.
 aes-gcm.workspace = true
 # Secret material is zeroized after use.
 zeroize.workspace = true
@@ -50,5 +50,5 @@ tracing.workspace = true
 tokio = { workspace = true }
 # Property tests: scrub totality, and the gate fail-closed invariants.
 proptest = { workspace = true }
-# Dispatcher-integration test: the real PhylaxGate in the canonical chain's phylax slot.
+# Dispatcher integration tests exercise the real compatibility gate in the canonical broker slot.
 syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }

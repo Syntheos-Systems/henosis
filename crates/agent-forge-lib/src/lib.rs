@@ -17,7 +17,7 @@
 //! The one structural change from upstream: Kleos HTTP coupling goes through the
 //! [`SkillsBridge`] seam instead of a hardwired client (the OutputFilter/Narrator/StepExecutor
 //! pattern). The CLI wires the feature-gated [`bridge::HttpSkillsBridge`] (`KLEOS_URL` +
-//! `KLEOS_API_KEY` env; the phylax-broker keyless fallback deliberately stays in the
+//! `KLEOS_API_KEY` env; the phylaxd keyless fallback deliberately stays in the
 //! Kleos-repo binary, which keeps that cross-repo dependency out of this workspace).
 //! NOTE: the roadmap story text mentions a `FORGE_URL` fallback; no such variable exists in
 //! the upstream source or hooks -- the real variable is `KLEOS_URL`, and nothing was invented
@@ -127,6 +127,7 @@ pub fn run_tool(
 }
 
 #[cfg(test)]
+/// Verifies the in-process library API and tool dispatch lifecycle.
 mod tests {
     use super::*;
 

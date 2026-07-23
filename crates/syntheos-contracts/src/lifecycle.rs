@@ -174,7 +174,7 @@ mod tests {
     fn task_scoped_event_serializes_correlation() {
         let task_id = TaskId::new();
         let ev = ActionInvoked {
-            tool: "phylax".into(),
+            tool: "phylaxd".into(),
             action: "sign".into(),
             task_id: Some(task_id),
         };

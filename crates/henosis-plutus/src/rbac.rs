@@ -88,7 +88,7 @@ pub enum Permission {
     MemoryStore,
     /// Search stored memories.
     MemorySearch,
-    /// Read a credential or secret from the Phylax store.
+    /// Read a credential or secret through the credential broker.
     SecretRead,
     /// Manage billing configuration and payment methods.
     BillingManage,
