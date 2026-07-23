@@ -3530,6 +3530,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-credential-store"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "proptest",
+ "rand 0.9.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ssh-key",
+ "subtle",
+ "syntheos-axon",
+ "syntheos-contracts",
+ "syntheos-dispatch",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "henosis-eidolon"
 version = "0.1.0"
 dependencies = [
@@ -3636,34 +3664,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "henosis-phylax"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "base64 0.22.1",
- "ed25519-dalek",
- "hex",
- "hkdf",
- "hmac",
- "proptest",
- "rand 0.9.4",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "ssh-key",
- "subtle",
- "syntheos-axon",
- "syntheos-contracts",
- "syntheos-dispatch",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -8352,11 +8352,11 @@ dependencies = [
  "henosis-broca",
  "henosis-chiasm",
  "henosis-cognition",
+ "henosis-credential-store",
  "henosis-eidolon",
  "henosis-hephaestus",
  "henosis-hermes",
  "henosis-loom",
- "henosis-phylax",
  "henosis-pistis",
  "henosis-plutus",
  "henosis-rift",

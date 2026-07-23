@@ -56,6 +56,7 @@ pub struct PhylaxStore {
     master_key: Zeroizing<[u8; KEY_SIZE]>,
 }
 
+/// Opens the credential store and manages encrypted secret records.
 impl PhylaxStore {
     /// Open (or create) a store at `path` under `master_key`.
     pub fn open(
@@ -281,6 +282,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), PhylaxError> {
 }
 
 #[cfg(test)]
+/// Verifies encrypted secret persistence, lookup, and lifecycle behavior.
 mod tests {
     use super::*;
 

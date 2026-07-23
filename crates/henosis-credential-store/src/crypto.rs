@@ -84,6 +84,7 @@ pub fn generate_key() -> Zeroizing<[u8; KEY_SIZE]> {
 }
 
 #[cfg(test)]
+/// Verifies encryption round trips and authenticated-decryption failure behavior.
 mod tests {
     use super::*;
 

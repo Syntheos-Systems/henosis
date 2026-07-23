@@ -24,6 +24,7 @@ pub enum ResolveMode {
     Exec,
 }
 
+/// Provides stable wire representations for credential resolution modes.
 impl ResolveMode {
     /// The lowercase token used in policy `allowed_modes` JSON and on the wire.
     pub fn as_token(self) -> &'static str {
@@ -54,6 +55,7 @@ pub struct Policy {
     pub exec_allowlist: Option<Vec<String>>,
 }
 
+/// Evaluates the operations allowed by a capability policy.
 impl Policy {
     /// True if this policy permits `mode`.
     pub fn allows(&self, mode: ResolveMode) -> bool {
@@ -70,6 +72,7 @@ pub enum SignAlgo {
     Ed25519,
 }
 
+/// Parses signing algorithm identifiers from the credential resolution protocol.
 impl SignAlgo {
     /// Parse the wire token (`"hmac-sha256"` or `"ed25519"`).
     pub fn parse(token: &str) -> Option<Self> {
@@ -165,6 +168,7 @@ pub enum SecretData {
     },
 }
 
+/// Exposes the canonical secret value for operations that require a single key.
 impl SecretData {
     /// The canonical secret bytes used to key HMAC/HKDF and to inject into exec.
     ///

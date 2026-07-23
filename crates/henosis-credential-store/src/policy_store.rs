@@ -28,6 +28,7 @@ fn validate_exec_allowlist(allowlist: Option<&[String]>) -> Result<(), PhylaxErr
     Ok(())
 }
 
+/// Manages durable capability policies for the embedded credential store.
 impl PhylaxStore {
     /// Create a capability policy. Returns the stored policy with its assigned id.
     ///

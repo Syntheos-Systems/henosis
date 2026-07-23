@@ -18,7 +18,7 @@ members = [
     "crates/henosis-loom",
     "crates/henosis-thymus",
     "crates/henosis-eidolon",
-    "crates/henosis-phylax",
+    "crates/henosis-credential-store",
     "crates/henosis-pistis",
     "crates/henosis-memory-client",
     "crates/agent-forge-lib",

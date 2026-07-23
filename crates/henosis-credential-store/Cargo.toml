@@ -1,11 +1,11 @@
 [package]
-name = "henosis-phylax"
+name = "henosis-credential-store"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Phylax: the credential authority for the dispatcher's phylax gate slot -- field-encrypted secrets, capability policies, and use-without-holding resolve modes (sign/verify/derive/exec)."
+description = "Embedded credential compatibility store with field-encrypted secrets, capability policies, and use-without-holding resolve modes."
 
 [dependencies]
 # Gate/GateDecision/GateRequest contract plus PrincipalId/TenantId/Timestamp/TypedEvent.

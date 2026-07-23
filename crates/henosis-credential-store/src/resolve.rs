@@ -31,8 +31,10 @@ const EXEC_TIMEOUT_SECS: u64 = 20;
 /// Cap on returned child output per stream, post-scrub.
 const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 
+/// HMAC-SHA256 implementation used by credential signing and verification.
 type HmacSha256 = Hmac<Sha256>;
 
+/// Authorizes and executes non-command credential resolution modes.
 impl PhylaxStore {
     /// Confirm a policy permits `mode` for (tenant, principal, category, name) without performing
     /// the operation. This is the [`crate::gate::PhylaxGate`]'s decision point: `Ok(())` means
@@ -257,6 +259,7 @@ fn valid_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Executes allowlisted commands without returning the underlying credential.
 impl PhylaxStore {
     /// Run an allowlisted command with the secret injected as `env_var`. The agent receives the
     /// command's scrubbed output and exit code, never the secret.
@@ -352,6 +355,7 @@ impl PhylaxStore {
 }
 
 #[cfg(test)]
+/// Exercises complete credential resolution flows against an in-memory store.
 mod functional_tests {
     use super::*;
     use crate::model::SecretData;
@@ -652,6 +656,7 @@ mod functional_tests {
 }
 
 #[cfg(test)]
+/// Verifies secret scrubbing properties and input validation helpers.
 mod tests {
     use super::*;
     use proptest::prelude::*;
