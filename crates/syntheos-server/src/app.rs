@@ -1274,6 +1274,10 @@ async fn loom_get_logs(
 pub struct LoomCompleteStep {
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
+    /// Retry counter of the exact attempt that produced this result.
+    pub expected_retry_count: i32,
+    /// Start time of the exact attempt that produced this result.
+    pub expected_started_at: Timestamp,
     /// The step's output object.
     pub output: serde_json::Value,
 }
@@ -1286,7 +1290,13 @@ async fn loom_complete_step(
 ) -> Result<Json<Step>, (StatusCode, String)> {
     state
         .loom
-        .complete_step(req.principal_id, id, req.output)
+        .complete_step(
+            req.principal_id,
+            id,
+            req.expected_retry_count,
+            req.expected_started_at,
+            req.output,
+        )
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1297,6 +1307,10 @@ async fn loom_complete_step(
 pub struct LoomFailStep {
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
+    /// Retry counter of the exact attempt that failed.
+    pub expected_retry_count: i32,
+    /// Start time of the exact attempt that failed.
+    pub expected_started_at: Timestamp,
     /// The failure reason.
     pub error: String,
 }
@@ -1309,7 +1323,13 @@ async fn loom_fail_step(
 ) -> Result<Json<Step>, (StatusCode, String)> {
     state
         .loom
-        .fail_step(req.principal_id, id, &req.error)
+        .fail_step(
+            req.principal_id,
+            id,
+            req.expected_retry_count,
+            req.expected_started_at,
+            &req.error,
+        )
         .await
         .map(Json)
         .map_err(loom_error)

@@ -31,7 +31,7 @@ use crate::executor::{StepContext, StepExecutor};
 use crate::model::{
     LogEntry, LogLevel, LoomStats, NewWorkflow, Run, RunFilter, RunStatus, Step, StepDef,
     StepStatus, StepType, Workflow, WorkflowPatch, MAX_STEP_RETRIES, MAX_STEP_TIMEOUT_MS,
-    MAX_WORKFLOW_DEPTH,
+    MAX_WORKFLOW_DEPTH, MAX_WORKFLOW_STEPS,
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
@@ -61,6 +61,19 @@ pub struct LoomStore {
     executor: Option<Box<dyn StepExecutor>>,
 }
 
+/// The result of an exact-attempt lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepTransition {
+    /// The captured attempt or its owning run is no longer active.
+    Stale,
+    /// The captured attempt completed.
+    Completed,
+    /// The captured attempt failed and was reset for another retry.
+    Retrying,
+    /// The captured attempt exhausted its retry budget and failed its run.
+    Failed,
+}
+
 /// Map a generic rusqlite error to an opaque backend error.
 fn berr(e: rusqlite::Error) -> LoomError {
     LoomError::Backend(e.to_string())
@@ -82,6 +95,12 @@ fn ts_from_db(s: &str) -> Result<Timestamp, LoomError> {
 
 /// Validate a workflow definition for unique names, resolvable dependencies, and acyclicity.
 fn validate_steps(steps: &[StepDef]) -> Result<(), LoomError> {
+    if steps.len() > MAX_WORKFLOW_STEPS {
+        return Err(LoomError::InvalidInput(format!(
+            "workflow step count {} exceeds limit {MAX_WORKFLOW_STEPS}",
+            steps.len()
+        )));
+    }
     let mut names = HashSet::new();
     for step in steps {
         if step.name.trim().is_empty() {
@@ -970,13 +989,17 @@ impl LoomStore {
             .map(|(step, _)| step))
     }
 
-    /// Complete a running step with `output` and advance the run. The external-completion path
-    /// for action/decision/parallel/wait steps (and anything the executor does not claim).
-    /// Owner-scoped; the step must currently be `running`.
+    /// Complete an exact running attempt with `output` and advance the run.
+    ///
+    /// The external-completion path for action/decision/parallel/wait steps (and anything the
+    /// executor does not claim). Owner-scoped; `expected_retry_count` and
+    /// `expected_started_at` must match the attempt the caller actually executed.
     pub async fn complete_step(
         &self,
         principal: PrincipalId,
         step_id: i64,
+        expected_retry_count: i32,
+        expected_started_at: Timestamp,
         output: serde_json::Value,
     ) -> Result<Step, LoomError> {
         // The guard must leave scope via the block (an explicit drop is not enough for the
@@ -987,16 +1010,39 @@ impl LoomStore {
                 .filter(|(_, run)| run.principal_id == principal)
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
-        self.complete_step_inner(&step, &run, output).await?;
+        match self.complete_step_inner(
+            &step,
+            &run,
+            expected_retry_count,
+            expected_started_at,
+            output,
+        )? {
+            StepTransition::Completed => {}
+            StepTransition::Stale => {
+                return Err(LoomError::InvalidInput(format!(
+                    "cannot complete step {step_id}: attempt is no longer active"
+                )));
+            }
+            unexpected => {
+                return Err(LoomError::Backend(format!(
+                    "completion returned unexpected transition {unexpected:?}"
+                )));
+            }
+        }
         self.advance_inner(step.run_id).await?;
         self.read_step(step_id)
     }
 
-    /// Fail a running step's attempt and advance the run (retry semantics apply). Owner-scoped.
+    /// Fail an exact running attempt and advance the run (retry semantics apply).
+    ///
+    /// Owner-scoped; `expected_retry_count` and `expected_started_at` must identify the attempt
+    /// whose work produced the failure.
     pub async fn fail_step(
         &self,
         principal: PrincipalId,
         step_id: i64,
+        expected_retry_count: i32,
+        expected_started_at: Timestamp,
         error: &str,
     ) -> Result<Step, LoomError> {
         let (step, run) = {
@@ -1005,7 +1051,25 @@ impl LoomStore {
                 .filter(|(_, run)| run.principal_id == principal)
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
-        self.fail_step_inner(&step, &run, error).await?;
+        match self.fail_step_inner(
+            &step,
+            &run,
+            expected_retry_count,
+            expected_started_at,
+            error,
+        )? {
+            StepTransition::Retrying | StepTransition::Failed => {}
+            StepTransition::Stale => {
+                return Err(LoomError::InvalidInput(format!(
+                    "cannot fail step {step_id}: attempt is no longer active"
+                )));
+            }
+            unexpected => {
+                return Err(LoomError::Backend(format!(
+                    "failure returned unexpected transition {unexpected:?}"
+                )));
+            }
+        }
         self.advance_inner(step.run_id).await?;
         self.read_step(step_id)
     }
@@ -1018,50 +1082,70 @@ impl LoomStore {
             .ok_or(LoomError::StepNotFound(step_id))
     }
 
-    /// Mark a running step completed and log it without advancing the scheduler.
-    async fn complete_step_inner(
+    /// Check whether a captured running step is still the current attempt of an active run.
+    fn attempt_is_current(&self, step: &Step) -> Result<bool, LoomError> {
+        let Some(started_at) = step.started_at else {
+            return Ok(false);
+        };
+        let conn = self.lock();
+        let current: i64 = conn
+            .query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM loom_steps s \
+                     JOIN loom_runs r ON r.id = s.run_id \
+                     WHERE s.id = ?1 AND s.status = 'running' \
+                       AND s.retry_count = ?2 AND s.started_at = ?3 \
+                       AND r.status IN ('pending', 'running') \
+                 )",
+                rusqlite::params![step.id, step.retry_count, ts_to_db(&started_at)?],
+                |row| row.get(0),
+            )
+            .map_err(berr)?;
+        Ok(current != 0)
+    }
+
+    /// Mark an exact running attempt completed and log it without advancing the scheduler.
+    fn complete_step_inner(
         &self,
         step: &Step,
         run: &Run,
+        expected_retry_count: i32,
+        expected_started_at: Timestamp,
         output: serde_json::Value,
-    ) -> Result<(), LoomError> {
-        if step.status != StepStatus::Running {
-            return Err(LoomError::InvalidInput(format!(
-                "cannot complete step {}: status is {:?}",
-                step.id,
-                step.status.as_str()
-            )));
-        }
+    ) -> Result<StepTransition, LoomError> {
         {
-            let conn = self.lock();
-            // TOCTOU guard: `step` is a snapshot read before this call, so a
-            // concurrent cancel_run (which sets running steps to 'skipped') can
-            // land between the snapshot and this write. Scope the UPDATE to
-            // `status = 'running'` so the DB enforces the precondition
-            // atomically; if no row changed, the step is no longer running and
-            // we must NOT force it to 'completed' or emit a completion event.
-            let affected = conn
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(berr)?;
+            let affected = tx
                 .execute(
                     "UPDATE loom_steps SET status = 'completed', output = ?1, completed_at = ?2 \
-                     WHERE id = ?3 AND status = 'running'",
-                    rusqlite::params![output.to_string(), ts_to_db(&Timestamp::now())?, step.id],
+                     WHERE id = ?3 AND status = 'running' \
+                       AND retry_count = ?4 AND started_at = ?5 \
+                       AND EXISTS (SELECT 1 FROM loom_runs r \
+                                   WHERE r.id = loom_steps.run_id \
+                                     AND r.status IN ('pending', 'running'))",
+                    rusqlite::params![
+                        output.to_string(),
+                        ts_to_db(&Timestamp::now())?,
+                        step.id,
+                        expected_retry_count,
+                        ts_to_db(&expected_started_at)?,
+                    ],
                 )
                 .map_err(berr)?;
             if affected == 0 {
-                return Err(LoomError::InvalidInput(format!(
-                    "cannot complete step {}: it is no longer running \
-                     (concurrently cancelled or changed)",
-                    step.id
-                )));
+                tx.commit().map_err(berr)?;
+                return Ok(StepTransition::Stale);
             }
             Self::add_log(
-                &conn,
+                &tx,
                 step.run_id,
                 Some(step.id),
                 LogLevel::Info,
                 &format!("step {:?} completed", step.name),
                 None,
             )?;
+            tx.commit().map_err(berr)?;
         }
         self.emit(
             &StepCompleted {
@@ -1072,33 +1156,46 @@ impl LoomStore {
             run.tenant,
             run.principal_id,
         );
-        Ok(())
+        Ok(StepTransition::Completed)
     }
 
-    /// Fail a step attempt: reset it to pending within budget or fail the step and run.
-    async fn fail_step_inner(&self, step: &Step, run: &Run, error: &str) -> Result<(), LoomError> {
-        let will_retry = step.retry_count < step.max_retries;
+    /// Fail an exact attempt: reset it within budget or atomically fail its step and run.
+    fn fail_step_inner(
+        &self,
+        step: &Step,
+        run: &Run,
+        expected_retry_count: i32,
+        expected_started_at: Timestamp,
+        error: &str,
+    ) -> Result<StepTransition, LoomError> {
+        let will_retry = expected_retry_count < step.max_retries;
         {
-            let conn = self.lock();
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(berr)?;
             if will_retry {
-                // Same TOCTOU guard as complete_step_inner: only reset a step
-                // that is still 'running', so a concurrent cancel is not undone.
-                let affected = conn
+                let affected = tx
                     .execute(
                         "UPDATE loom_steps SET status = 'pending', retry_count = retry_count + 1, \
-                         error = ?1, started_at = NULL WHERE id = ?2 AND status = 'running'",
-                        rusqlite::params![error, step.id],
+                         error = ?1, started_at = NULL \
+                         WHERE id = ?2 AND status = 'running' \
+                           AND retry_count = ?3 AND started_at = ?4 \
+                           AND EXISTS (SELECT 1 FROM loom_runs r \
+                                       WHERE r.id = loom_steps.run_id \
+                                         AND r.status IN ('pending', 'running'))",
+                        rusqlite::params![
+                            error,
+                            step.id,
+                            expected_retry_count,
+                            ts_to_db(&expected_started_at)?,
+                        ],
                     )
                     .map_err(berr)?;
                 if affected == 0 {
-                    return Err(LoomError::InvalidInput(format!(
-                        "cannot fail/retry step {}: it is no longer running \
-                         (concurrently cancelled or changed)",
-                        step.id
-                    )));
+                    tx.commit().map_err(berr)?;
+                    return Ok(StepTransition::Stale);
                 }
                 Self::add_log(
-                    &conn,
+                    &tx,
                     step.run_id,
                     Some(step.id),
                     LogLevel::Warn,
@@ -1110,45 +1207,58 @@ impl LoomStore {
                     ),
                     Some(serde_json::json!({ "error": error })),
                 )?;
+                tx.commit().map_err(berr)?;
             } else {
                 let now = ts_to_db(&Timestamp::now())?;
-                // Guard the step transition on 'running' first; only fail the
-                // run if this step was actually the one still running (so a
-                // concurrent cancel is not overwritten with 'failed').
-                let affected = conn
+                let affected = tx
                     .execute(
                         "UPDATE loom_steps SET status = 'failed', error = ?1, completed_at = ?2 \
-                         WHERE id = ?3 AND status = 'running'",
-                        rusqlite::params![error, now, step.id],
+                         WHERE id = ?3 AND status = 'running' \
+                           AND retry_count = ?4 AND started_at = ?5 \
+                           AND EXISTS (SELECT 1 FROM loom_runs r \
+                                       WHERE r.id = loom_steps.run_id \
+                                         AND r.status IN ('pending', 'running'))",
+                        rusqlite::params![
+                            error,
+                            now,
+                            step.id,
+                            expected_retry_count,
+                            ts_to_db(&expected_started_at)?,
+                        ],
                     )
                     .map_err(berr)?;
                 if affected == 0 {
-                    return Err(LoomError::InvalidInput(format!(
-                        "cannot fail step {}: it is no longer running \
-                         (concurrently cancelled or changed)",
-                        step.id
-                    )));
+                    tx.commit().map_err(berr)?;
+                    return Ok(StepTransition::Stale);
                 }
-                conn.execute(
+                tx.execute(
                     "UPDATE loom_steps SET status = 'skipped', completed_at = ?1 \
                      WHERE run_id = ?2 AND id != ?3 AND status IN ('pending', 'running')",
                     rusqlite::params![now, step.run_id.to_string(), step.id],
                 )
                 .map_err(berr)?;
-                conn.execute(
-                    "UPDATE loom_runs SET status = 'failed', error = ?1, completed_at = ?2, \
-                     updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![error, now, step.run_id.to_string()],
-                )
-                .map_err(berr)?;
+                let run_affected = tx
+                    .execute(
+                        "UPDATE loom_runs SET status = 'failed', error = ?1, completed_at = ?2, \
+                     updated_at = ?2 WHERE id = ?3 AND status IN ('pending', 'running')",
+                        rusqlite::params![error, now, step.run_id.to_string()],
+                    )
+                    .map_err(berr)?;
+                if run_affected != 1 {
+                    return Err(LoomError::Backend(format!(
+                        "active step {} had no active owning run",
+                        step.id
+                    )));
+                }
                 Self::add_log(
-                    &conn,
+                    &tx,
                     step.run_id,
                     Some(step.id),
                     LogLevel::Error,
                     &format!("step {:?} failed (max retries exhausted)", step.name),
                     Some(serde_json::json!({ "error": error })),
                 )?;
+                tx.commit().map_err(berr)?;
             }
         }
         self.emit(
@@ -1173,7 +1283,11 @@ impl LoomStore {
                 run.principal_id,
             );
         }
-        Ok(())
+        Ok(if will_retry {
+            StepTransition::Retrying
+        } else {
+            StepTransition::Failed
+        })
     }
 
     /// Advance an owned run: the public nudge for externally driven graphs.
@@ -1198,23 +1312,29 @@ impl LoomStore {
     /// dependency chains and retries reuse one async frame.
     async fn advance_inner(&self, run_id: RunId) -> Result<(), LoomError> {
         loop {
-            let (run, ready) = {
-                let conn = self.lock();
-                let Some(run) = Self::get_run_any(&conn, run_id)? else {
+            let (run, ready, completed) = {
+                let mut conn = self.lock();
+                let tx = conn.transaction().map_err(berr)?;
+                let Some(run) = Self::get_run_any(&tx, run_id)? else {
                     return Err(LoomError::RunNotFound(run_id));
                 };
                 if run.status.is_terminal() {
                     return Ok(());
                 }
                 if run.status == RunStatus::Pending {
-                    conn.execute(
-                        "UPDATE loom_runs SET status = 'running', started_at = ?2, updated_at = ?2 \
-                         WHERE id = ?1 AND status = 'pending'",
-                        rusqlite::params![run_id.to_string(), ts_to_db(&Timestamp::now())?],
-                    )
-                    .map_err(berr)?;
+                    let affected = tx
+                        .execute(
+                            "UPDATE loom_runs SET status = 'running', started_at = ?2, \
+                             updated_at = ?2 WHERE id = ?1 AND status = 'pending'",
+                            rusqlite::params![run_id.to_string(), ts_to_db(&Timestamp::now())?],
+                        )
+                        .map_err(berr)?;
+                    if affected == 0 {
+                        tx.commit().map_err(berr)?;
+                        continue;
+                    }
                 }
-                let mut stmt = conn
+                let mut stmt = tx
                     .prepare(&format!(
                         "SELECT {STEP_COLUMNS} FROM loom_steps WHERE run_id = ?1 ORDER BY id ASC"
                     ))
@@ -1248,7 +1368,7 @@ impl LoomStore {
                         }
                     }
                     let now = ts_to_db(&Timestamp::now())?;
-                    let affected = conn
+                    let affected = tx
                         .execute(
                             "UPDATE loom_runs SET status = 'completed', output = ?1, \
                              completed_at = ?2, updated_at = ?2 \
@@ -1261,80 +1381,94 @@ impl LoomStore {
                         )
                         .map_err(berr)?;
                     if affected == 0 {
+                        tx.commit().map_err(berr)?;
                         continue;
                     }
-                    Self::add_log(&conn, run_id, None, LogLevel::Info, "run completed", None)?;
-                    drop(conn);
-                    self.emit(
-                        &RunCompleted {
-                            run_id: run_id.to_string(),
-                        },
-                        run.tenant,
-                        run.principal_id,
-                    );
-                    return Ok(());
-                }
-
-                let mut ready = Vec::new();
-                for step in &steps {
-                    if step.status != StepStatus::Pending {
-                        continue;
-                    }
-                    let deps_met = step.depends_on.iter().all(|dependency| {
-                        by_name
-                            .get(dependency.as_str())
-                            .is_some_and(|candidate| candidate.status == StepStatus::Completed)
-                    });
-                    if !deps_met {
-                        continue;
-                    }
-                    let mut merged = serde_json::Map::new();
-                    if let serde_json::Value::Object(map) = &run.input {
-                        for (key, value) in map {
-                            merged.insert(key.clone(), value.clone());
+                    Self::add_log(&tx, run_id, None, LogLevel::Info, "run completed", None)?;
+                    tx.commit().map_err(berr)?;
+                    (run, Vec::new(), true)
+                } else {
+                    let mut ready = Vec::new();
+                    for step in &steps {
+                        if step.status != StepStatus::Pending {
+                            continue;
                         }
-                    }
-                    for dependency in &step.depends_on {
-                        if let Some(dependency_step) = by_name.get(dependency.as_str()) {
-                            if let serde_json::Value::Object(map) = &dependency_step.output {
-                                for (key, value) in map {
-                                    merged.insert(key.clone(), value.clone());
+                        let deps_met = step.depends_on.iter().all(|dependency| {
+                            by_name
+                                .get(dependency.as_str())
+                                .is_some_and(|candidate| candidate.status == StepStatus::Completed)
+                        });
+                        if !deps_met {
+                            continue;
+                        }
+                        let mut merged = serde_json::Map::new();
+                        if let serde_json::Value::Object(map) = &run.input {
+                            for (key, value) in map {
+                                merged.insert(key.clone(), value.clone());
+                            }
+                        }
+                        for dependency in &step.depends_on {
+                            if let Some(dependency_step) = by_name.get(dependency.as_str()) {
+                                if let serde_json::Value::Object(map) = &dependency_step.output {
+                                    for (key, value) in map {
+                                        merged.insert(key.clone(), value.clone());
+                                    }
                                 }
                             }
                         }
+                        let started_at = Timestamp::now();
+                        let mut started = step.clone();
+                        started.input = serde_json::Value::Object(merged);
+                        started.status = StepStatus::Running;
+                        started.started_at = Some(started_at);
+                        let affected = tx
+                            .execute(
+                                "UPDATE loom_steps SET status = 'running', input = ?1, \
+                                 started_at = ?2 WHERE id = ?3 AND status = 'pending' \
+                                   AND EXISTS (SELECT 1 FROM loom_runs r \
+                                               WHERE r.id = loom_steps.run_id \
+                                                 AND r.status IN ('pending', 'running'))",
+                                rusqlite::params![
+                                    started.input.to_string(),
+                                    ts_to_db(&started_at)?,
+                                    step.id
+                                ],
+                            )
+                            .map_err(berr)?;
+                        if affected == 0 {
+                            continue;
+                        }
+                        Self::add_log(
+                            &tx,
+                            run_id,
+                            Some(step.id),
+                            LogLevel::Info,
+                            &format!("step {:?} started", step.name),
+                            None,
+                        )?;
+                        ready.push(started);
                     }
-                    let mut started = step.clone();
-                    started.input = serde_json::Value::Object(merged);
-                    started.status = StepStatus::Running;
-                    let affected = conn
-                        .execute(
-                            "UPDATE loom_steps SET status = 'running', input = ?1, started_at = ?2 \
-                             WHERE id = ?3 AND status = 'pending'",
-                            rusqlite::params![
-                                started.input.to_string(),
-                                ts_to_db(&Timestamp::now())?,
-                                step.id
-                            ],
-                        )
-                        .map_err(berr)?;
-                    if affected == 0 {
-                        continue;
-                    }
-                    Self::add_log(
-                        &conn,
-                        run_id,
-                        Some(step.id),
-                        LogLevel::Info,
-                        &format!("step {:?} started", step.name),
-                        None,
-                    )?;
-                    ready.push(started);
+                    tx.commit().map_err(berr)?;
+                    (run, ready, false)
                 }
-                (run, ready)
             };
+
+            if completed {
+                self.emit(
+                    &RunCompleted {
+                        run_id: run_id.to_string(),
+                    },
+                    run.tenant,
+                    run.principal_id,
+                );
+                return Ok(());
+            }
 
             let mut made_inline_progress = false;
             for step in ready {
+                if !self.attempt_is_current(&step)? {
+                    continue;
+                }
                 self.emit(
                     &StepStarted {
                         run_id: run_id.to_string(),
@@ -1350,6 +1484,9 @@ impl LoomStore {
                 if !executor.handles(step.step_type) {
                     continue;
                 }
+                let started_at = step.started_at.ok_or_else(|| {
+                    LoomError::Backend(format!("running step {} has no start time", step.id))
+                })?;
                 made_inline_progress = true;
                 let result = executor
                     .execute(StepContext {
@@ -1363,11 +1500,39 @@ impl LoomStore {
                     })
                     .await;
                 match result {
-                    Ok(output) => self.complete_step_inner(&step, &run, output).await?,
+                    Ok(output) => {
+                        match self.complete_step_inner(
+                            &step,
+                            &run,
+                            step.retry_count,
+                            started_at,
+                            output,
+                        )? {
+                            StepTransition::Completed => {}
+                            StepTransition::Stale => continue,
+                            unexpected => {
+                                return Err(LoomError::Backend(format!(
+                                    "completion returned unexpected transition {unexpected:?}"
+                                )));
+                            }
+                        }
+                    }
                     Err(message) => {
-                        self.fail_step_inner(&step, &run, &message).await?;
-                        if step.retry_count >= step.max_retries {
-                            return Ok(());
+                        match self.fail_step_inner(
+                            &step,
+                            &run,
+                            step.retry_count,
+                            started_at,
+                            &message,
+                        )? {
+                            StepTransition::Retrying => {}
+                            StepTransition::Failed => return Ok(()),
+                            StepTransition::Stale => continue,
+                            unexpected => {
+                                return Err(LoomError::Backend(format!(
+                                    "failure returned unexpected transition {unexpected:?}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -1407,27 +1572,44 @@ impl LoomStore {
             }
             out
         };
-        let now = Timestamp::now().as_offset_date_time();
+        self.sweep_timeout_candidates(candidates, Timestamp::now())
+            .await
+    }
+
+    /// Apply timeout handling to captured candidates, skipping attempts that became stale.
+    async fn sweep_timeout_candidates(
+        &self,
+        candidates: Vec<(Step, Run)>,
+        now: Timestamp,
+    ) -> Result<Vec<Step>, LoomError> {
+        let now = now.as_offset_date_time();
         let mut timed_out = Vec::new();
         for (step, run) in candidates {
-            let Some(started) = step.started_at.as_ref().map(|t| t.as_offset_date_time()) else {
+            let Some(started_at) = step.started_at else {
                 continue;
             };
             // Nanoseconds, not whole milliseconds: a sub-millisecond elapse truncates to 0ms
             // and would never trip a 0ms timeout.
-            let elapsed_ns = (now - started).whole_nanoseconds();
+            let elapsed_ns = (now - started_at.as_offset_date_time()).whole_nanoseconds();
             if elapsed_ns <= step.timeout_ms as i128 * 1_000_000 {
                 continue;
             }
-            if self.read_step(step.id)?.status != StepStatus::Running {
-                continue;
-            }
-            self.fail_step_inner(
+            let transition = self.fail_step_inner(
                 &step,
                 &run,
+                step.retry_count,
+                started_at,
                 &format!("step timed out after {}ms", step.timeout_ms),
-            )
-            .await?;
+            )?;
+            if transition == StepTransition::Stale {
+                continue;
+            }
+            if transition == StepTransition::Completed {
+                return Err(LoomError::Backend(format!(
+                    "timeout failure for step {} completed the attempt",
+                    step.id
+                )));
+            }
             self.advance_inner(step.run_id).await?;
             timed_out.push(self.read_step(step.id)?);
         }
@@ -1818,6 +2000,85 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Workflow creation, replacement, and instantiation enforce the width limit.
+    async fn workflow_width_limit_is_enforced_at_every_entry_point() {
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let wide = |count: usize| {
+            (0..count)
+                .map(|index| StepDef {
+                    name: format!("s{index}"),
+                    step_type: StepType::Action,
+                    config: None,
+                    depends_on: None,
+                    max_retries: Some(0),
+                    timeout_ms: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let new = |steps| NewWorkflow {
+            tenant: TenantId::new(),
+            principal_id: principal,
+            name: format!("wf-{}", WorkflowId::new()),
+            description: None,
+            steps,
+        };
+
+        let boundary = store
+            .create_workflow(new(wide(MAX_WORKFLOW_STEPS)))
+            .await
+            .expect("width boundary");
+        assert_eq!(boundary.steps.len(), MAX_WORKFLOW_STEPS);
+
+        let oversized = wide(MAX_WORKFLOW_STEPS + 1);
+        assert!(matches!(
+            store
+                .create_workflow(new(oversized.clone()))
+                .await
+                .expect_err("oversized create"),
+            LoomError::InvalidInput(_)
+        ));
+
+        let update_target = store
+            .create_workflow(new(vec![action("valid", &[])]))
+            .await
+            .expect("update target");
+        assert!(matches!(
+            store
+                .update_workflow(
+                    principal,
+                    update_target.id,
+                    WorkflowPatch {
+                        steps: Some(oversized.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("oversized update"),
+            LoomError::InvalidInput(_)
+        ));
+
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE loom_workflows SET steps = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&oversized).expect("serialize oversized definition"),
+                    update_target.id.to_string()
+                ],
+            )
+            .expect("persist legacy oversized definition");
+        }
+        assert!(matches!(
+            store
+                .create_run(principal, update_target.id, None)
+                .await
+                .expect_err("oversized legacy definition"),
+            LoomError::InvalidInput(_)
+        ));
+    }
+
+    #[tokio::test]
     /// Run creation rejects legacy definitions before persisting any run state.
     async fn create_run_revalidates_legacy_definitions() {
         let (store, _bus) = store();
@@ -1938,17 +2199,30 @@ mod tests {
         let steps = store.get_steps(principal, run.id).await.expect("steps");
         let approve = steps.iter().find(|s| s.name == "approve").expect("step");
         assert_eq!(approve.status, StepStatus::Running);
+        let approve_started_at = approve.started_at.expect("attempt start");
 
         // A stranger cannot complete it.
         let err = store
-            .complete_step(PrincipalId::new(), approve.id, serde_json::json!({}))
+            .complete_step(
+                PrincipalId::new(),
+                approve.id,
+                approve.retry_count,
+                approve_started_at,
+                serde_json::json!({}),
+            )
             .await
             .expect_err("foreign");
         assert!(matches!(err, LoomError::StepNotFound(_)));
 
         // The owner completes it; the dependent transform runs and the run finishes.
         store
-            .complete_step(principal, approve.id, serde_json::json!({"approved": true}))
+            .complete_step(
+                principal,
+                approve.id,
+                approve.retry_count,
+                approve_started_at,
+                serde_json::json!({"approved": true}),
+            )
             .await
             .expect("complete");
         let run = store
@@ -1963,6 +2237,104 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Results from an older retry cannot mutate or narrate the current attempt.
+    async fn stale_attempt_results_are_rejected() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("workflow");
+        let (principal, workflow) = workflow_with(&store, vec![action("external", &[])]).await;
+        let run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("run");
+        let attempt_zero = store
+            .get_steps(principal, run.id)
+            .await
+            .expect("steps")
+            .into_iter()
+            .next()
+            .expect("attempt zero");
+        let attempt_zero_started = attempt_zero.started_at.expect("attempt zero start");
+
+        let attempt_one = store
+            .fail_step(
+                principal,
+                attempt_zero.id,
+                attempt_zero.retry_count,
+                attempt_zero_started,
+                "retry once",
+            )
+            .await
+            .expect("retry");
+        assert_eq!(attempt_one.status, StepStatus::Running);
+        assert_eq!(attempt_one.retry_count, 1);
+        let attempt_one_started = attempt_one.started_at.expect("attempt one start");
+        let _ = drain_kinds(&mut rx);
+        let log_count = store
+            .logs(principal, run.id, 100)
+            .await
+            .expect("logs")
+            .len();
+
+        assert!(matches!(
+            store
+                .complete_step(
+                    principal,
+                    attempt_zero.id,
+                    attempt_zero.retry_count,
+                    attempt_zero_started,
+                    serde_json::json!({"stale": true}),
+                )
+                .await
+                .expect_err("stale completion"),
+            LoomError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            store
+                .fail_step(
+                    principal,
+                    attempt_zero.id,
+                    attempt_zero.retry_count,
+                    attempt_zero_started,
+                    "stale failure",
+                )
+                .await
+                .expect_err("stale failure"),
+            LoomError::InvalidInput(_)
+        ));
+
+        let current = store
+            .get_step(principal, attempt_zero.id)
+            .await
+            .expect("read current")
+            .expect("current attempt");
+        assert_eq!(current.status, StepStatus::Running);
+        assert_eq!(current.retry_count, attempt_one.retry_count);
+        assert_eq!(current.started_at, Some(attempt_one_started));
+        assert_eq!(current.output, serde_json::json!({}));
+        assert_eq!(
+            store
+                .logs(principal, run.id, 100)
+                .await
+                .expect("logs")
+                .len(),
+            log_count
+        );
+        assert!(drain_kinds(&mut rx).is_empty());
+
+        let completed = store
+            .complete_step(
+                principal,
+                current.id,
+                current.retry_count,
+                attempt_one_started,
+                serde_json::json!({"current": true}),
+            )
+            .await
+            .expect("current completion");
+        assert_eq!(completed.status, StepStatus::Completed);
+    }
+
+    #[tokio::test]
     /// Completing a non running step is rejected.
     async fn completing_a_non_running_step_is_rejected() {
         let (store, _bus) = store();
@@ -1973,7 +2345,13 @@ mod tests {
         let b = steps.iter().find(|s| s.name == "b").expect("step");
         assert_eq!(b.status, StepStatus::Pending, "deps unmet");
         let err = store
-            .complete_step(principal, b.id, serde_json::json!({}))
+            .complete_step(
+                principal,
+                b.id,
+                b.retry_count,
+                Timestamp::now(),
+                serde_json::json!({}),
+            )
             .await
             .expect_err("not running");
         assert!(matches!(err, LoomError::InvalidInput(_)));
@@ -2275,14 +2653,150 @@ mod tests {
 
         // Completing with the now-stale 'running' snapshot must be refused.
         let result = store
-            .complete_step_inner(&running, &run, serde_json::json!({"ok": true}))
-            .await;
-        assert!(result.is_err(), "stale complete must be refused");
+            .complete_step_inner(
+                &running,
+                &run,
+                running.retry_count,
+                running.started_at.expect("attempt start"),
+                serde_json::json!({"ok": true}),
+            )
+            .expect("stale result");
+        assert_eq!(result, StepTransition::Stale);
 
         // The step must remain skipped, not flipped to completed.
         let steps = store.get_steps(principal, run.id).await.expect("steps");
         let s = steps.iter().find(|s| s.id == running.id).expect("step");
         assert_eq!(s.status, StepStatus::Skipped);
+    }
+
+    #[tokio::test]
+    /// Lifecycle mutations roll back when their required log insertion fails.
+    async fn lifecycle_state_and_logs_commit_atomically() {
+        let (store, bus) = store();
+        let mut rx = bus.subscribe("workflow");
+        let principal = PrincipalId::new();
+        let workflow = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "atomic-lifecycle".to_string(),
+                description: None,
+                steps: ["first", "second"]
+                    .into_iter()
+                    .map(|name| StepDef {
+                        name: name.to_string(),
+                        step_type: StepType::Action,
+                        config: None,
+                        depends_on: None,
+                        max_retries: Some(0),
+                        timeout_ms: None,
+                    })
+                    .collect(),
+            })
+            .await
+            .expect("workflow");
+        let run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("run");
+        let first = store
+            .get_steps(principal, run.id)
+            .await
+            .expect("steps")
+            .into_iter()
+            .next()
+            .expect("first step");
+        let first_started = first.started_at.expect("attempt start");
+        let initial_log_count = store
+            .logs(principal, run.id, 100)
+            .await
+            .expect("logs")
+            .len();
+        let _ = drain_kinds(&mut rx);
+
+        {
+            let conn = store.lock();
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER reject_loom_logs \
+                 BEFORE INSERT ON loom_logs \
+                 BEGIN SELECT RAISE(FAIL, 'forced log failure'); END;",
+            )
+            .expect("install log failure trigger");
+        }
+        assert!(matches!(
+            store
+                .complete_step(
+                    principal,
+                    first.id,
+                    first.retry_count,
+                    first_started,
+                    serde_json::json!({"must": "rollback"}),
+                )
+                .await
+                .expect_err("completion log failure"),
+            LoomError::Backend(_)
+        ));
+        {
+            let conn = store.lock();
+            conn.execute_batch("DROP TRIGGER reject_loom_logs;")
+                .expect("remove log failure trigger");
+        }
+
+        let after_completion = store
+            .get_step(principal, first.id)
+            .await
+            .expect("read step")
+            .expect("step");
+        assert_eq!(after_completion.status, StepStatus::Running);
+        assert_eq!(after_completion.output, serde_json::json!({}));
+
+        {
+            let conn = store.lock();
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER reject_loom_logs \
+                 BEFORE INSERT ON loom_logs \
+                 BEGIN SELECT RAISE(FAIL, 'forced log failure'); END;",
+            )
+            .expect("install log failure trigger");
+        }
+        assert!(matches!(
+            store
+                .fail_step(
+                    principal,
+                    first.id,
+                    first.retry_count,
+                    first_started,
+                    "must rollback",
+                )
+                .await
+                .expect_err("failure log failure"),
+            LoomError::Backend(_)
+        ));
+        {
+            let conn = store.lock();
+            conn.execute_batch("DROP TRIGGER reject_loom_logs;")
+                .expect("remove log failure trigger");
+        }
+
+        let persisted_run = store
+            .get_run(principal, run.id)
+            .await
+            .expect("read run")
+            .expect("run");
+        assert_eq!(persisted_run.status, RunStatus::Running);
+        let persisted_steps = store.get_steps(principal, run.id).await.expect("steps");
+        assert!(persisted_steps
+            .iter()
+            .all(|step| step.status == StepStatus::Running));
+        assert_eq!(
+            store
+                .logs(principal, run.id, 100)
+                .await
+                .expect("logs")
+                .len(),
+            initial_log_count
+        );
+        assert!(drain_kinds(&mut rx).is_empty());
     }
 
     #[tokio::test]
@@ -2327,6 +2841,75 @@ mod tests {
             .contains("timed out"));
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
+    }
+
+    #[tokio::test]
+    /// A stale timeout candidate does not prevent a later overdue attempt from failing.
+    async fn timeout_sweep_continues_after_stale_candidate() {
+        let (store, _bus) = store();
+        let principal = PrincipalId::new();
+        let workflow = store
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "timeout-candidates".to_string(),
+                description: None,
+                steps: vec![StepDef {
+                    name: "wait".to_string(),
+                    step_type: StepType::Wait,
+                    config: None,
+                    depends_on: None,
+                    max_retries: Some(0),
+                    timeout_ms: Some(0),
+                }],
+            })
+            .await
+            .expect("workflow");
+        let stale_run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("stale run");
+        let live_run = store
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("live run");
+        let stale_step = store
+            .get_steps(principal, stale_run.id)
+            .await
+            .expect("stale steps")
+            .into_iter()
+            .next()
+            .expect("stale step");
+        let live_step = store
+            .get_steps(principal, live_run.id)
+            .await
+            .expect("live steps")
+            .into_iter()
+            .next()
+            .expect("live step");
+        let sweep_time = Timestamp::from_utc(
+            live_step
+                .started_at
+                .expect("live attempt start")
+                .as_offset_date_time()
+                + time::Duration::nanoseconds(1),
+        );
+
+        assert!(store
+            .cancel_run(principal, stale_run.id)
+            .await
+            .expect("cancel stale run"));
+        let timed_out = store
+            .sweep_timeout_candidates(
+                vec![(stale_step, stale_run), (live_step.clone(), live_run)],
+                sweep_time,
+            )
+            .await
+            .expect("apply timeout candidates");
+
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].id, live_step.id);
+        assert_eq!(timed_out[0].status, StepStatus::Failed);
     }
 
     #[tokio::test]

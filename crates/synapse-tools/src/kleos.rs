@@ -2459,6 +2459,7 @@ impl AgentTool for LoomCreateRunTool {
 
 // ─── Loom Complete Step ───────────────────────────────────────────────────────
 
+/// Completes one exact running Loom step attempt.
 pub struct LoomCompleteStepTool;
 
 /// Implements `AgentTool` behavior for `LoomCompleteStepTool`.
@@ -2480,9 +2481,17 @@ impl AgentTool for LoomCompleteStepTool {
             "type": "object",
             "properties": {
                 "step_id": { "type": "number", "description": "Step ID to complete." },
+                "principal_id": { "type": "string", "description": "Owner principal UUID from the running step." },
+                "expected_retry_count": { "type": "integer", "description": "Retry count from the running step." },
+                "expected_started_at": { "type": "string", "description": "RFC3339 start time from the running step." },
                 "output":  { "type": "object", "description": "Step output data." }
             },
-            "required": ["step_id"]
+            "required": [
+                "step_id",
+                "principal_id",
+                "expected_retry_count",
+                "expected_started_at"
+            ]
         })
     }
 
@@ -2497,8 +2506,44 @@ impl AgentTool for LoomCompleteStepTool {
                 });
             }
         };
+        let principal_id = match params.get("principal_id").and_then(Value::as_str) {
+            Some(id) => id,
+            None => {
+                return Ok(ToolResult {
+                    content: "Missing required parameter: principal_id".into(),
+                    is_error: true,
+                });
+            }
+        };
+        let expected_retry_count = match params
+            .get("expected_retry_count")
+            .and_then(Value::as_i64)
+            .and_then(|count| i32::try_from(count).ok())
+        {
+            Some(count) => count,
+            None => {
+                return Ok(ToolResult {
+                    content: "Missing or invalid required parameter: expected_retry_count".into(),
+                    is_error: true,
+                });
+            }
+        };
+        let expected_started_at = match params.get("expected_started_at").and_then(Value::as_str) {
+            Some(started_at) => started_at,
+            None => {
+                return Ok(ToolResult {
+                    content: "Missing required parameter: expected_started_at".into(),
+                    is_error: true,
+                });
+            }
+        };
         let output = params.get("output").cloned().unwrap_or(json!({}));
-        let body = json!({ "output": output });
+        let body = json!({
+            "principal_id": principal_id,
+            "expected_retry_count": expected_retry_count,
+            "expected_started_at": expected_started_at,
+            "output": output
+        });
 
         match client()
             .await?

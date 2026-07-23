@@ -14,6 +14,12 @@ use syntheos_contracts::{PrincipalId, RunId, TenantId, Timestamp, WorkflowId};
 
 use crate::error::LoomError;
 
+/// The maximum number of steps a workflow definition may contain.
+///
+/// Validation performs graph scans whose work grows with both vertices and edges, so the width
+/// limit is checked before any graph traversal.
+pub const MAX_WORKFLOW_STEPS: usize = 1_000;
+
 /// The maximum dependency-chain depth a workflow definition may declare.
 ///
 /// A finite graph-height budget limits the amount of inline scheduler work triggered by one
