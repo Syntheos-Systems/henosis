@@ -28,6 +28,14 @@ const MAX_COMPONENT_BYTES: usize = 64 * 1024 * 1024;
 const EPOCH_TICK_MS: u64 = 10;
 /// Maximum component compilations or invocations admitted process-wide.
 const MAX_CONCURRENT_INVOCATIONS: usize = 8;
+/// Maximum core instances allocated by one component invocation store.
+const MAX_STORE_INSTANCES: usize = 1;
+/// Maximum linear memories allocated by one component invocation store.
+const MAX_STORE_MEMORIES: usize = 1;
+/// Maximum tables allocated by one component invocation store.
+const MAX_STORE_TABLES: usize = 1;
+/// Maximum elements allocated by the single table in one invocation store.
+const MAX_STORE_TABLE_ELEMENTS: usize = 10_000;
 /// Maximum bytes accepted from one DNS resolution result.
 const MAX_RESOLUTION_BYTES: usize = 16 * 16;
 /// Absolute host ceiling for one mediated or component output.
@@ -754,6 +762,17 @@ fn epoch_deadline_ticks(timeout_ms: u64) -> u64 {
     timeout_ms.saturating_add(EPOCH_TICK_MS - 1) / EPOCH_TICK_MS
 }
 
+/// Builds the complete fixed allocation envelope for one component invocation store.
+fn component_store_limits(memory_bytes: usize) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(memory_bytes)
+        .instances(MAX_STORE_INSTANCES)
+        .memories(MAX_STORE_MEMORIES)
+        .tables(MAX_STORE_TABLES)
+        .table_elements(MAX_STORE_TABLE_ELEMENTS)
+        .build()
+}
+
 /// Wasmtime engine wrapper that has Component Model support but never links WASI.
 pub struct ComponentSandbox {
     /// Shared Wasmtime engine configured with Component Model resource controls.
@@ -811,9 +830,7 @@ impl ComponentSandbox {
         let component = self.load_component_admitted(trust, manifest, bytes)?;
         let limits = &manifest.limits;
         let budget = InvocationBudget::new(limits.clone())?;
-        let store_limits = StoreLimitsBuilder::new()
-            .memory_size(limits.memory_bytes)
-            .build();
+        let store_limits = component_store_limits(limits.memory_bytes);
         let mut store = Store::new(
             &self.engine,
             SandboxState {
@@ -1334,6 +1351,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::str::FromStr;
     use std::sync::Mutex;
+    use wasmtime::ResourceLimiter;
 
     /// Records the addresses handed from resolution to the connection mediator.
     struct RecordingHttp {
@@ -1875,6 +1893,36 @@ mod tests {
         assert_eq!(epoch_deadline_ticks(EPOCH_TICK_MS), 1);
         assert_eq!(epoch_deadline_ticks(EPOCH_TICK_MS + 1), 2);
         assert_eq!(epoch_deadline_ticks(60_000), 6_000);
+    }
+
+    /// Bounds every store allocation count and the single table's element capacity.
+    #[test]
+    fn component_store_counts_and_table_elements_are_bounded() {
+        let mut store_limits = component_store_limits(ResourceLimits::default().memory_bytes);
+
+        assert_eq!(store_limits.instances(), MAX_STORE_INSTANCES);
+        assert_eq!(store_limits.memories(), MAX_STORE_MEMORIES);
+        assert_eq!(store_limits.tables(), MAX_STORE_TABLES);
+        assert!(store_limits
+            .table_growing(0, MAX_STORE_TABLE_ELEMENTS, None)
+            .unwrap());
+        assert!(!store_limits
+            .table_growing(0, MAX_STORE_TABLE_ELEMENTS + 1, None)
+            .unwrap());
+    }
+
+    /// Allows one memory through its signed ceiling and rejects growth beyond it.
+    #[test]
+    fn component_store_supports_one_bounded_memory() {
+        const WASM_PAGE_BYTES: usize = 64 * 1024;
+        let memory_bytes = ResourceLimits::default().memory_bytes;
+        let mut store_limits = component_store_limits(memory_bytes);
+
+        assert_eq!(store_limits.memories(), 1);
+        assert!(store_limits.memory_growing(0, memory_bytes, None).unwrap());
+        assert!(!store_limits
+            .memory_growing(0, memory_bytes + WASM_PAGE_BYTES, None)
+            .unwrap());
     }
 
     /// Releases a fixed invocation slot after every permit is dropped.
