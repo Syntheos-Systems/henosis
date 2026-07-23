@@ -77,7 +77,7 @@ pub struct Task {
     pub id: TaskId,
     /// Tenant the task belongs to.
     pub tenant: TenantId,
-    /// Owner principal (replaces Kleos `user_id`). All reads/writes scope on this.
+    /// Owner principal (replaces Kleos `user_id`); reads and writes also require the tenant.
     pub principal_id: PrincipalId,
     /// Assignee principal, or `None` when unassigned.
     pub assignee: Option<PrincipalId>,
@@ -222,10 +222,10 @@ pub struct TaskActivity {
     pub created_at: Timestamp,
 }
 
-/// Aggregate task counts for one principal.
+/// Aggregate task counts for one tenant-bound principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChiasmStats {
-    /// Total tasks owned by the principal.
+    /// Total tasks inside the tenant-and-owner boundary.
     pub total: i64,
     /// Count per status token.
     pub by_status: BTreeMap<String, i64>,
@@ -234,15 +234,16 @@ pub struct ChiasmStats {
 /// A path claim: a TTL lease a task holds on a file path while an agent works it.
 ///
 /// The Kleos claim was held by a stringly `agent` within a `user_id` shard. Here the claim is
-/// held by its [`TaskId`] and scoped to the task's owner [`PrincipalId`]; heartbeats on the task
-/// push `expires_at` forward, and the stale sweep releases the leases of any task it stales.
+/// held by its [`TaskId`] and scoped to the task's tenant and owner [`PrincipalId`]; heartbeats on
+/// the task push `expires_at` forward, and the stale sweep releases the leases of any task it
+/// stales.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathClaim {
     /// Lease log id (storage surrogate, not a projection key).
     pub id: i64,
     /// The task that holds this claim.
     pub task_id: TaskId,
-    /// Owner principal of the claiming task. All claim reads/writes scope on this.
+    /// Owner principal of the claiming task; tenant scope comes from the task foreign key.
     pub principal_id: PrincipalId,
     /// Project the claimed path belongs to.
     pub project: String,

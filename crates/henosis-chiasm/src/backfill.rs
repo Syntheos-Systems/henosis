@@ -638,12 +638,13 @@ mod tests {
         let (legacy, target) = db_pair("dry");
         build_legacy_fixture(&legacy);
         let dir = InMemoryDirectory::new();
+        let tenant = TenantId::new();
 
         let report = backfill_from_kleos(
             &legacy,
             &target,
             &dir,
-            TenantId::new(),
+            tenant,
             "monolith",
             BackfillOptions { dry_run: true },
         )
@@ -659,7 +660,7 @@ mod tests {
         let store = ChiasmStore::open(&target, Arc::new(AxonBus::new())).expect("open");
         for principal in report.principals_by_legacy_user.values() {
             assert!(store
-                .list(*principal, TaskFilter::default())
+                .list(tenant, *principal, TaskFilter::default())
                 .await
                 .expect("list")
                 .is_empty());
@@ -668,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    /// Confirms an applied import projects tasks into owner-scoped records.
+    /// Confirms an applied import projects tasks into tenant-and-owner-scoped records.
     async fn apply_imports_everything_principal_correct() {
         let (legacy, target) = db_pair("apply");
         build_legacy_fixture(&legacy);
@@ -700,10 +701,10 @@ mod tests {
         let owner2 = report.principals_by_legacy_user[&2];
         assert_ne!(owner1, owner2);
 
-        // The imported tasks are owner-scoped, statuses and timestamps converted.
+        // The imported tasks are tenant-and-owner-scoped, statuses and timestamps converted.
         let store = ChiasmStore::open(&target, Arc::new(AxonBus::new())).expect("open");
         let mine = store
-            .list(owner1, TaskFilter::default())
+            .list(tenant, owner1, TaskFilter::default())
             .await
             .expect("list");
         assert_eq!(mine.len(), 2, "legacy key 1 owned two tasks");
@@ -723,15 +724,16 @@ mod tests {
             "datetime('now') form converted to a UTC Timestamp"
         );
         let theirs = store
-            .list(owner2, TaskFilter::default())
+            .list(tenant, owner2, TaskFilter::default())
             .await
             .expect("list");
         assert_eq!(theirs.len(), 1);
         assert_eq!(theirs[0].status, TaskStatus::Completed);
 
-        // History rode along (owner-scoped read).
+        // History rode along through the same identity boundary.
         let blocked = store
             .list(
+                tenant,
                 owner1,
                 TaskFilter {
                     status: Some(TaskStatus::Blocked),
@@ -743,7 +745,7 @@ mod tests {
             .pop()
             .expect("blocked task");
         let history = store
-            .history(owner1, blocked.id, 10)
+            .history(tenant, owner1, blocked.id, 10)
             .await
             .expect("history");
         assert_eq!(history.len(), 1);
@@ -751,7 +753,7 @@ mod tests {
 
         // The dependency edge was remapped onto the minted TaskIds.
         let deps = store
-            .get_dependencies(owner1, blocked.id)
+            .get_dependencies(tenant, owner1, blocked.id)
             .await
             .expect("deps");
         assert_eq!(deps.len(), 1);

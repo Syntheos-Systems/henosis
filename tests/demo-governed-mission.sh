@@ -81,7 +81,7 @@ case "$method $url" in
             printf '%s' '{"Executed":{"result":{"status":"ready","runtime":"henosis"}}}'
         fi
         ;;
-    'GET http://127.0.0.1:8088/chiasm/tasks/33333333-3333-8333-8333-333333333333/activity?principal_id=22222222-2222-8222-8222-222222222222&limit=20')
+    'GET http://127.0.0.1:8088/chiasm/tasks/33333333-3333-8333-8333-333333333333/activity?tenant=11111111-1111-8111-8111-111111111111&principal_id=22222222-2222-8222-8222-222222222222&limit=20')
         printf '%s' '[{"kind":"action.denied","payload":{"task_id":"33333333-3333-8333-8333-333333333333","tool":"henosis","action":"probe"}},{"kind":"action.invoked","payload":{"task_id":"33333333-3333-8333-8333-333333333333","tool":"henosis","action":"probe"}},{"kind":"action.completed","payload":{"task_id":"33333333-3333-8333-8333-333333333333","tool":"henosis","action":"probe"}},{"kind":"action.invoked","payload":{"task_id":"33333333-3333-8333-8333-333333333333","tool":"henosis","action":"probe"}}]'
         ;;
     'GET http://127.0.0.1:8088/broca/actions?tenant=11111111-1111-8111-8111-111111111111&service=dispatcher&limit=20')

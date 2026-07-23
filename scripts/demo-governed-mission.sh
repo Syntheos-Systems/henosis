@@ -256,7 +256,7 @@ wait_for_projections() {
     task_id=$1
     deadline=$(( $(date +%s) + POLL_TIMEOUT_SECS ))
     while [ "$(date +%s)" -le "$deadline" ]; do
-        TASK_ACTIVITY=$(request GET "$BASE_URL/chiasm/tasks/$task_id/activity?principal_id=$PRINCIPAL&limit=20")
+        TASK_ACTIVITY=$(request GET "$BASE_URL/chiasm/tasks/$task_id/activity?tenant=$TENANT&principal_id=$PRINCIPAL&limit=20")
         BROCA_ACTIVITY=$(request GET "$BASE_URL/broca/actions?tenant=$TENANT&service=dispatcher&limit=20")
         if projection_complete "$task_id" "$TASK_ACTIVITY" "$BROCA_ACTIVITY"; then
             return

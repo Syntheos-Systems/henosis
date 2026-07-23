@@ -123,7 +123,7 @@ pub struct DashboardResponse {
     pub services: Vec<ServiceHealth>,
     /// Agent presence aggregate from Soma (org-scoped).
     pub agents: AgentStats,
-    /// Task aggregate from Chiasm (principal-scoped).
+    /// Task aggregate from Chiasm (tenant-and-principal-scoped).
     pub tasks: TaskStats,
     /// Workflow/run aggregate from Loom (principal-scoped).
     pub workflows: WorkflowStats,
@@ -187,10 +187,10 @@ pub async fn compose_dashboard(
         }
     };
 
-    // -- Chiasm: task aggregate, scoped by principal. --
+    // -- Chiasm: task aggregate, scoped by tenant and principal. --
     // "active" = total minus completed: covers active, queued, paused, blocked,
     // blocked_on_human, and stale statuses without hard-coding each name.
-    let (chiasm_health, tasks) = match chiasm.stats(principal).await {
+    let (chiasm_health, tasks) = match chiasm.stats(org, principal).await {
         Ok(stats) => {
             let completed = stats.by_status.get("completed").copied().unwrap_or(0);
             let active = stats.total - completed;

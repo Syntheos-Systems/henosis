@@ -153,7 +153,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let task_rows = chiasm
-                    .activity(principal, task.id, 10)
+                    .activity(tenant, principal, task.id, 10)
                     .await
                     .expect("task activity");
                 let broca_rows = broca
@@ -176,7 +176,7 @@ mod tests {
         .expect("both projections become visible");
 
         let task_rows = chiasm
-            .activity(principal, task.id, 10)
+            .activity(tenant, principal, task.id, 10)
             .await
             .expect("task activity");
         assert_eq!(task_rows[0].kind, "action.completed");
@@ -291,7 +291,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let task_rows = chiasm
-                    .activity(principal, task.id, 10)
+                    .activity(tenant, principal, task.id, 10)
                     .await
                     .expect("task activity");
                 let broca_rows = broca
@@ -433,7 +433,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let task_rows = chiasm
-                    .activity(principal, task.id, 10)
+                    .activity(tenant, principal, task.id, 10)
                     .await
                     .expect("task activity");
                 let broca_rows = broca
@@ -456,7 +456,7 @@ mod tests {
         .expect("both projections observe all mission events");
 
         let task_kinds = chiasm
-            .activity(principal, task.id, 10)
+            .activity(tenant, principal, task.id, 10)
             .await
             .expect("task activity")
             .into_iter()

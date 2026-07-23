@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use henosis_broca::{BrocaStore, LogAction};
 use henosis_chiasm::{ChiasmStore, NewTask, Task, TaskFilter, TaskPatch, TaskStatus};
@@ -838,7 +838,7 @@ impl KleosClient for InProcessKleosClient {
         };
         let tasks = self
             .chiasm
-            .list(self.principal, filter)
+            .list(self.tenant, self.principal, filter)
             .await
             .map_err(|e| BridgeError::Kleos(e.to_string()))?;
         Ok(summarize_tasks(&tasks))
@@ -981,7 +981,7 @@ impl KleosClient for InProcessKleosClient {
             assignee: None,
         };
         self.chiasm
-            .update(self.principal, id, patch)
+            .update(self.tenant, self.principal, id, patch)
             .await
             .map_err(|e| BridgeError::Kleos(e.to_string()))?;
         Ok(())
@@ -1028,7 +1028,7 @@ pub fn summarize_active_tasks(tasks: &[KleosTaskSummary]) -> Option<String> {
 #[cfg(test)]
 /// Tests for Kleos context helper behavior.
 mod tests {
-    use super::{KleosTaskSummary, build_memory_query, summarize_active_tasks};
+    use super::{build_memory_query, summarize_active_tasks, KleosTaskSummary};
 
     /// Verifies the memory query keeps the channel and recent human context.
     #[test]

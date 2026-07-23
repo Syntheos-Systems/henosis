@@ -34,6 +34,15 @@ pub enum ChiasmError {
         depends_on: TaskId,
     },
 
+    /// Another task already holds an active lease on the requested path.
+    #[error("path {path:?} is actively claimed by task {claimed_by_task}")]
+    ClaimConflict {
+        /// The path whose lease could not be acquired.
+        path: String,
+        /// The task holding the conflicting active lease.
+        claimed_by_task: TaskId,
+    },
+
     /// The one-time legacy backfill failed (unreadable legacy DB, unparseable legacy row,
     /// or a directory enrollment error). Bad legacy data produces an explicit failure naming
     /// the problem rather than being silently discarded.

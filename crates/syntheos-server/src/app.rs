@@ -571,6 +571,7 @@ async fn dispatch(
 fn chiasm_error(e: ChiasmError) -> (StatusCode, String) {
     let status = match &e {
         ChiasmError::NotFound(_) => StatusCode::NOT_FOUND,
+        ChiasmError::ClaimConflict { .. } => StatusCode::CONFLICT,
         ChiasmError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
         // Backend, backfill, and any future variants are server-side failures.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -631,9 +632,11 @@ async fn chiasm_create_task(
         .map_err(chiasm_error)
 }
 
-/// Query string for [`chiasm_list_tasks`]: the asserted owner plus optional AND-filters.
+/// Query string for [`chiasm_list_tasks`]: the asserted identity plus optional AND-filters.
 #[derive(Debug, Deserialize)]
 pub struct ChiasmListQuery {
+    /// Tenant whose tasks are listed.
+    pub tenant: TenantId,
     /// Owner principal whose tasks are listed.
     pub principal_id: PrincipalId,
     /// Only tasks with this status.
@@ -646,7 +649,7 @@ pub struct ChiasmListQuery {
     pub offset: Option<usize>,
 }
 
-/// List the asserted principal's tasks, newest-updated first.
+/// List the asserted tenant-bound principal's tasks, newest-updated first.
 async fn chiasm_list_tasks(
     State(state): State<AppState>,
     Query(q): Query<ChiasmListQuery>,
@@ -654,6 +657,7 @@ async fn chiasm_list_tasks(
     state
         .chiasm
         .list(
+            q.tenant,
             q.principal_id,
             TaskFilter {
                 status: q.status,
@@ -667,24 +671,29 @@ async fn chiasm_list_tasks(
         .map_err(chiasm_error)
 }
 
-/// Query string asserting the owner principal for single-task reads and stats.
+/// Query string asserting the tenant-bound owner for single-task reads and stats.
 #[derive(Debug, Deserialize)]
 pub struct ChiasmOwnerQuery {
-    /// The asserted owner principal.
+    /// Tenant containing the task.
+    pub tenant: TenantId,
+    /// The asserted owner principal inside the tenant.
     pub principal_id: PrincipalId,
 }
 
-/// Query string for an owner-scoped task activity read.
+/// Query string for a tenant-and-owner-scoped task activity read.
 #[derive(Debug, Deserialize)]
 pub struct ChiasmActivityQuery {
+    /// Tenant containing the task.
+    pub tenant: TenantId,
     /// Owner principal whose task activity is requested.
     pub principal_id: PrincipalId,
     /// Maximum lifecycle rows to return, capped by [`MAX_TASK_ACTIVITY_LIMIT`].
     pub limit: Option<usize>,
 }
 
-/// Fetch one of the asserted principal's tasks by id. Owner-scoped: another principal's task is
-/// indistinguishable from a missing one (404), never disclosed.
+/// Fetch one task inside the asserted tenant-and-owner boundary.
+///
+/// A task outside either boundary is indistinguishable from a missing one.
 async fn chiasm_get_task(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
@@ -692,14 +701,14 @@ async fn chiasm_get_task(
 ) -> Result<Json<Task>, (StatusCode, String)> {
     state
         .chiasm
-        .get(q.principal_id, id)
+        .get(q.tenant, q.principal_id, id)
         .await
         .map_err(chiasm_error)?
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, format!("task not found: {id}")))
 }
 
-/// Return one owned task's dispatcher lifecycle activity, newest first.
+/// Return one tenant-bound task's dispatcher lifecycle activity, newest first.
 async fn chiasm_task_activity(
     State(state): State<AppState>,
     Path(id): Path<TaskId>,
@@ -707,7 +716,7 @@ async fn chiasm_task_activity(
 ) -> Result<Json<Vec<henosis_chiasm::TaskActivity>>, (StatusCode, String)> {
     let owned = state
         .chiasm
-        .get(q.principal_id, id)
+        .get(q.tenant, q.principal_id, id)
         .await
         .map_err(chiasm_error)?;
     if owned.is_none() {
@@ -719,20 +728,20 @@ async fn chiasm_task_activity(
         .min(MAX_TASK_ACTIVITY_LIMIT);
     state
         .chiasm
-        .activity(q.principal_id, id, limit)
+        .activity(q.tenant, q.principal_id, id, limit)
         .await
         .map(Json)
         .map_err(chiasm_error)
 }
 
-/// Aggregate task counts for the asserted principal.
+/// Aggregate task counts for the asserted tenant-bound principal.
 async fn chiasm_stats(
     State(state): State<AppState>,
     Query(q): Query<ChiasmOwnerQuery>,
 ) -> Result<Json<ChiasmStats>, (StatusCode, String)> {
     state
         .chiasm
-        .stats(q.principal_id)
+        .stats(q.tenant, q.principal_id)
         .await
         .map(Json)
         .map_err(chiasm_error)
@@ -2428,7 +2437,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/chiasm/tasks/{id}?principal_id={owner}"))
+                    .uri(format!(
+                        "/chiasm/tasks/{id}?tenant={tenant}&principal_id={owner}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2444,7 +2455,24 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/chiasm/tasks/{id}?principal_id={other}"))
+                    .uri(format!(
+                        "/chiasm/tasks/{id}?tenant={tenant}&principal_id={other}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The same principal cannot cross a tenant boundary.
+        let other_tenant = TenantId::new();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/chiasm/tasks/{id}?tenant={other_tenant}&principal_id={owner}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2495,7 +2523,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/chiasm/tasks/{id}/activity?principal_id={owner}&limit={}",
+                        "/chiasm/tasks/{id}/activity?tenant={tenant}&principal_id={owner}&limit={}",
                         MAX_TASK_ACTIVITY_LIMIT + 100
                     ))
                     .body(Body::empty())
@@ -2515,7 +2543,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/chiasm/tasks/{id}/activity?principal_id={stranger}"
+                        "/chiasm/tasks/{id}/activity?tenant={tenant}&principal_id={stranger}"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -2540,7 +2568,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/chiasm/tasks?principal_id={owner}&project=beta"))
+                    .uri(format!(
+                        "/chiasm/tasks?tenant={tenant}&principal_id={owner}&project=beta"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2556,7 +2586,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/chiasm/stats?principal_id={owner}"))
+                    .uri(format!(
+                        "/chiasm/stats?tenant={tenant}&principal_id={owner}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2569,7 +2601,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/chiasm/stats?principal_id={stranger}"))
+                    .uri(format!(
+                        "/chiasm/stats?tenant={tenant}&principal_id={stranger}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
