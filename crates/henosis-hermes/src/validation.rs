@@ -75,6 +75,18 @@ pub fn validate(schema: &Value, instance: &Value) -> Result<(), Vec<FieldError>>
         }
     }
 
+    // Closed object schemas reject input keys that do not have a declared
+    // property. Schemas that omit this standard JSON Schema keyword retain the
+    // existing permissive behavior for backwards compatibility.
+    if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        let properties = schema.get("properties").and_then(|v| v.as_object());
+        for name in obj.keys() {
+            if properties.is_none_or(|declared| !declared.contains_key(name)) {
+                errors.push(FieldError::new(name, format!("'{name}' is not allowed")));
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -235,5 +247,27 @@ mod tests {
     #[test]
     fn non_object_schema_passes() {
         assert!(validate(&json!({ "type": "string" }), &json!("anything")).is_ok());
+    }
+
+    #[test]
+    /// Verifies closed object schemas reject keys with no declared property.
+    fn rejects_unknown_property_when_closed() {
+        let closed = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "name": { "type": "string" } }
+        });
+        let errors = validate(&closed, &json!({ "unexpected": true })).unwrap_err();
+        assert!(errors.iter().any(|error| error.field == "unexpected"));
+    }
+
+    #[test]
+    /// Verifies schemas that omit additionalProperties remain permissive.
+    fn permits_unknown_property_when_open_by_default() {
+        let open = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        });
+        assert!(validate(&open, &json!({ "unexpected": true })).is_ok());
     }
 }

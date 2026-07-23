@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -39,6 +40,8 @@ jobs:
         run: cargo test --locked --workspace --exclude henosis-cognition
       - name: Scan for unfinished production code
         run: ./scripts/stub-scan.sh
+      - name: Validate release package contract
+        run: ./tests/release-package.sh
 
   dependencies:
     name: Dependency audit
@@ -72,3 +75,175 @@ jobs:
       - name: Scan complete history
         run: |
           "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --no-banner --redact .
+
+  release-package-windows:
+    name: Windows release package contract
+    runs-on: windows-2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Execute Windows packager contract
+        shell: pwsh
+        run: ./tests/release-package.ps1
+
+  release-version:
+    name: Release version gate
+    needs: [quality, dependencies, secrets, release-package-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require public Sigstore provenance support
+        env:
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$REPOSITORY_VISIBILITY" != "public" ]]; then
+            echo "Authenticated releases require a public repository on the current GitHub plan." >&2
+            exit 1
+          fi
+      - name: Match the release tag to syntheos-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="$(awk -F '"' '/^version = / { print $2; exit }' crates/syntheos-server/Cargo.toml)"
+          test -n "$version"
+          test "$tag" = "v$version"
+
+  release-build:
+    name: Release ${{ matrix.target }}
+    needs: [quality, dependencies, secrets, release-version]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: syntheos-server
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: syntheos-server
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: syntheos-server
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: syntheos-server.exe
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.88 and target
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 ${{ matrix.target }}
+      - name: Install Rust 1.88 and target
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 ${{ matrix.target }}
+      - name: Install Linux musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update -q && sudo apt-get install -y musl-tools
+      - name: Install GNU tar on macOS
+        if: runner.os == 'macOS'
+        run: brew install gnu-tar
+      - name: Build release binary
+        shell: bash
+        if: runner.os != 'Windows'
+        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
+      - name: Build release binary
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
+      - name: Set deterministic release metadata
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Set deterministic release metadata
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          "RELEASE_VERSION=$($env:GITHUB_REF_NAME.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Package Unix archive
+        shell: bash
+        if: runner.os != 'Windows'
+        run: ./scripts/package-release.sh "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$RELEASE_VERSION" "${{ matrix.target }}" dist
+      - name: Package Windows archive
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: >-
+          & .\scripts\package-release.ps1
+          -BinaryPath "target\${{ matrix.target }}\release\${{ matrix.binary }}"
+          -Version "$env:RELEASE_VERSION"
+          -Target "${{ matrix.target }}"
+          -OutputDirectory dist
+          -SourceDateEpoch ([long]$env:SOURCE_DATE_EPOCH)
+      - name: Attest native archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/*
+      - name: Upload native archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: henosis-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release-publish:
+    name: Publish authenticated release
+    needs: release-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    steps:
+      - name: Download native archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: henosis-*
+          path: release
+          merge-multiple: true
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' \
+            | LC_ALL=C sort \
+            | while IFS= read -r archive; do sha256sum "release/$archive"; done \
+            > release/SHA256SUMS
+          test "$(wc -l < release/SHA256SUMS)" -eq 4
+      - name: Attest release checksums
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release/SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag \
+            --title "Henosis $GITHUB_REF_NAME" \
+            --generate-notes

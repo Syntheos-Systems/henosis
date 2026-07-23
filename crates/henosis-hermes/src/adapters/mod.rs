@@ -19,6 +19,8 @@ pub mod gdrive;
 pub mod github;
 /// Gmail adapters (send, read, search, list_labels).
 pub mod gmail;
+/// Henosis-owned side-effect-free adapters used to verify governed execution.
+pub mod henosis;
 /// Linear GraphQL adapters (issues, search, webhooks).
 pub mod linear;
 /// Notion REST API adapters (search, get_page, create_page, append_blocks).
@@ -30,6 +32,8 @@ use crate::registry::ToolRegistry;
 
 /// Register every bundled adapter tool into `registry`.
 pub fn register_all(registry: &mut ToolRegistry) {
+    // Henosis local diagnostics
+    registry.register(henosis::HenosisProbeTool);
     // Gmail
     registry.register(gmail::GmailSendTool);
     registry.register(gmail::GmailReadTool);

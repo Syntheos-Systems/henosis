@@ -14,8 +14,9 @@ This gives operators a durable answer to four questions: who acted, why policy a
 credential boundary it crossed, and what changed afterward.
 
 > **Status:** Henosis is under active development. The integrated server runs, the source installer
-> produces a persistent user service, and the core authorities fail closed. APIs, database schemas,
-> configuration, and deployment requirements may change before the first stable release.
+> produces a persistent user service, the governed mission proves the live action path, and the
+> core authorities fail closed. APIs, database schemas, configuration, and deployment requirements
+> may change before the first stable release.
 
 ## Operating model
 
@@ -105,12 +106,24 @@ systemctl --user status henosis
 curl http://127.0.0.1:8088/health
 ```
 
+Run the governed mission after the health check. This command requires `curl` and Python 3:
+
+```sh
+./scripts/demo-governed-mission.sh
+```
+
+The mission creates a Chiasm task, sends a side-effect-free `henosis.probe` action through the
+production five-gate dispatcher, and confirms a clean execution. It then sends a prompt-injection
+payload that Eidolon must deny. The script exits after Chiasm and Broca contain all
+four correlated lifecycle records. It reads the generated tenant and principal from the installer
+configuration and rejects any target outside a loopback HTTP address.
+
 A production or multi-tenant source install needs:
 
-- Git, Rust 1.88 or newer, Cargo, OpenSSL, and ripgrep
+- Git, Rust 1.88 or newer, Cargo, OpenSSL, ripgrep, and Python 3
 - Rust 1.94 or newer when building the optional `cognition` feature
 - A reachable PostgreSQL database for the Plutus authority
-- `curl` or `wget` for the startup health check
+- `curl` for the governed mission; `curl` or `wget` for the startup health check
 - A systemd user manager, unless you pass `--no-service`
 
 Run the installer without `--local` and provide PostgreSQL when prompted:
@@ -161,6 +174,26 @@ all path and bind-address options.
 The installer configures the integrated server. Rift, Synapse CLI/TUI, and standalone compatibility
 binaries have separate configuration and launch paths.
 
+## Native releases
+
+The tag workflow builds `syntheos-server` for Linux x86-64 musl, macOS Intel, macOS Apple silicon,
+and Windows x86-64. Each archive contains the native binary, license, installer, governed mission,
+and release-specific instructions. GitHub publishes a `SHA256SUMS` file and Sigstore artifact
+attestations after the quality, dependency, secret, and version gates pass.
+
+Verify a downloaded release before extracting it:
+
+```sh
+sha256sum --check SHA256SUMS
+gh attestation verify henosis-VERSION-TARGET.tar.gz \
+  --repo Syntheos-Systems/henosis
+```
+
+Use the `.zip` filename on Windows. The workflow refuses to publish a tag unless GitHub reports the
+repository as public, because the current repository plan does not provide artifact attestations
+for private repositories. It also rejects a tag that does not equal `v` plus the
+`syntheos-server` manifest version.
+
 ## API surfaces
 
 The integrated server binds to `127.0.0.1:8088` unless `SYNTHEOS_ADDR` selects another IP socket
@@ -170,7 +203,7 @@ development bind only when an authenticated private boundary protects the server
 include:
 
 - `/health`, `/version`, `/enroll`, and `/dispatch`
-- Chiasm task, Soma agent, Broca action, Loom workflow, and Thymus quality APIs
+- Chiasm task and task-activity APIs, Soma agent, Broca action, Loom workflow, and Thymus quality APIs
 - Optional `/cognition/*` routes in a build with `--features cognition`
 - Optional operator authentication, dashboard, and WebSocket routes when an operator JWT secret is configured
 - Optional Stripe entitlement webhook when its signing secret is configured
@@ -242,9 +275,11 @@ The stub scan requires ripgrep. Run the repository checks with:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
+cargo test --locked --workspace --exclude henosis-cognition
 ./tests/install.sh
+./tests/demo-governed-mission.sh
+./tests/release-package.sh
 ./scripts/stub-scan.sh
 ```
 
@@ -267,9 +302,19 @@ cargo test --locked --workspace
 - Hephaestus has a placeholder production Plutus token provider for tenant-scoped Anthropic authentication. Development credentials and OpenAI-compatible providers use separate paths.
 - Credential handling is split between the canonical `phylaxd` broker and the legacy in-process
   credential-policy path described above.
+- Hermes adapters execute inside the server process. Henosis does not provide a process, container,
+  or WebAssembly sandbox for a malicious or compromised tool adapter.
+- Dispatcher events and service records are queryable and restart-safe where documented, but they
+  do not have a cryptographic hash chain or an off-host tamper-evident sink.
+- The human gate denies on timeout, but the integrated server does not expose an authenticated
+  route that resolves pending approval IDs. Trusted invocation builders must also mark actions
+  that require approval.
 - The default Rift bridge expects a reachable Kleos HTTP service. An embedded memory path requires the `cognition` feature.
 - The source installer configures `syntheos-server`; it does not provision PostgreSQL or install every workspace binary.
 - Public APIs and persistence formats have no stable compatibility guarantee yet.
+
+The [known-incomplete ledger](scripts/known-incomplete.md) tracks each unresolved production
+wiring gap and the condition required to close it.
 
 The repository keeps test-only allow gates behind the non-default `stubs` feature. Production
 startup uses the five authority implementations and fails when required authority configuration is

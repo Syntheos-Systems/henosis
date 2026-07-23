@@ -72,8 +72,20 @@ plus task-correlated events into an append-only Chiasm task-activity projection.
 gate chain no longer substitutes a deny gate when the credential-policy key is absent; missing
 authority configuration is an explicit boot error.
 
+The 2026-07-22 public-readiness review reopened five production-boundary gaps. They do not block
+the loopback-only governed mission, but they do block claims that Henosis is ready for an
+untrusted remote deployment. The legacy in-process Phylax experiment remains in the server's
+credential gate and executor even though `cred`, brokered by `phylaxd`, is the canonical
+credential path. Caller-supplied identities, caller-declared approval requirements, mutable audit
+storage, and in-process adapters are also explicit active-development limits.
+
 | # | Sev | Not-wired | Where | Closes when |
 |---|-----|-----------|-------|-------------|
+| 19 | HIGH | The server credential gate and credential operations still use the legacy in-process Phylax store instead of the canonical `cred` and `phylaxd` path. | `crates/syntheos-server/src/main.rs`, `crates/syntheos-server/src/henosis_executor.rs` | Dispatcher policy and executor credential use are brokered through `phylaxd`, then the legacy production dependency is removed. |
+| 20 | HIGH | The human gate trusts `args.requires_approval`, and the server exposes no authenticated operator route that resolves pending approvals. | `crates/henosis-rift/src/gate.rs`, `crates/henosis-rift/src/approver.rs`, `crates/syntheos-server/src/main.rs` | Trusted policy marks approval-required actions and an authenticated operator surface resolves approval IDs. |
+| 21 | HIGH | Kernel HTTP routes accept caller-asserted tenant and principal identities. | `crates/syntheos-server/src/app.rs` | An authentication boundary derives tenant and principal identities from verified credentials before handlers run. |
+| 22 | MEDIUM | Chiasm, Broca, and Hermes audit records are mutable data without a cryptographic or off-host witness. | `crates/syntheos-server/src/action_reactor.rs`, `crates/henosis-hermes/src/audit.rs` | Audit records are hash-chained or signed and anchored in an append-only external witness with verification support. |
+| 23 | MEDIUM | Hermes adapters execute in-process without a universal capability sandbox or egress policy. | `crates/henosis-hermes/src/adapters/`, `crates/henosis-hermes/src/lib.rs` | Adapter execution is isolated and every filesystem, process, credential, and network capability is explicitly scoped. |
 
 <!-- Add a row whenever a half-wire is introduced or discovered; delete it when wired. -->
 

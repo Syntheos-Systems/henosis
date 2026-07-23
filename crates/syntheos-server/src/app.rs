@@ -36,6 +36,12 @@ use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, Tas
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 use syntheos_identity::PrincipalDirectory;
 
+/// Default number of lifecycle rows returned by the task activity endpoint.
+const DEFAULT_TASK_ACTIVITY_LIMIT: usize = 100;
+
+/// Hard ceiling for one task activity response.
+const MAX_TASK_ACTIVITY_LIMIT: usize = 500;
+
 /// The foundation wired together once at boot and shared with every handler.
 ///
 /// Cheap to clone (it is all `Arc`s), as the `axum` `State` extractor requires.
@@ -62,11 +68,10 @@ pub struct AppState {
     /// build never compiles the heavy ML stack. Additive -- nothing in the
     /// non-feature build references it.
     ///
-    /// WIRED (Wave 3): the `/cognition/memory` and `/cognition/memory/search`
-    /// routes read this field, and `main.rs` opens it over a persistent
-    /// path-backed store (`open_path`), so memory survives a restart. The facade
-    /// surface is still partial (memory/context/scratchpad/handoffs only); see
-    /// `scripts/known-incomplete.md` row 3.
+    /// The `/cognition/memory` and `/cognition/memory/search` routes read this
+    /// field, and `main.rs` opens it over a persistent path-backed store so
+    /// memory survives a restart. The facade also exposes the remaining
+    /// Cognition services to in-process callers.
     #[cfg(feature = "cognition")]
     cognition: Arc<henosis_cognition::Cognition>,
     /// The operator API state. `None` when `SYNTHEOS_OPERATOR_JWT_SECRET` is unset
@@ -282,6 +287,7 @@ pub fn router(state: AppState) -> Router {
             post(chiasm_create_task).get(chiasm_list_tasks),
         )
         .route("/chiasm/tasks/{id}", get(chiasm_get_task))
+        .route("/chiasm/tasks/{id}/activity", get(chiasm_task_activity))
         .route("/chiasm/stats", get(chiasm_stats))
         .route("/soma/agents", post(soma_register).get(soma_list))
         .route("/soma/agents/{id}", get(soma_get))
@@ -607,6 +613,15 @@ pub struct ChiasmOwnerQuery {
     pub principal_id: PrincipalId,
 }
 
+/// Query string for an owner-scoped task activity read.
+#[derive(Debug, Deserialize)]
+pub struct ChiasmActivityQuery {
+    /// Owner principal whose task activity is requested.
+    pub principal_id: PrincipalId,
+    /// Maximum lifecycle rows to return, capped by [`MAX_TASK_ACTIVITY_LIMIT`].
+    pub limit: Option<usize>,
+}
+
 /// Fetch one of the asserted principal's tasks by id. Owner-scoped: another principal's task is
 /// indistinguishable from a missing one (404), never disclosed.
 async fn chiasm_get_task(
@@ -621,6 +636,32 @@ async fn chiasm_get_task(
         .map_err(chiasm_error)?
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, format!("task not found: {id}")))
+}
+
+/// Return one owned task's dispatcher lifecycle activity, newest first.
+async fn chiasm_task_activity(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Query(q): Query<ChiasmActivityQuery>,
+) -> Result<Json<Vec<henosis_chiasm::TaskActivity>>, (StatusCode, String)> {
+    let owned = state
+        .chiasm
+        .get(q.principal_id, id)
+        .await
+        .map_err(chiasm_error)?;
+    if owned.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("task not found: {id}")));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_TASK_ACTIVITY_LIMIT)
+        .min(MAX_TASK_ACTIVITY_LIMIT);
+    state
+        .chiasm
+        .activity(q.principal_id, id, limit)
+        .await
+        .map(Json)
+        .map_err(chiasm_error)
 }
 
 /// Aggregate task counts for the asserted principal.
@@ -2322,6 +2363,78 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/chiasm/tasks/{id}?principal_id={other}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    /// Chiasm task activity is owner scoped, newest first, and hard capped.
+    async fn chiasm_task_activity_is_scoped_and_bounded() {
+        use syntheos_contracts::{PrincipalId, TaskId, TenantId};
+
+        let state = test_state();
+        let chiasm = state.chiasm.clone();
+        let app = router(state);
+        let tenant = TenantId::new();
+        let owner = PrincipalId::new();
+        let created = create_task_http(
+            &app,
+            &tenant.to_string(),
+            &owner.to_string(),
+            "henosis",
+            "inspect governed activity",
+        )
+        .await;
+        let id = created["id"]
+            .as_str()
+            .expect("task id")
+            .parse::<TaskId>()
+            .expect("valid task id");
+
+        for sequence in 0..=MAX_TASK_ACTIVITY_LIMIT {
+            chiasm
+                .record_activity(
+                    tenant,
+                    owner,
+                    id,
+                    "action.completed",
+                    serde_json::json!({"sequence": sequence}),
+                )
+                .await
+                .expect("record activity");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/chiasm/tasks/{id}/activity?principal_id={owner}&limit={}",
+                        MAX_TASK_ACTIVITY_LIMIT + 100
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let activity: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).expect("activity response");
+        let activity = activity.as_array().expect("activity array");
+        assert_eq!(activity.len(), MAX_TASK_ACTIVITY_LIMIT);
+        assert_eq!(activity[0]["payload"]["sequence"], MAX_TASK_ACTIVITY_LIMIT);
+
+        let stranger = PrincipalId::new();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/chiasm/tasks/{id}/activity?principal_id={stranger}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
