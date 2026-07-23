@@ -14,6 +14,9 @@
 //! the bug. Each test therefore "de-fixes" the tables under test back to the
 //! exact buggy shape an old deployment has on disk, seeds skewed rows, and
 //! then migrates forward -- the same shape production databases hit.
+//! The rows use fixed timestamps because current SQLite releases recognize
+//! that `now` is already UTC and no longer reproduce the historical undefined
+//! behavior of applying the `utc` modifier to it.
 //!
 //! The whole file pins TZ=Europe/Berlin so the expected offsets are
 //! deterministic regardless of host timezone (CI runs on UTC, where the
@@ -61,6 +64,7 @@ fn defix_global_handoffs(conn: &Connection) {
              branch TEXT,
              directory TEXT,
              agent TEXT DEFAULT 'unknown',
+             -- Handoff kind discriminator, such as manual or automatic.
              type TEXT DEFAULT 'manual',
              content TEXT NOT NULL,
              metadata TEXT,
@@ -197,10 +201,10 @@ fn buggy_default_count(conn: &Connection) -> i64 {
     .expect("sqlite_master scan")
 }
 
-/// Old-DB path: rows written under the buggy default (summer, winter, and
-/// live-default) come out of migration 99 as true UTC, with per-row DST-aware
-/// offsets, the last_seen_at carve-out honored, and no buggy default left in
-/// the live schema.
+/// Old-DB path: rows written under the buggy default in summer and winter come
+/// out of migration 99 as true UTC, with per-row DST-aware offsets, the
+/// last_seen_at carve-out honored, and no buggy default left in the live
+/// schema.
 #[test]
 fn global_v99_backfills_skewed_rows_dst_aware() {
     use_berlin_tz();
@@ -217,8 +221,6 @@ fn global_v99_backfills_skewed_rows_dst_aware() {
              VALUES (42, 'p', 'summer row', '2026-07-01 10:00:00');
          INSERT INTO handoffs (id, project, content, created_at)
              VALUES (43, 'p', 'winter row', '2026-01-15 10:00:00');
-         INSERT INTO handoffs (id, project, content)
-             VALUES (44, 'p', 'live default row');
          INSERT INTO handoff_atoms
              (id, atom_id, handoff_id, project, atom_type, content, canonical_form,
               created_at, last_seen_at, seen_count)
@@ -246,12 +248,6 @@ fn global_v99_backfills_skewed_rows_dst_aware() {
         text_at(&conn, "SELECT created_at FROM handoffs WHERE id = ?1", 43),
         "2026-01-15 11:00:00"
     );
-    // A row written through the live buggy default lands back on true UTC.
-    assert!(
-        drift_seconds(&conn, "handoffs", "created_at", 44) < 10,
-        "live-default row must backfill to within seconds of true UTC"
-    );
-
     // Atom carve-out: created_at always shifts; last_seen_at shifts only for
     // rows still on their insert default (seen_count <= 1). The re-seen row's
     // last_seen_at was written correctly and must come through untouched.
