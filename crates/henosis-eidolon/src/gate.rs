@@ -31,11 +31,31 @@ fn normalize(text: &str) -> String {
     out
 }
 
-/// JSON object keys that claim to address a tenant.
-const TENANT_KEYS: [&str; 2] = ["tenant", "tenant_id"];
+/// The request-context identity addressed by a JSON object key.
+enum ScopeIdentityKey {
+    /// A tenant identifier.
+    Tenant,
+    /// A principal identifier.
+    Principal,
+}
 
-/// JSON object keys that claim to address a principal.
-const PRINCIPAL_KEYS: [&str; 2] = ["principal", "principal_id"];
+/// Classify tenant/principal identifier aliases without treating unrelated keys as identities.
+///
+/// Identity APIs commonly spell these fields in snake case, kebab case, camel case, or
+/// uppercase. ASCII case and `_`/`-` separators are irrelevant only for the four exact semantic
+/// forms `tenant`, `tenantid`, `principal`, and `principalid`.
+fn scope_identity_key(key: &str) -> Option<ScopeIdentityKey> {
+    let canonical = key
+        .chars()
+        .filter(|character| !matches!(character, '_' | '-'))
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    match canonical.as_str() {
+        "tenant" | "tenantid" => Some(ScopeIdentityKey::Tenant),
+        "principal" | "principalid" => Some(ScopeIdentityKey::Principal),
+        _ => None,
+    }
+}
 
 /// Judge one scalar scope field: `Ok(true)` from `matches_ctx` means the value names the
 /// request's own tenant/principal (in scope), `Ok(false)` a different one, `Err(())` a value
@@ -75,9 +95,8 @@ fn scope_violation(ctx: &RequestContext, args: &serde_json::Value) -> Option<Str
         match value {
             serde_json::Value::Object(map) => {
                 for (k, v) in map {
-                    let key = k.to_ascii_lowercase();
-                    if TENANT_KEYS.contains(&key.as_str()) {
-                        let violation = scalar_scope_violation(&key, v, "tenant", |s| {
+                    if matches!(scope_identity_key(k), Some(ScopeIdentityKey::Tenant)) {
+                        let violation = scalar_scope_violation(k, v, "tenant", |s| {
                             s.parse::<TenantId>()
                                 .map(|t| t == ctx.tenant)
                                 .map_err(|_| ())
@@ -86,8 +105,8 @@ fn scope_violation(ctx: &RequestContext, args: &serde_json::Value) -> Option<Str
                             return violation;
                         }
                     }
-                    if PRINCIPAL_KEYS.contains(&key.as_str()) {
-                        let violation = scalar_scope_violation(&key, v, "principal", |s| {
+                    if matches!(scope_identity_key(k), Some(ScopeIdentityKey::Principal)) {
+                        let violation = scalar_scope_violation(k, v, "principal", |s| {
                             s.parse::<PrincipalId>()
                                 .map(|p| p == ctx.principal)
                                 .map_err(|_| ())
@@ -250,7 +269,7 @@ mod tests {
     use syntheos_contracts::{PrincipalId, RequestContext, TenantId, ToolInvocation};
 
     use super::*;
-    use crate::policy::{DriftSeverity, default_injection_patterns};
+    use crate::policy::{default_injection_patterns, DriftSeverity};
     use crate::signal::DriftFlag;
 
     /// A drift signal reporting no flags.
@@ -541,6 +560,98 @@ mod tests {
             matches!(decision, GateDecision::Deny { .. }),
             "got {decision:?}"
         );
+    }
+
+    /// Top-level tenant/principal aliases cannot address a foreign request context.
+    #[tokio::test]
+    async fn top_level_foreign_identity_aliases_deny() {
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let cases = [
+            (
+                "Tenant-ID",
+                TenantId::new().as_uuid().to_string(),
+                "tenant alias",
+            ),
+            (
+                "principalId",
+                PrincipalId::new().as_uuid().to_string(),
+                "principal alias",
+            ),
+        ];
+        for (key, value, case) in cases {
+            let args = serde_json::Value::Object(serde_json::Map::from_iter([(
+                key.to_string(),
+                serde_json::Value::String(value),
+            )]));
+            let decision = gate(QuietSignal)
+                .check(&request_with(tenant, principal, args))
+                .await
+                .expect("decides");
+            assert!(
+                matches!(decision, GateDecision::Deny { .. }),
+                "{case} must deny, got {decision:?}"
+            );
+        }
+    }
+
+    /// Foreign identity aliases remain guarded when buried inside arrays and objects.
+    #[tokio::test]
+    async fn nested_foreign_identity_aliases_deny() {
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let decision = gate(QuietSignal)
+            .check(&request_with(
+                tenant,
+                principal,
+                serde_json::json!({
+                    "batch": [{
+                        "metadata": {
+                            "PRINCIPAL-ID": PrincipalId::new().as_uuid().to_string()
+                        }
+                    }]
+                }),
+            ))
+            .await
+            .expect("decides");
+        assert!(
+            matches!(decision, GateDecision::Deny { .. }),
+            "nested foreign alias must deny, got {decision:?}"
+        );
+    }
+
+    /// Identity aliases naming the request's own context remain in scope.
+    #[tokio::test]
+    async fn matching_identity_aliases_allow() {
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let decision = gate(QuietSignal)
+            .check(&request_with(
+                tenant,
+                principal,
+                serde_json::json!({
+                    "TENANT-ID": tenant.as_uuid().to_string(),
+                    "principalId": principal.as_uuid().to_string(),
+                }),
+            ))
+            .await
+            .expect("decides");
+        assert_eq!(decision, GateDecision::Allow);
+    }
+
+    /// Keys outside the four exact identity forms retain their unrelated-field behavior.
+    #[tokio::test]
+    async fn unrelated_identity_like_keys_allow() {
+        let decision = gate(QuietSignal)
+            .check(&request(serde_json::json!({
+                "tenant_name": "not-an-id",
+                "tenantidentifier": "not-an-id",
+                "principal_role": false,
+                "principality": 7,
+            })))
+            .await
+            .expect("decides");
+        assert_eq!(decision, GateDecision::Allow);
     }
 
     /// A tenant field that does not parse as a tenant id cannot be in scope: denied.

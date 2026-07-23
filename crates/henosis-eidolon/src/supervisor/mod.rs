@@ -682,8 +682,13 @@ mod tests {
     /// With allowed_paths configured, an out-of-scope edit fires and an in-scope one does not.
     #[tokio::test]
     async fn scope_check_wired_when_allow_list_present() {
-        let (mut sup, bus) =
-            supervisor_with(default_rules(), vec!["/home/user/projects/henosis".into()]);
+        let allowed_root = temp_path("scope-root");
+        std::fs::create_dir(&allowed_root).expect("create allowed root");
+        let allowed_target = allowed_root.join("README.md");
+        let (mut sup, bus) = supervisor_with(
+            default_rules(),
+            vec![allowed_root.to_string_lossy().into_owned()],
+        );
         let mut rx = bus.subscribe_typed::<ViolationDetected>();
         let path = temp_path("jsonl");
         let mut f = std::fs::OpenOptions::new()
@@ -706,7 +711,7 @@ mod tests {
             "{}",
             serde_json::json!({
                 "tool_name": "Edit",
-                "tool_input": { "file_path": "/home/user/projects/henosis/README.md" },
+                "tool_input": { "file_path": allowed_target },
                 "sessionId": "s",
             })
         )
@@ -721,6 +726,7 @@ mod tests {
             event.context
         );
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&allowed_root);
     }
 
     /// Non-tool entries (plain assistant messages) are ignored.
