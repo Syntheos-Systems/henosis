@@ -1,5 +1,6 @@
 //! `syntheos-server` binary: the single entry point that boots and serves Henosis.
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -132,6 +133,12 @@ const DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 /// Largest accepted Plutus acquisition timeout, preventing an accidental unbounded boot stall.
 const MAX_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
+/// Default seconds between production Loom timeout-enforcement passes.
+const DEFAULT_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// Largest accepted Loom timeout sweep interval, keeping enforcement operationally prompt.
+const MAX_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 300;
+
 /// Largest local authority credential file read into memory.
 const MAX_AUTHORITY_FILE_BYTES: u64 = 4096;
 
@@ -208,6 +215,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // never decides whether production witness and broker authentication requirements apply.
     let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
     let addr = validated_bind_addr(&raw_addr)?;
+    let loom_timeout_sweep_interval = loom_timeout_sweep_interval_from_env()?;
     let plutus_url = optional_env("SYNTHEOS_PLUTUS_DB")?;
     let local_config = validated_local_policy_config(
         optional_env("SYNTHEOS_LOCAL_POLICY")?.as_deref(),
@@ -448,10 +456,45 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "henosis listening with authenticated authority, phylaxd broker, and durable audit");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    let (loom_sweeper_shutdown, loom_sweeper_shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut loom_sweeper = tokio::spawn(run_loom_timeout_sweeper(
+        loom,
+        loom_timeout_sweep_interval,
+        loom_sweeper_shutdown_rx,
+    ));
+    let mut server = Box::pin(
+        axum::serve(listener, app)
+            .with_graceful_shutdown({
+                let mut requested_shutdown = loom_sweeper_shutdown.subscribe();
+                async move {
+                    tokio::select! {
+                        _ = shutdown_signal() => {}
+                        _ = requested_shutdown.changed() => {}
+                    }
+                }
+            })
+            .into_future(),
+    );
+
+    tokio::select! {
+        server_result = &mut server => {
+            loom_sweeper_shutdown.send_replace(true);
+            let sweeper_result = loom_sweeper.await;
+            server_result?;
+            sweeper_result
+                .map_err(|error| format!("Loom timeout sweeper task failed: {error}"))?;
+            Ok(())
+        }
+        sweeper_result = &mut loom_sweeper => {
+            loom_sweeper_shutdown.send_replace(true);
+            let server_result = server.await;
+            server_result?;
+            match sweeper_result {
+                Ok(()) => Err("Loom timeout sweeper exited before server shutdown".into()),
+                Err(error) => Err(format!("Loom timeout sweeper task failed: {error}").into()),
+            }
+        }
+    }
 }
 
 /// Parse the configured IP socket address without accepting ambiguous hostnames.
@@ -1107,6 +1150,72 @@ fn plutus_acquire_timeout_from_env() -> Result<Duration, String> {
     validated_plutus_acquire_timeout(raw.as_deref())
 }
 
+/// Read and validate the production Loom timeout sweep interval from the environment.
+fn loom_timeout_sweep_interval_from_env() -> Result<Duration, String> {
+    let raw = match std::env::var("SYNTHEOS_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(format!(
+                "SYNTHEOS_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS: {error}"
+            ));
+        }
+    };
+    validated_loom_timeout_sweep_interval(raw.as_deref())
+}
+
+/// Validate an optional Loom timeout sweep interval and use the production default when absent.
+fn validated_loom_timeout_sweep_interval(raw: Option<&str>) -> Result<Duration, String> {
+    let seconds = match raw {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            "SYNTHEOS_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS must be an integer from 1 through 300"
+                .to_string()
+        })?,
+        None => DEFAULT_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS,
+    };
+    if !(1..=MAX_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS).contains(&seconds) {
+        return Err(
+            "SYNTHEOS_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS must be an integer from 1 through 300"
+                .to_string(),
+        );
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// Enforce Loom step deadlines periodically until coordinated server shutdown.
+async fn run_loom_timeout_sweeper(
+    loom: Arc<LoomStore>,
+    sweep_interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(sweep_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                match loom.sweep_timeouts().await {
+                    Ok(timed_out) if !timed_out.is_empty() => {
+                        tracing::warn!(
+                            timed_out_steps = timed_out.len(),
+                            "Loom timeout sweep enforced overdue step deadlines"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "Loom timeout sweep failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Validate an optional Plutus acquisition timeout and return the production default when absent.
 fn validated_plutus_acquire_timeout(raw: Option<&str>) -> Result<Duration, String> {
     let seconds = match raw {
@@ -1280,6 +1389,97 @@ mod plutus_timeout_tests {
     #[test]
     fn excessive_timeout_is_rejected() {
         assert!(validated_plutus_acquire_timeout(Some("301")).is_err());
+    }
+}
+
+#[cfg(test)]
+/// Unit and lifecycle tests for the production Loom timeout sweeper.
+mod loom_timeout_sweeper_tests {
+    use super::*;
+    use henosis_loom::{NewWorkflow, StepDef, StepStatus, StepType};
+    use syntheos_contracts::{PrincipalId, TenantId};
+
+    /// An absent override uses the bounded production default.
+    #[test]
+    fn absent_interval_uses_default() {
+        assert_eq!(
+            validated_loom_timeout_sweep_interval(None).expect("default must be valid"),
+            Duration::from_secs(DEFAULT_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS)
+        );
+    }
+
+    /// The supported interval boundaries are accepted.
+    #[test]
+    fn interval_boundaries_are_accepted() {
+        assert_eq!(
+            validated_loom_timeout_sweep_interval(Some("1")).expect("minimum must be valid"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            validated_loom_timeout_sweep_interval(Some("300")).expect("maximum must be valid"),
+            Duration::from_secs(MAX_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS)
+        );
+    }
+
+    /// Zero, malformed, and excessive intervals fail closed at startup.
+    #[test]
+    fn invalid_intervals_are_rejected() {
+        assert!(validated_loom_timeout_sweep_interval(Some("0")).is_err());
+        assert!(validated_loom_timeout_sweep_interval(Some("soon")).is_err());
+        assert!(validated_loom_timeout_sweep_interval(Some("301")).is_err());
+    }
+
+    /// The production loop fails an overdue step and exits promptly when shutdown is requested.
+    #[tokio::test]
+    async fn sweeper_enforces_deadlines_and_obeys_shutdown() {
+        let bus = Arc::new(AxonBus::new());
+        let loom = Arc::new(LoomStore::open(":memory:", bus).expect("open Loom"));
+        let principal = PrincipalId::new();
+        let workflow = loom
+            .create_workflow(NewWorkflow {
+                tenant: TenantId::new(),
+                principal_id: principal,
+                name: "timeout-sweeper-test".to_string(),
+                description: None,
+                steps: vec![StepDef {
+                    name: "overdue".to_string(),
+                    step_type: StepType::Action,
+                    config: None,
+                    depends_on: None,
+                    max_retries: Some(0),
+                    timeout_ms: Some(0),
+                }],
+            })
+            .await
+            .expect("create workflow");
+        let run = loom
+            .create_run(principal, workflow.id, None)
+            .await
+            .expect("create run");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let sweeper = tokio::spawn(run_loom_timeout_sweeper(
+            loom.clone(),
+            Duration::from_millis(1),
+            shutdown_rx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let steps = loom.get_steps(principal, run.id).await.expect("read steps");
+                if steps.iter().any(|step| step.status == StepStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sweeper must enforce the deadline");
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), sweeper)
+            .await
+            .expect("sweeper must stop promptly")
+            .expect("sweeper task must not panic");
     }
 }
 
