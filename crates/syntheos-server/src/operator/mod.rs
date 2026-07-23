@@ -142,10 +142,10 @@ pub struct OperatorState {
 /// Build the operator API router: all six operator routes bound to `state`.
 ///
 /// Routes:
-/// - `POST /api/auth/login` -- verify credentials and issue a 24-hour JWT.
+/// - `POST /api/auth/login` -- verify credentials and issue access plus refresh credentials.
 /// - `GET  /api/auth/session` -- decode the Bearer token and return its claims.
-/// - `POST /api/auth/refresh` -- re-sign a valid token for another 24 hours.
-/// - `POST /api/auth/logout` -- client-side session termination (stateless; always 200).
+/// - `POST /api/auth/refresh` -- atomically rotate a JSON-provided refresh credential.
+/// - `POST /api/auth/logout` -- revoke a JSON-provided durable refresh credential.
 /// - `GET  /api/dashboard` -- composed kernel-store snapshot (requires `OrgRead`).
 /// - `GET  /ws` -- org-filtered WebSocket event hub over the AxonBus.
 ///

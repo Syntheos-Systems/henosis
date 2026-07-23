@@ -23,11 +23,16 @@
 //! those). No update, delete, or revocation yet.
 
 pub mod accounts;
+/// Persistent machine-token and operator-refresh authority credential storage.
+pub mod authority;
 pub mod directory;
 pub mod error;
 pub mod sqlite;
 
 pub use accounts::OperatorAccount;
+pub use authority::{
+    MachineToken, MachineTokenIssued, OperatorRefreshSession, RefreshSessionIssued,
+};
 pub use directory::{InMemoryDirectory, PrincipalDirectory};
 pub use error::DirectoryError;
 pub use sqlite::SqliteDirectory;

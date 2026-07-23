@@ -223,6 +223,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: tool.to_owned(),

@@ -1,7 +1,7 @@
 //! The `human` gate: human-in-the-loop approval, fail-closed.
 //!
 //! HumanGate is the fourth gate in the canonical dispatcher chain (`pistis ->
-//! plutus -> eidolon -> human -> phylax`). It acts only on an invocation that
+//! plutus -> eidolon -> human -> phylaxd`). It acts only on an invocation that
 //! *declares it requires approval*; everything else passes through (mirroring
 //! how PistisGate only acts on capability-bearing invocations).
 //!
@@ -214,6 +214,7 @@ mod tests {
                 room: Some("!room".to_owned()),
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "synapse".to_owned(),
@@ -320,7 +321,7 @@ mod tests {
                 Arc::new(FixedApprover(decision)),
                 bus.clone(),
             )),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         Dispatcher::new(gates, Box::new(EchoExecutor), bus).expect("canonical chain")
     }

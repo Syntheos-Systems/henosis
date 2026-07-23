@@ -60,8 +60,8 @@ pub fn map_invocation(inv: &ToolInvocation) -> ActionClass {
             quota_dimension: None,
         },
 
-        // Secret resolution via Phylax.
-        ("phylax", _) | (_, "secret_read") | (_, "secret_resolve") => ActionClass {
+        // Secret operations delegated to the phylaxd credential broker.
+        ("phylaxd", _) | (_, "secret_read") | (_, "secret_resolve") => ActionClass {
             permission: Permission::SecretRead,
             quota_dimension: Some(QuotaDimension::ToolCalls),
         },
@@ -89,6 +89,7 @@ pub fn map_invocation(inv: &ToolInvocation) -> ActionClass {
     }
 }
 
+/// Tests the invocation-to-action classification map.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +119,7 @@ mod tests {
         assert_eq!(task.permission, Permission::TaskSubmit);
         assert_eq!(task.quota_dimension, Some(QuotaDimension::Tasks));
 
-        let secret = map_invocation(&inv("phylax", "resolve"));
+        let secret = map_invocation(&inv("phylaxd", "sign"));
         assert_eq!(secret.permission, Permission::SecretRead);
         assert_eq!(secret.quota_dimension, Some(QuotaDimension::ToolCalls));
     }

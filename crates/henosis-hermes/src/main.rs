@@ -12,10 +12,12 @@ use axum::{routing::get, routing::post, Json, Router};
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use henosis_hermes::{config::Config, mcp_bridge, routes, webhooks, AppState};
 
@@ -73,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build the standalone HTTP router with a narrow public surface and one
 /// fail-closed authorization layer around every sensitive route.
-fn build_router(state: AppState, api_token: String, mcp_enabled: bool) -> Router {
+fn build_router(state: AppState, api_token: Zeroizing<String>, mcp_enabled: bool) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -102,8 +104,10 @@ fn build_router(state: AppState, api_token: String, mcp_enabled: bool) -> Router
         info!("MCP bridge enabled at POST /mcp");
         protected = protected.route("/mcp", post(mcp_bridge::jsonrpc_handler));
     }
-    let protected =
-        protected.route_layer(middleware::from_fn_with_state(api_token, require_api_token));
+    let protected = protected.route_layer(middleware::from_fn_with_state(
+        Arc::new(api_token),
+        require_api_token,
+    ));
 
     public.merge(protected).with_state(state)
 }
@@ -111,11 +115,11 @@ fn build_router(state: AppState, api_token: String, mcp_enabled: bool) -> Router
 /// Reject requests whose Authorization header does not carry the configured
 /// standalone Hermes service token.
 async fn require_api_token(
-    State(expected): State<String>,
+    State(expected): State<Arc<Zeroizing<String>>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if authorize_api_token(request.headers(), &expected) {
+    if authorize_api_token(request.headers(), expected.as_str()) {
         return next.run(request).await;
     }
 
@@ -190,7 +194,6 @@ async fn shutdown_signal() {
 /// Tests for the standalone HTTP authorization boundary.
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use henosis_hermes::audit::AuditTrail;
     use henosis_hermes::axon::AxonPublisher;
@@ -253,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn router_protects_sensitive_routes() {
         let token = "hermes-api-token-that-is-at-least-32-bytes";
-        let app = build_router(test_state(), token.to_string(), true);
+        let app = build_router(test_state(), Zeroizing::new(token.to_string()), true);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

@@ -37,7 +37,7 @@ pub use event::{AxonEnvelope, TypedEvent};
 pub mod action;
 pub mod task;
 
-pub use action::{RequestContext, ToolInvocation};
+pub use action::{AuthorityContext, RequestContext, ToolInvocation};
 pub use task::TaskRef;
 
 pub mod credential;

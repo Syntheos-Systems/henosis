@@ -1,0 +1,42 @@
+package henosis:component@0.1.0;
+
+/// Host-mediated network authority with no ambient socket access.
+interface http {
+  /// Host-controlled HTTPS request metadata.
+  record request {
+    scheme: string,
+    host: string,
+    path-and-query: string,
+    body: list<u8>,
+  }
+
+  /// Sanitized HTTPS response metadata.
+  record response {
+    status: u16,
+    body: list<u8>,
+  }
+
+  send: func(request: request) -> response;
+}
+
+/// Capability broker operations that never return a plaintext or derived secret.
+interface broker {
+  /// Sanitized result of an allowlisted broker execution.
+  record exec-result {
+    status: s32,
+    stdout: list<u8>,
+    stderr: list<u8>,
+  }
+
+  sign: func(handle: string, payload: list<u8>) -> list<u8>;
+  verify: func(handle: string, payload: list<u8>, signature: list<u8>) -> bool;
+  derive: func(handle: string, purpose: string) -> string;
+  exec: func(handle: string, argv: list<string>, input: list<u8>) -> exec-result;
+}
+
+/// The exact no-WASI component ABI accepted by the Henosis extension host.
+world extension {
+  import http;
+  import broker;
+  export invoke: func(payload: list<u8>) -> list<u8>;
+}

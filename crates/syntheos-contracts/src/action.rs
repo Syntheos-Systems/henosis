@@ -5,6 +5,18 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{PrincipalId, TenantId};
 use crate::task::TaskRef;
 
+/// Server-derived authority facts that callers cannot choose through the public API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityContext {
+    /// Stable identifier for the authenticated token or operator session.
+    pub token_identity: String,
+    /// Server-validated public dispatch key used to enforce at-most-once execution.
+    pub idempotency_key: String,
+    /// Durable approval presented for this exact request, when one exists.
+    pub approval_id: Option<String>,
+}
+
 /// A proposed action, resolved from skill/adapter registries before authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +47,9 @@ pub struct RequestContext {
     pub task: Option<TaskRef>,
     /// Workflow this request is part of, if any.
     pub workflow: Option<String>,
+    /// Server-derived authenticated authority for the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<AuthorityContext>,
 }
 
 /// Tests for action request wire contracts.
@@ -66,6 +81,7 @@ mod tests {
             room: None,
             task: None,
             workflow: None,
+            authority: None,
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let back: RequestContext = serde_json::from_str(&json).expect("deserialize");

@@ -22,6 +22,7 @@ pub struct DenyGate {
     name: &'static str,
 }
 
+/// Implements construction of the deny-by-default gate.
 impl DenyGate {
     /// Create a deny-everything gate that reports `name`.
     pub fn new(name: &'static str) -> Self {
@@ -30,11 +31,14 @@ impl DenyGate {
 }
 
 #[async_trait]
+/// Applies the unconditional fail-closed denial policy.
 impl Gate for DenyGate {
+    /// Returns the authority name represented by this deny gate.
     fn name(&self) -> &str {
         self.name
     }
 
+    /// Denies every request because the authority is not wired.
     async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
         Ok(GateDecision::Deny {
             reason: format!(
@@ -46,7 +50,7 @@ impl Gate for DenyGate {
 }
 
 /// The canonical deny-by-default gate chain, in dispatch order:
-/// `pistis -> plutus -> eidolon -> human -> phylax`, every gate a [`DenyGate`].
+/// `pistis -> plutus -> eidolon -> human -> phylaxd`, every gate a [`DenyGate`].
 ///
 /// This is what the live binary wires until real authorities land: structurally canonical (so
 /// [`crate::Dispatcher::new`] accepts it) but denying every action at the first gate.
@@ -65,7 +69,9 @@ pub fn deny_gate_chain() -> Vec<Box<dyn Gate>> {
 pub struct DenyExecutor;
 
 #[async_trait]
+/// Refuses every executor invocation in the live fail-closed configuration.
 impl Executor for DenyExecutor {
+    /// Returns an error for every attempted invocation.
     async fn execute(
         &self,
         _ctx: &RequestContext,

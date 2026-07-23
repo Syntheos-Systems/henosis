@@ -2,12 +2,17 @@
 //! the Phase 0 HTTP surface.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use henosis_approval::ApprovalStore;
+use henosis_audit::{AuditStore, OriginSigner, WitnessClient, WitnessedAudit};
 use henosis_broca::BrocaStore;
 use henosis_chiasm::ChiasmStore;
 use henosis_eidolon::supervisor::{self, Supervisor, SupervisorConfig};
@@ -15,23 +20,26 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{
     CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor,
 };
-use henosis_phylax::PhylaxStore;
 use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource};
 use henosis_plutus::{LocalPolicyBackend, PlutusStore, PolicyBackend, QuotaTier, Role};
-use henosis_rift::{Approver, RegistryApprover};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalKind, TenantId};
 use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
+use syntheos_server::authority::{AuditBoundary, AuditExecutionGuard, AuthorityState};
 use syntheos_server::billing::BillingState;
+use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, InitMode, RunResult};
 use syntheos_server::operator::OperatorState;
-use syntheos_server::{live_gate_chain, spawn_action_reactor, HenosisExecutor, SomaQualitySink};
-use syntheos_server::{router, AppState};
+use syntheos_server::{
+    production_router, public_gate_chain, spawn_action_reactor, AppState, HenosisExecutor,
+    SomaQualitySink,
+};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tracing_subscriber::EnvFilter;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Largest request body the server accepts, in bytes (1 MiB). Phase 0 payloads are small JSON;
 /// anything bigger is rejected before it can exhaust memory.
@@ -126,6 +134,9 @@ const DEFAULT_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 /// Largest accepted Plutus acquisition timeout, preventing an accidental unbounded boot stall.
 const MAX_PLUTUS_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
+/// Largest local authority credential file read into memory.
+const MAX_AUTHORITY_FILE_BYTES: u64 = 4096;
+
 /// Validated identity pair for the explicit loopback-only policy backend.
 #[derive(Debug)]
 struct LocalPolicyConfig {
@@ -135,76 +146,70 @@ struct LocalPolicyConfig {
     principal: syntheos_contracts::PrincipalId,
 }
 
-#[tokio::main]
+/// Parse local commands and load private configuration before creating worker threads.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli_paths = CliPaths::from_environment()?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if !arguments.is_empty() {
+        let command = Command::parse(&arguments)?;
+        let result = if control_command(&command) {
+            syntheos_server::cli::load_local_environment_if_present(&cli_paths)?;
+            let control_api = HttpControlApi::from_environment()?;
+            CliRunner::local(cli_paths.clone())
+                .with_control_api(&control_api)
+                .run(command)?
+        } else {
+            CliRunner::local(cli_paths.clone()).run(command)?
+        };
+        if !matches!(result, RunResult::Serve) {
+            println!("{}", result.render()?);
+            return Ok(());
+        }
+    }
+    if auto_init_requested(optional_env("HENOSIS_AUTO_INIT")?.as_deref())? {
+        CliRunner::local(cli_paths.clone()).run(Command::Init(InitMode::Quick))?;
+    }
+    syntheos_server::cli::load_local_environment_if_present(&cli_paths)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_server())
+}
+
+/// Identify commands that need the authenticated live control-plane client.
+fn control_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Status
+            | Command::Update
+            | Command::Uninstall
+            | Command::Token(_)
+            | Command::Approvals(_)
+            | Command::AuditVerify
+    )
+}
+
+/// Validate the explicit container-oriented quick-initialization switch.
+fn auto_init_requested(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("quick") => Ok(true),
+        Some(_) => Err("HENOSIS_AUTO_INIT must be exactly quick when enabled".to_string()),
+    }
+}
+
 /// Initialize every kernel authority and serve the unified Syntheos API.
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    // Resolve the bind before selecting a policy backend. Local policy has a stricter boundary
-    // than the general development override and may never listen beyond loopback.
+    // Resolve the explicit policy authority before selecting security boundaries. Listen topology
+    // never decides whether production witness and broker authentication requirements apply.
     let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
-    let insecure_remote = std::env::var("SYNTHEOS_ALLOW_INSECURE_REMOTE").ok();
-    let addr = validated_bind_addr(&raw_addr, insecure_remote.as_deref())?;
-
-    // Wire the foundation: bus and directory first, stores next, then the dispatcher (its
-    // eidolon gate reads drift from the Thymus store, so Thymus must exist first).
-    // The directory is the persistent SqliteDirectory (G2): with persistent Chiasm/Soma stores,
-    // an in-memory directory would orphan every projection row on restart.
-    let bus = Arc::new(AxonBus::new());
-    let identity_db = db_path("SYNTHEOS_IDENTITY_DB", "data/identity.sqlite")?;
-    // Keep a concrete Arc<SqliteDirectory> so the operator bootstrap and OperatorState
-    // can call the accounts API (create_account, get_account, verify_login) which are
-    // defined on SqliteDirectory directly, not on the PrincipalDirectory trait.
-    let directory_store = Arc::new(SqliteDirectory::open(&identity_db)?);
-    let directory: Arc<dyn PrincipalDirectory> = directory_store.clone();
-    tracing::info!(path = %identity_db, "principal directory open");
-
-    // Phase 1 kernel services: persistent SQLite at configurable paths (migrations apply on
-    // open).
-    let chiasm_db = db_path("SYNTHEOS_CHIASM_DB", "data/chiasm.sqlite")?;
-    let chiasm = Arc::new(ChiasmStore::open(&chiasm_db, bus.clone())?);
-    tracing::info!(path = %chiasm_db, "chiasm task store open");
-    let soma_db = db_path("SYNTHEOS_SOMA_DB", "data/soma.sqlite")?;
-    let soma = Arc::new(SomaStore::open(&soma_db, bus.clone(), directory.clone())?);
-    tracing::info!(path = %soma_db, "soma presence store open");
-    // No LLM narrator is attached in Phase 1 (template-or-nothing); a Synapse/Foundry-backed
-    // Narrator plugs in via BrocaStore::with_narrator when Phase 4 lands.
-    let broca_db = db_path("SYNTHEOS_BROCA_DB", "data/broca.sqlite")?;
-    let broca = Arc::new(BrocaStore::open(&broca_db, bus.clone())?);
-    tracing::info!(path = %broca_db, "broca narration log open");
-    // Build the in-process Hephaestus executor from env (Config::from_env). If provider
-    // credentials are absent the AppState still constructs and attaches; individual task
-    // executions will fail with a meaningful auth error rather than silently succeeding.
-    let heph_state = henosis_hephaestus::build_state(henosis_hephaestus::Config::from_env());
-    let heph_dispatch = HephaestusRuntimeDispatch { state: heph_state };
-
-    // CompositeStepExecutor: Transform handles pure-JSON steps inline; Hephaestus dispatches
-    // agent tasks to the in-process executor (story 5.5). First-match wins; unclaimed types
-    // (action, decision, wait, ...) stay Running for external completion via complete_step.
-    let loom_db = db_path("SYNTHEOS_LOOM_DB", "data/loom.sqlite")?;
-    let loom = Arc::new(
-        LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(
-            CompositeStepExecutor::new(vec![
-                Box::new(TransformExecutor),
-                Box::new(HephaestusStepExecutor::new(heph_dispatch)),
-            ]),
-        )),
-    );
-    tracing::info!(path = %loom_db, "loom workflow engine open (composite executor: transform + hephaestus)");
-    // Evaluations and drift propagate into the agents' Soma presence via the sink adapter.
-    let thymus_db = db_path("SYNTHEOS_THYMUS_DB", "data/thymus.sqlite")?;
-    let thymus = Arc::new(
-        ThymusStore::open(&thymus_db, bus.clone())?
-            .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
-    );
-    tracing::info!(path = %thymus_db, "thymus quality store open");
-
-    // Select exactly one real Plutus policy backend. Production uses PostgreSQL. An explicit
-    // local install uses a single-operator backend with real RBAC, quota, and rate-limit checks.
+    let addr = validated_bind_addr(&raw_addr)?;
     let plutus_url = optional_env("SYNTHEOS_PLUTUS_DB")?;
     let local_config = validated_local_policy_config(
         optional_env("SYNTHEOS_LOCAL_POLICY")?.as_deref(),
@@ -213,8 +218,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         optional_env("SYNTHEOS_PLUTUS_OPERATOR_TENANT")?.as_deref(),
         optional_env("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL")?.as_deref(),
     )?;
+    let local_mode = local_config.is_some();
+    validate_phylaxd_config(local_mode)?;
+
+    // Open exactly one real Plutus policy backend before any dependent local state. Production
+    // uses PostgreSQL. An explicit local install uses a single-operator backend with real RBAC,
+    // quota, and rate-limit checks.
     let (plutus, plutus_store): (Arc<dyn PolicyBackend>, Option<Arc<PlutusStore>>) =
-        if let Some(config) = local_config {
+        if let Some(config) = local_config.as_ref() {
             tracing::info!(
                 tenant = %config.tenant,
                 principal = %config.principal,
@@ -236,12 +247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = Arc::new(
                 PlutusStore::open_with_acquire_timeout(&plutus_url, plutus_acquire_timeout)
                     .await
-                    .map_err(|e| format!("plutus store open failed: {e}"))?,
+                    .map_err(|error| format!("plutus store open failed: {error}"))?,
             );
-            store
-                .bootstrap_operator_org_if_absent()
-                .await
-                .map_err(|e| format!("plutus operator bootstrap: {e}"))?;
             tracing::info!(
                 url = %redact_postgres_password(&plutus_url),
                 "PostgreSQL Plutus policy authority open"
@@ -249,10 +256,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (store.clone(), Some(store))
         };
 
-    // The dispatcher gate chain: all five slots run real authorities. Phylax is required rather
-    // than replaced by a deny-shaped placeholder when its key is missing.
-    let phylax = phylax_from_env(bus.clone())?;
-    tracing::info!("phylax credential authority enabled (real gate and executor path)");
+    // Wire the remaining foundation: bus and directory first, stores next, then the dispatcher (its
+    // eidolon gate reads drift from the Thymus store, so Thymus must exist first).
+    // The directory is the persistent SqliteDirectory (G2): with persistent Chiasm/Soma stores,
+    // an in-memory directory would orphan every projection row on restart.
+    let bus = Arc::new(AxonBus::new());
+    let identity_db = db_path("SYNTHEOS_IDENTITY_DB", "data/identity.sqlite")?;
+    // Keep a concrete Arc<SqliteDirectory> so the operator bootstrap and OperatorState
+    // can call the accounts API (create_account, get_account, verify_login) which are
+    // defined on SqliteDirectory directly, not on the PrincipalDirectory trait.
+    let directory_store = Arc::new(SqliteDirectory::open(&identity_db)?);
+    let directory: Arc<dyn PrincipalDirectory> = directory_store.clone();
+    tracing::info!(path = %identity_db, "principal directory open");
+    let approval_db = db_path("HENOSIS_APPROVAL_DB", "data/approval.sqlite")?;
+    let approvals = Arc::new(ApprovalStore::open(&approval_db)?);
+    tracing::info!(path = %approval_db, "durable approval store open");
+    let audit = audit_boundary_from_env(local_mode)?;
+    tracing::info!(
+        witnessed = audit.is_witnessed(),
+        "durable audit boundary open"
+    );
+
+    // Kernel services open persistent SQLite stores at configurable paths and apply migrations.
+    let chiasm_db = db_path("SYNTHEOS_CHIASM_DB", "data/chiasm.sqlite")?;
+    let chiasm = Arc::new(ChiasmStore::open(&chiasm_db, bus.clone())?);
+    tracing::info!(path = %chiasm_db, "chiasm task store open");
+    let soma_db = db_path("SYNTHEOS_SOMA_DB", "data/soma.sqlite")?;
+    let soma = Arc::new(SomaStore::open(&soma_db, bus.clone(), directory.clone())?);
+    tracing::info!(path = %soma_db, "soma presence store open");
+    // Without an attached narrator, Broca uses its deterministic template path.
+    let broca_db = db_path("SYNTHEOS_BROCA_DB", "data/broca.sqlite")?;
+    let broca = Arc::new(BrocaStore::open(&broca_db, bus.clone())?);
+    tracing::info!(path = %broca_db, "broca narration log open");
+    // Build the in-process Hephaestus executor from env (Config::from_env). If provider
+    // credentials are absent the AppState still constructs and attaches; individual task
+    // executions will fail with a meaningful auth error rather than silently succeeding.
+    let heph_state = henosis_hephaestus::build_state(henosis_hephaestus::Config::from_env());
+    let heph_dispatch = HephaestusRuntimeDispatch { state: heph_state };
+
+    // CompositeStepExecutor handles pure-JSON transforms inline and dispatches agent tasks to
+    // Hephaestus. First-match wins; unclaimed types
+    // (action, decision, wait, ...) stay Running for external completion via complete_step.
+    let loom_db = db_path("SYNTHEOS_LOOM_DB", "data/loom.sqlite")?;
+    let loom = Arc::new(
+        LoomStore::open(&loom_db, bus.clone())?.with_executor(Box::new(
+            CompositeStepExecutor::new(vec![
+                Box::new(TransformExecutor),
+                Box::new(HephaestusStepExecutor::new(heph_dispatch)),
+            ]),
+        )),
+    );
+    tracing::info!(path = %loom_db, "loom workflow engine open (composite executor: transform + hephaestus)");
+    // Evaluations and drift propagate into the agents' Soma presence via the sink adapter.
+    let thymus_db = db_path("SYNTHEOS_THYMUS_DB", "data/thymus.sqlite")?;
+    let thymus = Arc::new(
+        ThymusStore::open(&thymus_db, bus.clone())?
+            .with_quality_sink(Box::new(SomaQualitySink(soma.clone()))),
+    );
+    tracing::info!(path = %thymus_db, "thymus quality store open");
+
+    if let Some(config) = local_config.as_ref() {
+        bootstrap_local_machine_token(&directory_store, config)?;
+    }
 
     // Subscribe before the dispatcher is made reachable so no action can race past the two
     // downstream projections required by the kernel definition of done.
@@ -264,34 +329,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the rest of the chain to decide.
     let pistis_source: Arc<dyn RoomStateSource> = Arc::new(InMemoryRoomStateSource::new());
 
-    // The human-in-the-loop authority is a REAL gate in the human slot (Story 4.6).
-    // Approval-required invocations block on this approver until a human decides
-    // (via Rift, which calls RegistryApprover::resolve out-of-band) or the deadline
-    // elapses and the gate denies (fail-closed). The deadline is configurable.
-    let approval_timeout_secs = std::env::var("SYNTHEOS_HUMAN_APPROVAL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300);
-    let human_approver: Arc<dyn Approver> = Arc::new(RegistryApprover::new(Duration::from_secs(
-        approval_timeout_secs,
-    )));
-
     let policy = EidolonPolicy::default();
+    let execution_guard = Arc::new(AuditExecutionGuard::new(approvals.clone(), audit.clone()));
     let dispatcher = Arc::new(
         Dispatcher::new(
-            live_gate_chain(
+            public_gate_chain(
                 &policy,
                 thymus.clone(),
                 pistis_source,
-                phylax.clone(),
-                bus.clone(),
-                human_approver,
+                approvals.clone(),
                 plutus.clone(),
             )?,
-            Box::new(HenosisExecutor::from_env(phylax)),
+            Box::new(HenosisExecutor::from_env()),
             bus.clone(),
         )?
-        .with_output_filter(Box::new(EidolonOutputFilter::new(&policy)?)),
+        .with_output_filter(Box::new(EidolonOutputFilter::new(&policy)?))
+        .with_execution_guard(execution_guard),
     );
 
     // The eidolon supervisor task (Stories 2.5/2.6): watches session JSONL and publishes
@@ -334,7 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut state = AppState::new(
-        dispatcher,
+        dispatcher.clone(),
         directory,
         bus.clone(),
         chiasm.clone(),
@@ -346,9 +399,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cognition,
     );
 
-    // Mount the operator surface when SYNTHEOS_OPERATOR_JWT_SECRET is configured.
-    // A set-but-invalid secret is a hard boot error so misconfiguration is never silent.
-    if let Some(op_state) = operator_state_from_env(
+    // The authenticated public API and operator surface share one verified signing key. Public
+    // runtime startup never silently drops either authentication boundary.
+    let op_state = operator_state_from_env(
         directory_store.clone(),
         plutus.clone(),
         soma.clone(),
@@ -359,15 +412,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bus.clone(),
     )
     .await?
-    {
-        // Bootstrap the first operator account when the bootstrap env vars are set.
-        let store = plutus_store.as_deref().ok_or(
-            "operator account bootstrap requires the PostgreSQL policy backend; unset operator bootstrap variables in local policy mode",
-        )?;
-        bootstrap_operator_if_configured(&directory_store, store).await?;
-        state = state.with_operator(op_state);
-        tracing::info!("operator surface enabled: /api/auth/*, /api/dashboard, /ws");
+    .ok_or("SYNTHEOS_OPERATOR_JWT_SECRET is required")?;
+    if let Some(store) = plutus_store.as_deref() {
+        if operator_bootstrap_requested()? {
+            bootstrap_operator_if_configured(&directory_store, store).await?;
+        }
+        if !directory_store.has_operator_accounts()? {
+            return Err(
+                "fresh production startup requires SYNTHEOS_OPERATOR_BOOTSTRAP_EMAIL and SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD"
+                    .into(),
+            );
+        }
     }
+    let authority = AuthorityState {
+        dispatcher,
+        accounts: directory_store.clone(),
+        policy: plutus.clone(),
+        jwt_secret: op_state.jwt_secret.clone(),
+        approvals,
+        audit,
+    };
+    state = state.with_operator(op_state).with_authority(authority);
+    tracing::info!(
+        "authenticated operator and authority surfaces enabled: /api/auth/*, /api/v1/*, /ws"
+    );
 
     // Mount the Stripe billing webhook when SYNTHEOS_STRIPE_WEBHOOK_SECRET is configured.
     // A set-but-empty secret is a hard boot error so misconfiguration is never silent.
@@ -378,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
-    let app = router(state)
+    let app = production_router(state)
         .layer(GlobalConcurrencyLimitLayer::new(MAX_IN_FLIGHT))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -387,7 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "syntheos-server listening (five real gates, in-process Hermes/Phylax executor, action projections live)");
+    tracing::info!(%addr, "henosis listening with authenticated authority, phylaxd broker, and durable audit");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -395,17 +463,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse the configured bind address and reject accidental remote exposure of the
-/// caller-asserted kernel APIs.
-fn validated_bind_addr(raw: &str, insecure_remote: Option<&str>) -> Result<SocketAddr, String> {
+/// Parse the configured IP socket address without accepting ambiguous hostnames.
+fn validated_bind_addr(raw: &str) -> Result<SocketAddr, String> {
     let addr = raw.parse::<SocketAddr>().map_err(|_| {
         "SYNTHEOS_ADDR must be an IP socket address such as 127.0.0.1:8088".to_string()
     })?;
-    if !addr.ip().is_loopback() && insecure_remote != Some("1") {
-        return Err(format!(
-            "refusing non-loopback SYNTHEOS_ADDR {addr}: kernel APIs use caller-asserted identity; set SYNTHEOS_ALLOW_INSECURE_REMOTE=1 only behind an authenticated private boundary"
-        ));
-    }
     Ok(addr)
 }
 
@@ -450,27 +512,310 @@ fn validated_local_policy_config(
     Ok(Some(LocalPolicyConfig { tenant, principal }))
 }
 
-/// Open the required Phylax credential store from its configured master key.
-///
-/// `SYNTHEOS_PHYLAX_KEY` must hold a 64-hex (32-byte) master key. The DB path defaults to
-/// `data/phylax.sqlite` (override with `SYNTHEOS_PHYLAX_DB`). Missing or malformed authority
-/// configuration is a boot error because a five-gate production dispatcher may not substitute a
-/// stub for Phylax.
-fn phylax_from_env(bus: Arc<AxonBus>) -> Result<Arc<PhylaxStore>, Box<dyn std::error::Error>> {
-    let key_hex = std::env::var("SYNTHEOS_PHYLAX_KEY")
-        .map_err(|_| "SYNTHEOS_PHYLAX_KEY is required (64 hex characters)")?;
-    if key_hex.is_empty() {
-        return Err("SYNTHEOS_PHYLAX_KEY is required (64 hex characters)".into());
+/// Validate the outbound credential-broker URL and mode-specific authentication boundary.
+fn validate_phylaxd_config(local_mode: bool) -> Result<(), String> {
+    let config = henosis_hermes::config::Config::from_env();
+    let url = reqwest::Url::parse(&config.phylaxd_url)
+        .map_err(|_| "PHYLAXD_URL must be an absolute HTTP or HTTPS URL".to_string())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("PHYLAXD_URL must not contain credentials, a query, or a fragment".to_string());
     }
-    let key_bytes =
-        hex::decode(key_hex.trim()).map_err(|e| format!("SYNTHEOS_PHYLAX_KEY must be hex: {e}"))?;
-    let key: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| "SYNTHEOS_PHYLAX_KEY must decode to exactly 32 bytes (64 hex chars)")?;
-    let db = db_path("SYNTHEOS_PHYLAX_DB", "data/phylax.sqlite")?;
-    let store = PhylaxStore::open(&db, bus, key)?;
-    tracing::info!(path = %db, "phylax credential store open");
-    Ok(Arc::new(store))
+    let loopback_host = is_loopback_url_host(url.host_str().unwrap_or_default());
+    let secure_transport = url.scheme() == "https";
+    if !secure_transport && !(url.scheme() == "http" && loopback_host) {
+        return Err("PHYLAXD_URL must use HTTPS unless it targets loopback".to_string());
+    }
+    match config.phylaxd_token.as_deref() {
+        Some(token)
+            if token.len() >= 32
+                && token.trim() == token
+                && !token.chars().any(char::is_whitespace) => {}
+        Some(_) => {
+            return Err(
+                "HERMES_PHYLAXD_TOKEN must contain at least 32 non-whitespace bytes".to_string(),
+            );
+        }
+        None if !local_mode => {
+            return Err("production deployments require HERMES_PHYLAXD_TOKEN".to_string());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Determine whether a serialized URL host identifies the local machine.
+fn is_loopback_url_host(host: &str) -> bool {
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address.eq_ignore_ascii_case("localhost")
+        || address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Open local audit storage and require an independent witness outside explicit local mode.
+fn audit_boundary_from_env(local_mode: bool) -> Result<AuditBoundary, Box<dyn std::error::Error>> {
+    let audit_path = db_path("HENOSIS_AUDIT_DB", "data/audit.sqlite")?;
+    let store = AuditStore::open(&audit_path)?;
+    let witness_names = [
+        "HENOSIS_WITNESS_URL",
+        "HENOSIS_AUDIT_ORIGIN_KEY_FILE",
+        "HENOSIS_AUDIT_ORIGIN_KEY_ID",
+        "HENOSIS_WITNESS_PUBLIC_KEY_FILE",
+        "HENOSIS_WITNESS_KEY_ID",
+    ];
+    let configured = witness_names
+        .iter()
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+        .count();
+    if configured == 0 && local_mode {
+        return Ok(AuditBoundary::Local(store));
+    }
+    if configured != witness_names.len() {
+        return Err(format!(
+            "witnessed audit requires all of: {}",
+            witness_names.join(", ")
+        )
+        .into());
+    }
+    require_witness_file_security()?;
+
+    let witness_url = required_nonempty_env("HENOSIS_WITNESS_URL")?;
+    let origin_key_path = required_nonempty_env("HENOSIS_AUDIT_ORIGIN_KEY_FILE")?;
+    let origin_key_id = required_nonempty_env("HENOSIS_AUDIT_ORIGIN_KEY_ID")?;
+    let witness_key_path = required_nonempty_env("HENOSIS_WITNESS_PUBLIC_KEY_FILE")?;
+    let witness_key_id = required_nonempty_env("HENOSIS_WITNESS_KEY_ID")?;
+    let origin = OriginSigner::new(
+        origin_key_id,
+        load_signing_key(Path::new(&origin_key_path))?,
+    )?;
+    let witness = WitnessClient::new(
+        &witness_url,
+        witness_key_id,
+        load_verifying_key(Path::new(&witness_key_path))?,
+        Duration::from_secs(5),
+    )?;
+    Ok(AuditBoundary::Witnessed(WitnessedAudit::new(
+        store, origin, witness,
+    )))
+}
+
+/// Read one mandatory non-blank environment value without logging its contents.
+fn required_nonempty_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(format!("{name} is required").into()),
+    }
+}
+
+/// Load a base64-encoded Ed25519 signing key from an owner-private regular file.
+fn load_signing_key(path: &Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
+    let encoded = Zeroizing::new(read_owned_regular_text(
+        path,
+        0o077,
+        "audit origin signing key",
+    )?);
+    let decoded = Zeroizing::new(BASE64.decode(encoded.trim())?);
+    let key_bytes = Zeroizing::new(decoded.as_slice().try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit origin signing key must contain 32 bytes",
+        )
+    })?);
+    let key = SigningKey::from_bytes(&key_bytes);
+    Ok(key)
+}
+
+/// Load a base64-encoded Ed25519 verifying key from an integrity-protected regular file.
+fn load_verifying_key(path: &Path) -> Result<VerifyingKey, Box<dyn std::error::Error>> {
+    let encoded = Zeroizing::new(read_owned_regular_text(path, 0o022, "witness public key")?);
+    let bytes = Zeroizing::new(BASE64.decode(encoded.trim())?);
+    let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "witness public key must contain 32 bytes",
+        )
+    })?;
+    Ok(VerifyingKey::from_bytes(&key)?)
+}
+
+/// Open, validate, and read one bounded authority file through the same descriptor.
+#[cfg(unix)]
+fn read_owned_regular_text(
+    path: &Path,
+    forbidden_mode: u32,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & forbidden_mode != 0
+    {
+        return Err(format!("{label} has unsafe ownership or permissions").into());
+    }
+    if metadata.len() > MAX_AUTHORITY_FILE_BYTES {
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_AUTHORITY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_AUTHORITY_FILE_BYTES {
+        bytes.zeroize();
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    authority_text(bytes, label)
+}
+
+/// Open and read one bounded regular file on platforms without Unix ownership metadata.
+#[cfg(not(unix))]
+fn read_owned_regular_text(
+    path: &Path,
+    _forbidden_mode: u32,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{label} must be a regular file, not a symlink").into());
+    }
+    if metadata.len() > MAX_AUTHORITY_FILE_BYTES {
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(format!("{label} must be a regular file").into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_AUTHORITY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_AUTHORITY_FILE_BYTES {
+        bytes.zeroize();
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    authority_text(bytes, label)
+}
+
+/// Decode bounded authority bytes as UTF-8 and clear the intermediate buffer.
+fn authority_text(mut bytes: Vec<u8>, label: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|_| format!("{label} must contain valid UTF-8"));
+    bytes.zeroize();
+    text.map_err(Into::into)
+}
+
+/// Confirm that witnessed-audit key permissions can be enforced on this platform.
+#[cfg(unix)]
+fn require_witness_file_security() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+/// Refuse witnessed audit where file ownership and mode enforcement are unavailable.
+#[cfg(not(unix))]
+fn require_witness_file_security() -> Result<(), Box<dyn std::error::Error>> {
+    Err("witnessed audit key loading requires Unix file ownership enforcement".into())
+}
+
+/// Ensure a local installation has one usable owner token without printing its credential.
+fn bootstrap_local_machine_token(
+    directory: &SqliteDirectory,
+    config: &LocalPolicyConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token_path = std::env::var("HENOSIS_LOCAL_TOKEN_FILE")
+        .unwrap_or_else(|_| "data/local-operator.token".to_string());
+    let path = Path::new(&token_path);
+    let now = chrono::Utc::now().timestamp();
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let mut token = read_owned_regular_text(path, 0o077, "local operator token")?;
+            let authenticated = directory.authenticate_machine_token(token.trim(), now)?;
+            token.zeroize();
+            let metadata = authenticated.ok_or("local operator token is invalid or revoked")?;
+            if metadata.tenant != config.tenant
+                || metadata.principal != config.principal
+                || !metadata.scopes.iter().any(|scope| scope == "admin")
+                || !metadata.scopes.iter().any(|scope| scope == "dispatch")
+            {
+                return Err("local operator token does not match the configured owner".into());
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+        set_private_directory_mode(parent)?;
+    }
+    let issued = directory.create_machine_token(
+        config.tenant,
+        config.principal,
+        "local-owner",
+        vec![
+            "admin".to_string(),
+            "audit:read".to_string(),
+            "dispatch".to_string(),
+        ],
+        None,
+        now,
+    )?;
+    if let Err(error) = write_private_new_file(path, issued.token.as_bytes()) {
+        let _ = directory.revoke_machine_token(config.tenant, issued.metadata.id, now);
+        return Err(error.into());
+    }
+    tracing::info!(path = %path.display(), "local operator token created");
+    Ok(())
+}
+
+/// Create one new owner-private file without following or replacing an existing path.
+fn write_private_new_file(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+/// Apply owner-only permissions to a local state directory.
+#[cfg(unix)]
+fn set_private_directory_mode(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Keep local state initialization portable on platforms without Unix modes.
+#[cfg(not(unix))]
+fn set_private_directory_mode(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 /// Build the supervisor from the environment, when enabled.
@@ -654,6 +999,31 @@ async fn operator_state_from_env(
     Ok(Some(op_state))
 }
 
+/// Return whether both first-operator bootstrap values are configured.
+fn operator_bootstrap_requested() -> Result<bool, String> {
+    let email = optional_env("SYNTHEOS_OPERATOR_BOOTSTRAP_EMAIL")?;
+    let mut password = optional_env("SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD")?;
+    let result = bootstrap_pair_requested(email.as_deref(), password.as_deref());
+    if let Some(password) = password.as_mut() {
+        password.zeroize();
+    }
+    result
+}
+
+/// Validate that operator bootstrap credentials are either both present or both absent.
+fn bootstrap_pair_requested(email: Option<&str>, password: Option<&str>) -> Result<bool, String> {
+    let email_present = email.is_some_and(|value| !value.trim().is_empty());
+    let password_present = password.is_some_and(|value| !value.is_empty());
+    match (email_present, password_present) {
+        (false, false) => Ok(false),
+        (true, true) => Ok(true),
+        _ => Err(
+            "SYNTHEOS_OPERATOR_BOOTSTRAP_EMAIL and SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD must be set together"
+                .to_string(),
+        ),
+    }
+}
+
 /// Bootstrap the first operator account when the bootstrap environment variables
 /// are present and the account does not yet exist.
 ///
@@ -662,14 +1032,10 @@ async fn operator_state_from_env(
 /// - `SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD` -- the plaintext password to hash.
 ///
 /// When both are set AND no account for that email exists yet:
-/// 1. Enroll a new `Human` principal in the identity directory.
-/// 2. Create a Plutus org (`Enterprise` tier) with the new principal as `Owner`.
-/// 3. Create the operator account in the identity store (argon2id-hashed password).
+/// 1. Reuse an existing account principal or create the account with an Argon2id hash.
+/// 2. Reuse its Plutus tenant or create one with the principal as `Owner`.
 ///
-/// Idempotent: if the account already exists the whole block is skipped.
-/// On a second boot the account row is present; no duplicate enroll or org creation.
-///
-/// This function is exercised by the manual launch checklist (Plan B), not a unit test.
+/// The ordering permits a retry to finish tenant creation after a transient PostgreSQL failure.
 async fn bootstrap_operator_if_configured(
     directory: &SqliteDirectory,
     plutus_store: &PlutusStore,
@@ -678,43 +1044,49 @@ async fn bootstrap_operator_if_configured(
         Ok(e) if !e.is_empty() => e,
         _ => return Ok(()), // bootstrap env var not set; nothing to do
     };
-    let password = match std::env::var("SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return Ok(()), // bootstrap env var not set; nothing to do
-    };
+    let password = Zeroizing::new(
+        match std::env::var("SYNTHEOS_OPERATOR_BOOTSTRAP_PASSWORD") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return Ok(()), // bootstrap env var not set; nothing to do
+        },
+    );
 
-    // Idempotency check: if the account already exists, skip everything.
-    if directory
+    // Reuse an existing account so a prior Postgres failure can finish bootstrap on retry.
+    let principal = if let Some(account) = directory
         .get_account(&email)
         .map_err(|e| format!("bootstrap get_account: {e}"))?
+    {
+        account.principal
+    } else {
+        let principal = directory
+            .enroll(PrincipalKind::Human, Some(format!("operator:{email}")))
+            .await
+            .map_err(|e| format!("bootstrap enroll: {e}"))?;
+        let account_result = directory
+            .create_account(&email, &password, principal.id)
+            .map_err(|e| format!("bootstrap create_account: {e}"));
+        account_result?;
+        principal.id
+    };
+
+    if plutus_store
+        .tenant_for_principal(principal)
+        .await
+        .map_err(|e| format!("bootstrap tenant lookup: {e}"))?
         .is_some()
     {
-        tracing::debug!(email, "operator account already exists; skipping bootstrap");
+        tracing::debug!("operator account and tenant already exist; skipping bootstrap");
         return Ok(());
     }
 
-    // 1. Enroll a new principal for this operator account.
-    let principal = directory
-        .enroll(PrincipalKind::Human, Some(format!("operator:{email}")))
-        .await
-        .map_err(|e| format!("bootstrap enroll: {e}"))?;
-
-    // 2. Create a Plutus org with the new principal as Owner.
-    //    A fresh TenantId is generated; it is logged so the operator knows their org UUID.
     let tenant = TenantId::new();
     plutus_store
-        .create_org(tenant, "operator", principal.id, QuotaTier::Enterprise)
+        .create_org(tenant, "operator", principal, QuotaTier::Enterprise)
         .await
         .map_err(|e| format!("bootstrap create_org: {e}"))?;
 
-    // 3. Create the account in the SQLite accounts store (argon2id hash applied inside).
-    directory
-        .create_account(&email, &password, principal.id)
-        .map_err(|e| format!("bootstrap create_account: {e}"))?;
-
     tracing::info!(
-        email,
-        principal_id = %principal.id,
+        principal_id = %principal,
         tenant_id    = %tenant,
         "operator bootstrap complete: account created (Owner in new Enterprise org)"
     );
@@ -925,41 +1297,134 @@ mod plutus_timeout_tests {
 mod bind_policy_tests {
     use super::*;
 
-    /// IPv4 loopback is accepted without an unsafe override.
+    /// IPv4 loopback is accepted.
     #[test]
     fn ipv4_loopback_is_accepted() {
-        let addr = validated_bind_addr("127.0.0.1:8088", None).expect("loopback must be valid");
+        let addr = validated_bind_addr("127.0.0.1:8088").expect("loopback must be valid");
         assert!(addr.ip().is_loopback());
     }
 
-    /// IPv6 loopback is accepted without an unsafe override.
+    /// IPv6 loopback is accepted.
     #[test]
     fn ipv6_loopback_is_accepted() {
-        let addr = validated_bind_addr("[::1]:8088", None).expect("loopback must be valid");
+        let addr = validated_bind_addr("[::1]:8088").expect("loopback must be valid");
         assert!(addr.ip().is_loopback());
     }
 
-    /// A wildcard bind is rejected because the kernel APIs do not authenticate callers.
+    /// A wildcard bind is accepted because public routes authenticate their callers.
     #[test]
-    fn wildcard_bind_is_rejected_by_default() {
-        let error = validated_bind_addr("0.0.0.0:8088", None).expect_err("remote bind must fail");
-        assert!(error.contains("caller-asserted identity"));
+    fn wildcard_bind_is_accepted() {
+        let addr = validated_bind_addr("0.0.0.0:8088").expect("wildcard bind must be valid");
+        assert!(addr.ip().is_unspecified());
     }
 
-    /// Only the exact documented override enables a deliberate non-loopback bind.
+    /// A concrete non-loopback bind is accepted for authenticated deployments.
     #[test]
-    fn exact_override_allows_deliberate_remote_bind() {
-        let addr = validated_bind_addr("192.0.2.1:8088", Some("1"))
-            .expect("explicit development override must be accepted");
+    fn remote_bind_is_accepted() {
+        let addr = validated_bind_addr("192.0.2.1:8088").expect("remote bind must be accepted");
         assert_eq!(addr.to_string(), "192.0.2.1:8088");
-        assert!(validated_bind_addr("192.0.2.1:8088", Some("true")).is_err());
     }
 
     /// Hostnames and malformed values fail with a stable configuration error.
     #[test]
     fn malformed_address_is_rejected() {
-        let error = validated_bind_addr("localhost:8088", None).expect_err("hostname must fail");
+        let error = validated_bind_addr("localhost:8088").expect_err("hostname must fail");
         assert!(error.contains("must be an IP socket address"));
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for broker endpoint loopback classification.
+mod phylaxd_url_tests {
+    use super::*;
+
+    /// URL host serialization encloses IPv6 literals in brackets, which remain loopback.
+    #[test]
+    fn bracketed_ipv6_loopback_is_accepted() {
+        let url = reqwest::Url::parse("http://[::1]:8089").expect("URL must parse");
+        assert!(is_loopback_url_host(
+            url.host_str().expect("host must exist")
+        ));
+    }
+
+    /// IPv4 loopback and localhost remain accepted.
+    #[test]
+    fn conventional_loopback_hosts_are_accepted() {
+        assert!(is_loopback_url_host("127.0.0.1"));
+        assert!(is_loopback_url_host("localhost"));
+        assert!(is_loopback_url_host("LOCALHOST"));
+    }
+
+    /// Non-loopback and malformed host strings never gain loopback privileges.
+    #[test]
+    fn remote_and_malformed_hosts_are_rejected() {
+        assert!(!is_loopback_url_host("[::]"));
+        assert!(!is_loopback_url_host("192.0.2.1"));
+        assert!(!is_loopback_url_host("[::1"));
+        assert!(!is_loopback_url_host("::1]"));
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for strict first-operator bootstrap configuration.
+mod operator_bootstrap_tests {
+    use super::*;
+
+    /// Both absent values leave browser operator bootstrap disabled.
+    #[test]
+    fn absent_pair_is_disabled() {
+        assert!(!bootstrap_pair_requested(None, None).expect("absent pair must be valid"));
+    }
+
+    /// Both present values enable browser operator bootstrap.
+    #[test]
+    fn complete_pair_is_enabled() {
+        assert!(
+            bootstrap_pair_requested(Some("owner@example.test"), Some("secret"))
+                .expect("complete pair must be valid")
+        );
+    }
+
+    /// A partial pair is rejected instead of silently skipping bootstrap.
+    #[test]
+    fn partial_pair_is_rejected() {
+        assert!(bootstrap_pair_requested(Some("owner@example.test"), None).is_err());
+        assert!(bootstrap_pair_requested(None, Some("secret")).is_err());
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for the explicit no-prompt local auto-initialization switch.
+mod auto_init_tests {
+    use super::*;
+
+    /// Distinguishes local and live commands before the runtime starts.
+    #[test]
+    fn control_commands_are_classified_before_execution() {
+        assert!(control_command(&Command::Status));
+        assert!(control_command(&Command::Token(
+            syntheos_server::cli::TokenCommand::List
+        )));
+        assert!(!control_command(&Command::Init(InitMode::Quick)));
+        assert!(!control_command(&Command::Serve));
+    }
+
+    /// An absent switch leaves filesystem initialization under explicit CLI control.
+    #[test]
+    fn absent_switch_is_disabled() {
+        assert!(!auto_init_requested(None).expect("absent switch must be valid"));
+    }
+
+    /// The exact quick token enables the idempotent local initializer.
+    #[test]
+    fn exact_quick_switch_is_enabled() {
+        assert!(auto_init_requested(Some("quick")).expect("quick switch must be valid"));
+    }
+
+    /// Unknown values fail instead of silently initializing an unintended environment.
+    #[test]
+    fn unknown_switch_is_rejected() {
+        assert!(auto_init_requested(Some("1")).is_err());
     }
 }
 

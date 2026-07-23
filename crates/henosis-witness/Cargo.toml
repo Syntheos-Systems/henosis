@@ -1,0 +1,30 @@
+[package]
+name = "henosis-witness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Separately deployable audit-head witness for Henosis."
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+henosis-audit = { path = "../henosis-audit" }
+libc = "0.2"
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "henosis-witness"
+path = "src/main.rs"

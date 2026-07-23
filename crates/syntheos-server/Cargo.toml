@@ -17,6 +17,8 @@ syntheos-contracts = { path = "../syntheos-contracts" }
 syntheos-axon = { path = "../syntheos-axon" }
 syntheos-dispatch = { path = "../syntheos-dispatch" }
 syntheos-identity = { path = "../syntheos-identity" }
+henosis-approval = { path = "../henosis-approval" }
+henosis-audit = { path = "../henosis-audit" }
 # Phase 1 kernel services, wired into AppState as they are extracted (Story 1.7).
 henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
@@ -49,6 +51,14 @@ thiserror.workspace = true
 hex.workspace = true
 # Phylax signatures, derived bytes, and scrubbed exec output use base64 on the wire.
 base64.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+# Synchronous, redirect-disabled HTTP client for short-lived operator CLI commands.
+reqwest = { workspace = true, features = ["blocking"] }
+libc = "0.2"
 # `now` for the Stripe webhook signature tolerance window (Story 6.4a). Pinned directly,
 # matching henosis-plutus, which owns the verifier this clock is handed to.
 chrono = "0.4"

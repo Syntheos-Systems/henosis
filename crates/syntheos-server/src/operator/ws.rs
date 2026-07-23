@@ -25,24 +25,26 @@
 //!
 //! ## Auth
 //!
-//! The `?token=<jwt>` query parameter is decoded and verified before the WS
-//! upgrade is accepted. A missing or invalid token returns HTTP 401 -- the WS
-//! handshake is never completed for unauthenticated callers.
+//! The handshake must offer `henosis.v1` and `henosis.auth.<jwt>` through
+//! `Sec-WebSocket-Protocol`. Only the fixed public protocol is echoed. A missing
+//! or invalid credential returns HTTP 401, and the session closes at token expiry.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::Message;
-use axum::extract::{Query, State, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::extract::{State, WebSocketUpgrade};
+use axum::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use henosis_plutus::{can, Permission, PolicyBackend};
 use serde_json::json;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{AxonEnvelope, TenantId};
+use syntheos_contracts::{AxonEnvelope, PrincipalId, TenantId};
 use tokio::sync::broadcast::error::RecvError;
+use zeroize::Zeroizing;
 
 use super::auth;
+use super::rbac::resolve_live_role;
 use super::OperatorState;
 
 /// Channels the hub subscribes to at connection time.
@@ -60,12 +62,10 @@ const SUBSCRIBED_CHANNELS: &[&str] = &[
 /// `HEARTBEAT_INTERVAL_SECS` seconds so clients can detect stale connections.
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
-/// Query parameters for the `/ws` endpoint.
-#[derive(Debug, Deserialize)]
-pub struct WsQuery {
-    /// JWT operator session token, validated before the WS upgrade is accepted.
-    pub token: String,
-}
+/// Fixed public WebSocket subprotocol negotiated with authenticated clients.
+const WS_PROTOCOL: &str = "henosis.v1";
+/// Prefix separating the private bearer credential from the public subprotocol.
+const WS_AUTH_PREFIX: &str = "henosis.auth.";
 
 /// Convert an [`AxonEnvelope`] to a WS event JSON frame, enforcing org isolation.
 ///
@@ -105,10 +105,29 @@ pub fn envelope_to_event(env: &AxonEnvelope, org: TenantId) -> Option<serde_json
     }))
 }
 
-/// `GET /ws` -- upgrade to WebSocket, validate `?token=`, then stream events.
+/// Extract one bearer credential from the strict WebSocket subprotocol offer.
+fn websocket_credential(headers: &HeaderMap) -> Result<Zeroizing<String>, StatusCode> {
+    let mut values = headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    let value = values.next().ok_or(StatusCode::UNAUTHORIZED)?;
+    if values.next().is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let protocols = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if protocols.len() != 2 || protocols[0] != WS_PROTOCOL {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let credential = protocols[1]
+        .strip_prefix(WS_AUTH_PREFIX)
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    Ok(Zeroizing::new(credential.to_string()))
+}
+
+/// `GET /ws` -- validate subprotocol authentication, upgrade, then stream events.
 ///
-/// **Auth gate**: the `?token=` query param is decoded with [`auth::decode`]
-/// BEFORE [`WebSocketUpgrade::on_upgrade`] is called. A missing or invalid token
+/// **Auth gate**: the bearer credential is decoded with [`auth::decode`] before
+/// [`WebSocketUpgrade::on_upgrade`] is called. A missing or invalid credential
 /// returns HTTP 401 -- the WS handshake is never completed for unauthenticated
 /// callers (the close-code-1008 equivalent at the HTTP layer).
 ///
@@ -116,27 +135,52 @@ pub fn envelope_to_event(env: &AxonEnvelope, org: TenantId) -> Option<serde_json
 /// `SUBSCRIBED_CHANNELS` on the [`AxonBus`], then runs the event loop.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     State(state): State<OperatorState>,
 ) -> Response {
     // Decode the JWT BEFORE completing the upgrade. Bad token -> HTTP 401;
     // the handshake is never completed for unauthenticated callers.
-    let claims = match auth::decode(&params.token, &state.jwt_secret) {
+    let credential = match websocket_credential(&headers) {
+        Ok(credential) => credential,
+        Err(status) => return status.into_response(),
+    };
+    let claims = match auth::decode(&credential, &state.jwt_secret) {
         Ok(c) => c,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // Parse the org UUID from the JWT claims (auth::decode already verified the
-    // signature and expiry, but the claim value might still be malformed).
+    // Parse the subject identifiers from the signed claims before consulting live policy.
     let org: TenantId = match claims.org.parse() {
         Ok(t) => t,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
+    let principal = match claims.sub.parse() {
+        Ok(principal) => principal,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let role = match resolve_live_role(&*state.plutus, org, principal).await {
+        Ok(role) => role,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if !can(role, Permission::OrgRead) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Some(expires_in) = claims
+        .exp
+        .checked_sub(now)
+        .filter(|remaining| *remaining > 0)
+        .map(|remaining| Duration::from_secs(remaining as u64))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
     let axon = Arc::clone(&state.axon);
-    ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, org, axon).await;
-    })
+    let policy = Arc::clone(&state.plutus);
+    ws.protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            handle_socket(socket, org, principal, axon, policy, expires_in).await;
+        })
 }
 
 /// Internal event discriminant used to consolidate `tokio::select!` results.
@@ -152,6 +196,8 @@ enum SessionEvent {
     Envelope(Option<AxonEnvelope>),
     /// A tick from the periodic heartbeat interval.
     Heartbeat,
+    /// The authenticated access token reached its signed expiry.
+    Expired,
 }
 
 /// Drive the authenticated WebSocket session: bus forwarding + heartbeat + ping/pong.
@@ -162,11 +208,12 @@ enum SessionEvent {
 /// This merge pattern means the select! loop holds only one `mpsc::Receiver`,
 /// avoiding multiple concurrent mutable borrows on the socket.
 ///
-/// **Select! loop** (three arms):
+/// **Select! loop** (four arms):
 /// 1. `socket.recv()` -- client frames. Responds to pings; breaks on close/error.
 /// 2. `rx.recv()` -- merged bus envelopes. Calls [`envelope_to_event`] for org
 ///    filtering; forwards `Some` results as JSON text frames; skips `None`.
 /// 3. `hb.tick()` -- heartbeat. Sends `{"type":"server.heartbeat","payload":{"ts":<u64>}}`.
+/// 4. signed expiry -- closes the connection when its access token expires.
 ///
 /// **Lag handling**: when a broadcast receiver falls behind (ring buffer
 /// overrun), the forwarder logs a warning and continues -- the receiver
@@ -177,18 +224,22 @@ enum SessionEvent {
 async fn handle_socket(
     mut socket: axum::extract::ws::WebSocket,
     org: TenantId,
+    principal: PrincipalId,
     axon: Arc<AxonBus>,
+    policy: Arc<dyn PolicyBackend>,
+    expires_in: Duration,
 ) {
     use tokio::sync::mpsc;
 
     // Merge all channel receivers into one mpsc so the select! loop has a
     // single recv() future -- avoids concurrent &mut borrows on the socket.
     let (tx, mut rx) = mpsc::channel::<AxonEnvelope>(256);
+    let mut forwarders = Vec::with_capacity(SUBSCRIBED_CHANNELS.len());
 
     for &channel in SUBSCRIBED_CHANNELS {
         let mut receiver = axon.subscribe(channel);
         let fwd_tx = tx.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(env) => {
@@ -211,6 +262,7 @@ async fn handle_socket(
                 }
             }
         });
+        forwarders.push(forwarder);
     }
     // Drop the original sender so the mpsc closes when ALL forwarder tasks exit.
     drop(tx);
@@ -220,13 +272,16 @@ async fn handle_socket(
     let mut hb = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hb.tick().await;
+    let expires = tokio::time::sleep(expires_in);
+    tokio::pin!(expires);
 
     loop {
-        // Gather the next event from one of the three sources.
+        // Gather the next event from one of the four sources.
         let event = tokio::select! {
             msg  = socket.recv()  => SessionEvent::Client(msg),
             env  = rx.recv()      => SessionEvent::Envelope(env),
             _    = hb.tick()      => SessionEvent::Heartbeat,
+            _    = &mut expires   => SessionEvent::Expired,
         };
 
         match event {
@@ -256,6 +311,13 @@ async fn handle_socket(
 
             // -- Heartbeat --
             SessionEvent::Heartbeat => {
+                let authorized = resolve_live_role(&*policy, org, principal)
+                    .await
+                    .is_ok_and(|role| can(role, Permission::OrgRead));
+                if !authorized {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -269,7 +331,16 @@ async fn handle_socket(
                     break;
                 }
             }
+
+            // -- Credential expiry --
+            SessionEvent::Expired => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
         }
+    }
+    for forwarder in forwarders {
+        forwarder.abort();
     }
 }
 
@@ -279,6 +350,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use axum::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode};
     use axum::routing::get;
     use axum::Router;
     use henosis_broca::BrocaStore;
@@ -293,7 +365,7 @@ mod tests {
 
     use super::super::auth::{sign, OperatorClaims};
     use super::super::OperatorState;
-    use super::{envelope_to_event, ws_handler};
+    use super::{envelope_to_event, websocket_credential, ws_handler, WS_AUTH_PREFIX, WS_PROTOCOL};
 
     /// Build an in-memory `OperatorState` for WS tests.
     ///
@@ -340,10 +412,55 @@ mod tests {
             &principal.to_string(),
             &org.to_string(),
             "viewer",
+            "ws-test-session",
             9_000_000_000,
             3600,
         );
         sign(&claims, secret).expect("sign test JWT")
+    }
+
+    /// Build a WebSocket request with the fixed protocol and private JWT offer.
+    fn websocket_request(
+        port: u16,
+        credential: &str,
+    ) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut request = format!("ws://127.0.0.1:{port}/ws")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            format!("{WS_PROTOCOL}, {WS_AUTH_PREFIX}{credential}")
+                .parse()
+                .expect("protocol header"),
+        );
+        request
+    }
+
+    /// Authentication parsing rejects missing, duplicate, and malformed protocol offers.
+    #[test]
+    fn websocket_protocol_authentication_is_strict() {
+        let empty = HeaderMap::new();
+        assert_eq!(websocket_credential(&empty), Err(StatusCode::UNAUTHORIZED));
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            "henosis.v1, henosis.auth.token-value"
+                .parse()
+                .expect("header"),
+        );
+        assert_eq!(
+            websocket_credential(&valid).expect("credential").as_str(),
+            "token-value"
+        );
+
+        valid.append(
+            SEC_WEBSOCKET_PROTOCOL,
+            "henosis.v1, henosis.auth.other".parse().expect("header"),
+        );
+        assert_eq!(websocket_credential(&valid), Err(StatusCode::UNAUTHORIZED));
     }
 
     // ----------------------------------------------------------------
@@ -401,8 +518,8 @@ mod tests {
     /// cannot provide.
     ///
     /// **Auth assertions**:
-    /// - A `connect_async` with `?token=garbage` fails (server returns non-101).
-    /// - A `connect_async` with a valid token succeeds (101 Switching Protocols).
+    /// - A `connect_async` with a malformed credential protocol fails (server returns non-101).
+    /// - A `connect_async` with a valid credential protocol succeeds (101 Switching Protocols).
     ///
     /// **Org-filter assertions** (after a valid-token connection):
     /// - An envelope whose `tenant == org` arrives as a JSON text frame.
@@ -430,18 +547,25 @@ mod tests {
         });
 
         // -- Auth rejection: a bad token must be refused before the upgrade. --
-        let bad_url = format!("ws://127.0.0.1:{port}/ws?token=garbage_token");
-        let bad_result = tokio_tungstenite::connect_async(&bad_url).await;
+        let bad_result =
+            tokio_tungstenite::connect_async(websocket_request(port, "garbage_token")).await;
         assert!(
             bad_result.is_err(),
             "connect_async with a garbage token must fail (server returns non-101)"
         );
 
         // -- Valid token: connect succeeds. --
-        let url = format!("ws://127.0.0.1:{port}/ws?token={valid_token}");
-        let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("valid token must connect successfully");
+        let (mut ws_stream, response) =
+            tokio_tungstenite::connect_async(websocket_request(port, &valid_token))
+                .await
+                .expect("valid token must connect successfully");
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some(WS_PROTOCOL)
+        );
 
         // Wait briefly for the server task to subscribe to the bus channels.
         tokio::time::sleep(Duration::from_millis(20)).await;

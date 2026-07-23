@@ -21,6 +21,7 @@ pub struct StubGate {
     name: &'static str,
 }
 
+/// Implements construction of the test-only allow-all gate.
 impl StubGate {
     /// Create a stub gate that reports `name` and always allows.
     pub fn new(name: &'static str) -> Self {
@@ -29,18 +30,21 @@ impl StubGate {
 }
 
 #[async_trait]
+/// Applies the test-only unconditional allow policy.
 impl Gate for StubGate {
+    /// Returns the authority name represented by this stub gate.
     fn name(&self) -> &str {
         self.name
     }
 
+    /// Allows every request in test-only configurations.
     async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
         Ok(GateDecision::Allow)
     }
 }
 
 /// The canonical gate chain, all allow-all stubs, in dispatch order:
-/// `pistis -> plutus -> eidolon -> human -> phylax`. TESTS ONLY -- the live default is
+/// `pistis -> plutus -> eidolon -> human -> phylaxd`. TESTS ONLY -- the live default is
 /// [`crate::deny::deny_gate_chain`].
 pub fn stub_gate_chain() -> Vec<Box<dyn Gate>> {
     CANONICAL_GATE_ORDER
@@ -54,7 +58,9 @@ pub fn stub_gate_chain() -> Vec<Box<dyn Gate>> {
 pub struct EchoExecutor;
 
 #[async_trait]
+/// Echoes invocations for test-only dispatch configurations.
 impl Executor for EchoExecutor {
+    /// Returns a JSON representation of the received invocation.
     async fn execute(
         &self,
         _ctx: &RequestContext,

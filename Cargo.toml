@@ -8,6 +8,10 @@ members = [
     "crates/syntheos-dispatch",
     "crates/syntheos-identity",
     "crates/syntheos-server",
+    "crates/henosis-audit",
+    "crates/henosis-approval",
+    "crates/henosis-witness",
+    "crates/henosis-component-host",
     "crates/henosis-chiasm",
     "crates/henosis-soma",
     "crates/henosis-broca",
@@ -119,6 +123,9 @@ env_logger = "0.11"
 # Terminal UI for synapse-tui (ratatui renderer over a crossterm backend).
 ratatui = "0.29"
 crossterm = "0.28"
+# Component Model runtime for signed third-party tool extensions. This is exact-pinned so the
+# sandbox ABI and security review do not drift underneath a release.
+wasmtime = { version = "=36.0.12", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std"] }
 
 # Postgres-only fork of the sqlx facade. Upstream sqlx declares `sqlx-sqlite` as an optional
 # dependency; cargo locks optional deps and enforces `links = "sqlite3"` uniqueness even with the

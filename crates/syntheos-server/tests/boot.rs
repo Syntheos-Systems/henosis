@@ -5,10 +5,18 @@ use std::time::{Duration, Instant};
 
 /// Construct the production binary command with isolated, write-free local service stores.
 fn isolated_server() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_syntheos-server"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_henosis"));
+    let isolated_home =
+        std::env::temp_dir().join(format!("henosis-boot-test-{}", std::process::id()));
     command
+        .arg("serve")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env("HENOSIS_HOME", isolated_home)
+        .env(
+            "HERMES_PHYLAXD_TOKEN",
+            "boot-test-broker-token-32-bytes-minimum",
+        )
         .env("RUST_LOG", "off")
         .env("SYNTHEOS_ADDR", "127.0.0.1:0")
         .env("SYNTHEOS_IDENTITY_DB", ":memory:")

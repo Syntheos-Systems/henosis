@@ -91,9 +91,9 @@ mod tests {
         phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
-        AppState as HermesState, ToolRegistry,
+        AppState as HermesState,
     };
-    use henosis_phylax::{PhylaxStore, ResolveMode, SecretData};
+    use henosis_phylax::PhylaxStore;
     use henosis_pistis::InMemoryRoomStateSource;
     use henosis_plutus::{LocalPolicyBackend, MockPolicyBackend, PolicyBackend, QuotaTier, Role};
     use henosis_rift::RegistryApprover;
@@ -196,7 +196,7 @@ mod tests {
         reactor.abort();
     }
 
-    /// The five real gates execute a Phylax action and expose it to both downstream subscribers.
+    /// The real gate chain executes a bundled adapter and reaches both downstream subscribers.
     #[tokio::test]
     async fn canonical_dispatch_executes_and_reaches_two_subscribers() {
         let bus = Arc::new(AxonBus::new());
@@ -209,27 +209,6 @@ mod tests {
         );
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
-        phylax
-            .store_secret(
-                &tenant,
-                &principal,
-                "test",
-                "signing",
-                &SecretData::Note {
-                    content: "subscriber-proof-secret".to_string(),
-                },
-            )
-            .expect("secret");
-        phylax
-            .create_policy(
-                &tenant,
-                Some(&principal),
-                Some("test"),
-                Some("signing"),
-                &[ResolveMode::Sign],
-                None,
-            )
-            .expect("policy");
         let task = chiasm
             .create(NewTask {
                 tenant,
@@ -258,23 +237,20 @@ mod tests {
         )
         .expect("five real gates");
         let axon = AxonPublisher::from_env();
-        let executor = HenosisExecutor::new(
-            HermesState {
-                registry: Arc::new(ToolRegistry::new()),
-                phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
-                rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
-                    capacity: 60,
-                    refill_per_sec: 1.0,
-                })),
-                circuits: Arc::new(CircuitRegistry::new()),
-                metrics: Arc::new(MetricsRegistry::new()),
-                audit: Arc::new(AuditTrail::new(axon.clone())),
-                axon,
-                tenant_config: Arc::new(TenantConfigStore::new()),
-                public_url: None,
-            },
-            phylax,
-        );
+        let executor = HenosisExecutor::new(HermesState {
+            registry: Arc::new(build_registry()),
+            phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                capacity: 60,
+                refill_per_sec: 1.0,
+            })),
+            circuits: Arc::new(CircuitRegistry::new()),
+            metrics: Arc::new(MetricsRegistry::new()),
+            audit: Arc::new(AuditTrail::new(axon.clone())),
+            axon,
+            tenant_config: Arc::new(TenantConfigStore::new()),
+            public_url: None,
+        });
         let dispatcher = Dispatcher::new(gates, Box::new(executor), bus).expect("dispatcher");
 
         let outcome = dispatcher
@@ -291,15 +267,12 @@ mod tests {
                         title: Some(task.title.clone()),
                     }),
                     workflow: None,
+                    authority: None,
                 },
                 invocation: ToolInvocation {
-                    tool: "phylax".to_string(),
-                    action: "sign".to_string(),
-                    args: serde_json::json!({
-                        "category": "test",
-                        "name": "signing",
-                        "payload": "prove the chain"
-                    }),
+                    tool: "henosis".to_string(),
+                    action: "probe".to_string(),
+                    args: serde_json::json!({}),
                 },
             })
             .await
@@ -307,8 +280,10 @@ mod tests {
         let DispatchOutcome::Executed { result } = outcome else {
             panic!("canonical request did not execute: {outcome:?}");
         };
-        assert!(result["signature"].as_str().is_some());
-        assert!(!result.to_string().contains("subscriber-proof-secret"));
+        assert_eq!(
+            result,
+            serde_json::json!({"status": "ready", "runtime": "henosis"})
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -383,23 +358,20 @@ mod tests {
         )
         .expect("five real gates");
         let axon = AxonPublisher::from_env();
-        let executor = HenosisExecutor::new(
-            HermesState {
-                registry: Arc::new(build_registry()),
-                phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
-                rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
-                    capacity: 60,
-                    refill_per_sec: 1.0,
-                })),
-                circuits: Arc::new(CircuitRegistry::new()),
-                metrics: Arc::new(MetricsRegistry::new()),
-                audit: Arc::new(AuditTrail::new(axon.clone())),
-                axon,
-                tenant_config: Arc::new(TenantConfigStore::new()),
-                public_url: None,
-            },
-            phylax,
-        );
+        let executor = HenosisExecutor::new(HermesState {
+            registry: Arc::new(build_registry()),
+            phylaxd: Arc::new(PhylaxdClient::new("http://127.0.0.1:1".to_string(), None)),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                capacity: 60,
+                refill_per_sec: 1.0,
+            })),
+            circuits: Arc::new(CircuitRegistry::new()),
+            metrics: Arc::new(MetricsRegistry::new()),
+            audit: Arc::new(AuditTrail::new(axon.clone())),
+            axon,
+            tenant_config: Arc::new(TenantConfigStore::new()),
+            public_url: None,
+        });
         let dispatcher = Dispatcher::new(gates, Box::new(executor), bus).expect("dispatcher");
         let context = RequestContext {
             tenant,
@@ -413,6 +385,7 @@ mod tests {
                 title: Some(task.title.clone()),
             }),
             workflow: None,
+            authority: None,
         };
 
         let allowed = dispatcher

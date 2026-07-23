@@ -1,36 +1,46 @@
-//! Production dispatcher executor for in-process Hermes tools and Phylax operations.
+//! Production dispatcher executor for in-process Hermes tools and phylaxd operations.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine;
+use henosis_hermes::phylaxd_client::{PhylaxdClient, PhylaxdError};
 use henosis_hermes::{invoke_controlled, AppState as HermesState, InvokeRequest};
-use henosis_phylax::{PhylaxStore, SignAlgo};
 use serde_json::Value;
 use syntheos_contracts::{RequestContext, ToolInvocation};
 use syntheos_dispatch::{Executor, ExecutorError};
 
+/// Maximum accepted credential slot or algorithm token length.
+const MAX_TOKEN_LEN: usize = 128;
+/// Maximum accepted base64 payload or signature length.
+const MAX_B64_LEN: usize = 2 * 1024 * 1024;
+/// Maximum number of arguments in a broker-mediated command.
+const MAX_ARGV_ITEMS: usize = 64;
+/// Maximum length of one broker-mediated command argument.
+const MAX_ARG_LEN: usize = 4096;
+
 /// The live executor behind the canonical dispatcher.
 ///
-/// Credential-authority operations stay inside Phylax. Every other invocation resolves to a
-/// Hermes adapter by joining the contract's `tool` and `action` fields with a dot.
+/// Credential operations are delegated to phylaxd over its authenticated API.
+/// Every other invocation resolves to a Hermes adapter by joining the contract's
+/// `tool` and `action` fields with a dot.
 pub struct HenosisExecutor {
     /// Complete in-process Hermes runtime, including policy and observability controls.
     hermes: HermesState,
-    /// Credential authority used for use-without-holding operations.
-    phylax: Arc<PhylaxStore>,
+    /// Credential broker used only for non-plaintext mediated operations.
+    phylaxd: Arc<PhylaxdClient>,
 }
 
 /// Construction and routing helpers for [`HenosisExecutor`].
 impl HenosisExecutor {
-    /// Build the production executor from the environment and the live Phylax store.
-    pub fn from_env(phylax: Arc<PhylaxStore>) -> Self {
-        Self::new(HermesState::from_env(), phylax)
+    /// Build the production executor from process environment configuration.
+    pub fn from_env() -> Self {
+        Self::new(HermesState::from_env())
     }
 
-    /// Build an executor from explicit components for integration tests and alternate runtimes.
-    pub fn new(hermes: HermesState, phylax: Arc<PhylaxStore>) -> Self {
-        Self { hermes, phylax }
+    /// Build an executor from explicit Hermes state for tests and alternate runtimes.
+    pub fn new(hermes: HermesState) -> Self {
+        let phylaxd = hermes.phylaxd.clone();
+        Self { hermes, phylaxd }
     }
 
     /// Invoke a Hermes adapter through the full shared control and observability path.
@@ -65,168 +75,203 @@ impl HenosisExecutor {
         ))
     }
 
-    /// Execute one authorized Phylax use-without-holding operation.
-    async fn execute_phylax(
+    /// Execute one authorized use-without-holding operation through phylaxd.
+    async fn execute_phylaxd(
         &self,
         context: &RequestContext,
         invocation: &ToolInvocation,
     ) -> Result<Value, ExecutorError> {
-        let category = required_string(&invocation.args, "category")?;
-        let name = required_string(&invocation.args, "name")?;
+        let category = required_bounded_string(&invocation.args, "category", MAX_TOKEN_LEN)?;
+        let name = required_bounded_string(&invocation.args, "name", MAX_TOKEN_LEN)?;
+        let tenant_slot = context.tenant.to_string();
+        if name != tenant_slot.as_str() {
+            return Err(ExecutorError::new(
+                "credential slot does not belong to the authenticated tenant",
+            ));
+        }
         match invocation.action.as_str() {
             "sign" => {
-                let payload = required_string(&invocation.args, "payload")?;
-                let algorithm = parse_algorithm(&invocation.args)?;
-                let signature = self
-                    .phylax
-                    .resolve_sign(
-                        &context.tenant,
-                        &context.principal,
-                        category,
-                        name,
-                        payload.as_bytes(),
-                        algorithm,
-                    )
-                    .map_err(phylax_error)?;
+                let payload_b64 =
+                    required_bounded_string(&invocation.args, "payload_b64", MAX_B64_LEN)?;
+                let algorithm = signing_algorithm(&invocation.args)?;
+                let result = self
+                    .phylaxd
+                    .sign(category, name, payload_b64, algorithm)
+                    .await
+                    .map_err(phylaxd_error)?;
                 Ok(serde_json::json!({
-                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
-                    "algorithm": algorithm_token(algorithm),
+                    "signature_b64": result.signature_b64,
+                    "algorithm": algorithm,
                 }))
             }
             "verify" => {
-                let payload = required_string(&invocation.args, "payload")?;
-                let signature = required_string(&invocation.args, "signature")?;
-                let signature = base64::engine::general_purpose::STANDARD
-                    .decode(signature)
-                    .map_err(|error| {
-                        ExecutorError::new(format!("invalid base64 signature: {error}"))
-                    })?;
-                let algorithm = parse_algorithm(&invocation.args)?;
-                let valid = self
-                    .phylax
-                    .resolve_verify(
-                        &context.tenant,
-                        &context.principal,
-                        category,
-                        name,
-                        payload.as_bytes(),
-                        &signature,
-                        algorithm,
-                    )
-                    .map_err(phylax_error)?;
-                Ok(serde_json::json!({"valid": valid}))
+                let payload_b64 =
+                    required_bounded_string(&invocation.args, "payload_b64", MAX_B64_LEN)?;
+                let signature_b64 =
+                    required_bounded_string(&invocation.args, "signature_b64", MAX_B64_LEN)?;
+                let algorithm = signing_algorithm(&invocation.args)?;
+                let result = self
+                    .phylaxd
+                    .verify(category, name, payload_b64, signature_b64, algorithm)
+                    .await
+                    .map_err(phylaxd_error)?;
+                Ok(serde_json::json!({"valid": result.valid}))
             }
             "derive" => {
-                let purpose = required_string(&invocation.args, "purpose")?;
+                let purpose = required_bounded_string(&invocation.args, "purpose", MAX_TOKEN_LEN)?;
                 let length = invocation
                     .args
                     .get("length")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| {
-                        ExecutorError::new("Phylax argument 'length' must be an unsigned integer")
+                        ExecutorError::new("phylaxd argument 'length' must be an unsigned integer")
                     })?;
                 let length = usize::try_from(length)
-                    .map_err(|_| ExecutorError::new("Phylax argument 'length' is too large"))?;
-                let derived = self
-                    .phylax
-                    .resolve_derive(
-                        &context.tenant,
-                        &context.principal,
-                        category,
-                        name,
-                        purpose,
-                        length,
-                    )
-                    .map_err(phylax_error)?;
-                Ok(serde_json::json!({
-                    "derived": base64::engine::general_purpose::STANDARD.encode(derived),
-                }))
+                    .map_err(|_| ExecutorError::new("phylaxd argument 'length' is too large"))?;
+                if !(1..=64).contains(&length) {
+                    return Err(ExecutorError::new(
+                        "phylaxd argument 'length' must be between 1 and 64",
+                    ));
+                }
+                let result = self
+                    .phylaxd
+                    .derive(category, name, purpose, length)
+                    .await
+                    .map_err(phylaxd_error)?;
+                Ok(serde_json::json!({"derived_b64": result.derived_b64}))
             }
             "exec" => {
-                let argv = invocation
-                    .args
-                    .get("argv")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| ExecutorError::new("Phylax argument 'argv' must be an array"))?
-                    .iter()
-                    .map(|value| {
-                        value.as_str().map(str::to_string).ok_or_else(|| {
-                            ExecutorError::new("every Phylax 'argv' item must be a string")
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let env_var = required_string(&invocation.args, "env_var")?;
-                let outcome = self
-                    .phylax
-                    .resolve_exec(
-                        &context.tenant,
-                        &context.principal,
-                        category,
-                        name,
-                        &argv,
-                        env_var,
-                    )
+                let argv = command_arguments(&invocation.args)?;
+                let env_var = required_bounded_string(&invocation.args, "env_var", MAX_TOKEN_LEN)?;
+                if !valid_env_var(env_var) {
+                    return Err(ExecutorError::new(
+                        "phylaxd argument 'env_var' is not a valid environment variable name",
+                    ));
+                }
+                let result = self
+                    .phylaxd
+                    .exec(category, name, &argv, env_var)
                     .await
-                    .map_err(phylax_error)?;
+                    .map_err(phylaxd_error)?;
                 Ok(serde_json::json!({
-                    "timed_out": outcome.timed_out,
-                    "exit_code": outcome.exit_code,
-                    "stdout": base64::engine::general_purpose::STANDARD.encode(outcome.stdout),
-                    "stderr": base64::engine::general_purpose::STANDARD.encode(outcome.stderr),
+                    "timed_out": result.timed_out,
+                    "exit_code": result.exit_code,
+                    "stdout_b64": result.stdout_b64,
+                    "stderr_b64": result.stderr_b64,
                 }))
             }
             action => Err(ExecutorError::new(format!(
-                "unknown Phylax action: {action}"
+                "unknown phylaxd action: {action}"
             ))),
         }
     }
 }
 
 #[async_trait]
-/// Execute authorized contract invocations against the in-process authorities.
+/// Execute authorized contract invocations against the in-process tool gateway.
 impl Executor for HenosisExecutor {
-    /// Route the invocation to Phylax or Hermes after the full gate chain has authorized it.
+    /// Route the invocation to phylaxd or Hermes after every authority has allowed it.
     async fn execute(
         &self,
         context: &RequestContext,
         invocation: &ToolInvocation,
     ) -> Result<Value, ExecutorError> {
-        if invocation.tool == "phylax" {
-            self.execute_phylax(context, invocation).await
+        if invocation.tool == "phylaxd" {
+            self.execute_phylaxd(context, invocation).await
         } else {
             self.execute_hermes(context, invocation).await
         }
     }
 }
 
-/// Read a required string argument from an invocation payload.
-fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, ExecutorError> {
-    args.get(key)
+/// Read a required non-empty bounded string argument from an invocation payload.
+fn required_bounded_string<'a>(
+    args: &'a Value,
+    key: &str,
+    maximum: usize,
+) -> Result<&'a str, ExecutorError> {
+    let value = args
+        .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| ExecutorError::new(format!("Phylax argument '{key}' must be a string")))
+        .ok_or_else(|| ExecutorError::new(format!("phylaxd argument '{key}' must be a string")))?;
+    if value.is_empty() || value.len() > maximum {
+        return Err(ExecutorError::new(format!(
+            "phylaxd argument '{key}' must contain 1 to {maximum} bytes"
+        )));
+    }
+    Ok(value)
 }
 
-/// Parse the optional signing algorithm, defaulting to HMAC-SHA256.
-fn parse_algorithm(args: &Value) -> Result<SignAlgo, ExecutorError> {
-    let token = args
+/// Parse and validate the signing algorithm token.
+fn signing_algorithm(args: &Value) -> Result<&str, ExecutorError> {
+    let algorithm = args
         .get("algorithm")
         .and_then(Value::as_str)
         .unwrap_or("hmac-sha256");
-    SignAlgo::parse(token)
-        .ok_or_else(|| ExecutorError::new(format!("unsupported Phylax algorithm: {token}")))
-}
-
-/// Return the wire token for a Phylax signing algorithm.
-fn algorithm_token(algorithm: SignAlgo) -> &'static str {
     match algorithm {
-        SignAlgo::HmacSha256 => "hmac-sha256",
-        SignAlgo::Ed25519 => "ed25519",
+        "hmac-sha256" | "ed25519" => Ok(algorithm),
+        _ => Err(ExecutorError::new(
+            "phylaxd argument 'algorithm' must be hmac-sha256 or ed25519",
+        )),
     }
 }
 
-/// Convert a Phylax failure into the dispatcher executor boundary.
-fn phylax_error(error: henosis_phylax::PhylaxError) -> ExecutorError {
-    ExecutorError::new(format!("Phylax execution failed: {error}"))
+/// Parse a bounded direct-exec argument vector.
+fn command_arguments(args: &Value) -> Result<Vec<String>, ExecutorError> {
+    let values = args
+        .get("argv")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ExecutorError::new("phylaxd argument 'argv' must be an array"))?;
+    if values.is_empty() || values.len() > MAX_ARGV_ITEMS {
+        return Err(ExecutorError::new(format!(
+            "phylaxd argument 'argv' must contain 1 to {MAX_ARGV_ITEMS} items"
+        )));
+    }
+    let mut argv = Vec::with_capacity(values.len());
+    for value in values {
+        let item = value
+            .as_str()
+            .ok_or_else(|| ExecutorError::new("every phylaxd 'argv' item must be a string"))?;
+        if item.is_empty() || item.len() > MAX_ARG_LEN {
+            return Err(ExecutorError::new(format!(
+                "every phylaxd 'argv' item must contain 1 to {MAX_ARG_LEN} bytes"
+            )));
+        }
+        argv.push(item.to_string());
+    }
+    if !argv[0].starts_with('/') {
+        return Err(ExecutorError::new(
+            "phylaxd argument 'argv[0]' must be an absolute path",
+        ));
+    }
+    Ok(argv)
+}
+
+/// Validate a POSIX-shaped environment variable name.
+fn valid_env_var(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(
+        characters.next(),
+        Some(character) if character.is_ascii_alphabetic() || character == '_'
+    ) && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Convert a broker failure into a non-secret dispatcher error.
+fn phylaxd_error(error: PhylaxdError) -> ExecutorError {
+    let message = match error {
+        PhylaxdError::AuthMissing => "phylaxd authentication is not configured".to_string(),
+        PhylaxdError::TenantNotAuthorized { .. } => {
+            "phylaxd rejected the credential operation".to_string()
+        }
+        PhylaxdError::Unreachable { .. } => "phylaxd is unavailable".to_string(),
+        PhylaxdError::Upstream { status, .. } => {
+            format!("phylaxd rejected the credential operation with status {status}")
+        }
+        PhylaxdError::MalformedResponse => {
+            "phylaxd returned an invalid operation response".to_string()
+        }
+    };
+    ExecutorError::new(message)
 }
 
 #[cfg(test)]
@@ -238,13 +283,10 @@ mod tests {
         axon::AxonPublisher,
         circuit::CircuitRegistry,
         metrics::MetricsRegistry,
-        phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
         InvokeContext, InvokeResponse, Tool, ToolRegistry, ToolSchema,
     };
-    use henosis_phylax::{ResolveMode, SecretData};
-    use syntheos_axon::AxonBus;
 
     /// A deterministic Hermes tool used to prove in-process adapter execution.
     struct EchoTool;
@@ -282,13 +324,8 @@ mod tests {
         }
     }
 
-    /// Construct an executor and identities over an in-memory Phylax store.
-    fn executor() -> (HenosisExecutor, Arc<PhylaxStore>, RequestContext) {
-        let bus = Arc::new(AxonBus::new());
-        let phylax = Arc::new(
-            PhylaxStore::open_in_memory(bus, *henosis_phylax::crypto::generate_key())
-                .expect("phylax"),
-        );
+    /// Construct an executor and request identity over deterministic in-memory state.
+    fn executor() -> (HenosisExecutor, RequestContext) {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
         let axon = AxonPublisher::from_env();
@@ -306,7 +343,7 @@ mod tests {
             tenant_config: Arc::new(TenantConfigStore::new()),
             public_url: None,
         };
-        let executor = HenosisExecutor::new(hermes, phylax.clone());
+        let executor = HenosisExecutor::new(hermes);
         let context = RequestContext {
             tenant: syntheos_contracts::TenantId::new(),
             principal: syntheos_contracts::PrincipalId::new(),
@@ -315,14 +352,15 @@ mod tests {
             room: None,
             task: None,
             workflow: None,
+            authority: None,
         };
-        (executor, phylax, context)
+        (executor, context)
     }
 
     /// A contract invocation resolves to and executes its dotted Hermes adapter ID.
     #[tokio::test]
     async fn dotted_hermes_tool_executes() {
-        let (executor, _phylax, context) = executor();
+        let (executor, context) = executor();
         let result = executor
             .execute(
                 &context,
@@ -340,7 +378,7 @@ mod tests {
     /// Unknown Hermes IDs fail closed at the executor boundary.
     #[tokio::test]
     async fn unknown_hermes_tool_fails_closed() {
-        let (executor, _phylax, context) = executor();
+        let (executor, context) = executor();
         let error = executor
             .execute(
                 &context,
@@ -355,48 +393,51 @@ mod tests {
         assert!(error.to_string().contains("missing.tool"));
     }
 
-    /// An authorized sign operation executes without returning the stored secret.
+    /// Invalid derive bounds fail before a request can reach phylaxd.
     #[tokio::test]
-    async fn phylax_sign_executes_without_secret_material() {
-        let (executor, phylax, context) = executor();
-        phylax
-            .store_secret(
-                &context.tenant,
-                &context.principal,
-                "test",
-                "signing",
-                &SecretData::Note {
-                    content: "never-return-this".to_string(),
-                },
-            )
-            .expect("secret");
-        phylax
-            .create_policy(
-                &context.tenant,
-                Some(&context.principal),
-                Some("test"),
-                Some("signing"),
-                &[ResolveMode::Sign],
-                None,
-            )
-            .expect("policy");
-
-        let result = executor
+    async fn phylaxd_derive_bounds_fail_closed() {
+        let (executor, context) = executor();
+        let error = executor
             .execute(
                 &context,
                 &ToolInvocation {
-                    tool: "phylax".to_string(),
-                    action: "sign".to_string(),
+                    tool: "phylaxd".to_string(),
+                    action: "derive".to_string(),
                     args: serde_json::json!({
                         "category": "test",
-                        "name": "signing",
-                        "payload": "hello"
+                        "name": context.tenant.to_string(),
+                        "purpose": "session",
+                        "length": 65
                     }),
                 },
             )
             .await
-            .expect("sign");
-        assert!(result["signature"].as_str().is_some());
-        assert!(!result.to_string().contains("never-return-this"));
+            .expect_err("oversized derive");
+        assert!(error.to_string().contains("between 1 and 64"));
+    }
+
+    /// The executor rejects another tenant's slot before contacting phylaxd.
+    #[tokio::test]
+    async fn phylaxd_cross_tenant_slot_fails_closed() {
+        let (executor, context) = executor();
+        let error = executor
+            .execute(
+                &context,
+                &ToolInvocation {
+                    tool: "phylaxd".to_string(),
+                    action: "derive".to_string(),
+                    args: serde_json::json!({
+                        "category": "test",
+                        "name": syntheos_contracts::TenantId::new().to_string(),
+                        "purpose": "session",
+                        "length": 32
+                    }),
+                },
+            )
+            .await
+            .expect_err("cross-tenant slot");
+        assert!(error
+            .to_string()
+            .contains("does not belong to the authenticated tenant"));
     }
 }

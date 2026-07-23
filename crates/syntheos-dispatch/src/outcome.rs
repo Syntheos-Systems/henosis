@@ -33,5 +33,7 @@ pub enum DispatchOutcome {
         gate: String,
         /// The prompt to present to the approver.
         prompt: String,
+        /// Durable approval identifier used to resume this exact request.
+        approval_id: Option<String>,
     },
 }

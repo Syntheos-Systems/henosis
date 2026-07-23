@@ -1,0 +1,25 @@
+[package]
+name = "henosis-approval"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Server-owned, request-bound approval storage for Henosis authority decisions."
+
+[dependencies]
+# Canonical tenant and principal identities.
+syntheos-contracts = { path = "../syntheos-contracts" }
+# SQLite durable state with explicit transactions for at-most-once authorization consumption.
+rusqlite = { workspace = true, features = ["bundled"] }
+# Request envelope values and canonical JSON string encoding.
+serde_json.workspace = true
+# SHA-256 canonical request fingerprints.
+sha2.workspace = true
+# Approval record identifiers.
+uuid.workspace = true
+# Public store errors.
+thiserror.workspace = true
+
+[dev-dependencies]
+# Concurrent consume behavior uses native test threads only.

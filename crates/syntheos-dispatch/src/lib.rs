@@ -16,7 +16,7 @@
 //! The gate trait and the canonical chain order already exist; the real authorities do not.
 //! The dispatcher is fail-closed BY CONSTRUCTION: [`Dispatcher::new`] rejects an empty chain and
 //! any chain that is not *exactly* the canonical authority set (`pistis -> plutus -> eidolon ->
-//! human -> phylax`, [`dispatcher::CANONICAL_GATE_ORDER`]) -- a missing, duplicated, or misordered
+//! human -> phylaxd`, [`dispatcher::CANONICAL_GATE_ORDER`]) -- a missing, duplicated, or misordered
 //! authority, or any extra non-canonical gate, is refused. A gate that cannot reach a decision
 //! returns `Err`, which the dispatcher also denies (fail-closed). The fail-closed deny fixtures
 //! remain available for isolated tests. Allow-all placeholders (`stubs::stub_gate_chain`,
@@ -33,6 +33,7 @@ pub mod deny;
 pub mod dispatcher;
 pub mod error;
 pub mod executor;
+pub mod guard;
 pub mod outcome;
 /// Allow-all test placeholders, compiled only for this crate's own tests or under the
 /// non-default `stubs` feature -- never into a default or release build.
@@ -43,4 +44,5 @@ pub use deny::{deny_gate_chain, DenyExecutor, DenyGate};
 pub use dispatcher::{Dispatcher, CANONICAL_GATE_ORDER};
 pub use error::DispatchError;
 pub use executor::{Executor, ExecutorError};
+pub use guard::{ExecutionDecision, ExecutionGuard, ExecutionOutcome};
 pub use outcome::DispatchOutcome;

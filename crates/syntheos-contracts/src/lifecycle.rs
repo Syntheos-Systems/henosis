@@ -111,6 +111,9 @@ pub struct ApprovalRequired {
     pub gate: String,
     /// The prompt to show the approver.
     pub prompt: String,
+    /// Durable approval identifier used to resume this exact request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
     /// Chiasm task correlated with this action, when the request is task-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
@@ -154,7 +157,7 @@ mod tests {
         let ev = ActionDenied {
             tool: "kleos".into(),
             action: "memory_store".into(),
-            gate: "phylax".into(),
+            gate: "phylaxd".into(),
             reason: "no capability".into(),
             task_id: None,
         };

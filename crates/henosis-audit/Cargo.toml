@@ -1,0 +1,22 @@
+[package]
+name = "henosis-audit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronous tamper-evident audit streams and off-host witness protocol for Henosis."
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+reqwest.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

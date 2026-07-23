@@ -7,11 +7,19 @@
 
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::oauth_refresh::RefreshRegistry;
+
+/// Bounds ordinary credential-broker requests.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Allows phylaxd's 20-second child deadline to return before its 30-second request cutoff.
+const EXEC_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Errors returned by phylaxd credential resolution calls.
 #[derive(Debug, Error)]
@@ -38,15 +46,13 @@ pub enum PhylaxdError {
     #[error("phylaxd auth missing -- set HERMES_PHYLAXD_TOKEN")]
     AuthMissing,
     /// Phylaxd returned a non-success HTTP status.
-    #[error("phylaxd returned {status}: {body}")]
+    #[error("phylaxd returned HTTP {status}")]
     Upstream {
         /// HTTP status code.
         status: u16,
-        /// Response body (truncated to 512 bytes).
-        body: String,
     },
-    /// The phylaxd response did not contain an `access_token` or `value` field.
-    #[error("phylaxd response missing access_token field")]
+    /// The phylaxd response did not contain the expected operation fields.
+    #[error("phylaxd response is malformed")]
     MalformedResponse,
 }
 
@@ -58,7 +64,7 @@ struct RawRequest<'a> {
 }
 
 /// Wire format for the phylaxd `/resolve/raw` response body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawResponse {
     #[allow(dead_code)]
     category: String,
@@ -68,24 +74,96 @@ struct RawResponse {
 }
 
 /// Wire format for the phylaxd `/secret/{category}/{name}` PUT request body.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct StoreRequest<'a> {
     data: &'a Value,
 }
 
-/// HTTP client for the phylaxd credential daemon. Cloneable; intended to be
-/// shared via `Arc<PhylaxdClient>` across all in-flight invocations.
-#[derive(Debug, Clone)]
+/// Wire format for a phylaxd sign request.
+#[derive(Serialize)]
+struct SignRequest<'a> {
+    category: &'a str,
+    name: &'a str,
+    payload_b64: &'a str,
+    algo: &'a str,
+}
+
+/// Successful result from a phylaxd sign operation.
+#[derive(Debug, Deserialize)]
+pub struct SignResult {
+    /// Base64-encoded signature produced without releasing the signing key.
+    pub signature_b64: String,
+}
+
+/// Wire format for a phylaxd verify request.
+#[derive(Serialize)]
+struct VerifyRequest<'a> {
+    category: &'a str,
+    name: &'a str,
+    payload_b64: &'a str,
+    signature_b64: &'a str,
+    algo: &'a str,
+}
+
+/// Successful result from a phylaxd verify operation.
+#[derive(Debug, Deserialize)]
+pub struct VerifyResult {
+    /// Whether the supplied signature is valid for the stored key.
+    pub valid: bool,
+}
+
+/// Wire format for a phylaxd derive request.
+#[derive(Debug, Serialize)]
+struct DeriveRequest<'a> {
+    category: &'a str,
+    name: &'a str,
+    purpose: &'a str,
+    length: usize,
+}
+
+/// Successful result from a phylaxd derive operation.
+#[derive(Deserialize)]
+pub struct DeriveResult {
+    /// Base64-encoded, domain-separated derived key material.
+    pub derived_b64: String,
+}
+
+/// Wire format for a phylaxd exec request.
+#[derive(Serialize)]
+struct ExecRequest<'a> {
+    category: &'a str,
+    name: &'a str,
+    argv: &'a [String],
+    env_var: &'a str,
+}
+
+/// Successful result from a phylaxd mediated command execution.
+#[derive(Deserialize)]
+pub struct ExecResult {
+    /// Whether the broker terminated the command at its deadline.
+    pub timed_out: bool,
+    /// Child exit code when one was available.
+    pub exit_code: Option<i32>,
+    /// Base64-encoded, broker-scrubbed standard output.
+    pub stdout_b64: String,
+    /// Base64-encoded, broker-scrubbed standard error.
+    pub stderr_b64: String,
+}
+
+/// HTTP client for the phylaxd credential daemon, shared through `Arc` across
+/// all in-flight invocations.
 pub struct PhylaxdClient {
     /// Shared HTTP client with connect and read timeouts.
     http: reqwest::Client,
     /// Base URL of the phylaxd daemon.
     base_url: String,
     /// Bearer token for authenticating to phylaxd.
-    token: Option<String>,
+    token: Option<Zeroizing<String>>,
     /// Optional refresh registry to register (tenant, provider) pairs after a
     /// successful token fetch.
     refresh_registry: Option<RefreshRegistry>,
+    /// Total request timeout reserved for broker-mediated command execution.
+    exec_request_timeout: Duration,
 }
 
 /// Implements authenticated credential reads, refreshes, and updates against phylaxd.
@@ -93,17 +171,33 @@ impl PhylaxdClient {
     /// Construct a new client for the given phylaxd base URL and optional bearer
     /// token.
     pub fn new(base_url: String, token: Option<String>) -> Self {
+        Self::new_with_timeouts(
+            base_url,
+            token,
+            DEFAULT_REQUEST_TIMEOUT,
+            EXEC_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Build a client with explicit timeouts so contract tests can exercise deadline ordering.
+    fn new_with_timeouts(
+        base_url: String,
+        token: Option<String>,
+        default_request_timeout: Duration,
+        exec_request_timeout: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(15))
+            .timeout(default_request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client build");
         Self {
             http,
             base_url,
-            token,
+            token: token.map(Zeroizing::new),
             refresh_registry: None,
+            exec_request_timeout,
         }
     }
 
@@ -113,6 +207,89 @@ impl PhylaxdClient {
     pub fn with_refresh_registry(mut self, registry: RefreshRegistry) -> Self {
         self.refresh_registry = Some(registry);
         self
+    }
+
+    /// Sign a base64-encoded payload through phylaxd without exposing the key.
+    pub async fn sign(
+        &self,
+        category: &str,
+        name: &str,
+        payload_b64: &str,
+        algo: &str,
+    ) -> Result<SignResult, PhylaxdError> {
+        self.post_operation(
+            "/resolve/sign",
+            &SignRequest {
+                category,
+                name,
+                payload_b64,
+                algo,
+            },
+        )
+        .await
+    }
+
+    /// Verify a base64-encoded signature through phylaxd without exposing the key.
+    pub async fn verify(
+        &self,
+        category: &str,
+        name: &str,
+        payload_b64: &str,
+        signature_b64: &str,
+        algo: &str,
+    ) -> Result<VerifyResult, PhylaxdError> {
+        self.post_operation(
+            "/resolve/verify",
+            &VerifyRequest {
+                category,
+                name,
+                payload_b64,
+                signature_b64,
+                algo,
+            },
+        )
+        .await
+    }
+
+    /// Derive bounded key material through phylaxd without exposing the root secret.
+    pub async fn derive(
+        &self,
+        category: &str,
+        name: &str,
+        purpose: &str,
+        length: usize,
+    ) -> Result<DeriveResult, PhylaxdError> {
+        self.post_operation(
+            "/resolve/derive",
+            &DeriveRequest {
+                category,
+                name,
+                purpose,
+                length,
+            },
+        )
+        .await
+    }
+
+    /// Run one broker-allowlisted command with a secret injected inside phylaxd.
+    pub async fn exec(
+        &self,
+        category: &str,
+        name: &str,
+        argv: &[String],
+        env_var: &str,
+    ) -> Result<ExecResult, PhylaxdError> {
+        self.post_operation_with_timeout(
+            "/resolve/exec",
+            &ExecRequest {
+                category,
+                name,
+                argv,
+                env_var,
+            },
+            Some(self.exec_request_timeout),
+        )
+        .await
     }
 
     /// Fetch the OAuth bearer token for a tenant + provider.
@@ -153,10 +330,8 @@ impl PhylaxdClient {
             });
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
-                body: truncate(&body, 512),
             });
         }
 
@@ -224,10 +399,8 @@ impl PhylaxdClient {
             });
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
-                body: truncate(&body, 512),
             });
         }
 
@@ -281,10 +454,8 @@ impl PhylaxdClient {
             });
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
-                body: truncate(&body, 512),
             });
         }
         let parsed: RawResponse = resp
@@ -327,23 +498,200 @@ impl PhylaxdClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(PhylaxdError::Upstream {
                 status: status.as_u16(),
-                body: truncate(&body, 512),
             });
         }
         Ok(())
     }
+
+    /// Send one authenticated non-plaintext operation and decode its typed result.
+    async fn post_operation<B, R>(&self, path: &str, body: &B) -> Result<R, PhylaxdError>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        self.post_operation_with_timeout(path, body, None).await
+    }
+
+    /// Send one operation with an optional request-level timeout override.
+    async fn post_operation_with_timeout<B, R>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<R, PhylaxdError>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        let token = self.token.as_deref().ok_or(PhylaxdError::AuthMissing)?;
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let request = self.http.post(&url).bearer_auth(token).json(body);
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|source| PhylaxdError::Unreachable {
+                url: url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(PhylaxdError::Upstream {
+                status: status.as_u16(),
+            });
+        }
+        response
+            .json::<R>()
+            .await
+            .map_err(|_| PhylaxdError::MalformedResponse)
+    }
 }
 
-/// Truncate a string to `max` bytes, appending `...[truncated]` when clipped.
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut out = s[..max].to_string();
-        out.push_str("...[truncated]");
-        out
+#[cfg(test)]
+/// Contract tests for authenticated phylaxd non-plaintext operations.
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// All four broker operations use the reviewed phylaxd wire contract.
+    #[tokio::test]
+    async fn mediated_operations_match_phylaxd_contract() {
+        let server = MockServer::start().await;
+        let client = PhylaxdClient::new(server.uri(), Some("service-token".to_string()));
+
+        Mock::given(method("POST"))
+            .and(path("/resolve/sign"))
+            .and(header("authorization", "Bearer service-token"))
+            .and(body_json(serde_json::json!({
+                "category": "release",
+                "name": "manifest",
+                "payload_b64": "aGVsbG8=",
+                "algo": "hmac-sha256"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "signature_b64": "c2ln"
+            })))
+            .mount(&server)
+            .await;
+        let signed = client
+            .sign("release", "manifest", "aGVsbG8=", "hmac-sha256")
+            .await
+            .expect("sign");
+        assert_eq!(signed.signature_b64, "c2ln");
+
+        Mock::given(method("POST"))
+            .and(path("/resolve/verify"))
+            .and(body_json(serde_json::json!({
+                "category": "release",
+                "name": "manifest",
+                "payload_b64": "aGVsbG8=",
+                "signature_b64": "c2ln",
+                "algo": "hmac-sha256"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "valid": true
+            })))
+            .mount(&server)
+            .await;
+        assert!(
+            client
+                .verify("release", "manifest", "aGVsbG8=", "c2ln", "hmac-sha256")
+                .await
+                .expect("verify")
+                .valid
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/resolve/derive"))
+            .and(body_json(serde_json::json!({
+                "category": "release",
+                "name": "manifest",
+                "purpose": "artifact",
+                "length": 32
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "derived_b64": "ZGVyaXZlZA=="
+            })))
+            .mount(&server)
+            .await;
+        let derived = client
+            .derive("release", "manifest", "artifact", 32)
+            .await
+            .expect("derive");
+        assert_eq!(derived.derived_b64, "ZGVyaXZlZA==");
+
+        let argv = vec!["/usr/bin/printf".to_string(), "ok".to_string()];
+        Mock::given(method("POST"))
+            .and(path("/resolve/exec"))
+            .and(body_json(serde_json::json!({
+                "category": "release",
+                "name": "manifest",
+                "argv": argv,
+                "env_var": "SIGNING_KEY"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "timed_out": false,
+                "exit_code": 0,
+                "stdout_b64": "b2s=",
+                "stderr_b64": ""
+            })))
+            .mount(&server)
+            .await;
+        let executed = client
+            .exec(
+                "release",
+                "manifest",
+                &["/usr/bin/printf".to_string(), "ok".to_string()],
+                "SIGNING_KEY",
+            )
+            .await
+            .expect("exec");
+        assert_eq!(executed.exit_code, Some(0));
+        assert_eq!(executed.stdout_b64, "b2s=");
+    }
+
+    /// Exec's request override outlives the ordinary client timeout and receives the broker reply.
+    #[tokio::test]
+    async fn exec_timeout_override_preserves_delayed_broker_response() {
+        let server = MockServer::start().await;
+        let client = PhylaxdClient::new_with_timeouts(
+            server.uri(),
+            Some("service-token".to_string()),
+            Duration::from_millis(20),
+            Duration::from_millis(150),
+        );
+        Mock::given(method("POST"))
+            .and(path("/resolve/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(75))
+                    .set_body_json(serde_json::json!({
+                        "timed_out": true,
+                        "exit_code": null,
+                        "stdout_b64": "",
+                        "stderr_b64": ""
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let result = client
+            .exec(
+                "release",
+                "manifest",
+                &["/usr/bin/printf".to_string()],
+                "SIGNING_KEY",
+            )
+            .await
+            .expect("exec override must outlive the ordinary timeout");
+
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, None);
     }
 }

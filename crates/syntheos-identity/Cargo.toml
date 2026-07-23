@@ -23,6 +23,18 @@ serde_json.workspace = true
 # Version pinned to match henosis-rift-server. Default features include password-hash
 # re-exports; rand_core::OsRng + SaltString::generate are available at this version.
 argon2 = { version = "0.5", features = ["std"] }
+# Fixed-size authority-secret digests.
+sha2.workspace = true
+# Machine-token and refresh-secret base64url encoding.
+base64.workspace = true
+# Constant-time digest equality during credential authentication.
+subtle.workspace = true
+# UUID record identifiers for opaque authority credentials.
+uuid.workspace = true
+# Clears decoded and generated authority-secret buffers when they leave scope.
+zeroize.workspace = true
+# Cryptographically secure authority-secret generation.
+rand.workspace = true
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test].

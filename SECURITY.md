@@ -10,13 +10,17 @@ Use [support@syntheos.dev](mailto:support@syntheos.dev) for non-sensitive operat
 
 ## Deployment boundary
 
-Local mode is loopback-only by default and is not a remote multi-user deployment. Production needs authenticated ingress, TLS termination, managed PostgreSQL, protected persistent storage, backups, monitoring, an independent audit witness, and the proprietary `phylaxd` credential broker.
+Local mode is loopback-only by default and is not a remote multi-user deployment. Production needs authenticated ingress, TLS termination, source-aware login rate limiting at the ingress, managed PostgreSQL, protected persistent storage, backups, monitoring, an independent audit witness, and the proprietary `phylaxd` credential broker. The process-local login limits bound password-verification work but are not a replacement for source-aware edge controls.
 
-The repository does not distribute `phylaxd` or the full proprietary Pistis service, which is separately published from a private repository. A deployment that cannot authenticate and protect its broker endpoint is not production-ready. Capability-bearing Pistis requests fail closed until a trusted room-state source is integrated.
+The repository does not distribute `phylaxd` or the full proprietary Pistis service. A deployment that cannot authenticate and protect its broker endpoint is not production-ready. Capability-bearing Pistis requests fail closed until a trusted room-state source is integrated.
 
-Machine credentials are tenant-bound, scoped, revocable, and checked against live organization membership on every request. Network production approvals require a different administrator principal from the request initiator. Local mode permits same-principal confirmation because it intentionally has one operator.
+Machine credentials are tenant-bound, scoped, revocable, and checked against live organization membership on every request. Production approvals require a different administrator principal from the request initiator, including deployments bound to loopback behind a reverse proxy. Local mode permits same-principal confirmation because it intentionally has one operator.
 
-Network production startup requires synchronous audit witnessing. If terminal audit persistence fails, Henosis marks that tenant stream ambiguous and blocks further execution.
+Operator access tokens expire after at most 15 minutes. Logging out revokes the durable refresh family immediately, but an already issued access token remains cryptographically valid until its signed expiry unless the operator loses live organization membership first. WebSocket authentication uses the `Sec-WebSocket-Protocol` offer `henosis.v1, henosis.auth.<access-token>` so credentials do not enter request URLs or ordinary server access logs. The server echoes only `henosis.v1`, rechecks live membership during the session, and closes the connection when the access token expires.
+
+Every public dispatch requires an idempotency key scoped to the authenticated tenant and principal. The exact request is claimed durably before execution. A completed request replays only its stored, output-filtered result; the executor is not called again. Reusing a key with different request content fails as a conflict.
+
+Production startup requires synchronous audit witnessing regardless of listen address. Henosis obtains an off-host receipt for intent before execution and for a successful outcome before making its result replayable. If execution may have occurred but a safe completion cannot be established, the request is marked indeterminate and is never executed automatically on retry.
 
 ## Scope
 

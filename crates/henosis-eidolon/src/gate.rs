@@ -119,6 +119,7 @@ pub struct EidolonGate {
     signal: Arc<dyn DriftSignal>,
 }
 
+/// Implements Eidolon's policy construction and request-local checks.
 impl EidolonGate {
     /// Build the gate, validating the policy: every injection pattern must survive
     /// normalization non-empty (an empty pattern is a substring of everything and would deny
@@ -195,6 +196,7 @@ impl EidolonGate {
 }
 
 #[async_trait]
+/// Applies Eidolon's input policy in the dispatcher gate chain.
 impl Gate for EidolonGate {
     /// The canonical authority name for this slot.
     fn name(&self) -> &str {
@@ -257,6 +259,7 @@ mod tests {
     /// The quiet signal always answers "no drift".
     #[async_trait]
     impl DriftSignal for QuietSignal {
+        /// Returns an empty drift-flag list.
         async fn active_drift(
             &self,
             _tenant: TenantId,
@@ -272,6 +275,7 @@ mod tests {
     /// The flag signal returns its fixed flags for every principal.
     #[async_trait]
     impl DriftSignal for FlagSignal {
+        /// Returns the signal's configured drift flags.
         async fn active_drift(
             &self,
             _tenant: TenantId,
@@ -287,6 +291,7 @@ mod tests {
     /// The erroring signal always fails with its fixed message.
     #[async_trait]
     impl DriftSignal for ErrSignal {
+        /// Returns the signal's configured read error.
         async fn active_drift(
             &self,
             _tenant: TenantId,
@@ -302,6 +307,7 @@ mod tests {
     /// The counting signal records the read, then answers "no drift".
     #[async_trait]
     impl DriftSignal for CountingSignal {
+        /// Records a read and returns no drift flags.
         async fn active_drift(
             &self,
             _tenant: TenantId,
@@ -327,6 +333,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".to_string(),
@@ -637,7 +644,7 @@ mod tests {
             Box::new(StubGate::new("plutus")),
             Box::new(gate(QuietSignal)),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher =
             Dispatcher::new(gates, Box::new(EchoExecutor), bus).expect("canonical chain");
@@ -659,7 +666,7 @@ mod tests {
             Box::new(StubGate::new("plutus")),
             Box::new(gate(QuietSignal)),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher =
             Dispatcher::new(gates, Box::new(EchoExecutor), bus).expect("canonical chain");

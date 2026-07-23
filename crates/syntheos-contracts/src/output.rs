@@ -94,6 +94,7 @@ mod tests {
             room: None,
             task: None,
             workflow: None,
+            authority: None,
         }
     }
 

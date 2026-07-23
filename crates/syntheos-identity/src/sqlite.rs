@@ -16,6 +16,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
@@ -29,6 +30,10 @@ use crate::error::DirectoryError;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__principals.sql")),
     (2, include_str!("../migrations/V2__operator_accounts.sql")),
+    (
+        3,
+        include_str!("../migrations/V3__authority_credentials.sql"),
+    ),
 ];
 
 /// A persistent [`PrincipalDirectory`] backed by a single SQLite database.
@@ -45,6 +50,7 @@ fn backend(e: rusqlite::Error) -> DirectoryError {
     DirectoryError::Backend(e.to_string())
 }
 
+/// Provides constructors and internal insert helpers for the SQLite directory.
 impl SqliteDirectory {
     /// Open (creating the file if absent) a directory at `path`, applying any pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DirectoryError> {
@@ -60,6 +66,7 @@ impl SqliteDirectory {
 
     /// Apply migrations to a fresh connection and wrap it.
     fn from_conn(mut conn: Connection) -> Result<Self, DirectoryError> {
+        conn.busy_timeout(Duration::from_secs(2)).map_err(backend)?;
         apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -139,8 +146,10 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), DirectoryError> {
     Ok(())
 }
 
+/// Implements principal-directory operations against the SQLite connection.
 #[async_trait]
 impl PrincipalDirectory for SqliteDirectory {
+    /// Enroll a newly generated principal in persistent storage.
     async fn enroll(
         &self,
         kind: PrincipalKind,
@@ -156,6 +165,7 @@ impl PrincipalDirectory for SqliteDirectory {
         Ok(principal)
     }
 
+    /// Look up one principal by canonical identifier.
     async fn lookup(&self, id: PrincipalId) -> Result<Option<Principal>, DirectoryError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let row = conn
@@ -178,6 +188,7 @@ impl PrincipalDirectory for SqliteDirectory {
         }
     }
 
+    /// List every enrolled principal from persistent storage.
     async fn list(&self) -> Result<Vec<Principal>, DirectoryError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
@@ -201,11 +212,13 @@ impl PrincipalDirectory for SqliteDirectory {
     }
 }
 
+/// Unit tests for persistent principal-directory behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Enrollment creates a principal that can immediately be looked up.
     #[tokio::test]
     async fn enroll_then_lookup() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
@@ -217,6 +230,7 @@ mod tests {
         assert_eq!(got, p);
     }
 
+    /// An unknown principal identifier returns no matching record.
     #[tokio::test]
     async fn lookup_unknown_is_none() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
@@ -227,6 +241,7 @@ mod tests {
             .is_none());
     }
 
+    /// Principal kind and optional display values survive storage round trips.
     #[tokio::test]
     async fn kind_and_display_roundtrip_through_storage() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
@@ -239,6 +254,7 @@ mod tests {
         assert_eq!(got.display.as_deref(), Some("hermes"));
     }
 
+    /// Listing returns every principal enrolled in the directory.
     #[tokio::test]
     async fn list_returns_all_enrolled() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
@@ -251,6 +267,7 @@ mod tests {
         assert_eq!(dir.list().await.expect("list").len(), 2);
     }
 
+    /// The persistent directory can be used through its trait-object interface.
     #[tokio::test]
     async fn usable_as_trait_object() {
         let dir: Arc<dyn PrincipalDirectory> =

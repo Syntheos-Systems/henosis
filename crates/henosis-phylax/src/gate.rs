@@ -30,12 +30,13 @@ use crate::store::PhylaxStore;
 /// The tool name that marks an invocation as a Phylax credential operation.
 const PHYLAX_TOOL: &str = "phylax";
 
-/// The fail-closed authorization gate for the dispatcher's phylax slot.
+/// The fail-closed embedded compatibility gate for credential-store operations.
 pub struct PhylaxGate {
     /// The store whose capability policies the gate consults.
     store: Arc<PhylaxStore>,
 }
 
+/// Implements embedded credential-policy construction and action classification.
 impl PhylaxGate {
     /// Build the gate over a credential store.
     pub fn new(store: Arc<PhylaxStore>) -> Self {
@@ -60,10 +61,11 @@ impl PhylaxGate {
 }
 
 #[async_trait]
+/// Applies embedded credential-access policy in the compatibility gate chain.
 impl Gate for PhylaxGate {
     /// The canonical authority name for this slot.
     fn name(&self) -> &str {
-        "phylax"
+        "phylaxd"
     }
 
     /// Authorize a credential operation, allow a non-credential one, deny a malformed one, and
@@ -106,6 +108,7 @@ impl Gate for PhylaxGate {
     }
 }
 
+/// Tests embedded credential-gate authorization decisions.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +163,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "phylax".into(),
@@ -289,7 +293,7 @@ mod tests {
             .await
             .expect("dispatch");
         match denied {
-            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "phylax"),
+            DispatchOutcome::Denied { gate, .. } => assert_eq!(gate, "phylaxd"),
             other => panic!("expected Denied at phylax, got {other:?}"),
         }
 

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::phylaxd_client::{PhylaxdClient, PhylaxdError};
 
@@ -56,12 +57,11 @@ impl RefreshRegistry {
 }
 
 /// Google OAuth client credentials used for token refresh.
-#[derive(Debug, Clone)]
 pub struct GoogleClient {
     /// Google OAuth client ID.
-    pub client_id: String,
+    pub client_id: Zeroizing<String>,
     /// Google OAuth client secret.
-    pub client_secret: String,
+    pub client_secret: Zeroizing<String>,
 }
 
 /// Implements the behavior exposed by GoogleClient.
@@ -75,14 +75,13 @@ impl GoogleClient {
             return None;
         }
         Some(Self {
-            client_id,
-            client_secret,
+            client_id: Zeroizing::new(client_id),
+            client_secret: Zeroizing::new(client_secret),
         })
     }
 }
 
 /// Background daemon that keeps registered OAuth tokens from expiring.
-#[derive(Debug, Clone)]
 pub struct OAuthRefreshDaemon {
     /// Source of (tenant, provider) pairs to refresh.
     pub registry: RefreshRegistry,
@@ -185,11 +184,13 @@ impl OAuthRefreshDaemon {
             return Ok(());
         }
 
-        let refresh_token = record
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .ok_or(RefreshError::NoRefreshToken)?
-            .to_string();
+        let refresh_token = Zeroizing::new(
+            record
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .ok_or(RefreshError::NoRefreshToken)?
+                .to_string(),
+        );
 
         let new_bundle = match provider {
             "google" => {
@@ -197,7 +198,7 @@ impl OAuthRefreshDaemon {
                     .google
                     .as_ref()
                     .ok_or(RefreshError::ProviderClientMissing)?;
-                self.google_refresh(client, &refresh_token).await?
+                self.google_refresh(client, refresh_token.as_str()).await?
             }
             other => return Err(RefreshError::UnsupportedProvider(other.to_string())),
         };
@@ -235,13 +236,14 @@ impl OAuthRefreshDaemon {
             .await
             .map_err(|e| RefreshError::Provider(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = Zeroizing::new(resp.text().await.unwrap_or_default());
         if !status.is_success() {
             return Err(RefreshError::Provider(format!(
-                "google returned HTTP {status}: {body}"
+                "google returned HTTP {status}: {}",
+                body.as_str()
             )));
         }
-        serde_json::from_str(&body).map_err(|e| RefreshError::Provider(e.to_string()))
+        serde_json::from_str(body.as_str()).map_err(|e| RefreshError::Provider(e.to_string()))
     }
 
     /// Publish a `hermes.oauth.refreshed` event to Axon after a successful

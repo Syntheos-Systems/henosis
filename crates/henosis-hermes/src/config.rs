@@ -1,8 +1,9 @@
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr};
+
+use zeroize::Zeroizing;
 
 /// Runtime configuration for the Hermes tool gateway, loaded from environment
 /// variables with sensible defaults.
-#[derive(Debug, Clone)]
 pub struct Config {
     /// TCP port Hermes listens on (default 4800, override with `HERMES_PORT`).
     pub port: u16,
@@ -10,7 +11,7 @@ pub struct Config {
     pub phylaxd_url: String,
     /// Bearer token for authenticating to phylaxd. When absent, OAuth-requiring
     /// adapters return `phylaxd_auth_missing`.
-    pub phylaxd_token: Option<String>,
+    pub phylaxd_token: Option<Zeroizing<String>>,
     #[allow(dead_code)]
     /// Base URL of the Kleos memory/event service (unused at runtime; reserved
     /// for future direct Kleos integration).
@@ -26,19 +27,30 @@ pub struct Config {
     /// When absent, the server derives `127.0.0.1:<port>`.
     pub listen_addr: Option<String>,
     /// Dedicated Bearer token accepted by protected standalone HTTP routes.
-    pub api_token: Option<String>,
+    pub api_token: Option<Zeroizing<String>>,
     /// Exact acknowledgement required before the standalone server binds to a
     /// non-loopback address without providing its own TLS termination.
     pub allow_insecure_remote: bool,
 }
 
 /// Validated security-sensitive settings used only by the standalone server.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Socket address that the standalone Hermes server may bind.
     pub listen_addr: SocketAddr,
     /// Dedicated Bearer token protecting every non-public route.
-    pub api_token: String,
+    pub api_token: Zeroizing<String>,
+}
+
+/// Formats validated server configuration without disclosing its bearer token.
+impl fmt::Debug for ServerConfig {
+    /// Write a redacted representation suitable for validation errors and tests.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("api_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Loads Hermes network, storage, and credential-broker settings from the environment.
@@ -54,7 +66,8 @@ impl Config {
             phylaxd_url: env_or("PHYLAXD_URL", "http://127.0.0.1:3100"),
             phylaxd_token: std::env::var("HERMES_PHYLAXD_TOKEN")
                 .ok()
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .map(Zeroizing::new),
             kleos_url: env_or("KLEOS_URL", "http://127.0.0.1:4200"),
             kleos_token_slot: env_or("KLEOS_TOKEN_CRED_SLOT", "henosis/kleos-api"),
             public_url: std::env::var("HERMES_PUBLIC_URL")
@@ -65,7 +78,8 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             api_token: std::env::var("HERMES_API_TOKEN")
                 .ok()
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .map(Zeroizing::new),
             allow_insecure_remote: std::env::var("HERMES_ALLOW_INSECURE_REMOTE").as_deref()
                 == Ok("1"),
         }
@@ -90,7 +104,8 @@ impl Config {
 
         let api_token = self
             .api_token
-            .as_deref()
+            .as_ref()
+            .map(|token| token.as_str())
             .ok_or_else(|| "HERMES_API_TOKEN is required for the standalone server".to_string())?;
         if api_token.len() < 32 {
             return Err("HERMES_API_TOKEN must contain at least 32 bytes".to_string());
@@ -98,13 +113,13 @@ impl Config {
         if api_token.trim() != api_token || api_token.chars().any(char::is_whitespace) {
             return Err("HERMES_API_TOKEN must not contain whitespace".to_string());
         }
-        if self.phylaxd_token.as_deref() == Some(api_token) {
+        if self.phylaxd_token.as_ref().map(|token| token.as_str()) == Some(api_token) {
             return Err("HERMES_API_TOKEN must be distinct from HERMES_PHYLAXD_TOKEN".to_string());
         }
 
         Ok(ServerConfig {
             listen_addr,
-            api_token: api_token.to_string(),
+            api_token: Zeroizing::new(api_token.to_string()),
         })
     }
 }
@@ -124,12 +139,16 @@ mod tests {
         Config {
             port: 4800,
             phylaxd_url: "http://127.0.0.1:3100".to_string(),
-            phylaxd_token: Some("phylaxd-token-that-is-long-and-distinct".to_string()),
+            phylaxd_token: Some(Zeroizing::new(
+                "phylaxd-token-that-is-long-and-distinct".to_string(),
+            )),
             kleos_url: "http://127.0.0.1:4200".to_string(),
             kleos_token_slot: "henosis/kleos-api".to_string(),
             public_url: None,
             listen_addr: None,
-            api_token: Some("hermes-api-token-that-is-at-least-32-bytes".to_string()),
+            api_token: Some(Zeroizing::new(
+                "hermes-api-token-that-is-at-least-32-bytes".to_string(),
+            )),
             allow_insecure_remote: false,
         }
     }
@@ -170,7 +189,7 @@ mod tests {
         config.api_token = None;
         assert!(config.validate_server().is_err());
 
-        config.api_token = Some("short".to_string());
+        config.api_token = Some(Zeroizing::new("short".to_string()));
         assert!(config.validate_server().is_err());
 
         config.api_token = config.phylaxd_token.clone();

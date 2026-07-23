@@ -55,6 +55,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # HTTP mock server for adapter integration tests

@@ -1,7 +1,7 @@
 //! The `pistis` gate: capability + trust authorization, fail-closed.
 //!
 //! Pistis is the first gate in the canonical dispatcher chain (`pistis ->
-//! plutus -> eidolon -> human -> phylax`). It authorizes an invocation that
+//! plutus -> eidolon -> human -> phylaxd`). It authorizes an invocation that
 //! *declares a capability requirement* against the requesting principal's
 //! admission and trust in the relevant room. An invocation that declares no
 //! capability requirement is not Pistis's concern -- it is allowed for the rest
@@ -52,6 +52,7 @@ pub struct InMemoryRoomStateSource {
     rooms: std::collections::HashMap<String, RoomState>,
 }
 
+/// Implements construction and mutation for the in-memory state source.
 impl InMemoryRoomStateSource {
     /// Construct an empty source (no rooms materialized).
     pub fn new() -> Self {
@@ -64,6 +65,7 @@ impl InMemoryRoomStateSource {
     }
 }
 
+/// Supplies room state from the in-memory source.
 impl RoomStateSource for InMemoryRoomStateSource {
     /// Look up the materialized state for `room`.
     fn room_state(&self, room: &str) -> Option<RoomState> {
@@ -81,6 +83,7 @@ pub trait Clock: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
+/// Reads current instants from the system clock.
 impl Clock for SystemClock {
     /// Read the OS clock in UTC.
     fn now(&self) -> OffsetDateTime {
@@ -96,6 +99,7 @@ pub struct PistisGate {
     clock: Arc<dyn Clock>,
 }
 
+/// Implements Pistis gate construction and capability parsing.
 impl PistisGate {
     /// Build the gate over a room-state source, using the system clock.
     pub fn new(source: Arc<dyn RoomStateSource>) -> Self {
@@ -143,6 +147,7 @@ impl PistisGate {
 }
 
 #[async_trait]
+/// Applies Pistis capability and trust policy in the dispatcher gate chain.
 impl Gate for PistisGate {
     /// The canonical authority name for this slot.
     fn name(&self) -> &str {
@@ -198,6 +203,7 @@ impl Gate for PistisGate {
     }
 }
 
+/// Tests Pistis capability authorization behavior.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +214,9 @@ mod tests {
 
     /// A fixed clock for deterministic trust evaluation.
     struct FixedClock(OffsetDateTime);
+    /// Reads the deterministic test instant.
     impl Clock for FixedClock {
+        /// Returns the fixed test instant.
         fn now(&self) -> OffsetDateTime {
             self.0
         }
@@ -217,7 +225,9 @@ mod tests {
     /// An in-memory room-state source.
     #[derive(Default)]
     struct MapSource(HashMap<String, RoomState>);
+    /// Supplies cloned room state from the test map.
     impl RoomStateSource for MapSource {
+        /// Returns the configured state for a room.
         fn room_state(&self, room: &str) -> Option<RoomState> {
             self.0.get(room).cloned()
         }
@@ -264,6 +274,7 @@ mod tests {
                 room: room.map(str::to_owned),
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "synapse".into(),
@@ -393,7 +404,7 @@ mod tests {
             Box::new(StubGate::new("plutus")),
             Box::new(StubGate::new("eidolon")),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher =
             Dispatcher::new(gates, Box::new(EchoExecutor), bus).expect("canonical chain");
@@ -436,6 +447,7 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
+        /// Proves an empty authority never allows a capability request.
         #[test]
         fn empty_authority_never_allows_capability_request(
             name in "[a-z_]{1,16}",

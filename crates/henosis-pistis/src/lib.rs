@@ -1,8 +1,7 @@
 //! Pistis: the capability authority behind the dispatcher's `pistis` gate slot.
 //!
-//! Henosis owns this copy of the proprietary Pistis decision core, reworked onto
-//! the principal model. The standalone Pistis service remains separately
-//! maintained, and this workspace does not depend on its repository.
+//! Henosis owns this compatibility decision core on its principal model. The
+//! full proprietary Pistis service is not distributed in this repository.
 //!
 //! What lives here is the *decision* core: ed25519 admission identity
 //! ([`crypto`]), the capability + trust-input taxonomy ([`model`]), a focused

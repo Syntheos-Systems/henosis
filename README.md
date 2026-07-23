@@ -38,6 +38,26 @@ henosis serve
 
 The first boot creates a private local owner token under `HENOSIS_HOME`. Live CLI commands read that token automatically and never print it except when a newly requested token must be shown once.
 
+Create a scoped machine token for an agent or integration:
+
+```sh
+henosis token create first-agent
+```
+
+Every public dispatch requires a unique retry identity in `X-Henosis-Idempotency-Key`. Keys are scoped to the authenticated tenant and principal. Repeating the same key and exact request returns the stored filtered result without running the tool again. Reusing the key with different content returns a conflict.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8088/api/v1/dispatch \
+  -H "Authorization: Bearer $HENOSIS_AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-Henosis-Idempotency-Key: first-agent-probe-1" \
+  --data '{"tool":"henosis","action":"probe","args":{}}'
+```
+
+Operations that require approval return `202 Accepted` with an approval ID. Approve that ID with `henosis approvals approve <approval-id>`, then repeat the exact dispatch with both the original idempotency key and `X-Henosis-Approval-Id`.
+
+Operator WebSocket clients authenticate without URL credentials by offering the subprotocols `henosis.v1, henosis.auth.<access-token>`. The server negotiates only `henosis.v1`, checks live organization membership during the connection, and disconnects at the token's signed expiry.
+
 ## Local development
 
 Local mode binds to loopback by default at `127.0.0.1:8088`. It is intended for one operator and uses the embedded local policy backend. Its quota and rate-limit counters reset when the process restarts. Do not expose local mode directly to a network.
@@ -51,9 +71,9 @@ The Compose service runs the same idempotent `henosis init --quick` path as the 
 
 ## Production prerequisites
 
-Production requires a managed PostgreSQL authority, protected persistent storage, TLS termination, authenticated ingress, backups, an independent audit witness, and the proprietary `phylaxd` credential broker. `phylaxd` is a separately deployed dependency and must be reachable through a private, authenticated endpoint.
+Production requires a managed PostgreSQL authority, protected persistent storage, TLS termination, authenticated ingress with source-aware login rate limiting, backups, an independent audit witness, and the proprietary `phylaxd` credential broker. `phylaxd` is a separately deployed dependency and must be reachable through a private, authenticated endpoint.
 
-Pistis is separately published from a private repository and remains proprietary. Henosis contains a narrow fail-closed compatibility decision core, not the full Pistis service. Capability-bearing requests remain denied until a deployment supplies trusted room-state integration.
+The full Pistis service is proprietary and is not distributed in this repository. Henosis contains a narrow fail-closed compatibility decision core. Capability-bearing requests remain denied until a deployment supplies trusted room-state integration.
 
 Use `containers/compose.production.yml` only after:
 

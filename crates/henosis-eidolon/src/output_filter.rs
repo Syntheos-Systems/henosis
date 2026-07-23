@@ -27,6 +27,7 @@ pub struct EidolonOutputFilter {
     sensitive_fields: Vec<String>,
 }
 
+/// Implements Eidolon's sensitive-output filtering helpers.
 impl EidolonOutputFilter {
     /// Build the filter from the shared policy, validating the sensitive-field patterns: every
     /// pattern must survive normalization non-empty (an empty pattern is a substring of every
@@ -57,6 +58,7 @@ impl EidolonOutputFilter {
 }
 
 #[async_trait]
+/// Applies Eidolon's output-redaction policy to executor results.
 impl OutputFilter for EidolonOutputFilter {
     /// The canonical authority name, matching the gate slot this filter is the output side of.
     fn name(&self) -> &str {
@@ -113,6 +115,7 @@ mod tests {
             room: None,
             task: None,
             workflow: None,
+            authority: None,
         }
     }
 
@@ -250,6 +253,7 @@ mod tests {
         /// The leaky executor returns a payload with a secret to scrub.
         #[async_trait]
         impl syntheos_dispatch::Executor for LeakyExecutor {
+            /// Returns a payload containing a field the filter must redact.
             async fn execute(
                 &self,
                 _ctx: &RequestContext,

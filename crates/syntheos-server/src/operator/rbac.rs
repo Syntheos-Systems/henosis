@@ -2,8 +2,8 @@
 //!
 //! [`OperatorAuth`] implements [`axum::extract::FromRequestParts<OperatorState>`].
 //! It reads the `Authorization: Bearer` header, decodes and verifies the JWT via
-//! [`super::auth::decode`], then parses the embedded `sub`, `org`, and `role`
-//! fields into their strongly-typed forms. Any failure produces a 401 response.
+//! [`super::auth::decode`], parses the embedded `sub` and `org` fields, and resolves the current
+//! membership role from policy state. Any authentication failure produces a 401 response.
 //!
 //! [`OperatorAuth::require`] is the per-endpoint permission gate: it calls
 //! [`henosis_plutus::can`] and converts a denial into a 403 [`OperatorError::Forbidden`].
@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use henosis_plutus::{can, Permission, Role};
+use henosis_plutus::{can, OrgStatus, Permission, PolicyBackend, Role};
 use syntheos_contracts::{PrincipalId, TenantId};
 
 use super::auth::{self, OperatorError};
@@ -54,6 +54,26 @@ impl OperatorAuth {
     }
 }
 
+/// Resolve the current active membership role for one signed operator identity.
+pub(super) async fn resolve_live_role(
+    policy: &dyn PolicyBackend,
+    org: TenantId,
+    principal: PrincipalId,
+) -> Result<Role, OperatorError> {
+    let status = policy
+        .org_status(org)
+        .await
+        .map_err(|error| OperatorError::Backend(error.to_string()))?;
+    if status != Some(OrgStatus::Active) {
+        return Err(OperatorError::Auth("invalid session token".into()));
+    }
+    policy
+        .member_role(org, principal)
+        .await
+        .map_err(|error| OperatorError::Backend(error.to_string()))?
+        .ok_or_else(|| OperatorError::Auth("invalid session token".into()))
+}
+
 /// Extracts and validates operator identity and role claims from bearer tokens.
 impl FromRequestParts<OperatorState> for OperatorAuth {
     /// Authentication or authorization failures become [`OperatorError`] responses
@@ -67,13 +87,13 @@ impl FromRequestParts<OperatorState> for OperatorAuth {
     /// 2. Decode and verify the JWT against `state.jwt_secret` (401 on any JWT failure).
     /// 3. Parse `claims.sub` -> [`PrincipalId`] via [`PrincipalId::from_str`] (401 on failure).
     /// 4. Parse `claims.org` -> [`TenantId`] via [`TenantId::from_str`] (401 on failure).
-    /// 5. Parse `claims.role` -> [`Role`] via [`Role::from_str`] (401 on unrecognized role).
+    /// 5. Resolve the current active membership and role from the policy backend.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &OperatorState,
     ) -> Result<Self, Self::Rejection> {
         // Step 1: extract the raw Bearer token string from the Authorization header.
-        let token = bearer_from_parts(parts)?;
+        let token = auth::bearer_token(&parts.headers)?;
 
         // Step 2: decode and cryptographically verify the JWT.
         let claims = auth::decode(token, &state.jwt_secret)?;
@@ -86,9 +106,8 @@ impl FromRequestParts<OperatorState> for OperatorAuth {
         let org = TenantId::from_str(&claims.org)
             .map_err(|e| OperatorError::Auth(format!("invalid org in JWT: {e}")))?;
 
-        // Step 5: parse the role string from the `role` claim.
-        let role = Role::from_str(&claims.role)
-            .map_err(|e| OperatorError::Auth(format!("invalid role in JWT: {e}")))?;
+        // Step 5: signed claims identify the subject, but current policy grants authority.
+        let role = resolve_live_role(&*state.plutus, org, principal).await?;
 
         Ok(OperatorAuth {
             principal,
@@ -96,21 +115,6 @@ impl FromRequestParts<OperatorState> for OperatorAuth {
             role,
         })
     }
-}
-
-/// Extract a Bearer token string from the request's `Authorization` header.
-///
-/// Returns the raw token string (without the `Bearer ` prefix) as a slice
-/// borrowing from `parts.headers`. Returns [`OperatorError::Auth`] (401) when
-/// the header is absent or its value does not start with `Bearer `.
-fn bearer_from_parts(parts: &Parts) -> Result<&str, OperatorError> {
-    let auth = parts
-        .headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| OperatorError::Auth("missing Authorization header".into()))?;
-    auth.strip_prefix("Bearer ")
-        .ok_or_else(|| OperatorError::Auth("expected Bearer token in Authorization header".into()))
 }
 
 #[cfg(test)]
@@ -131,5 +135,29 @@ mod tests {
         };
         assert!(auth.require(Permission::OrgRead).is_ok());
         assert!(auth.require(Permission::OrgDelete).is_err());
+    }
+
+    /// Live role resolution rejects stale tenant membership instead of trusting JWT role claims.
+    #[tokio::test]
+    async fn live_role_resolution_rejects_stale_membership() {
+        use henosis_plutus::{LocalPolicyBackend, QuotaTier};
+
+        let active_org = TenantId::new();
+        let principal = PrincipalId::new();
+        let policy = LocalPolicyBackend::new(active_org, principal, Role::Member, QuotaTier::Free);
+        assert_eq!(
+            resolve_live_role(&policy, active_org, principal)
+                .await
+                .expect("active membership"),
+            Role::Member
+        );
+        assert!(matches!(
+            resolve_live_role(&policy, TenantId::new(), principal).await,
+            Err(OperatorError::Auth(_))
+        ));
+        assert!(matches!(
+            resolve_live_role(&policy, active_org, PrincipalId::new()).await,
+            Err(OperatorError::Auth(_))
+        ));
     }
 }

@@ -7,6 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use henosis_approval::ApprovalStore;
 use henosis_broca::{ActionEntry, ActionFilter, BrocaError, BrocaStats, BrocaStore, LogAction};
 use henosis_chiasm::{
     ChiasmError, ChiasmStats, ChiasmStore, NewTask, Task, TaskFilter, TaskStatus,
@@ -35,6 +36,8 @@ use syntheos_contracts::{Gate, RunId, Timestamp, WorkflowId};
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 use syntheos_identity::PrincipalDirectory;
+
+use crate::authority::{DurableHumanGate, PhylaxdGate};
 
 /// Default number of lifecycle rows returned by the task activity endpoint.
 const DEFAULT_TASK_ACTIVITY_LIMIT: usize = 100;
@@ -78,6 +81,8 @@ pub struct AppState {
     /// (the default kernel server is unchanged). `Some` causes `router()` to merge
     /// the operator surface (`/api/auth/*`, `/api/dashboard`, `/ws`).
     operator: Option<crate::operator::OperatorState>,
+    /// Authenticated public authority surface for dispatch, tokens, approvals, and audit.
+    authority: Option<crate::authority::AuthorityState>,
     /// The Stripe billing webhook state. `None` when `SYNTHEOS_STRIPE_WEBHOOK_SECRET` is
     /// unset (the default kernel server is unchanged). `Some` causes `router()` to merge
     /// `POST /billing/stripe/webhook`.
@@ -128,18 +133,19 @@ pub fn eidolon_gate(
     EidolonGate::new(policy.clone(), Arc::new(ThymusDriftSignal(thymus)))
 }
 
-/// The live gate chain: all five slots now run REAL gates.
+/// Build the embedded compatibility gate chain used by loopback integrations and tests.
 ///
-/// Slots in canonical order (`pistis -> plutus -> eidolon -> human -> phylax`):
+/// Slots remain in dispatcher order (`pistis -> plutus -> eidolon -> human -> phylaxd`):
 /// - `pistis`:  [`PistisGate`] -- capability/trust checks.
 /// - `plutus`:  [`PlutusGate`] -- org status, RBAC, daily quota, rate limit. Backed by the
 ///   supplied `plutus` backend (production: [`henosis_plutus::PlutusStore`] over Postgres;
 ///   tests: a [`henosis_plutus::MockPolicyBackend`]).
 /// - `eidolon`: [`EidolonGate`] -- prompt-injection, scope-violation, persona-drift policy.
 /// - `human`:   [`HumanGate`] -- human-in-the-loop approvals over Rift.
-/// - `phylax`:  [`PhylaxGate`] over the required credential store.
+/// - `phylaxd`: the legacy compatibility gate over an in-process [`PhylaxGate`] store.
 ///
-/// `Dispatcher::new` re-validates the canonical order at boot, so a mis-wiring is a boot error.
+/// Public production dispatch uses [`public_gate_chain`] and the external authenticated
+/// `phylaxd` broker. `Dispatcher::new` validates gate order at construction.
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
     thymus: Arc<ThymusStore>,
@@ -151,15 +157,33 @@ pub fn live_gate_chain(
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
     Ok(vec![
         Box::new(PistisGate::new(pistis_source)),
-        // The REAL PlutusGate (Story 6.x / row 1): org status, RBAC, hard-quota, and
-        // token-bucket rate-limit, all fail-closed. Replaces the final deny-stub.
+        // Plutus enforces organization status, RBAC, hard quota, and token-bucket rate limits.
         Box::new(PlutusGate::new(plutus)),
         Box::new(eidolon_gate(policy, thymus)?),
-        // The REAL human gate (Story 4.6): an approval-required invocation is
-        // escalated to a human (Axon notification) and blocks on the approver
-        // until they decide or it times out (fail-closed).
+        // The embedded human gate blocks approval-required work until a decision or timeout.
         Box::new(HumanGate::new(human_approver, bus)),
         Box::new(PhylaxGate::new(phylax)),
+    ])
+}
+
+/// Build the authenticated public gate chain over durable human approvals and phylaxd.
+///
+/// The production surface has no in-process credential store and no blocking in-memory approver.
+/// Every mutating request receives a durable approval record, while credential operations are
+/// structurally checked before the executor delegates them to the external broker.
+pub fn public_gate_chain(
+    policy: &EidolonPolicy,
+    thymus: Arc<ThymusStore>,
+    pistis_source: Arc<dyn RoomStateSource>,
+    approvals: Arc<ApprovalStore>,
+    plutus: Arc<dyn PolicyBackend>,
+) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
+    Ok(vec![
+        Box::new(PistisGate::new(pistis_source)),
+        Box::new(PlutusGate::new(plutus)),
+        Box::new(eidolon_gate(policy, thymus)?),
+        Box::new(DurableHumanGate::new(approvals)),
+        Box::new(PhylaxdGate::new()),
     ])
 }
 
@@ -223,6 +247,8 @@ impl AppState {
             cognition,
             // Operator surface is disabled by default; enabled via `with_operator`.
             operator: None,
+            // Public authority surface is disabled until its durable stores are wired.
+            authority: None,
             // Billing webhook is disabled by default; enabled via `with_billing`.
             billing: None,
         }
@@ -235,6 +261,12 @@ impl AppState {
     /// When not called, the routes are absent and the kernel server is unchanged.
     pub fn with_operator(mut self, op: crate::operator::OperatorState) -> Self {
         self.operator = Some(op);
+        self
+    }
+
+    /// Attach the authenticated public authority surface to this application state.
+    pub fn with_authority(mut self, authority: crate::authority::AuthorityState) -> Self {
+        self.authority = Some(authority);
         self
     }
 
@@ -274,6 +306,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     // Extract the conditional surfaces before AppState is consumed by with_state.
     let operator = state.operator.clone();
+    let authority = state.authority.clone();
     let billing = state.billing.clone();
 
     #[allow(unused_mut)]
@@ -348,6 +381,11 @@ pub fn router(state: AppState) -> Router {
         app = app.merge(crate::operator::operator_router(op));
     }
 
+    // Merge the authenticated control plane only when its durable authorities were wired.
+    if let Some(authority) = authority {
+        app = app.merge(crate::authority::authority_router(authority));
+    }
+
     // Conditionally merge the Stripe billing webhook. When `billing` is `None` (the default --
     // `SYNTHEOS_STRIPE_WEBHOOK_SECRET` unset), `POST /billing/stripe/webhook` does not exist
     // and the kernel router is unchanged.
@@ -355,6 +393,33 @@ pub fn router(state: AppState) -> Router {
         app = app.merge(crate::billing::billing_router(b));
     }
 
+    app
+}
+
+/// Build the public production router without caller-asserted legacy kernel routes.
+///
+/// Only liveness, version, authenticated operator routes, authenticated `/api/v1` authority
+/// routes, and an explicitly configured billing webhook are reachable. The broad legacy kernel
+/// surface remains available through [`router`] for loopback compatibility and tests.
+pub fn production_router(state: AppState) -> Router {
+    let operator = state.operator.clone();
+    let authority = state.authority.clone();
+    let billing = state.billing.clone();
+
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .route("/version", get(version))
+        .with_state(state);
+
+    if let Some(operator) = operator {
+        app = app.merge(crate::operator::operator_router(operator));
+    }
+    if let Some(authority) = authority {
+        app = app.merge(crate::authority::authority_router(authority));
+    }
+    if let Some(billing) = billing {
+        app = app.merge(crate::billing::billing_router(billing));
+    }
     app
 }
 
@@ -1730,7 +1795,7 @@ mod tests {
             Box::new(StubGate::new("plutus")),
             Box::new(eidolon_gate(&policy, thymus.clone()).expect("valid default policy")),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher = Arc::new(
             Dispatcher::new(gates, Box::new(LeakyExecutor), bus.clone())
@@ -1905,7 +1970,7 @@ mod tests {
                 .expect("canonical chain");
         assert_eq!(
             dispatcher.gate_names(),
-            ["pistis", "plutus", "eidolon", "human", "phylax"]
+            ["pistis", "plutus", "eidolon", "human", "phylaxd"]
         );
 
         // The plutus slot (chain[1]) is the REAL PlutusGate and allows an enrolled-member request.
@@ -1936,6 +2001,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".to_owned(),
@@ -1987,6 +2053,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".to_owned(),
@@ -2054,7 +2121,7 @@ mod tests {
         .expect("valid default policy");
         // The phylax slot is last; assert it is the real gate by exercising it.
         let phylax_slot = chain.last().expect("phylax slot");
-        assert_eq!(phylax_slot.name(), "phylax");
+        assert_eq!(phylax_slot.name(), "phylaxd");
         let req = GateRequest {
             context: RequestContext {
                 tenant,
@@ -2064,6 +2131,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "phylax".into(),
@@ -2129,6 +2197,7 @@ mod tests {
             room: Some("!room".into()),
             task: None,
             workflow: None,
+            authority: None,
         };
 
         // No declared capability -> pistis allows -> the configured Plutus backend denies. The denial landing
@@ -2262,6 +2331,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".into(),
@@ -2960,6 +3030,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".into(),

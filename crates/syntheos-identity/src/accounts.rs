@@ -81,6 +81,17 @@ fn verify_password(phc: &str, password: &str) -> Result<bool, DirectoryError> {
 
 /// Provides persistent operator-account creation, verification, and lookup.
 impl SqliteDirectory {
+    /// Return whether at least one operator account exists without exposing account metadata.
+    pub fn has_operator_accounts(&self) -> Result<bool, DirectoryError> {
+        let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operator_account LIMIT 1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| DirectoryError::Backend(error.to_string()))
+    }
+
     /// Create an operator account bound to `principal`.
     ///
     /// `email` is normalised to lowercase before storage. `password` is hashed
@@ -219,9 +230,13 @@ mod tests {
     #[test]
     fn operator_account_create_and_verify() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
+        assert!(!dir.has_operator_accounts().expect("empty account census"));
         let p = PrincipalId::new();
         dir.create_account("Op@example.com", "hunter2", p)
             .expect("create");
+        assert!(dir
+            .has_operator_accounts()
+            .expect("populated account census"));
         // Email is case-insensitive; password must match.
         assert_eq!(
             dir.verify_login("op@example.com", "hunter2")

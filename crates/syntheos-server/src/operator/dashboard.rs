@@ -508,6 +508,7 @@ mod tests {
             &principal.to_string(),
             &org.to_string(),
             "viewer",
+            "dashboard-test-session",
             iat,
             86_400,
         );

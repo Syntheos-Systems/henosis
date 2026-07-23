@@ -11,17 +11,18 @@ use syntheos_contracts::{
 
 use crate::error::DispatchError;
 use crate::executor::Executor;
+use crate::guard::{ExecutionDecision, ExecutionGuard, ExecutionOutcome};
 use crate::outcome::DispatchOutcome;
 
 /// The canonical authority order every gate chain must be, exactly, in dispatch order:
-/// `pistis -> plutus -> eidolon -> human -> phylax`.
+/// `pistis -> plutus -> eidolon -> human -> phylaxd`.
 ///
 /// [`Dispatcher::new`] validates against this by [`Gate::name`]: a runnable chain is *exactly*
 /// these five authorities, each once, in this order -- no missing authority, no duplicate, no
 /// reordering, and no extra non-canonical gate. The audit trail then attests precisely this set
 /// ran; defense-in-depth checks (rate limiting, quotas) belong at the transport/server layer,
 /// not interleaved into the authority chain.
-pub const CANONICAL_GATE_ORDER: [&str; 5] = ["pistis", "plutus", "eidolon", "human", "phylax"];
+pub const CANONICAL_GATE_ORDER: [&str; 5] = ["pistis", "plutus", "eidolon", "human", "phylaxd"];
 
 /// The single chokepoint every action passes through. Holds the ordered gate chain, the
 /// executor that runs an authorized action, an optional output filter, and the bus it narrates
@@ -45,6 +46,8 @@ pub struct Dispatcher {
     /// Optional redaction/transform applied to a successful result before it is returned. `None`
     /// passes the result through unchanged.
     output_filter: Option<Box<dyn OutputFilter>>,
+    /// Optional durable guard around the final execution boundary.
+    execution_guard: Option<Arc<dyn ExecutionGuard>>,
     /// In-process bus the lifecycle events are published to.
     bus: Arc<AxonBus>,
 }
@@ -67,6 +70,7 @@ impl Dispatcher {
             gates,
             executor,
             output_filter: None,
+            execution_guard: None,
             bus,
         })
     }
@@ -78,6 +82,12 @@ impl Dispatcher {
     /// more than once keeps the last filter.
     pub fn with_output_filter(mut self, filter: Box<dyn OutputFilter>) -> Self {
         self.output_filter = Some(filter);
+        self
+    }
+
+    /// Attach the durable guard that records intent before execution and outcome afterward.
+    pub fn with_execution_guard(mut self, guard: Arc<dyn ExecutionGuard>) -> Self {
+        self.execution_guard = Some(guard);
         self
     }
 
@@ -133,9 +143,13 @@ impl Dispatcher {
             principal,
         );
 
+        let mut allowed_gates = Vec::with_capacity(self.gates.len());
         for gate in &self.gates {
             match gate.check(&request).await {
-                Ok(GateDecision::Allow) => continue,
+                Ok(GateDecision::Allow) => {
+                    allowed_gates.push(gate.name().to_string());
+                    continue;
+                }
                 Ok(GateDecision::Deny { reason }) => {
                     let gate = gate.name().to_string();
                     self.emit(
@@ -151,7 +165,10 @@ impl Dispatcher {
                     );
                     return Ok(DispatchOutcome::Denied { gate, reason });
                 }
-                Ok(GateDecision::RequireApproval { prompt }) => {
+                Ok(GateDecision::RequireApproval {
+                    prompt,
+                    approval_id,
+                }) => {
                     let gate = gate.name().to_string();
                     self.emit(
                         &ApprovalRequired {
@@ -159,12 +176,17 @@ impl Dispatcher {
                             action: action.clone(),
                             gate: gate.clone(),
                             prompt: prompt.clone(),
+                            approval_id: approval_id.clone(),
                             task_id,
                         },
                         tenant,
                         principal,
                     );
-                    return Ok(DispatchOutcome::RequiresApproval { gate, prompt });
+                    return Ok(DispatchOutcome::RequiresApproval {
+                        gate,
+                        prompt,
+                        approval_id,
+                    });
                 }
                 // `GateDecision` is `#[non_exhaustive]`: an unrecognized decision is fail-closed.
                 Ok(_) => {
@@ -204,6 +226,37 @@ impl Dispatcher {
             }
         }
 
+        if let Some(guard) = &self.execution_guard {
+            match guard.before_execute(&request, &allowed_gates).await {
+                Ok(ExecutionDecision::Execute) => {}
+                Ok(ExecutionDecision::Cached(result)) => {
+                    self.emit(
+                        &ActionCompleted {
+                            tool,
+                            action,
+                            task_id,
+                        },
+                        tenant,
+                        principal,
+                    );
+                    return Ok(DispatchOutcome::Executed { result });
+                }
+                Err(err) => {
+                    self.emit(
+                        &ActionFailed {
+                            tool,
+                            action,
+                            error: err.to_string(),
+                            task_id,
+                        },
+                        tenant,
+                        principal,
+                    );
+                    return Err(DispatchError::Execution(err));
+                }
+            }
+        }
+
         match self
             .executor
             .execute(&request.context, &request.invocation)
@@ -230,6 +283,35 @@ impl Dispatcher {
                         }
                     }
                 }
+                if let Some(guard) = &self.execution_guard {
+                    if let Err(err) = guard
+                        .after_execute(
+                            &request,
+                            ExecutionOutcome::Succeeded {
+                                result: result.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        if let Err(mark_error) = guard.mark_indeterminate(&request).await {
+                            tracing::error!(
+                                error = %mark_error,
+                                "failed to persist indeterminate execution state"
+                            );
+                        }
+                        self.emit(
+                            &ActionFailed {
+                                tool,
+                                action,
+                                error: err.to_string(),
+                                task_id,
+                            },
+                            tenant,
+                            principal,
+                        );
+                        return Err(DispatchError::Execution(err));
+                    }
+                }
                 self.emit(
                     &ActionCompleted {
                         tool,
@@ -242,6 +324,30 @@ impl Dispatcher {
                 Ok(DispatchOutcome::Executed { result })
             }
             Err(err) => {
+                if let Some(guard) = &self.execution_guard {
+                    if let Err(guard_err) = guard
+                        .after_execute(&request, ExecutionOutcome::Failed)
+                        .await
+                    {
+                        if let Err(mark_error) = guard.mark_indeterminate(&request).await {
+                            tracing::error!(
+                                error = %mark_error,
+                                "failed to persist indeterminate execution state"
+                            );
+                        }
+                        self.emit(
+                            &ActionFailed {
+                                tool,
+                                action,
+                                error: guard_err.to_string(),
+                                task_id,
+                            },
+                            tenant,
+                            principal,
+                        );
+                        return Err(DispatchError::Execution(guard_err));
+                    }
+                }
                 self.emit(
                     &ActionFailed {
                         tool,
@@ -289,6 +395,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: tool.to_string(),
@@ -333,6 +440,7 @@ mod tests {
         async fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
             Ok(GateDecision::RequireApproval {
                 prompt: "approve?".to_string(),
+                approval_id: Some("approval-1".to_string()),
             })
         }
     }
@@ -391,6 +499,158 @@ mod tests {
         }
     }
 
+    /// An execution guard that records boundary calls and can fail either side.
+    struct RecordingExecutionGuard {
+        /// Ordered boundary observations made by the guard.
+        log: Arc<Mutex<Vec<String>>>,
+        /// Whether the pre-execution boundary returns an error.
+        fail_before: bool,
+        /// Whether the post-execution boundary returns an error.
+        fail_after: bool,
+    }
+
+    #[async_trait]
+    /// Execution guard implementation used to prove boundary ordering and fail-closed behavior.
+    impl ExecutionGuard for RecordingExecutionGuard {
+        /// Record the allowed authority chain before execution.
+        async fn before_execute(
+            &self,
+            _request: &GateRequest,
+            allowed_gates: &[String],
+        ) -> Result<ExecutionDecision, ExecutorError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("before:{}", allowed_gates.join(",")));
+            if self.fail_before {
+                return Err(ExecutorError::new("intent persistence failed"));
+            }
+            Ok(ExecutionDecision::Execute)
+        }
+
+        /// Record the executor outcome after execution.
+        async fn after_execute(
+            &self,
+            _request: &GateRequest,
+            outcome: ExecutionOutcome,
+        ) -> Result<(), ExecutorError> {
+            let label = match outcome {
+                ExecutionOutcome::Succeeded { .. } => "Succeeded",
+                ExecutionOutcome::Failed => "Failed",
+            };
+            self.log.lock().unwrap().push(format!("after:{label}"));
+            if self.fail_after {
+                return Err(ExecutorError::new("outcome persistence failed"));
+            }
+            Ok(())
+        }
+
+        /// Record that the dispatcher requested a durable indeterminate marker.
+        async fn mark_indeterminate(&self, _request: &GateRequest) -> Result<(), ExecutorError> {
+            self.log.lock().unwrap().push("indeterminate".to_string());
+            Ok(())
+        }
+    }
+
+    /// Minimal durable states used to simulate a retry after an ambiguous completion.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RetryLedgerState {
+        /// No caller has claimed the retry key.
+        Vacant,
+        /// One caller may be executing or may already have executed.
+        Claimed,
+        /// The side effect completed without a replayable terminal record.
+        Indeterminate,
+    }
+
+    /// Stateful guard that fails the first completion and blocks every retry.
+    struct IndeterminateExecutionGuard {
+        /// Shared durable-state simulation inspected by the test.
+        state: Arc<Mutex<RetryLedgerState>>,
+    }
+
+    #[async_trait]
+    /// Guard implementation modeling a durable claimed-to-indeterminate transition.
+    impl ExecutionGuard for IndeterminateExecutionGuard {
+        /// Acquire the first claim and reject all later claimed or indeterminate retries.
+        async fn before_execute(
+            &self,
+            _request: &GateRequest,
+            _allowed_gates: &[String],
+        ) -> Result<ExecutionDecision, ExecutorError> {
+            let mut state = self.state.lock().unwrap();
+            match *state {
+                RetryLedgerState::Vacant => {
+                    *state = RetryLedgerState::Claimed;
+                    Ok(ExecutionDecision::Execute)
+                }
+                RetryLedgerState::Claimed => {
+                    Err(ExecutorError::new("execution is already claimed"))
+                }
+                RetryLedgerState::Indeterminate => {
+                    Err(ExecutorError::new("execution result is indeterminate"))
+                }
+            }
+        }
+
+        /// Simulate loss of terminal persistence after a successful side effect.
+        async fn after_execute(
+            &self,
+            _request: &GateRequest,
+            outcome: ExecutionOutcome,
+        ) -> Result<(), ExecutorError> {
+            match outcome {
+                ExecutionOutcome::Succeeded { .. } => {
+                    Err(ExecutorError::new("outcome persistence failed"))
+                }
+                ExecutionOutcome::Failed => Ok(()),
+            }
+        }
+
+        /// Persist the simulated indeterminate state before returning the dispatch error.
+        async fn mark_indeterminate(&self, _request: &GateRequest) -> Result<(), ExecutorError> {
+            *self.state.lock().unwrap() = RetryLedgerState::Indeterminate;
+            Ok(())
+        }
+    }
+
+    /// Guard that always replays a previously filtered completed result.
+    struct CachedExecutionGuard {
+        /// Final filtered result stored by the simulated ledger.
+        result: serde_json::Value,
+    }
+
+    #[async_trait]
+    /// Guard implementation used to prove completed requests bypass execution and filtering.
+    impl ExecutionGuard for CachedExecutionGuard {
+        /// Return the cached final value without granting an execution claim.
+        async fn before_execute(
+            &self,
+            _request: &GateRequest,
+            _allowed_gates: &[String],
+        ) -> Result<ExecutionDecision, ExecutorError> {
+            Ok(ExecutionDecision::Cached(self.result.clone()))
+        }
+
+        /// Reject an impossible completion callback after a cached decision.
+        async fn after_execute(
+            &self,
+            _request: &GateRequest,
+            _outcome: ExecutionOutcome,
+        ) -> Result<(), ExecutorError> {
+            Err(ExecutorError::new(
+                "cached execution must not receive a completion callback",
+            ))
+        }
+
+        /// Reject an impossible indeterminate callback after a cached decision.
+        async fn mark_indeterminate(&self, _request: &GateRequest) -> Result<(), ExecutorError> {
+            Err(ExecutorError::new(
+                "cached execution must not become indeterminate",
+            ))
+        }
+    }
+
     /// Drain all currently-buffered envelopes from a raw subscriber into their kind strings.
     fn drain_kinds(rx: &mut tokio::sync::broadcast::Receiver<AxonEnvelope>) -> Vec<String> {
         let mut kinds = Vec::new();
@@ -423,6 +683,128 @@ mod tests {
     }
 
     #[tokio::test]
+    /// The execution guard runs around the executor with the complete allowed authority trace.
+    async fn execution_guard_wraps_execution() {
+        let bus = Arc::new(AxonBus::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(EchoExecutor), bus)
+            .expect("canonical chain")
+            .with_execution_guard(Arc::new(RecordingExecutionGuard {
+                log: log.clone(),
+                fail_before: false,
+                fail_after: false,
+            }));
+
+        dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("guarded dispatch");
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "before:pistis,plutus,eidolon,human,phylaxd",
+                "after:Succeeded"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    /// A pre-execution guard failure prevents the executor from running.
+    async fn execution_guard_fails_closed_before_execution() {
+        let bus = Arc::new(AxonBus::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher = Dispatcher::new(
+            stub_gate_chain(),
+            Box::new(CountingExecutor {
+                calls: calls.clone(),
+            }),
+            bus,
+        )
+        .expect("canonical chain")
+        .with_execution_guard(Arc::new(RecordingExecutionGuard {
+            log: Arc::new(Mutex::new(Vec::new())),
+            fail_before: true,
+            fail_after: false,
+        }));
+
+        let error = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect_err("guard must fail");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(error.to_string().contains("intent persistence failed"));
+    }
+
+    #[tokio::test]
+    /// A retry after post-effect persistence failure never invokes the executor a second time.
+    async fn indeterminate_retry_does_not_repeat_side_effect() {
+        let bus = Arc::new(AxonBus::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(RetryLedgerState::Vacant));
+        let dispatcher = Dispatcher::new(
+            stub_gate_chain(),
+            Box::new(CountingExecutor {
+                calls: calls.clone(),
+            }),
+            bus,
+        )
+        .expect("canonical chain")
+        .with_execution_guard(Arc::new(IndeterminateExecutionGuard {
+            state: state.clone(),
+        }));
+        let retryable_request = request("kleos", "memory_store");
+
+        let first_error = dispatcher
+            .dispatch(retryable_request.clone())
+            .await
+            .expect_err("terminal persistence must fail");
+        assert!(first_error
+            .to_string()
+            .contains("outcome persistence failed"));
+        assert_eq!(*state.lock().unwrap(), RetryLedgerState::Indeterminate);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let retry_error = dispatcher
+            .dispatch(retryable_request)
+            .await
+            .expect_err("indeterminate retry must fail closed");
+        assert!(retry_error
+            .to_string()
+            .contains("execution result is indeterminate"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    /// A completed retry returns its cached final value without execution or re-filtering.
+    async fn completed_retry_skips_executor_and_output_filter() {
+        let bus = Arc::new(AxonBus::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cached = serde_json::json!({"stable": true});
+        let dispatcher = Dispatcher::new(
+            stub_gate_chain(),
+            Box::new(CountingExecutor {
+                calls: calls.clone(),
+            }),
+            bus,
+        )
+        .expect("canonical chain")
+        .with_output_filter(Box::new(ScrubFilter { field: "stable" }))
+        .with_execution_guard(Arc::new(CachedExecutionGuard {
+            result: cached.clone(),
+        }));
+
+        let outcome = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect("cached dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::Executed { result: cached });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     /// A denial short-circuits later gates and the executor.
     async fn deny_short_circuits() {
         let bus = Arc::new(AxonBus::new());
@@ -437,7 +819,7 @@ mod tests {
             }),
             Box::new(StubGate::new("eidolon")),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher = Dispatcher::new(
             gates,
@@ -479,7 +861,7 @@ mod tests {
             Box::new(StubGate::new("plutus")),
             Box::new(StubGate::new("eidolon")),
             Box::new(ApprovalGate { name: "human" }),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher = Dispatcher::new(
             gates,
@@ -499,6 +881,7 @@ mod tests {
             DispatchOutcome::RequiresApproval {
                 gate: "human".into(),
                 prompt: "approve?".into(),
+                approval_id: Some("approval-1".into()),
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -528,11 +911,40 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A failed executor whose outcome cannot persist is marked indeterminate before returning.
+    async fn execution_failure_persistence_marks_indeterminate() {
+        let bus = Arc::new(AxonBus::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = Dispatcher::new(stub_gate_chain(), Box::new(FailingExecutor), bus)
+            .expect("canonical chain")
+            .with_execution_guard(Arc::new(RecordingExecutionGuard {
+                log: log.clone(),
+                fail_before: false,
+                fail_after: true,
+            }));
+
+        let error = dispatcher
+            .dispatch(request("kleos", "memory_store"))
+            .await
+            .expect_err("failed outcome persistence must fail closed");
+
+        assert!(error.to_string().contains("outcome persistence failed"));
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "before:pistis,plutus,eidolon,human,phylaxd",
+                "after:Failed",
+                "indeterminate"
+            ]
+        );
+    }
+
+    #[tokio::test]
     /// Gates run in canonical order and stop at the first denial.
     async fn gate_order_and_short_circuit() {
         let bus = Arc::new(AxonBus::new());
         let log = Arc::new(Mutex::new(Vec::new()));
-        // Full canonical chain of recording gates; plutus denies, so eidolon/human/phylax must
+        // Full canonical chain of recording gates; plutus denies, so eidolon/human/phylaxd must
         // never run.
         let gates: Vec<Box<dyn Gate>> = CANONICAL_GATE_ORDER
             .into_iter()
@@ -603,7 +1015,7 @@ mod tests {
             .expect("canonical chain");
         assert_eq!(
             dispatcher.gate_names(),
-            ["pistis", "plutus", "eidolon", "human", "phylax"]
+            ["pistis", "plutus", "eidolon", "human", "phylaxd"]
         );
     }
 
@@ -779,7 +1191,7 @@ mod tests {
     fn incomplete_chain_rejected() {
         let bus = Arc::new(AxonBus::new());
         // Canonical chain minus the human authority: incomplete, must be rejected.
-        let gates: Vec<Box<dyn Gate>> = ["pistis", "plutus", "eidolon", "phylax"]
+        let gates: Vec<Box<dyn Gate>> = ["pistis", "plutus", "eidolon", "phylaxd"]
             .into_iter()
             .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
             .collect();
@@ -789,7 +1201,7 @@ mod tests {
         match err {
             DispatchError::NonCanonicalChain { expected, got } => {
                 assert_eq!(expected, CANONICAL_GATE_ORDER);
-                assert_eq!(got, ["pistis", "plutus", "eidolon", "phylax"]);
+                assert_eq!(got, ["pistis", "plutus", "eidolon", "phylaxd"]);
             }
             other => panic!("expected NonCanonicalChain, got {other:?}"),
         }
@@ -799,8 +1211,8 @@ mod tests {
     /// A chain with canonical authorities in the wrong order is rejected.
     fn misordered_chain_rejected() {
         let bus = Arc::new(AxonBus::new());
-        // All five authorities present, but phylax before human: order violation, rejected.
-        let gates: Vec<Box<dyn Gate>> = ["pistis", "plutus", "eidolon", "phylax", "human"]
+        // All five authorities present, but phylaxd before human: order violation, rejected.
+        let gates: Vec<Box<dyn Gate>> = ["pistis", "plutus", "eidolon", "phylaxd", "human"]
             .into_iter()
             .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
             .collect();
@@ -819,7 +1231,7 @@ mod tests {
         let bus = Arc::new(AxonBus::new());
         // A duplicated canonical authority is rejected even with all five present in order.
         let gates: Vec<Box<dyn Gate>> =
-            ["pistis", "pistis", "plutus", "eidolon", "human", "phylax"]
+            ["pistis", "pistis", "plutus", "eidolon", "human", "phylaxd"]
                 .into_iter()
                 .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
                 .collect();
@@ -845,7 +1257,7 @@ mod tests {
             "ratelimit",
             "eidolon",
             "human",
-            "phylax",
+            "phylaxd",
         ]
         .into_iter()
         .map(|name| Box::new(StubGate::new(name)) as Box<dyn Gate>)
@@ -864,7 +1276,7 @@ mod tests {
                         "ratelimit",
                         "eidolon",
                         "human",
-                        "phylax"
+                        "phylaxd"
                     ]
                 );
             }
@@ -902,7 +1314,7 @@ mod tests {
             Box::new(ErroringGate { name: "plutus" }),
             Box::new(StubGate::new("eidolon")),
             Box::new(StubGate::new("human")),
-            Box::new(StubGate::new("phylax")),
+            Box::new(StubGate::new("phylaxd")),
         ];
         let dispatcher = Dispatcher::new(
             gates,

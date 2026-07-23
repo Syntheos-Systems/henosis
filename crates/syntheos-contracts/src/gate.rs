@@ -41,6 +41,8 @@ pub enum GateDecision {
     RequireApproval {
         /// The prompt shown to the approver.
         prompt: String,
+        /// Durable approval identifier used to resume this exact request.
+        approval_id: Option<String>,
     },
 }
 
@@ -59,6 +61,7 @@ pub struct GateError {
     pub message: String,
 }
 
+/// Implements GateError construction.
 impl GateError {
     /// Build a [`GateError`] from anything string-like.
     pub fn new(message: impl Into<String>) -> Self {
@@ -70,6 +73,7 @@ impl GateError {
 
 /// Render the gate error as its message.
 impl std::fmt::Display for GateError {
+    /// Writes the error's human-readable message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
@@ -127,6 +131,7 @@ mod tests {
                 room: None,
                 task: None,
                 workflow: None,
+                authority: None,
             },
             invocation: ToolInvocation {
                 tool: "kleos".to_string(),
@@ -155,6 +160,7 @@ mod tests {
             },
             GateDecision::RequireApproval {
                 prompt: "ok?".to_string(),
+                approval_id: Some("approval-1".to_string()),
             },
         ] {
             let json = serde_json::to_string(&d).expect("serialize");

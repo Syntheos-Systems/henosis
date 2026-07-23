@@ -130,11 +130,16 @@ impl AppState {
     ///
     /// This starts the OAuth refresh and audit-publishing background tasks, so
     /// it must be called from within a Tokio runtime.
-    pub fn from_config(config: config::Config) -> Self {
+    pub fn from_config(mut config: config::Config) -> Self {
         let registry = Arc::new(build_registry());
         let refresh_registry = oauth_refresh::RefreshRegistry::default();
+        let phylaxd_url = std::mem::take(&mut config.phylaxd_url);
+        let phylaxd_token = config
+            .phylaxd_token
+            .take()
+            .map(|mut token| std::mem::take(&mut *token));
         let phylaxd = Arc::new(
-            phylaxd_client::PhylaxdClient::new(config.phylaxd_url, config.phylaxd_token)
+            phylaxd_client::PhylaxdClient::new(phylaxd_url, phylaxd_token)
                 .with_refresh_registry(refresh_registry.clone()),
         );
         oauth_refresh::OAuthRefreshDaemon::new(refresh_registry, phylaxd.clone()).spawn();
@@ -158,7 +163,7 @@ impl AppState {
                     .unwrap_or_else(|_| "data/tenant_config.json".to_string())
                     .into(),
             )),
-            public_url: config.public_url,
+            public_url: config.public_url.take(),
         }
     }
 
