@@ -53,7 +53,9 @@ function Get-ReleaseApi {
 
 # Return the release target supported by this Windows host.
 function Get-ReleaseTarget {
-    if (-not $IsWindows) { Stop-Install 'this installer supports Windows only' }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        Stop-Install 'this installer supports Windows only'
+    }
     if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
         Stop-Install "unsupported Windows architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
     }
