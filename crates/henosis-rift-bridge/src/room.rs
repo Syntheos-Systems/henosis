@@ -357,8 +357,8 @@ impl Room {
             return Ok(());
         }
 
-        // Handle approval control commands from humans.
-        if let Some(cmd) = parse_control_command(&msg.content) {
+        // Handle approval control commands only from canonically typed humans.
+        if let Some(cmd) = authorized_control_command(&msg) {
             self.apply_control_command(cmd);
             return Ok(());
         }
@@ -619,7 +619,7 @@ impl Room {
                             if inbound_action(own, &m.message_type) == InboundAction::Ignore {
                                 continue;
                             }
-                            if let Some(cmd) = parse_control_command(&m.content) {
+                            if let Some(cmd) = authorized_control_command(&m) {
                                 self.apply_control_command(cmd);
                                 continue;
                             }
@@ -1248,8 +1248,19 @@ fn stimulus_announcement(text: &str) -> (String, &'static str) {
 enum InboundAction {
     /// Drop without any processing.
     Ignore,
-    /// Treat as a conversation trigger (control parsing, topic seed, cascade).
+    /// Treat as a conversation trigger eligible for user-only control parsing.
     Process,
+}
+
+/// Parse a room control command only when the server typed its author as a human user.
+///
+/// Foreign agents and stimulus injectors remain valid conversation triggers, but their
+/// message content carries no human approval authority.
+fn authorized_control_command(message: &RoomMessage) -> Option<ControlCommand> {
+    if message.message_type != MessageType::User.as_str() {
+        return None;
+    }
+    parse_control_command(&message.content)
 }
 
 /// Gate an inbound message before any processing.
@@ -1503,6 +1514,81 @@ mod tests {
         }
     }
 
+    /// Verifies approve and reject authority belongs only to the canonical user type.
+    #[test]
+    fn test_control_command_authority_requires_user_type() {
+        for content in ["!approve 5", "!reject 5"] {
+            assert!(
+                authorized_control_command(&human_msg(content)).is_some(),
+                "a canonical user command must parse"
+            );
+            for message_type in ["agent", "stimulus", "system"] {
+                let mut message = human_msg(content);
+                message.message_type = message_type.to_string();
+                assert!(
+                    authorized_control_command(&message).is_none(),
+                    "{message_type} content must not parse as a human command"
+                );
+            }
+        }
+    }
+
+    /// Verifies the idle room path still applies a canonical human approval command.
+    #[tokio::test]
+    async fn test_handle_message_applies_human_control_command() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(6),
+            agent: "nobody".to_string(),
+            task_id: "t-6".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+
+        room.handle_message(human_msg("!approve 6"), &mut rx, &mut pause_rx)
+            .await
+            .expect("human approval must be handled");
+
+        assert!(
+            room.approval_registry.list().is_empty(),
+            "a canonical human approval must consume the proposal"
+        );
+    }
+
+    /// Verifies foreign agent and stimulus commands cannot consume a proposal in the idle path.
+    #[tokio::test]
+    async fn test_handle_message_rejects_foreign_control_authority() {
+        for message_type in ["agent", "stimulus"] {
+            let (mut room, _agent) = offline_room();
+            room.config.max_cascade_rounds = 0;
+            room.approval_registry.insert_for_test(PendingProposal {
+                id: ProposalId(6),
+                agent: "nobody".to_string(),
+                task_id: "t-6".to_string(),
+                scope_summary: "test scope".to_string(),
+                granted_capabilities: Vec::new(),
+                workspace: "w".to_string(),
+            });
+            let (_tx, mut rx) = mpsc::channel(8);
+            let (_pause_tx, mut pause_rx) = watch::channel(false);
+            let mut message = human_msg("!approve 6");
+            message.message_type = message_type.to_string();
+
+            room.handle_message(message, &mut rx, &mut pause_rx)
+                .await
+                .expect("foreign message remains an ordinary conversation trigger");
+
+            assert_eq!(
+                room.approval_registry.list().len(),
+                1,
+                "{message_type} content must not carry human approval authority"
+            );
+        }
+    }
+
     /// Verifies an in-room `!approve` arriving mid-slot-wait is applied
     /// immediately (the approval leaves the registry) and the wait then
     /// completes normally -- the approval-latency fix in miniature.
@@ -1537,6 +1623,42 @@ mod tests {
             room.approval_registry.list().is_empty(),
             "approval must be consumed during the slot wait, not after the cascade"
         );
+    }
+
+    /// Verifies foreign agent and stimulus commands interrupt normally without approving.
+    #[tokio::test]
+    async fn test_wait_for_slot_rejects_foreign_control_authority() {
+        for message_type in ["agent", "stimulus"] {
+            let (mut room, _agent) = offline_room();
+            room.approval_registry.insert_for_test(PendingProposal {
+                id: ProposalId(8),
+                agent: "nobody".to_string(),
+                task_id: "t-8".to_string(),
+                scope_summary: "test scope".to_string(),
+                granted_capabilities: Vec::new(),
+                workspace: "w".to_string(),
+            });
+            let (tx, mut rx) = mpsc::channel(8);
+            let (_pause_tx, mut pause_rx) = watch::channel(false);
+            let mut message = human_msg("!approve 8");
+            message.message_type = message_type.to_string();
+            tx.send(RiftWsEvent::MessageCreate(message)).await.unwrap();
+
+            let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                room.wait_for_slot(target, &mut rx, &mut pause_rx),
+            )
+            .await
+            .expect("foreign conversation message must interrupt promptly");
+
+            assert!(matches!(outcome, SlotOutcome::Interrupted(_)));
+            assert_eq!(
+                room.approval_registry.list().len(),
+                1,
+                "{message_type} content must not carry human approval authority"
+            );
+        }
     }
 
     /// Verifies a fresh human message interrupts the slot wait and comes
