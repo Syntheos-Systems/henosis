@@ -27,6 +27,29 @@ jobs:
       - run: cargo +1.88.0 test --locked --workspace --exclude henosis-cognition
       - run: ./scripts/stub-scan.sh
 
+  cognition:
+    name: Cognition quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -y libpcsclite-dev libpq-dev libssl-dev pkg-config ripgrep
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Verify cognition dependency boundary
+        run: |
+          feature_tree="$(cargo +1.94.0 tree --locked -p henosis-cognition -e features)"
+          if printf '%s\n' "$feature_tree" | grep -E 'kleos-lib feature "(gate|grounding)"'; then
+            echo "Henosis cognition enabled an unused Kleos execution feature" >&2
+            exit 1
+          fi
+          if rg -n 'kleos_lib::(gate|grounding)|\b(GroundingClient|ShellProvider)\b' crates --glob '*.rs'; then
+            echo "Henosis source reached into an excluded Kleos execution module" >&2
+            exit 1
+          fi
+      - name: Test default Kleos surface
+        run: cargo +1.94.0 test --locked --manifest-path vendor/kleos/Cargo.toml -p kleos-lib
+      - run: cargo +1.94.0 test --locked -p henosis-cognition -p syntheos-server -p henosis-rift-bridge --features syntheos-server/cognition,henosis-rift-bridge/cognition
+
   dependencies:
     name: Dependency audit
     runs-on: ubuntu-24.04
@@ -90,7 +113,7 @@ jobs:
 
   release-build:
     name: Native ${{ matrix.target }}
-    needs: [quality, dependencies, secrets, release-package-contract, release-package-windows, release-version]
+    needs: [quality, cognition, dependencies, secrets, release-package-contract, release-package-windows, release-version]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     strategy:

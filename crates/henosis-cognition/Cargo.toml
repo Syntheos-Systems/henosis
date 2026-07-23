@@ -8,13 +8,12 @@ repository.workspace = true
 description = "Thin in-process facade over the vendored kleos-lib cognitive core (memory, context, storage organism)."
 
 [dependencies]
-# The vendored, UNTOUCHED Kleos library, depended on BY PATH so its heavy ML
-# stack (ort/tokenizers/lancedb/arrow/datafusion) resolves against the nested
+# The vendored Kleos library is depended on BY PATH so its heavy ML stack
+# (ort/tokenizers/lancedb/arrow/datafusion) resolves against the nested
 # vendor/kleos workspace and never routes through the Henosis workspace deps.
-# Default features keep brain_hopfield + the ML embedding path available; the
-# lightweight session never constructs an ONNX embedder so the native runtime
-# library is not required at build or test time.
-kleos-lib = { path = "../../vendor/kleos/kleos-lib" }
+# Keep the cognitive dependencies required by this facade while excluding the
+# unused generic gate and grounding execution APIs from Henosis builds.
+kleos-lib = { path = "../../vendor/kleos/kleos-lib", default-features = false, features = ["brain_hopfield", "ml"] }
 # Async runtime for the pass-through methods (all kleos-lib core fns are async).
 tokio = { workspace = true }
 # The facade error type wraps kleos-lib's `EngError`.
