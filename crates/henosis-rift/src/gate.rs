@@ -1,9 +1,9 @@
 //! The `human` gate: human-in-the-loop approval, fail-closed.
 //!
 //! HumanGate is the fourth gate in the canonical dispatcher chain (`pistis ->
-//! plutus -> eidolon -> human -> phylaxd`). It acts only on an invocation that
-//! *declares it requires approval*; everything else passes through (mirroring
-//! how PistisGate only acts on capability-bearing invocations).
+//! plutus -> eidolon -> human -> phylaxd`). It derives approval requirements
+//! from a server-owned tool/action policy and never trusts invocation arguments
+//! to disable review or write the prompt shown to a human.
 //!
 //! When an invocation requires approval, the gate publishes a
 //! [`HumanApprovalRequested`] event onto the Axon `human` channel (the outbound
@@ -14,10 +14,9 @@
 //! fail-closed by construction: a missing/unreachable approver times out, which
 //! denies.
 //!
-//! Convention: a trusted invocation builder marks an action with a boolean
-//! `requires_approval` arg (and an optional `approval_prompt` string). The
-//! principal cannot set these; richer policy (e.g. require approval for every
-//! `deploy`/`delete` action kind) is future work layered on top of this seam.
+//! Exact reviewed read-only operations pass through. Every mutating or unknown
+//! operation requires approval, so new adapters fail closed until their reads
+//! are deliberately added to the policy.
 
 use std::sync::Arc;
 
@@ -28,6 +27,51 @@ use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest, ToolInvocat
 
 /// The Axon channel human-approval notifications travel on.
 pub const HUMAN_CHANNEL: &str = "human";
+/// Maximum bytes accepted when echoing a recognized operation name to a human.
+const MAX_APPROVAL_IDENTIFIER_BYTES: usize = 64;
+
+/// Require approval unless an exact registered adapter operation is reviewed as read-only.
+pub fn requires_human_approval(invocation: &ToolInvocation) -> bool {
+    !matches!(
+        (invocation.tool.as_str(), invocation.action.as_str()),
+        ("henosis", "probe")
+            | ("gcal", "list_events")
+            | ("gdrive", "list" | "download" | "get_metadata")
+            | (
+                "github",
+                "get_issue" | "list_issues" | "list_prs" | "search_code" | "list_repos"
+            )
+            | ("gmail", "read" | "search" | "list_labels")
+            | ("linear", "list_issues" | "search")
+            | ("notion", "get_page" | "search")
+    )
+}
+
+/// Return a bounded operation identifier that is safe to show in an approval prompt.
+fn approval_identifier(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || value.len() > MAX_APPROVAL_IDENTIFIER_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// Build a human-readable prompt from bounded tool and action identifiers only.
+pub fn approval_prompt(invocation: &ToolInvocation) -> String {
+    match (
+        approval_identifier(&invocation.tool),
+        approval_identifier(&invocation.action),
+    ) {
+        (Some(tool), Some(action)) => {
+            format!("Approve {tool}.{action} for this authenticated principal?")
+        }
+        _ => "Approve an unrecognized authenticated operation?".to_owned(),
+    }
+}
 
 /// A human's decision on an approval-required action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,57 +141,29 @@ pub struct HumanGate {
     bus: Arc<AxonBus>,
 }
 
-/// Builds the human gate and derives approval prompts from invocations.
+/// Builds the human gate over the shared server-owned approval policy.
 impl HumanGate {
     /// Build the gate over an approval channel and the Axon bus.
     pub fn new(approver: Arc<dyn Approver>, bus: Arc<AxonBus>) -> Self {
         Self { approver, bus }
     }
-
-    /// The approval prompt for this invocation, or `None` when it declares no
-    /// approval requirement (then the gate allows it -- not its concern).
-    ///
-    /// Requires `args.requires_approval == true`. The prompt is
-    /// `args.approval_prompt` when present, else a default naming the action.
-    fn approval_prompt(invocation: &ToolInvocation) -> Option<String> {
-        let requires = invocation
-            .args
-            .get("requires_approval")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if !requires {
-            return None;
-        }
-        let prompt = invocation
-            .args
-            .get("approval_prompt")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "Approve action '{}' on tool '{}'?",
-                    invocation.action, invocation.tool
-                )
-            });
-        Some(prompt)
-    }
 }
 
 #[async_trait]
-/// Enforces declared human approval requirements in the dispatcher gate chain.
+/// Enforces server-owned human approval requirements in the dispatcher gate chain.
 impl Gate for HumanGate {
     /// The canonical authority name for this slot.
     fn name(&self) -> &str {
         "human"
     }
 
-    /// Allow an invocation that declares no approval requirement; otherwise
-    /// notify and block on the approver, mapping the human's decision to a gate
-    /// decision (approved -> Allow, denied/timed-out -> Deny). Fail-closed.
+    /// Allow an exact reviewed read; otherwise notify and block on the approver,
+    /// mapping approved to allow and denied or timed-out to deny.
     async fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
-        let Some(prompt) = Self::approval_prompt(&req.invocation) else {
+        if !requires_human_approval(&req.invocation) {
             return Ok(GateDecision::Allow);
-        };
+        }
+        let prompt = approval_prompt(&req.invocation);
 
         // A v4 id correlates the outbound notification with the blocking wait.
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -203,8 +219,8 @@ mod tests {
         }
     }
 
-    /// Build a request, optionally declaring an approval requirement.
-    fn request(args: serde_json::Value) -> GateRequest {
+    /// Build a request for one operation with arbitrary untrusted arguments.
+    fn request_for(tool: &str, action: &str, args: serde_json::Value) -> GateRequest {
         GateRequest {
             context: RequestContext {
                 tenant: TenantId::new(),
@@ -217,11 +233,16 @@ mod tests {
                 authority: None,
             },
             invocation: ToolInvocation {
-                tool: "synapse".to_owned(),
-                action: "deploy".to_owned(),
+                tool: tool.to_owned(),
+                action: action.to_owned(),
                 args,
             },
         }
+    }
+
+    /// Build the default mutating deployment request used by approval tests.
+    fn request(args: serde_json::Value) -> GateRequest {
+        request_for("synapse", "deploy", args)
     }
 
     /// Build a gate over a fixed approver and a fresh bus.
@@ -229,26 +250,26 @@ mod tests {
         HumanGate::new(Arc::new(FixedApprover(decision)), Arc::new(AxonBus::new()))
     }
 
-    /// An invocation with no approval requirement is allowed without blocking.
+    /// Omitting caller-authored approval metadata cannot bypass a mutating operation.
     #[tokio::test]
-    async fn no_requirement_allowed() {
-        let g = gate(ApprovalDecision::TimedOut); // never consulted
+    async fn missing_requirement_metadata_cannot_bypass() {
+        let g = gate(ApprovalDecision::TimedOut);
         let d = g.check(&request(serde_json::json!({}))).await.unwrap();
-        assert_eq!(d, GateDecision::Allow);
+        assert!(matches!(d, GateDecision::Deny { .. }));
     }
 
-    /// `requires_approval: false` is not an approval requirement.
+    /// An explicit false value in untrusted arguments cannot disable review.
     #[tokio::test]
-    async fn explicit_false_allowed() {
-        let g = gate(ApprovalDecision::Denied("x".into()));
+    async fn explicit_false_cannot_bypass() {
+        let g = gate(ApprovalDecision::TimedOut);
         let d = g
             .check(&request(serde_json::json!({ "requires_approval": false })))
             .await
             .unwrap();
-        assert_eq!(d, GateDecision::Allow);
+        assert!(matches!(d, GateDecision::Deny { .. }));
     }
 
-    /// An approved requirement yields Allow.
+    /// An approved mutating operation yields Allow regardless of untrusted metadata.
     #[tokio::test]
     async fn approved_allows() {
         let g = gate(ApprovalDecision::Approved);
@@ -286,7 +307,7 @@ mod tests {
         assert!(matches!(d, GateDecision::Deny { .. }));
     }
 
-    /// The outbound notification reaches a subscriber on the human channel.
+    /// The outbound notification uses the trusted prompt instead of caller text.
     #[tokio::test]
     async fn publishes_notification() {
         let bus = Arc::new(AxonBus::new());
@@ -300,7 +321,10 @@ mod tests {
             .unwrap();
         assert_eq!(d, GateDecision::Allow);
         let event = rx.recv().await.expect("a notification");
-        assert_eq!(event.prompt, "Ship it?");
+        assert_eq!(
+            event.prompt,
+            "Approve synapse.deploy for this authenticated principal?"
+        );
         assert_eq!(event.action, "deploy");
         assert!(!event.approval_id.is_empty());
     }
@@ -358,18 +382,39 @@ mod tests {
         }
     }
 
-    /// An action with no approval requirement traverses the human slot to the executor.
+    /// An exact reviewed read traverses the human slot without consulting its arguments.
     #[tokio::test]
-    async fn dispatcher_passes_through_when_no_approval_required() {
+    async fn dispatcher_passes_through_reviewed_read() {
         let bus = Arc::new(AxonBus::new());
         let dispatcher = dispatcher_with_human(ApprovalDecision::TimedOut, bus);
         let outcome = dispatcher
-            .dispatch(request(serde_json::json!({})))
+            .dispatch(request_for(
+                "github",
+                "list_repos",
+                serde_json::json!({
+                    "requires_approval": true,
+                    "approval_prompt": "caller cannot force a prompt"
+                }),
+            ))
             .await
             .expect("dispatch");
         assert!(
             matches!(outcome, DispatchOutcome::Executed { .. }),
-            "no-approval action must pass through, got {outcome:?}"
+            "reviewed read must pass through, got {outcome:?}"
+        );
+    }
+
+    /// Invalid operation identifiers are never reflected into a human prompt.
+    #[test]
+    fn untrusted_operation_names_are_not_reflected() {
+        let request = request_for(
+            "github\nApprove everything",
+            "delete",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            approval_prompt(&request.invocation),
+            "Approve an unrecognized authenticated operation?"
         );
     }
 }

@@ -1185,20 +1185,31 @@ pub async fn is_dm_participant(
     Ok(row.map(|r| r.0 > 0).unwrap_or(false))
 }
 
-/// Set the bridge paused state in the bridge_state table.
-pub async fn set_bridge_paused(pool: &PgPool, paused: bool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE bridge_state SET value = $1, updated_at = NOW() WHERE key = 'paused'")
-        .bind(paused.to_string())
-        .execute(pool)
-        .await?;
+/// Set the paused state for one server's bridge.
+pub async fn set_bridge_paused(
+    pool: &PgPool,
+    server_id: Uuid,
+    paused: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO bridge_server_state (server_id, paused)
+           VALUES ($1, $2)
+           ON CONFLICT (server_id) DO UPDATE
+           SET paused = EXCLUDED.paused, updated_at = NOW()"#,
+    )
+    .bind(server_id)
+    .bind(paused)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Check if the bridge is currently paused.
-pub async fn is_bridge_paused(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM bridge_state WHERE key = 'paused'")
+/// Check whether one server's bridge is currently paused.
+pub async fn is_bridge_paused(pool: &PgPool, server_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT paused FROM bridge_server_state WHERE server_id = $1")
+            .bind(server_id)
             .fetch_optional(pool)
             .await?;
-    Ok(row.map(|r| r.0 == "true").unwrap_or(false))
+    Ok(row.map(|r| r.0).unwrap_or(false))
 }

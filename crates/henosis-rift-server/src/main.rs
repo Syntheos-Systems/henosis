@@ -249,15 +249,15 @@ async fn main() {
             post(routes::bridge::provision_agents),
         )
         .route(
-            "/api/bridge/pause",
+            "/api/servers/{server_id}/bridge/pause",
             post(routes::bridge_control::pause_bridge),
         )
         .route(
-            "/api/bridge/resume",
+            "/api/servers/{server_id}/bridge/resume",
             post(routes::bridge_control::resume_bridge),
         )
         .route(
-            "/api/bridge/status",
+            "/api/servers/{server_id}/bridge/status",
             get(routes::bridge_control::bridge_status),
         )
         // DMs

@@ -201,9 +201,9 @@ impl RiftRestClient {
         }
     }
 
-    /// Check if bridge is paused via the server's bridge control endpoint.
-    pub async fn is_paused(&self) -> Result<bool, BridgeError> {
-        let url = format!("{}/api/bridge/status", self.base_url);
+    /// Check whether the bridge for one server is paused.
+    pub async fn is_paused(&self, server_id: Uuid) -> Result<bool, BridgeError> {
+        let url = bridge_status_url(&self.base_url, server_id);
         let resp = self.client.get(&url).send().await?;
 
         if resp.status().is_success() {
@@ -213,6 +213,11 @@ impl RiftRestClient {
             Ok(false)
         }
     }
+}
+
+/// Build the server-scoped bridge status endpoint.
+fn bridge_status_url(base_url: &str, server_id: Uuid) -> String {
+    format!("{base_url}/api/servers/{server_id}/bridge/status")
 }
 
 /// Build the JSON body for a message post.
@@ -341,7 +346,18 @@ async fn connect_and_listen(
 /// Covers the message post payload shape.
 #[cfg(test)]
 mod tests {
-    use super::message_payload;
+    use super::{bridge_status_url, message_payload};
+    use uuid::Uuid;
+
+    /// The pause poll is bound to the configured server rather than global state.
+    #[test]
+    fn test_bridge_status_url_is_server_scoped() {
+        let server_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(
+            bridge_status_url("https://rift.example", server_id),
+            "https://rift.example/api/servers/11111111-1111-1111-1111-111111111111/bridge/status"
+        );
+    }
 
     /// A typed post carries the discriminator for the server to stamp.
     #[test]

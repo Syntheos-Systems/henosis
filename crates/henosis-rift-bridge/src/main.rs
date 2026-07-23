@@ -15,7 +15,7 @@ use henosis_rift_bridge::config::{BridgeConfig, EmbeddingConfig};
 use henosis_rift_bridge::embedding::CognitionEmbedder;
 use henosis_rift_bridge::embedding::{Embedder, OpenAiEmbedder};
 use henosis_rift_bridge::execution::approval::{
-    ApprovalRegistry, DrainAction, decide_drain_action,
+    decide_drain_action, ApprovalRegistry, DrainAction,
 };
 use henosis_rift_bridge::execution::sandbox::SandboxManager;
 use henosis_rift_bridge::stimulus::{
@@ -50,7 +50,7 @@ struct EmbeddingRuntime {
     cognition: Option<Arc<dyn henosis_cognition::EmbeddingProvider>>,
 }
 
-use henosis_rift_bridge::rift_client::{RiftRestClient, RiftWsEvent, ws_listen};
+use henosis_rift_bridge::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use henosis_rift_bridge::room::Room;
 
 /// Entry point: load config, provision agents, then run the event loop.
@@ -186,13 +186,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the event loop, cascades, approval drain, and stimulus injector all
     // read (and react to) the same state without polling Rift themselves.
     let pause_interval = std::time::Duration::from_secs(config.rift.pause_poll_secs.unwrap_or(5));
+    let pause_server_id = config.rift.server_id;
     let (pause_tx, pause_rx) = watch::channel(false);
     {
         let rift = rift.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(pause_interval).await;
-                match rift.is_paused().await {
+                match rift.is_paused(pause_server_id).await {
                     Ok(p) => {
                         // Send only on transitions: watch::Sender::send marks
                         // the value changed unconditionally, and an
@@ -601,7 +602,7 @@ fn load_cred_secret(reference: &str) -> Result<String, Box<dyn std::error::Error
 /// ONNX session or contacting an HTTP endpoint.
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingBackendChoice, select_embedding_backend};
+    use super::{select_embedding_backend, EmbeddingBackendChoice};
 
     /// Verifies an explicit URL always preserves the HTTP override.
     #[test]

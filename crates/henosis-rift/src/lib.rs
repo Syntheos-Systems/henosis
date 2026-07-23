@@ -16,5 +16,6 @@ pub mod gate;
 
 pub use approver::RegistryApprover;
 pub use gate::{
-    ApprovalDecision, ApprovalRequest, Approver, HUMAN_CHANNEL, HumanApprovalRequested, HumanGate,
+    approval_prompt, requires_human_approval, ApprovalDecision, ApprovalRequest, Approver,
+    HumanApprovalRequested, HumanGate, HUMAN_CHANNEL,
 };

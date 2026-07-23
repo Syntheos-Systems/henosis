@@ -10,7 +10,7 @@ pub mod ws;
 #[cfg(test)]
 mod migrate_tests {
     /// The embedded migrator resolves `./migrations` at compile time and all
-    /// four SQL files parse. This database-free gate proves that the
+    /// five SQL files parse. This database-free gate proves that the
     /// migration set embedded by the binary is well-formed without
     /// standing up Postgres.
     #[test]
@@ -18,9 +18,9 @@ mod migrate_tests {
         let migrator = sqlx::migrate!("./migrations");
         assert_eq!(
             migrator.migrations.len(),
-            4,
+            5,
             "expected the embedded rift migrations (001_initial, 002_bridge, \
-             003_agent_support, 004_message_type_backfill)"
+             003_agent_support, 004_message_type_backfill, 005_server_bridge_state)"
         );
     }
 }

@@ -2039,7 +2039,7 @@ mod tests {
         );
     }
 
-    /// The HumanGate slot allows an invocation that declares no approval requirement.
+    /// The HumanGate slot allows an exact server-reviewed read without blocking.
     #[tokio::test]
     async fn human_slot_is_real_gate_not_deny_stub() {
         use henosis_plutus::MockPolicyBackend;
@@ -2076,12 +2076,15 @@ mod tests {
                 authority: None,
             },
             invocation: ToolInvocation {
-                tool: "kleos".to_owned(),
-                action: "memory_store".to_owned(),
-                args: serde_json::json!({}),
+                tool: "github".to_owned(),
+                action: "list_repos".to_owned(),
+                args: serde_json::json!({
+                    "requires_approval": true,
+                    "approval_prompt": "untrusted arguments are ignored"
+                }),
             },
         };
-        // The real HumanGate allows a no-approval invocation; a deny-stub would not.
+        // The real HumanGate allows an exact reviewed read; a deny-stub would not.
         assert_eq!(
             human.check(&req).await.expect("gate decides"),
             GateDecision::Allow

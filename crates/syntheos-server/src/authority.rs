@@ -22,6 +22,7 @@ use henosis_audit::{
     AuditEventInput, AuditPhase, AuditStore, ExecutionClaim, ExecutionState, WitnessedAudit,
 };
 use henosis_plutus::{can, OrgStatus, Permission, PolicyBackend, Role};
+use henosis_rift::{approval_prompt, requires_human_approval};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use syntheos_contracts::{
@@ -1238,31 +1239,6 @@ fn validate_scopes(scopes: &[String]) -> Result<(), AuthorityError> {
 fn parse_public_id(value: &str) -> Result<Uuid, AuthorityError> {
     Uuid::parse_str(value)
         .map_err(|_| AuthorityError::InvalidRequest("invalid record id".to_string()))
-}
-
-/// Require approval unless the exact registered adapter operation is reviewed as side-effect-free.
-fn requires_human_approval(invocation: &ToolInvocation) -> bool {
-    !matches!(
-        (invocation.tool.as_str(), invocation.action.as_str()),
-        ("henosis", "probe")
-            | ("gcal", "list_events")
-            | ("gdrive", "list" | "download" | "get_metadata")
-            | (
-                "github",
-                "get_issue" | "list_issues" | "list_prs" | "search_code" | "list_repos"
-            )
-            | ("gmail", "read" | "search" | "list_labels")
-            | ("linear", "list_issues" | "search")
-            | ("notion", "get_page" | "search")
-    )
-}
-
-/// Build a human-readable prompt only from bounded server-recognized identifiers.
-fn approval_prompt(invocation: &ToolInvocation) -> String {
-    format!(
-        "Approve {}.{} for this authenticated principal?",
-        invocation.tool, invocation.action
-    )
 }
 
 /// Build the canonical request envelope shared by approval and audit authorities.
