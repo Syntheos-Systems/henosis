@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, TenantId, Timestamp, TypedEvent};
@@ -55,8 +56,8 @@ pub trait QualitySink: Send + Sync {
 ///
 /// Share it as `Arc<ThymusStore>`; all methods take `&self`.
 pub struct ThymusStore {
-    /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send`, not `Sync`).
-    conn: Mutex<Connection>,
+    /// The database and its path guard, serialized by a `Mutex`.
+    conn: Mutex<OpenedDatabase>,
     /// The bus quality events are published onto.
     bus: Arc<AxonBus>,
     /// The optional propagation seam. `None` = evaluations stay Thymus-local.
@@ -289,14 +290,15 @@ impl ThymusStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     /// No sink is attached; see [`Self::with_quality_sink`].
     pub fn open(path: impl AsRef<Path>, bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
-        let conn = Connection::open(path).map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| ThymusError::Backend(error.to_string()))?;
+        Self::from_database(database, bus)
     }
 
     /// Open an ephemeral in-memory store. For tests and throwaway use.
     pub fn open_in_memory(bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
-        let conn = Connection::open_in_memory().map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = OpenedDatabase::open_in_memory().map_err(berr)?;
+        Self::from_database(database, bus)
     }
 
     /// Attach the [`QualitySink`] evaluation/drift outcomes propagate to (the server adapts
@@ -306,20 +308,21 @@ impl ThymusStore {
         self
     }
 
-    /// Enable foreign keys, apply migrations, and wrap the connection.
-    fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
-        conn.pragma_update(None, "foreign_keys", true)
+    /// Enable foreign keys and apply migrations while the database retains its path guard.
+    fn from_database(mut database: OpenedDatabase, bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
+        database
+            .pragma_update(None, "foreign_keys", true)
             .map_err(berr)?;
-        apply_migrations(&mut conn)?;
+        apply_migrations(&mut database)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(database),
             bus,
             sink: None,
         })
     }
 
     /// Lock the connection, recovering from a poisoned mutex.
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    fn lock(&self) -> MutexGuard<'_, OpenedDatabase> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1006,7 +1009,7 @@ impl ThymusStore {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-fn apply_migrations(conn: &mut Connection) -> Result<(), ThymusError> {
+fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), ThymusError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
@@ -1694,8 +1697,8 @@ mod tests {
     /// Verifies persisted quality data survives reopening the SQLite store.
     #[tokio::test]
     async fn quality_persists_across_reopen() {
-        let tmp =
-            std::env::temp_dir().join(format!("henosis-thymus-{}.sqlite", PrincipalId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-thymus-{}", PrincipalId::new()));
+        let tmp = root.join("state").join("thymus.sqlite");
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let rubric_id;
@@ -1727,7 +1730,7 @@ mod tests {
                 .expect("present after reopen");
             assert_eq!(got.name, "durable");
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `agent_drift_flags` is scoped by (tenant, agent): the distinct (type, severity) pairs for

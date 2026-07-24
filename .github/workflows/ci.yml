@@ -99,6 +99,8 @@ jobs:
       - shell: pwsh
         run: cargo +1.88.0 test --locked -p henosis-eidolon supervisor::tests --target x86_64-pc-windows-msvc
       - shell: pwsh
+        run: cargo +1.88.0 test --locked -p henosis-sqlite --target x86_64-pc-windows-msvc
+      - shell: pwsh
         run: cargo +1.88.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
       - shell: pwsh
         run: |

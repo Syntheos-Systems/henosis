@@ -22,6 +22,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, TenantId, Timestamp, TypedEvent};
@@ -53,8 +54,8 @@ const PRESENCE_COLUMNS: &str = "principal_id, tenant, name, agent_type, descript
 ///
 /// Share it as `Arc<SomaStore>`; all methods take `&self`.
 pub struct SomaStore {
-    /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send`, not `Sync`).
-    conn: Mutex<Connection>,
+    /// The database and its path guard, serialized by a `Mutex`.
+    conn: Mutex<OpenedDatabase>,
     /// The bus presence-lifecycle events are published onto.
     bus: Arc<AxonBus>,
     /// The canonical directory registration verifies principals against (lookup only -- Soma
@@ -175,8 +176,9 @@ impl SomaStore {
         bus: Arc<AxonBus>,
         directory: Arc<dyn PrincipalDirectory>,
     ) -> Result<Self, SomaError> {
-        let conn = Connection::open(path).map_err(berr)?;
-        Self::from_conn(conn, bus, directory)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| SomaError::Backend(error.to_string()))?;
+        Self::from_database(database, bus, directory)
     }
 
     /// Open an ephemeral in-memory store. For tests and throwaway use.
@@ -184,28 +186,29 @@ impl SomaStore {
         bus: Arc<AxonBus>,
         directory: Arc<dyn PrincipalDirectory>,
     ) -> Result<Self, SomaError> {
-        let conn = Connection::open_in_memory().map_err(berr)?;
-        Self::from_conn(conn, bus, directory)
+        let database = OpenedDatabase::open_in_memory().map_err(berr)?;
+        Self::from_database(database, bus, directory)
     }
 
-    /// Enable foreign keys, apply migrations, and wrap the connection.
-    fn from_conn(
-        mut conn: Connection,
+    /// Enable foreign keys and apply migrations while the database retains its path guard.
+    fn from_database(
+        mut database: OpenedDatabase,
         bus: Arc<AxonBus>,
         directory: Arc<dyn PrincipalDirectory>,
     ) -> Result<Self, SomaError> {
-        conn.pragma_update(None, "foreign_keys", true)
+        database
+            .pragma_update(None, "foreign_keys", true)
             .map_err(berr)?;
-        apply_migrations(&mut conn)?;
+        apply_migrations(&mut database)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(database),
             bus,
             directory,
         })
     }
 
     /// Lock the connection, recovering from a poisoned mutex.
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    fn lock(&self) -> MutexGuard<'_, OpenedDatabase> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -694,7 +697,7 @@ impl SomaStore {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), SomaError> {
+pub(crate) fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), SomaError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
@@ -1315,7 +1318,8 @@ mod tests {
     #[tokio::test]
     /// Presence persists across reopen.
     async fn presence_persists_across_reopen() {
-        let tmp = std::env::temp_dir().join(format!("henosis-soma-{}.sqlite", PrincipalId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-soma-{}", PrincipalId::new()));
+        let tmp = root.join("state").join("soma.sqlite");
         let directory = Arc::new(InMemoryDirectory::new());
         let tenant = TenantId::new();
         let principal;
@@ -1335,6 +1339,6 @@ mod tests {
                 .expect("present after reopen");
             assert_eq!(got.name, "durable");
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

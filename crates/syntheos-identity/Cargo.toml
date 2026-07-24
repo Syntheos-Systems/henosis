@@ -8,6 +8,8 @@ repository.workspace = true
 description = "The principal directory: the canonical actor registry gates resolve against."
 
 [dependencies]
+# Race-resistant, literal-path SQLite opening for persistent identity state.
+henosis-sqlite = { path = "../henosis-sqlite" }
 # The canonical Principal / PrincipalKind / PrincipalId this registry stores.
 syntheos-contracts = { path = "../syntheos-contracts" }
 # Object-safe async trait so a storage backend can swap in without churning callers.

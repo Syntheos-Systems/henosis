@@ -1,0 +1,31 @@
+[package]
+name = "henosis-sqlite"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Race-resistant SQLite file opening for Henosis services."
+
+[dependencies]
+# Descriptor-relative traversal retains path identity across the SQLite connection lifetime.
+cap-primitives = "4.0.2"
+# Bundled SQLite guarantees support for SQLITE_OPEN_NOFOLLOW.
+rusqlite = { workspace = true, features = ["bundled"] }
+# Structured open failures preserve filesystem and SQLite context.
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Unix ownership, mode, and no-follow flags secure database leaves and ancestors.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows reparse, sharing, token, and ACL APIs keep state private and path objects bound.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }

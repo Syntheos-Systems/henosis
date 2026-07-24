@@ -10,6 +10,7 @@ description = "Synchronous tamper-evident audit streams and off-host witness pro
 [dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
+henosis-sqlite = { path = "../henosis-sqlite" }
 reqwest.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true

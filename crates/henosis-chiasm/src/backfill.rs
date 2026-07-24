@@ -29,7 +29,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use henosis_sqlite::{open_database, open_database_read_only, OpenedDatabase};
+use rusqlite::Connection;
 use syntheos_contracts::{PrincipalId, PrincipalKind, TaskId, TenantId, Timestamp};
 use syntheos_identity::PrincipalDirectory;
 
@@ -317,16 +318,29 @@ pub async fn backfill_from_kleos(
             "a non-empty source label is required (e.g. 'monolith', 'tenant-1')".to_string(),
         ));
     }
-    let legacy = Connection::open_with_flags(
-        legacy_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| ChiasmError::Backfill(format!("open legacy db {legacy_db:?}: {e}")))?;
-    let mut target = Connection::open(target_db).map_err(berr)?;
-    target
-        .pragma_update(None, "foreign_keys", true)
-        .map_err(berr)?;
-    apply_migrations(&mut target)?;
+    let legacy = open_database_read_only(legacy_db)
+        .map_err(|e| ChiasmError::Backfill(format!("open legacy db {legacy_db:?}: {e}")))?
+        .ok_or_else(|| ChiasmError::Backfill(format!("legacy db {legacy_db:?} does not exist")))?;
+    let mut target = if options.dry_run {
+        match open_database_read_only(target_db).map_err(|e| {
+            ChiasmError::Backfill(format!("open target db {target_db:?} for dry run: {e}"))
+        })? {
+            Some(target) => target,
+            None => {
+                let mut target = OpenedDatabase::open_in_memory().map_err(berr)?;
+                apply_migrations(&mut target)?;
+                target
+            }
+        }
+    } else {
+        let mut target = open_database(target_db)
+            .map_err(|e| ChiasmError::Backfill(format!("open target db {target_db:?}: {e}")))?;
+        target
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
+        apply_migrations(&mut target)?;
+        target
+    };
 
     // Step 1: read + validate ALL legacy data before touching anything.
     let tasks = read_legacy_tasks(&legacy)?;
@@ -593,17 +607,17 @@ mod tests {
 
     /// Paths for a fresh (legacy, target) database pair, unique per test.
     fn db_pair(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir();
         let nonce = TaskId::new();
+        let root = std::env::temp_dir().join(format!("henosis-chiasm-backfill-{tag}-{nonce}"));
         (
-            dir.join(format!("henosis-backfill-legacy-{tag}-{nonce}.sqlite")),
-            dir.join(format!("henosis-backfill-target-{tag}-{nonce}.sqlite")),
+            root.join("legacy").join("kleos.sqlite"),
+            root.join("target").join("chiasm.sqlite"),
         )
     }
 
     /// Create a legacy fixture: 3 tasks across 2 legacy owner keys, history, and one edge.
     fn build_legacy_fixture(path: &Path) {
-        let conn = Connection::open(path).expect("legacy fixture");
+        let conn = open_database(path).expect("legacy fixture");
         conn.execute_batch(LEGACY_DDL).expect("legacy ddl");
         conn.execute_batch(
             "INSERT INTO chiasm_tasks (agent, project, title, status, summary, user_id, created_at, updated_at)
@@ -627,8 +641,18 @@ mod tests {
 
     /// Remove the test databases.
     fn cleanup(paths: &[&Path]) {
-        for p in paths {
-            let _ = std::fs::remove_file(p);
+        for path in paths {
+            let protected_parent = path.ancestors().find(|parent| {
+                parent.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("henosis-chiasm-backfill-")
+                })
+            });
+            if let Some(parent) = protected_parent {
+                let _ = std::fs::remove_dir_all(parent);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
@@ -655,6 +679,13 @@ mod tests {
         assert_eq!(report.tasks_imported, 3);
         assert_eq!(report.updates_imported, 2);
         assert_eq!(report.dependencies_imported, 1);
+        assert!(
+            !target
+                .parent()
+                .expect("target has a dedicated parent")
+                .exists(),
+            "dry run must not create the target directory"
+        );
         // Nothing was enrolled and nothing was written.
         assert!(dir.list().await.expect("list").is_empty());
         let store = ChiasmStore::open(&target, Arc::new(AxonBus::new())).expect("open");
@@ -760,7 +791,7 @@ mod tests {
         assert_eq!(deps[0].depends_on, ship.id);
 
         // The legacy agent label is preserved in the task-id map for Soma's later pass.
-        let raw = Connection::open(&target).expect("raw");
+        let raw = open_database(&target).expect("raw");
         let agent: String = raw
             .query_row(
                 "SELECT legacy_agent FROM chiasm_legacy_task_id_map WHERE legacy_task_id = 1",
@@ -820,7 +851,7 @@ mod tests {
         let (legacy, target) = db_pair("badstatus");
         build_legacy_fixture(&legacy);
         {
-            let conn = Connection::open(&legacy).expect("legacy");
+            let conn = open_database(&legacy).expect("legacy");
             conn.execute(
                 "INSERT INTO chiasm_tasks (agent, project, title, status, user_id) \
                  VALUES ('x', 'p', 'corrupt', 'bogus-status', 1)",
@@ -842,7 +873,7 @@ mod tests {
         assert!(matches!(err, ChiasmError::Backfill(_)));
         // Validation happens before minting or writing: directory empty, map table empty.
         assert!(dir.list().await.expect("list").is_empty());
-        let raw = Connection::open(&target).expect("raw");
+        let raw = open_database(&target).expect("raw");
         let mapped: i64 = raw
             .query_row("SELECT COUNT(*) FROM chiasm_legacy_user_id_map", [], |r| {
                 r.get(0)
@@ -857,7 +888,7 @@ mod tests {
     async fn legacy_db_without_deps_table_imports_tasks() {
         let (legacy, target) = db_pair("nodeps");
         {
-            let conn = Connection::open(&legacy).expect("legacy");
+            let conn = open_database(&legacy).expect("legacy");
             // An older legacy schema: no chiasm_task_dependencies table at all.
             conn.execute_batch(
                 "CREATE TABLE chiasm_tasks (
@@ -905,7 +936,7 @@ mod tests {
         build_legacy_fixture(&shard); // ALSO ids 1..=3, different logical tasks
         {
             // Make the shard's content distinguishable.
-            let conn = Connection::open(&shard).expect("shard");
+            let conn = open_database(&shard).expect("shard");
             conn.execute("UPDATE chiasm_tasks SET title = 'shard: ' || title", [])
                 .expect("retitle");
         }
@@ -943,7 +974,7 @@ mod tests {
         );
 
         // The target holds all six tasks; per-source idempotency still works.
-        let raw = Connection::open(&target).expect("raw");
+        let raw = open_database(&target).expect("raw");
         let total: i64 = raw
             .query_row("SELECT COUNT(*) FROM chiasm_tasks", [], |r| r.get(0))
             .expect("count");

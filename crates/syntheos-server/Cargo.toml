@@ -24,6 +24,8 @@ henosis-chiasm = { path = "../henosis-chiasm" }
 henosis-soma = { path = "../henosis-soma" }
 henosis-broca = { path = "../henosis-broca" }
 henosis-loom = { path = "../henosis-loom" }
+# Shared fail-closed SQLite path and ownership boundary.
+henosis-sqlite = { path = "../henosis-sqlite" }
 # In-process Hephaestus executor wired into Loom's CompositeStepExecutor.
 henosis-hephaestus = { path = "../henosis-hephaestus" }
 henosis-thymus = { path = "../henosis-thymus" }

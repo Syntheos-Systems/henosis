@@ -836,8 +836,8 @@ mod tests {
     /// Independent connections serialize rotation and logout so no successor remains active.
     #[test]
     fn refresh_rotation_racing_family_logout_leaves_no_active_session() {
-        let path =
-            std::env::temp_dir().join(format!("syntheos-refresh-race-{}.sqlite", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("syntheos-refresh-race-{}", Uuid::new_v4()));
+        let path = root.join("state").join("identity.sqlite");
         let rotate_store = SqliteDirectory::open(&path).expect("open rotate connection");
         let logout_store = SqliteDirectory::open(&path).expect("open logout connection");
         let tenant = TenantId::new();
@@ -877,6 +877,6 @@ mod tests {
                 .is_none());
         }
         drop(observer);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

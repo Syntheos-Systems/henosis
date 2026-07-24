@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, RunId, TenantId, Timestamp, TypedEvent, WorkflowId};
@@ -53,8 +54,8 @@ const STEP_COLUMNS: &str = "id, run_id, name, step_type, config, status, input, 
 ///
 /// Share it as `Arc<LoomStore>`; all methods take `&self`.
 pub struct LoomStore {
-    /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send`, not `Sync`).
-    conn: Mutex<Connection>,
+    /// The database and its path guard, serialized by a `Mutex`.
+    conn: Mutex<OpenedDatabase>,
     /// The bus workflow lifecycle events are published onto.
     bus: Arc<AxonBus>,
     /// The optional inline executor seam. `None` = every step waits for external completion.
@@ -466,14 +467,15 @@ impl LoomStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     /// No executor is attached; see [`Self::with_executor`].
     pub fn open(path: impl AsRef<Path>, bus: Arc<AxonBus>) -> Result<Self, LoomError> {
-        let conn = Connection::open(path).map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| LoomError::Backend(error.to_string()))?;
+        Self::from_database(database, bus)
     }
 
     /// Open an ephemeral in-memory store. For tests and throwaway use.
     pub fn open_in_memory(bus: Arc<AxonBus>) -> Result<Self, LoomError> {
-        let conn = Connection::open_in_memory().map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = OpenedDatabase::open_in_memory().map_err(berr)?;
+        Self::from_database(database, bus)
     }
 
     /// Attach a [`StepExecutor`] that runs the step types it claims inline during advance
@@ -483,20 +485,21 @@ impl LoomStore {
         self
     }
 
-    /// Enable foreign keys, apply migrations, and wrap the connection.
-    fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, LoomError> {
-        conn.pragma_update(None, "foreign_keys", true)
+    /// Enable foreign keys and apply migrations while the database retains its path guard.
+    fn from_database(mut database: OpenedDatabase, bus: Arc<AxonBus>) -> Result<Self, LoomError> {
+        database
+            .pragma_update(None, "foreign_keys", true)
             .map_err(berr)?;
-        apply_migrations(&mut conn)?;
+        apply_migrations(&mut database)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(database),
             bus,
             executor: None,
         })
     }
 
     /// Lock the connection, recovering from a poisoned mutex.
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    fn lock(&self) -> MutexGuard<'_, OpenedDatabase> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1708,7 +1711,7 @@ impl LoomStore {
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-fn apply_migrations(conn: &mut Connection) -> Result<(), LoomError> {
+fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), LoomError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
@@ -2953,7 +2956,8 @@ mod tests {
     #[tokio::test]
     /// Runs persist across reopen.
     async fn runs_persist_across_reopen() {
-        let tmp = std::env::temp_dir().join(format!("henosis-loom-{}.sqlite", RunId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-loom-{}", RunId::new()));
+        let tmp = root.join("state").join("loom.sqlite");
         let principal = PrincipalId::new();
         let run_id;
         {
@@ -2985,7 +2989,7 @@ mod tests {
                 .expect("present after reopen");
             assert_eq!(got.status, RunStatus::Completed);
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

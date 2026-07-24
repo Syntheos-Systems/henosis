@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension};
 use syntheos_contracts::{Principal, PrincipalId, PrincipalKind};
 
@@ -36,9 +37,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
 ///
 /// Share it as `Arc<SqliteDirectory>` or `Arc<dyn PrincipalDirectory>`; all methods take `&self`.
 pub struct SqliteDirectory {
-    /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send` but not `Sync`).
+    /// The database and its path guard, serialized by a `Mutex`.
     /// `pub(crate)` so sibling modules (e.g. `accounts`) can add `impl SqliteDirectory` blocks.
-    pub(crate) conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<OpenedDatabase>,
 }
 
 /// Map a generic rusqlite error to an opaque backend error.
@@ -50,22 +51,25 @@ fn backend(e: rusqlite::Error) -> DirectoryError {
 impl SqliteDirectory {
     /// Open (creating the file if absent) a directory at `path`, applying any pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DirectoryError> {
-        let conn = Connection::open(path).map_err(backend)?;
-        Self::from_conn(conn)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| DirectoryError::Backend(error.to_string()))?;
+        Self::from_database(database)
     }
 
     /// Open an ephemeral in-memory directory, applying migrations. For tests and throwaway use.
     pub fn open_in_memory() -> Result<Self, DirectoryError> {
-        let conn = Connection::open_in_memory().map_err(backend)?;
-        Self::from_conn(conn)
+        let database = OpenedDatabase::open_in_memory().map_err(backend)?;
+        Self::from_database(database)
     }
 
-    /// Apply migrations to a fresh connection and wrap it.
-    fn from_conn(mut conn: Connection) -> Result<Self, DirectoryError> {
-        conn.busy_timeout(Duration::from_secs(2)).map_err(backend)?;
-        apply_migrations(&mut conn)?;
+    /// Configure and migrate the database while it retains its path guard.
+    fn from_database(mut database: OpenedDatabase) -> Result<Self, DirectoryError> {
+        database
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(backend)?;
+        apply_migrations(&mut database)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(database),
         })
     }
 
@@ -124,7 +128,7 @@ fn parse_principal(
 /// Apply every migration whose version exceeds the database's `PRAGMA user_version`, each inside
 /// its own transaction, bumping `user_version` as it goes. Idempotent: re-opening an up-to-date
 /// database applies nothing.
-fn apply_migrations(conn: &mut Connection) -> Result<(), DirectoryError> {
+fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), DirectoryError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(backend)?;
@@ -300,7 +304,8 @@ mod tests {
     /// directory lacks and the backfill needs.
     #[tokio::test]
     async fn persists_across_reopen() {
-        let tmp = std::env::temp_dir().join(format!("henosis-dir-{}.sqlite", PrincipalId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-dir-{}", PrincipalId::new()));
+        let tmp = root.join("state").join("directory.sqlite");
         let id;
         {
             let dir = SqliteDirectory::open(&tmp).expect("open");
@@ -319,15 +324,16 @@ mod tests {
                 .expect("present after reopen");
             assert_eq!(got.display.as_deref(), Some("durable"));
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Re-opening runs migrations idempotently (user_version already at head -> no error).
     #[tokio::test]
     async fn migrations_are_idempotent_on_reopen() {
-        let tmp = std::env::temp_dir().join(format!("henosis-mig-{}.sqlite", PrincipalId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-mig-{}", PrincipalId::new()));
+        let tmp = root.join("state").join("directory.sqlite");
         SqliteDirectory::open(&tmp).expect("first open applies V1");
         SqliteDirectory::open(&tmp).expect("second open applies nothing");
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

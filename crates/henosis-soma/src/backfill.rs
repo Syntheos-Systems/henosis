@@ -31,7 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use henosis_sqlite::{open_database, open_database_read_only, OpenedDatabase};
+use rusqlite::{Connection, OptionalExtension};
 use syntheos_contracts::{PrincipalId, PrincipalKind, TenantId, Timestamp};
 use syntheos_identity::PrincipalDirectory;
 
@@ -259,37 +260,33 @@ pub async fn backfill_from_kleos(
             "a non-empty source label is required (e.g. 'monolith', 'tenant-1')".to_string(),
         ));
     }
-    let legacy = Connection::open_with_flags(
-        legacy_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| SomaError::Backfill(format!("open legacy db {legacy_db:?}: {e}")))?;
+    let legacy = open_database_read_only(legacy_db)
+        .map_err(|e| SomaError::Backfill(format!("open legacy db {legacy_db:?}: {e}")))?
+        .ok_or_else(|| SomaError::Backfill(format!("legacy db {legacy_db:?} does not exist")))?;
     // A dry run must write NOTHING to disk -- not even create or migrate the
     // target file. It still needs to READ prior-run state (owner/agent maps) to
     // count reused-vs-minted correctly, so read an existing target read-only, or
     // use a throwaway in-memory DB (empty prior state) when none exists yet. The
     // real (non-dry) path opens read-write and migrates as before.
     let mut target = if options.dry_run {
-        if Path::new(target_db).exists() {
-            Connection::open_with_flags(
-                target_db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|e| {
-                SomaError::Backfill(format!(
-                    "open target db {target_db:?} (dry-run, read-only): {e}"
-                ))
-            })?
-        } else {
-            let mut mem = Connection::open_in_memory().map_err(berr)?;
-            apply_migrations(&mut mem)?;
-            mem
+        match open_database_read_only(target_db).map_err(|e| {
+            SomaError::Backfill(format!("open target db {target_db:?} for dry run: {e}"))
+        })? {
+            Some(target) => target,
+            None => {
+                let mut target = OpenedDatabase::open_in_memory().map_err(berr)?;
+                apply_migrations(&mut target)?;
+                target
+            }
         }
     } else {
-        let mut t = Connection::open(target_db).map_err(berr)?;
-        t.pragma_update(None, "foreign_keys", true).map_err(berr)?;
-        apply_migrations(&mut t)?;
-        t
+        let mut target = open_database(target_db)
+            .map_err(|e| SomaError::Backfill(format!("open target db {target_db:?}: {e}")))?;
+        target
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
+        apply_migrations(&mut target)?;
+        target
     };
 
     // Step 1: read + validate + sanitize ALL legacy data before touching anything.
@@ -343,11 +340,9 @@ pub async fn backfill_from_kleos(
     };
     let chiasm_map: BTreeMap<i64, PrincipalId> = match chiasm_db {
         Some(path) => {
-            let chiasm = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|e| SomaError::Backfill(format!("open chiasm db {path:?}: {e}")))?;
+            let chiasm = open_database_read_only(path)
+                .map_err(|e| SomaError::Backfill(format!("open chiasm db {path:?}: {e}")))?
+                .ok_or_else(|| SomaError::Backfill(format!("chiasm db {path:?} does not exist")))?;
             read_i64_map(
                 &chiasm,
                 "SELECT user_id, principal_id FROM chiasm_legacy_user_id_map",
@@ -541,17 +536,17 @@ mod tests {
 
     /// Paths for a fresh (legacy, target) database pair, unique per test.
     fn db_pair(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir();
         let nonce = PrincipalId::new();
+        let root = std::env::temp_dir().join(format!("henosis-soma-backfill-{tag}-{nonce}"));
         (
-            dir.join(format!("henosis-soma-backfill-legacy-{tag}-{nonce}.sqlite")),
-            dir.join(format!("henosis-soma-backfill-target-{tag}-{nonce}.sqlite")),
+            root.join("legacy").join("kleos.sqlite"),
+            root.join("target").join("soma.sqlite"),
         )
     }
 
     /// Create a legacy fixture: 3 agents (one with messy JSON), one owner key.
     fn build_legacy_fixture(path: &Path) {
-        let conn = Connection::open(path).expect("legacy fixture");
+        let conn = open_database(path).expect("legacy fixture");
         conn.execute_batch(LEGACY_DDL).expect("legacy ddl");
         conn.execute_batch(
             "INSERT INTO soma_agents (name, type, capabilities, status, heartbeat_at, quality_score, user_id, created_at, updated_at)
@@ -568,8 +563,17 @@ mod tests {
 
     /// Remove the test databases.
     fn cleanup(paths: &[&Path]) {
-        for p in paths {
-            let _ = std::fs::remove_file(p);
+        for path in paths {
+            let protected_parent = path.ancestors().find(|parent| {
+                parent.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with("henosis-soma-backfill-")
+                })
+            });
+            if let Some(parent) = protected_parent {
+                let _ = std::fs::remove_dir_all(parent);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
@@ -595,6 +599,13 @@ mod tests {
         assert_eq!(report.owners_minted, 1);
         assert_eq!(report.owners_reused_from_chiasm, 0);
         assert_eq!(report.agents_imported, 3);
+        assert!(
+            !target
+                .parent()
+                .expect("target has a dedicated parent")
+                .exists(),
+            "dry run must not create the target directory"
+        );
         assert!(
             dir.list().await.expect("list").is_empty(),
             "nothing enrolled"
@@ -678,13 +689,15 @@ mod tests {
         let (legacy, target) = db_pair("crossmap");
         build_legacy_fixture(&legacy);
         // A chiasm target db whose backfill already mapped legacy key 1.
-        let chiasm_path = std::env::temp_dir().join(format!(
-            "henosis-soma-backfill-chiasm-{}.sqlite",
-            PrincipalId::new()
-        ));
+        let chiasm_path = target
+            .parent()
+            .and_then(Path::parent)
+            .expect("test pair has a root")
+            .join("chiasm")
+            .join("chiasm.sqlite");
         let chiasm_owner = PrincipalId::new();
         {
-            let conn = Connection::open(&chiasm_path).expect("chiasm fixture");
+            let conn = open_database(&chiasm_path).expect("chiasm fixture");
             conn.execute_batch(
                 "CREATE TABLE chiasm_legacy_user_id_map (
                      user_id INTEGER NOT NULL PRIMARY KEY,
@@ -770,7 +783,7 @@ mod tests {
         let (legacy, target) = db_pair("badstatus");
         build_legacy_fixture(&legacy);
         {
-            let conn = Connection::open(&legacy).expect("legacy");
+            let conn = open_database(&legacy).expect("legacy");
             conn.execute(
                 "INSERT INTO soma_agents (name, type, status, user_id) \
                  VALUES ('broken', 'cli', 'wedged', 1)",
@@ -804,7 +817,7 @@ mod tests {
         let (legacy, target) = db_pair("collision");
         build_legacy_fixture(&legacy);
         {
-            let conn = Connection::open(&legacy).expect("legacy");
+            let conn = open_database(&legacy).expect("legacy");
             // Same name under a different legacy owner: legal in Kleos, collides in one tenant.
             conn.execute(
                 "INSERT INTO soma_agents (name, type, user_id) VALUES ('claude-code', 'cli', 2)",
@@ -840,7 +853,7 @@ mod tests {
         build_legacy_fixture(&shard); // same names, ids also 1..=3
         {
             // The shard also has one agent the monolith lacks.
-            let conn = Connection::open(&shard).expect("shard");
+            let conn = open_database(&shard).expect("shard");
             conn.execute(
                 "INSERT INTO soma_agents (name, type, status, user_id) \
                  VALUES ('shard-only', 'cli', 'online', 1)",
@@ -902,7 +915,7 @@ mod tests {
         assert_eq!(agents, 4);
 
         // Both sources' map rows for 'claude-code' point at the SAME principal.
-        let raw = Connection::open(&target).expect("raw");
+        let raw = open_database(&target).expect("raw");
         let distinct: i64 = raw
             .query_row(
                 "SELECT COUNT(DISTINCT principal_id) FROM soma_legacy_agent_map \

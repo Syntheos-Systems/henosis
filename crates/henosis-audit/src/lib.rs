@@ -14,6 +14,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use henosis_sqlite::OpenedDatabase;
 use reqwest::{Client, StatusCode, Url};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,9 @@ const CREATE_EXECUTION_RECORDS_TABLE: &str = "
 /// A failure while appending, verifying, or witnessing an audit event.
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
+    /// The protected database-path opener rejected a configured disk path.
+    #[error("audit database open error: {0}")]
+    DatabaseOpen(String),
     /// SQLite rejected a durable operation.
     #[error("audit storage error: {0}")]
     Storage(#[from] rusqlite::Error),
@@ -308,26 +312,28 @@ impl OriginSigner {
 /// Synchronous SQLite store for immutable, tenant-scoped audit chains.
 #[derive(Clone)]
 pub struct AuditStore {
-    connection: Arc<Mutex<Connection>>,
+    /// The isolated SQLite database and path guard shared by cloned store handles.
+    connection: Arc<Mutex<OpenedDatabase>>,
 }
 
 /// Implements durable audit append and verification operations.
 impl AuditStore {
     /// Opens or creates an audit database and applies its schema.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, AuditError> {
-        let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| AuditError::DatabaseOpen(error.to_string()))?;
+        Self::from_database(database)
     }
 
     /// Creates an in-memory audit database for isolated tests and local evaluation.
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_database(OpenedDatabase::open_in_memory()?)
     }
 
-    /// Initializes a store around an already-open SQLite connection.
-    fn from_connection(mut connection: Connection) -> Result<Self, AuditError> {
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
+    /// Initializes a store while the opened database retains its path guard.
+    fn from_database(mut database: OpenedDatabase) -> Result<Self, AuditError> {
+        database.busy_timeout(Duration::from_secs(5))?;
+        database.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
@@ -356,9 +362,9 @@ impl AuditStore {
             );
             ",
         )?;
-        apply_principal_idempotency_schema(&mut connection)?;
+        apply_principal_idempotency_schema(&mut database)?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(database)),
         })
     }
 
@@ -715,7 +721,7 @@ impl AuditStore {
     }
 
     /// Acquires the SQLite connection or reports poison without panicking.
-    fn lock_connection(&self) -> Result<MutexGuard<'_, Connection>, AuditError> {
+    fn lock_connection(&self) -> Result<MutexGuard<'_, OpenedDatabase>, AuditError> {
         self.connection.lock().map_err(|_| AuditError::LockPoisoned)
     }
 }
@@ -966,7 +972,7 @@ pub fn unix_timestamp_ms() -> Result<i64, AuditError> {
 }
 
 /// Applies principal-scoped idempotency indexes and migrates legacy execution rows atomically.
-fn apply_principal_idempotency_schema(connection: &mut Connection) -> Result<(), AuditError> {
+fn apply_principal_idempotency_schema(connection: &mut OpenedDatabase) -> Result<(), AuditError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "
@@ -1715,10 +1721,11 @@ mod tests {
     /// Proves a legacy tenant-and-key ledger is migrated without losing its principal binding.
     #[test]
     fn execution_ledger_migrates_legacy_principal_namespace() {
-        let database = tempfile::NamedTempFile::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state").join("audit.sqlite");
         let key = "legacy-key";
         {
-            let store = AuditStore::open(database.path()).unwrap();
+            let store = AuditStore::open(&database).unwrap();
             store
                 .claim_execution(principal_input(AuditPhase::Intent, key, "machine:legacy"))
                 .unwrap();
@@ -1762,7 +1769,7 @@ mod tests {
                 .unwrap();
         }
 
-        let migrated = AuditStore::open(database.path()).unwrap();
+        let migrated = AuditStore::open(&database).unwrap();
         let legacy = migrated
             .execution_record("tenant-a", "machine:legacy", key)
             .unwrap()

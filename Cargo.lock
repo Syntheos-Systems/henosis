@@ -3496,6 +3496,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "henosis-approval"
 version = "0.1.0"
 dependencies = [
+ "henosis-sqlite",
  "rusqlite",
  "serde_json",
  "sha2",
@@ -3510,6 +3511,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "henosis-sqlite",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -3525,6 +3527,7 @@ name = "henosis-broca"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "henosis-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3539,6 +3542,7 @@ dependencies = [
 name = "henosis-chiasm"
 version = "0.1.0"
 dependencies = [
+ "henosis-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3689,6 +3693,7 @@ name = "henosis-loom"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "henosis-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3845,6 +3850,7 @@ dependencies = [
 name = "henosis-soma"
 version = "0.1.0"
 dependencies = [
+ "henosis-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3858,10 +3864,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-sqlite"
+version = "0.1.0"
+dependencies = [
+ "cap-primitives",
+ "libc",
+ "rusqlite",
+ "thiserror 1.0.69",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "henosis-thymus"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "henosis-sqlite",
  "rusqlite",
  "serde",
  "serde_json",
@@ -8392,6 +8410,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "base64 0.22.1",
+ "henosis-sqlite",
  "rand 0.9.4",
  "rusqlite",
  "serde_json",
@@ -8454,6 +8473,7 @@ dependencies = [
  "henosis-plutus",
  "henosis-rift",
  "henosis-soma",
+ "henosis-sqlite",
  "henosis-thymus",
  "hex",
  "jsonwebtoken",

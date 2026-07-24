@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Chiasm: tenant-scoped task coordination over an in-process event bus."
 
 [dependencies]
+# Race-resistant, literal-path SQLite opening for persistent task state.
+henosis-sqlite = { path = "../henosis-sqlite" }
 # Canonical ids (TaskId/TenantId/PrincipalId), Timestamp, and the TypedEvent trait.
 syntheos-contracts = { path = "../syntheos-contracts" }
 # In-process bus the task lifecycle events are published onto.

@@ -12,6 +12,8 @@ description = "Thymus: the quality-evaluation kernel service, extracted onto syn
 syntheos-contracts = { path = "../syntheos-contracts" }
 # In-process bus the quality events are published onto.
 syntheos-axon = { path = "../syntheos-axon" }
+# Race-resistant disk database opening with retained path guards.
+henosis-sqlite = { path = "../henosis-sqlite" }
 # SQLite backend (bundled = no system libsqlite). Migration convention: PRAGMA user_version.
 rusqlite = { workspace = true, features = ["bundled"] }
 # ThymusError.

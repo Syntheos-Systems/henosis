@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Server-owned, request-bound approval storage for Henosis authority decisions."
 
 [dependencies]
+# Race-resistant, literal-path SQLite opening for persistent approval state.
+henosis-sqlite = { path = "../henosis-sqlite" }
 # Canonical tenant and principal identities.
 syntheos-contracts = { path = "../syntheos-contracts" }
 # SQLite durable state with explicit transactions for at-most-once authorization consumption.

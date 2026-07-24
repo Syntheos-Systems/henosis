@@ -17,6 +17,7 @@ members = [
     "crates/henosis-broca",
     "crates/henosis-loom",
     "crates/henosis-thymus",
+    "crates/henosis-sqlite",
     "crates/henosis-eidolon",
     "crates/henosis-credential-store",
     "crates/henosis-pistis",

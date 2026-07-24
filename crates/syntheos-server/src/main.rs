@@ -1253,16 +1253,9 @@ async fn bootstrap_operator_if_configured(
     Ok(())
 }
 
-/// Resolve a service database path from `var` (default `default`), creating the parent
-/// directory if absent so `Connection::open` can create the file.
+/// Resolve a service database path from `var`, falling back to `default`.
 fn db_path(var: &str, default: &str) -> Result<String, std::io::Error> {
-    let path = std::env::var(var).unwrap_or_else(|_| default.to_string());
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    Ok(path)
+    Ok(std::env::var(var).unwrap_or_else(|_| default.to_string()))
 }
 
 /// Read and validate the Plutus pool acquisition deadline from the process environment.
@@ -1558,7 +1551,7 @@ mod loom_timeout_sweeper_tests {
     #[tokio::test]
     async fn sweeper_enforces_deadlines_and_obeys_shutdown() {
         let bus = Arc::new(AxonBus::new());
-        let loom = Arc::new(LoomStore::open(":memory:", bus).expect("open Loom"));
+        let loom = Arc::new(LoomStore::open_in_memory(bus).expect("open Loom"));
         let principal = PrincipalId::new();
         let workflow = loom
             .create_workflow(NewWorkflow {

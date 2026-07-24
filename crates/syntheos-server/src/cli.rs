@@ -1123,7 +1123,7 @@ fn control_operation_name(request: &ControlRequest) -> &'static str {
 /// Creates the local operator home, protected data directory, and bootable private configuration.
 fn initialize_quick(paths: &CliPaths) -> Result<InitResult, CliError> {
     ensure_private_directory(&paths.home)?;
-    ensure_private_directory(&paths.data)?;
+    ensure_private_database_directory(&paths.data)?;
     create_private_config(paths)?;
     Ok(InitResult {
         mode: InitMode::Quick,
@@ -1208,6 +1208,14 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
         local_ready,
         production_ready,
         next_step,
+    })
+}
+
+/// Creates or validates the database directory through the shared hardened path boundary.
+fn ensure_private_database_directory(path: &Path) -> Result<(), CliError> {
+    henosis_sqlite::ensure_private_directory(path).map_err(|error| CliError::Filesystem {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
     })
 }
 

@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, TaskId, TenantId, Timestamp, TypedEvent};
@@ -54,8 +55,8 @@ const TASK_COLUMNS: &str = "id, tenant, principal_id, assignee, project, title, 
 ///
 /// Share it as `Arc<ChiasmStore>`; all methods take `&self`.
 pub struct ChiasmStore {
-    /// The one connection, serialized by a `Mutex` (rusqlite `Connection` is `Send`, not `Sync`).
-    conn: Mutex<Connection>,
+    /// The database and its path guard, serialized by a `Mutex`.
+    conn: Mutex<OpenedDatabase>,
     /// The bus task-lifecycle events are published onto.
     bus: Arc<AxonBus>,
 }
@@ -242,30 +243,34 @@ impl RawTask {
 impl ChiasmStore {
     /// Open (creating the file if absent) a store at `path`, applying any pending migrations.
     pub fn open(path: impl AsRef<Path>, bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
-        let conn = Connection::open(path).map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| ChiasmError::Backend(error.to_string()))?;
+        Self::from_database(database, bus)
     }
 
     /// Open an ephemeral in-memory store. For tests and throwaway use.
     pub fn open_in_memory(bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
-        let conn = Connection::open_in_memory().map_err(berr)?;
-        Self::from_conn(conn, bus)
+        let database = OpenedDatabase::open_in_memory().map_err(berr)?;
+        Self::from_database(database, bus)
     }
 
-    /// Enable foreign keys, apply migrations, and wrap the connection.
-    fn from_conn(mut conn: Connection, bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
-        conn.busy_timeout(Duration::from_secs(5)).map_err(berr)?;
-        conn.pragma_update(None, "foreign_keys", true)
+    /// Configure and migrate the database while it retains its path guard.
+    fn from_database(mut database: OpenedDatabase, bus: Arc<AxonBus>) -> Result<Self, ChiasmError> {
+        database
+            .busy_timeout(Duration::from_secs(5))
             .map_err(berr)?;
-        apply_migrations(&mut conn)?;
+        database
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(berr)?;
+        apply_migrations(&mut database)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(database),
             bus,
         })
     }
 
     /// Lock the connection, recovering from a poisoned mutex.
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    fn lock(&self) -> MutexGuard<'_, OpenedDatabase> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1558,7 +1563,7 @@ pub(crate) fn insert_task(conn: &Connection, task: &Task) -> Result<(), ChiasmEr
 
 /// Apply every migration whose version exceeds `PRAGMA user_version`, each in its own transaction,
 /// bumping `user_version` as it goes. Idempotent: an up-to-date database applies nothing.
-pub(crate) fn apply_migrations(conn: &mut Connection) -> Result<(), ChiasmError> {
+pub(crate) fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), ChiasmError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
@@ -2123,7 +2128,8 @@ mod tests {
     #[tokio::test]
     /// Tasks persist across reopen.
     async fn tasks_persist_across_reopen() {
-        let tmp = std::env::temp_dir().join(format!("henosis-chiasm-{}.sqlite", TaskId::new()));
+        let root = std::env::temp_dir().join(format!("henosis-chiasm-{}", TaskId::new()));
+        let tmp = root.join("state").join("chiasm.sqlite");
         let (tenant, principal) = (TenantId::new(), PrincipalId::new());
         let id;
         {
@@ -2145,18 +2151,18 @@ mod tests {
                 .expect("present after reopen");
             assert_eq!(got.title, "durable");
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     /// Opening a V5 database applies the tenant-boundary indexes and advances to V6.
     fn v5_database_upgrades_to_v6_tenant_indexes() {
-        let path = std::env::temp_dir().join(format!(
-            "henosis-chiasm-v5-upgrade-{}.sqlite",
-            TaskId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("henosis-chiasm-v5-upgrade-{}", TaskId::new()));
+        let path = root.join("state").join("chiasm.sqlite");
         {
-            let connection = Connection::open(&path).expect("open V5 fixture");
+            let database = henosis_sqlite::open_database(&path).expect("open protected V5 fixture");
+            let connection = database.connection();
             for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version <= 5) {
                 connection
                     .execute_batch(sql)
@@ -2170,7 +2176,9 @@ mod tests {
         let store =
             ChiasmStore::open(&path, Arc::new(AxonBus::new())).expect("upgrade V5 database");
         drop(store);
-        let connection = Connection::open(&path).expect("inspect upgraded database");
+        let database =
+            henosis_sqlite::open_database(&path).expect("open protected upgraded database");
+        let connection = database.connection();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema version");
@@ -2197,8 +2205,8 @@ mod tests {
             ]
         );
         drop(statement);
-        drop(connection);
-        std::fs::remove_file(&path).expect("remove V5 upgrade fixture");
+        drop(database);
+        std::fs::remove_dir_all(&root).expect("remove V5 upgrade fixture");
     }
 
     /// A minimal EnqueueTask for `principal` in `tenant` under `project`.
@@ -2661,10 +2669,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     /// Two stores racing for one path produce one owner and one typed conflict.
     async fn create_claims_is_atomic_across_store_instances() {
-        let path = std::env::temp_dir().join(format!(
-            "henosis-chiasm-claim-race-{}.sqlite",
-            TaskId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("henosis-chiasm-claim-race-{}", TaskId::new()));
+        let path = root.join("state").join("chiasm.sqlite");
         let bus = Arc::new(AxonBus::new());
         let first_store = Arc::new(ChiasmStore::open(&path, bus.clone()).expect("first store"));
         let second_store = Arc::new(ChiasmStore::open(&path, bus).expect("second store"));
@@ -2733,7 +2740,7 @@ mod tests {
 
         drop(first_store);
         drop(second_store);
-        std::fs::remove_file(&path).expect("remove test database");
+        std::fs::remove_dir_all(&root).expect("remove test database");
     }
 
     #[tokio::test]

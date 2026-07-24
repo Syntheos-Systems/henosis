@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
 
+use henosis_sqlite::OpenedDatabase;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -182,8 +183,8 @@ pub struct Approval {
 
 /// A SQLite-backed authority approval store.
 pub struct ApprovalStore {
-    /// The isolated SQLite connection serialized for transaction integrity.
-    conn: Mutex<Connection>,
+    /// The isolated SQLite database and its path guard, serialized for transaction integrity.
+    conn: Mutex<OpenedDatabase>,
 }
 
 /// Convert a rusqlite failure into a public approval-store error.
@@ -427,24 +428,25 @@ fn migrate(connection: &Connection) -> Result<(), ApprovalError> {
 impl ApprovalStore {
     /// Open a persistent approval database and apply the isolated schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ApprovalError> {
-        let connection = Connection::open(path).map_err(storage)?;
-        Self::from_connection(connection)
+        let database = henosis_sqlite::open_database(path)
+            .map_err(|error| ApprovalError::Storage(error.to_string()))?;
+        Self::from_database(database)
     }
 
     /// Open an in-memory approval database for tests and short-lived isolated use.
     pub fn open_in_memory() -> Result<Self, ApprovalError> {
-        let connection = Connection::open_in_memory().map_err(storage)?;
-        Self::from_connection(connection)
+        let database = OpenedDatabase::open_in_memory().map_err(storage)?;
+        Self::from_database(database)
     }
 
-    /// Apply the schema and construct a store around the supplied connection.
-    fn from_connection(connection: Connection) -> Result<Self, ApprovalError> {
-        connection
+    /// Apply the schema while the supplied database retains its path guard.
+    fn from_database(database: OpenedDatabase) -> Result<Self, ApprovalError> {
+        database
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(storage)?;
-        migrate(&connection)?;
+        migrate(&database)?;
         Ok(Self {
-            conn: Mutex::new(connection),
+            conn: Mutex::new(database),
         })
     }
 
@@ -1150,7 +1152,8 @@ mod tests {
     /// Separate connections return the same durable idempotency record for one exact request.
     #[test]
     fn independent_connections_share_idempotency_record() {
-        let path = std::env::temp_dir().join(format!("henosis-approval-{}.sqlite", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("henosis-approval-{}", Uuid::new_v4()));
+        let path = root.join("state").join("approval.sqlite");
         let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let request = request(tenant, principal, [7; 32]);
@@ -1165,7 +1168,7 @@ mod tests {
         assert_eq!(replay.id, approval.id);
         drop(second);
         drop(first);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Token-shaped and oversized identities are rejected before persistence.
