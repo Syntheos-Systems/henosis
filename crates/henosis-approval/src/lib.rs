@@ -125,6 +125,24 @@ pub struct ApprovalRequest {
     pub expires_at: i64,
 }
 
+/// Exact request bindings required to consume one approved authorization.
+pub struct ApprovalConsumption<'a> {
+    /// Tenant that owns and scopes the approval.
+    pub tenant: TenantId,
+    /// Stable approval record identifier.
+    pub id: Uuid,
+    /// Principal attempting to consume the approval.
+    pub principal: PrincipalId,
+    /// Authenticated token identity bound to the original request.
+    pub token_identity: &'a str,
+    /// Canonical request hash bound to the original request.
+    pub request_hash: &'a RequestHash,
+    /// Policy version bound to the original approval decision.
+    pub policy_version: &'a str,
+    /// Current Unix timestamp used to enforce the approval lifetime.
+    pub now: i64,
+}
+
 /// A safely visible, request-bound approval record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
@@ -635,14 +653,17 @@ impl ApprovalStore {
     /// Atomically consume approval authorization at most once when its bindings and TTL all match.
     pub fn consume_approved(
         &self,
-        tenant: TenantId,
-        id: Uuid,
-        principal: PrincipalId,
-        token_identity: &str,
-        request_hash: &RequestHash,
-        policy_version: &str,
-        now: i64,
+        consumption: ApprovalConsumption<'_>,
     ) -> Result<Option<Approval>, ApprovalError> {
+        let ApprovalConsumption {
+            tenant,
+            id,
+            principal,
+            token_identity,
+            request_hash,
+            policy_version,
+            now,
+        } = consumption;
         let token_identity = canonical_token_identity(token_identity)?;
         let mut connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         let transaction = connection.transaction().map_err(storage)?;
@@ -904,15 +925,15 @@ mod tests {
             .expect("decide")
             .expect("approved");
         assert!(store
-            .consume_approved(
+            .consume_approved(ApprovalConsumption {
                 tenant,
-                approval.id,
-                PrincipalId::new(),
-                &token_identity,
-                &[2; 32],
-                "v9",
-                120
-            )
+                id: approval.id,
+                principal: PrincipalId::new(),
+                token_identity: &token_identity,
+                request_hash: &[2; 32],
+                policy_version: "v9",
+                now: 120,
+            })
             .expect("consume")
             .is_none());
     }
@@ -938,15 +959,15 @@ mod tests {
             )
             .expect("decide");
         assert!(store
-            .consume_approved(
+            .consume_approved(ApprovalConsumption {
                 tenant,
-                denied.id,
+                id: denied.id,
                 principal,
-                &denied_identity,
-                &[3; 32],
-                "v9",
-                120
-            )
+                token_identity: &denied_identity,
+                request_hash: &[3; 32],
+                policy_version: "v9",
+                now: 120,
+            })
             .expect("consume")
             .is_none());
         let expired = store
@@ -964,15 +985,15 @@ mod tests {
             )
             .expect("decide");
         assert!(store
-            .consume_approved(
+            .consume_approved(ApprovalConsumption {
                 tenant,
-                expired.id,
+                id: expired.id,
                 principal,
-                &expired_identity,
-                &[4; 32],
-                "v9",
-                200
-            )
+                token_identity: &expired_identity,
+                request_hash: &[4; 32],
+                policy_version: "v9",
+                now: 200,
+            })
             .expect("consume")
             .is_none());
     }
@@ -1003,15 +1024,15 @@ mod tests {
             let token_identity = token_identity.clone();
             handles.push(std::thread::spawn(move || {
                 store
-                    .consume_approved(
+                    .consume_approved(ApprovalConsumption {
                         tenant,
-                        approval.id,
+                        id: approval.id,
                         principal,
-                        &token_identity,
-                        &[5; 32],
-                        "v9",
-                        120,
-                    )
+                        token_identity: &token_identity,
+                        request_hash: &[5; 32],
+                        policy_version: "v9",
+                        now: 120,
+                    })
                     .expect("consume")
                     .is_some()
             }));
@@ -1068,15 +1089,15 @@ mod tests {
             )
             .expect("approve consumed request");
         assert!(store
-            .consume_approved(
+            .consume_approved(ApprovalConsumption {
                 tenant,
-                consumed.id,
+                id: consumed.id,
                 principal,
-                &consumed_identity,
-                &[9; 32],
-                "v9",
-                120,
-            )
+                token_identity: &consumed_identity,
+                request_hash: &[9; 32],
+                policy_version: "v9",
+                now: 120,
+            })
             .expect("consume")
             .is_some());
         let consumed_replay = store

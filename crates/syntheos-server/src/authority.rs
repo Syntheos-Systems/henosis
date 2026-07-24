@@ -15,8 +15,8 @@ use axum::{
     Json, Router,
 };
 use henosis_approval::{
-    canonical_request_hash, request_hash_hex, Approval, ApprovalDecision, ApprovalRequest,
-    ApprovalStatus, ApprovalStore, RequestHash,
+    canonical_request_hash, request_hash_hex, Approval, ApprovalConsumption, ApprovalDecision,
+    ApprovalRequest, ApprovalStatus, ApprovalStore, RequestHash,
 };
 use henosis_audit::{
     AuditEventInput, AuditPhase, AuditStore, ExecutionClaim, ExecutionState, WitnessedAudit,
@@ -738,15 +738,15 @@ impl ExecutionGuard for AuditExecutionGuard {
                 .map_err(|_| ExecutorError::new("request hash failed"))?;
             let consumed = self
                 .approvals
-                .consume_approved(
-                    request.context.tenant,
+                .consume_approved(ApprovalConsumption {
+                    tenant: request.context.tenant,
                     id,
-                    request.context.principal,
-                    &authority.token_identity,
-                    &hash,
-                    APPROVAL_POLICY_VERSION,
-                    unix_seconds(),
-                )
+                    principal: request.context.principal,
+                    token_identity: &authority.token_identity,
+                    request_hash: &hash,
+                    policy_version: APPROVAL_POLICY_VERSION,
+                    now: unix_seconds(),
+                })
                 .map_err(|error| {
                     tracing::error!(%error, "approval consumption failed");
                     ExecutorError::new("approval authority unavailable")
@@ -1871,15 +1871,15 @@ mod tests {
             .expect("approval decision")
             .expect("approved record");
         approvals
-            .consume_approved(
+            .consume_approved(ApprovalConsumption {
                 tenant,
-                approval.id,
+                id: approval.id,
                 principal,
-                &token_identity,
-                &request_hash,
-                APPROVAL_POLICY_VERSION,
+                token_identity: &token_identity,
+                request_hash: &request_hash,
+                policy_version: APPROVAL_POLICY_VERSION,
                 now,
-            )
+            })
             .expect("approval consumption")
             .expect("consumed record");
 
