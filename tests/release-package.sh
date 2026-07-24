@@ -42,7 +42,10 @@ printf '%s\n' \
     'case "$*" in' \
     '    *check-runs*)' \
     '        printf "Rust quality\tcompleted\tsuccess\n"' \
-    '        [ "${FAKE_COGNITION_STATUS:-missing}" = success ] && printf "Cognition quality\tcompleted\tsuccess\n"' \
+    '        case "${FAKE_COGNITION_STATUS:-missing}" in' \
+    '            success) printf "Cognition quality\tcompleted\tsuccess\n" ;;' \
+    '            failure) printf "Cognition quality\tcompleted\tfailure\n" ;;' \
+    '        esac' \
     '        printf "Dependency audit\tcompleted\tsuccess\n"' \
     '        printf "Secret scan\tcompleted\tsuccess\n"' \
     '        printf "Release package contract\tcompleted\tsuccess\n"' \
@@ -59,13 +62,45 @@ printf '%s\n' \
     '    rev-parse) printf "%s\n" "$FAKE_CANDIDATE_SHA" ;;' \
     '    show) printf "%s\n" "GhostFrame <ghostframe@girbox.org>" ;;' \
     '    verify-commit) [ "${FAKE_SIGNATURE_STATUS:-valid}" = valid ] ;;' \
-    '    push) printf "%s\n" "$*" >> "$PROMOTION_LOG" ;;' \
-    '    ls-remote) printf "%s\trefs/heads/main\n" "$FAKE_MAIN_SHA" ;;' \
-    '    merge-base) exit 0 ;;' \
+    '    push)' \
+    '        printf "%s\n" "$*" >> "$PROMOTION_LOG"' \
+    '        case "$*" in' \
+    '            *refs/heads/main) [ "${FAKE_MAIN_PUSH_STATUS:-success}" = success ] ;;' \
+    '        esac' \
+    '        ;;' \
+    '    ls-remote)' \
+    '        [ "${FAKE_MAIN_LOOKUP_STATUS:-success}" = success ] || exit 1' \
+    '        if [ "${FAKE_MAIN_REF_STATUS:-present}" = present ]; then' \
+    '            printf "%s\trefs/heads/main\n" "$FAKE_MAIN_SHA"' \
+    '        fi' \
+    '        ;;' \
+    '    merge-base) [ "${FAKE_FAST_FORWARD_STATUS:-success}" = success ] ;;' \
     '    *) exit 1 ;;' \
     'esac' > "$fake_bin/git"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/sleep"
+printf '%s\n' '#!/bin/sh' 'printf "sleep %s\n" "$*" >> "$PROMOTION_LOG"' > "$fake_bin/sleep"
 chmod 755 "$fake_bin/gh" "$fake_bin/git" "$fake_bin/sleep"
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" PROMOTION_CHECK_ATTEMPTS=0 \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-configuration.log" 2>&1
+then
+    fail 'promotion accepted an invalid polling budget'
+fi
+grep -F 'PROMOTION_CHECK_ATTEMPTS must be a positive integer' "$TEST_DIRECTORY/promotion-configuration.log" >/dev/null || fail 'polling budget validation failed for the wrong reason'
+if grep -F 'refs/heads/candidate/' "$promotion_log" >/dev/null; then
+    fail 'promotion pushed a candidate with an invalid polling budget'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" PROMOTION_CHECK_INTERVAL_SECONDS=0 \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-interval.log" 2>&1
+then
+    fail 'promotion accepted an invalid polling interval'
+fi
+grep -F 'PROMOTION_CHECK_INTERVAL_SECONDS must be a positive integer' "$TEST_DIRECTORY/promotion-interval.log" >/dev/null || fail 'polling interval validation failed for the wrong reason'
+if grep -F 'refs/heads/candidate/' "$promotion_log" >/dev/null; then
+    fail 'promotion pushed a candidate with an invalid polling interval'
+fi
 
 : > "$promotion_log"
 if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_SIGNATURE_STATUS=invalid \
@@ -92,15 +127,77 @@ if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/n
 fi
 
 : > "$promotion_log"
-if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=missing \
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=missing PROMOTION_CHECK_ATTEMPTS=2 PROMOTION_CHECK_INTERVAL_SECONDS=1 \
     "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-missing.log" 2>&1
 then
     fail 'promotion accepted a candidate without Cognition quality'
 fi
 grep -F 'required checks did not pass' "$TEST_DIRECTORY/promotion-missing.log" >/dev/null || fail 'promotion failed for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate with a missing check'
 if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
     fail 'promotion pushed main without Cognition quality'
 fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=failure \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-failure.log" 2>&1
+then
+    fail 'promotion accepted a failed Cognition quality check'
+fi
+grep -F 'required checks did not pass' "$TEST_DIRECTORY/promotion-failure.log" >/dev/null || fail 'terminal check failure stopped promotion for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate with a failed check'
+if grep -F 'sleep ' "$promotion_log" >/dev/null; then
+    fail 'promotion waited after a terminal check failure'
+fi
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed main after a failed Cognition quality check'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_MAIN_LOOKUP_STATUS=failure \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-main-lookup.log" 2>&1
+then
+    fail 'promotion accepted an unreadable main reference'
+fi
+grep -F 'main reference could not be read' "$TEST_DIRECTORY/promotion-main-lookup.log" >/dev/null || fail 'main lookup failure stopped promotion for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate after a main lookup failure'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed an unreadable main reference'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_MAIN_REF_STATUS=missing \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-main-missing.log" 2>&1
+then
+    fail 'promotion accepted a missing main reference'
+fi
+grep -F 'main reference is missing' "$TEST_DIRECTORY/promotion-main-missing.log" >/dev/null || fail 'missing main reference stopped promotion for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate after a missing main reference'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion created a missing main reference'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_FAST_FORWARD_STATUS=failure \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-fast-forward.log" 2>&1
+then
+    fail 'promotion accepted a non-fast-forward candidate'
+fi
+grep -F 'candidate is not a fast-forward of main' "$TEST_DIRECTORY/promotion-fast-forward.log" >/dev/null || fail 'fast-forward validation stopped promotion for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the non-fast-forward candidate'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed a non-fast-forward candidate to main'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_MAIN_PUSH_STATUS=failure \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-main-push.log" 2>&1
+then
+    fail 'promotion reported success after the main push failed'
+fi
+grep -F 'main reference could not be updated' "$TEST_DIRECTORY/promotion-main-push.log" >/dev/null || fail 'main push failure stopped promotion for the wrong reason'
+grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null || fail 'promotion did not attempt the validated main update'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate after the main push failed'
 
 : > "$promotion_log"
 PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success \

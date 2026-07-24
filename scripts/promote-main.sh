@@ -5,12 +5,24 @@ set -eu
 
 PROGRAM=promote-main
 REPOSITORY=${GITHUB_REPOSITORY:-Syntheos-Systems/henosis}
+CHECK_ATTEMPTS=${PROMOTION_CHECK_ATTEMPTS:-361}
+CHECK_INTERVAL_SECONDS=${PROMOTION_CHECK_INTERVAL_SECONDS:-10}
 
 # Stop promotion with a precise diagnostic.
 die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
 
 # Require the GitHub CLI before changing any remote references.
 require_gh() { command -v gh >/dev/null 2>&1 || die 'gh CLI is required'; }
+
+# Require a positive integer configuration value.
+require_positive_integer() {
+    name=$1
+    value=$2
+    case "$value" in
+        '' | *[!0-9]*) die "$name must be a positive integer" ;;
+    esac
+    [ "$value" -gt 0 ] 2>/dev/null || die "$name must be a positive integer"
+}
 
 # Verify the local candidate has the exact trusted identity and signature.
 verify_local_identity() {
@@ -25,27 +37,32 @@ verify_local_identity() {
 
 # Verify that GitHub attributes the remotely visible exact commit to Ghost-Frame.
 verify_actor() {
-    for attempt in $(seq 1 10); do
+    attempt=1
+    while [ "$attempt" -le 10 ]; do
         if actor=$(gh api "repos/$REPOSITORY/commits/$1" --jq '.author.login // empty' 2>/dev/null); then
             [ "$actor" = Ghost-Frame ]
             return
         fi
         sleep 1
+        attempt=$((attempt + 1))
     done
     return 1
 }
 
-# Remove only the isolated candidate ref after a remote trust failure.
+# Remove only the isolated candidate ref after a validation failure.
 discard_candidate() {
     git push origin --delete "candidate/$1" ||
-        die "candidate $1 failed attribution and its remote ref could not be removed"
+        die "candidate $1 failed validation and its remote ref could not be removed"
 }
 
 # Wait until each named check reaches a successful terminal conclusion.
 wait_for_checks() {
     sha=$1
-    for attempt in $(seq 1 60); do
-        checks=$(gh api "repos/$REPOSITORY/commits/$sha/check-runs?per_page=100" --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')
+    attempt=1
+    while [ "$attempt" -le "$CHECK_ATTEMPTS" ]; do
+        if ! checks=$(gh api "repos/$REPOSITORY/commits/$sha/check-runs?per_page=100" --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv'); then
+            checks=
+        fi
         complete=1
         for required in \
             'Rust quality' \
@@ -56,19 +73,30 @@ wait_for_checks() {
             'Windows release package contract'
         do
             line=$(printf '%s\n' "$checks" | awk -F '\t' -v check="$required" '$1 == check { print; exit }')
-            [ -n "$line" ] || complete=0
-            [ "$(printf '%s' "$line" | awk -F '\t' '{print $2}')" = completed ] || complete=0
-            [ "$(printf '%s' "$line" | awk -F '\t' '{print $3}')" = success ] || complete=0
+            if [ -z "$line" ]; then
+                complete=0
+                continue
+            fi
+            status=$(printf '%s' "$line" | awk -F '\t' '{print $2}')
+            conclusion=$(printf '%s' "$line" | awk -F '\t' '{print $3}')
+            if [ "$status" = completed ]; then
+                [ "$conclusion" = success ] || return 1
+            else
+                complete=0
+            fi
         done
-        [ "$complete" -eq 1 ] && return
-        sleep 10
+        [ "$complete" -eq 1 ] && return 0
+        [ "$attempt" -eq "$CHECK_ATTEMPTS" ] || sleep "$CHECK_INTERVAL_SECONDS"
+        attempt=$((attempt + 1))
     done
-    die "required checks did not pass for $sha"
+    return 1
 }
 
 # Push a candidate ref, wait for checks, and fast-forward main to the unchanged SHA.
 main() {
     [ "$#" -eq 1 ] || die "usage: $0 CANDIDATE_SHA"
+    require_positive_integer PROMOTION_CHECK_ATTEMPTS "$CHECK_ATTEMPTS"
+    require_positive_integer PROMOTION_CHECK_INTERVAL_SECONDS "$CHECK_INTERVAL_SECONDS"
     sha=$(git rev-parse --verify "$1^{commit}") || die 'candidate must resolve to a commit'
     require_gh
     verify_local_identity "$sha"
@@ -77,10 +105,27 @@ main() {
         discard_candidate "$sha"
         die "candidate $sha is not attributed to Ghost-Frame"
     fi
-    wait_for_checks "$sha"
-    main_sha=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-    git merge-base --is-ancestor "$main_sha" "$sha" || die 'candidate is not a fast-forward of main'
-    git push origin "$sha:refs/heads/main"
+    if ! wait_for_checks "$sha"; then
+        discard_candidate "$sha"
+        die "required checks did not pass for $sha"
+    fi
+    if ! remote_main=$(git ls-remote origin refs/heads/main); then
+        discard_candidate "$sha"
+        die 'main reference could not be read'
+    fi
+    main_sha=$(printf '%s\n' "$remote_main" | awk '{print $1}')
+    if [ -z "$main_sha" ]; then
+        discard_candidate "$sha"
+        die 'main reference is missing'
+    fi
+    if ! git merge-base --is-ancestor "$main_sha" "$sha"; then
+        discard_candidate "$sha"
+        die 'candidate is not a fast-forward of main'
+    fi
+    if ! git push origin "$sha:refs/heads/main"; then
+        discard_candidate "$sha"
+        die 'main reference could not be updated'
+    fi
     git push origin --delete "candidate/$sha"
 }
 
