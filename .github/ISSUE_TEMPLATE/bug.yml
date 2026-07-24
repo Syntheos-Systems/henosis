@@ -8,7 +8,7 @@ body:
       value: Do not include credentials, tokens, private URLs, or production data.
   - type: input
     id: version
-    attributes: { label: Henosis version, placeholder: v0.1.0-alpha.1 }
+    attributes: { label: Henosis version, placeholder: v0.1.0-alpha.2 }
     validations: { required: true }
   - type: textarea
     id: reproduction

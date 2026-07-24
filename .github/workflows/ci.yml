@@ -89,6 +89,11 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 x86_64-pc-windows-msvc
+          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target x86_64-pc-windows-msvc
       - shell: powershell
         run: ./tests/install.ps1
       - shell: pwsh

@@ -48,8 +48,8 @@ require_line "$REPOSITORY_DIR/install.sh" 'release_metadata_fields'
 require_line "$REPOSITORY_DIR/install.ps1" '$metadata.immutable -ne $true'
 require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.sh"
 require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.ps1"
-require_line "$README" '| sh -s -- --version v0.1.0-alpha.1'
-require_line "$README" "-Version 'v0.1.0-alpha.1'"
+require_line "$README" '| sh -s -- --version v0.1.0-alpha.2'
+require_line "$README" "-Version 'v0.1.0-alpha.2'"
 if sed -n 's/.*uses:[[:space:]]*[^@]*@\([^ #]*\).*/\1/p' "$WORKFLOW" |
     grep -Ev '^[0-9a-f]{40}$' >/dev/null; then
     fail 'workflow contains an action that is not pinned to a full commit'

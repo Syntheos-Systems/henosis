@@ -4,6 +4,7 @@
 | --- | --- |
 | Local policy is single-operator, loopback-only, and resets counters on restart. | Open |
 | Local credential operations need a separately running loopback `phylaxd`; the quick initializer does not manufacture broker credentials. | Open |
+| The embedded compatibility store's allowlisted exec mode is POSIX-only; non-Unix platforms deny it before loading secret material. | Open |
 | The full proprietary Pistis service is not distributed here, and the default empty room-state source denies capability-bearing requests. | Open |
 | The Wasmtime component host is implemented but third-party extension loading is not yet attached to the production dispatcher. | Open |
 | Component compilation is admission-bounded and requires a trusted signature, but it is outside the signed execution timeout. In-process mediator implementations must enforce supplied deadlines and allocation ceilings; hard cancellation requires future process isolation. | Open |

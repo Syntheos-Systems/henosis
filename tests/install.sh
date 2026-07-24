@@ -85,7 +85,7 @@ EOF
 
 # Verify a healthy installation selects the archive, verifies it, and initializes it.
 test_verified_install() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/release"; case_root="$TEST_ROOT/success"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/release"; case_root="$TEST_ROOT/success"
     make_release "$version" "$target" 'exit 0' "$release"
     make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version"
     cp "$release/$version"/* "$case_root/remote/$version/"
@@ -98,7 +98,7 @@ test_verified_install() {
 
 # Verify a failed initializer restores the precise previous executable.
 test_rollback() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/rollback-release"; case_root="$TEST_ROOT/rollback"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/rollback-release"; case_root="$TEST_ROOT/rollback"
     make_release "$version" "$target" 'exit 17' "$release"
     make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version" "$case_root/bin"
     cp "$release/$version"/* "$case_root/remote/$version/"
@@ -111,7 +111,7 @@ test_rollback() {
 
 # Verify a bad mandatory checksum prevents installation.
 test_checksum_failure() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/checksum-release"; case_root="$TEST_ROOT/checksum"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/checksum-release"; case_root="$TEST_ROOT/checksum"
     make_release "$version" "$target" 'exit 0' "$release"
     make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version"
     cp "$release/$version"/* "$case_root/remote/$version/"
@@ -123,7 +123,7 @@ test_checksum_failure() {
 
 # Verify a mutable release is rejected before its manifest or archive can be installed.
 test_mutable_release_failure() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/mutable-release"; case_root="$TEST_ROOT/mutable"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/mutable-release"; case_root="$TEST_ROOT/mutable"
     make_release "$version" "$target" 'exit 0' "$release"
     make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version"
     cp "$release/$version"/* "$case_root/remote/$version/"
@@ -135,7 +135,7 @@ test_mutable_release_failure() {
 
 # Verify user-controlled release text and nested fields cannot impersonate top-level trust fields.
 test_release_metadata_structure() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/metadata-release"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/metadata-release"
     make_release "$version" "$target" 'exit 0' "$release"
     for mode in embedded-true nested-true duplicate malformed malformed-token malformed-nested; do
         case_root="$TEST_ROOT/metadata-$mode"
@@ -153,7 +153,7 @@ test_release_metadata_structure() {
 
 # Verify an extracted release installs its adjacent binary without network access.
 test_archive_local_install() {
-    version=v0.1.0-alpha.1; target=x86_64-unknown-linux-musl; case_root="$TEST_ROOT/archive-local"
+    version=v0.1.0-alpha.2; target=x86_64-unknown-linux-musl; case_root="$TEST_ROOT/archive-local"
     mkdir -p "$case_root/archive" "$case_root/bin" "$case_root/tools"
     cp "$REPOSITORY_DIR/install.sh" "$case_root/archive/install.sh"
     printf '%s %s\n' "$version" "$target" > "$case_root/archive/HENOSIS_ARCHIVE"
@@ -180,7 +180,7 @@ test_archive_marker_mismatch() {
     cp /bin/true "$case_root/archive/henosis"
     printf '%s\n' 'v9.9.9 x86_64-unknown-linux-musl' > "$case_root/archive/HENOSIS_ARCHIVE"
     chmod 755 "$case_root/archive/install.sh" "$case_root/archive/henosis"
-    if "$case_root/archive/install.sh" --version v0.1.0-alpha.1 --install-dir "$case_root/bin" --headless > "$case_root/result.json" 2>&1; then
+    if "$case_root/archive/install.sh" --version v0.1.0-alpha.2 --install-dir "$case_root/bin" --headless > "$case_root/result.json" 2>&1; then
         fail 'mismatched archive marker succeeded'
     fi
     [ ! -e "$case_root/bin/henosis" ] || fail 'mismatched archive marker installed a binary'

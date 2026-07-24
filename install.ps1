@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = $(if ($env:HENOSIS_VERSION) { $env:HENOSIS_VERSION } else { 'v0.1.0-alpha.1' }),
+    [string]$Version = $(if ($env:HENOSIS_VERSION) { $env:HENOSIS_VERSION } else { 'v0.1.0-alpha.2' }),
     [string]$InstallDirectory = $(if ($env:HENOSIS_INSTALL_DIR) { $env:HENOSIS_INSTALL_DIR } else { Join-Path $HOME '.local\\bin' }),
     [switch]$Headless
 )

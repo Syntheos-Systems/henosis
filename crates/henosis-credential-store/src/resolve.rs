@@ -268,6 +268,7 @@ impl CredentialStore {
     ///
     /// `argv[0]` must be an absolute path on the matched policy's exec allowlist; a policy with no
     /// allowlist forbids exec entirely. No shell, cleared environment, stdin null, hard timeout.
+    /// Exec is POSIX-only; non-Unix platforms deny the operation before loading secret material.
     pub async fn resolve_exec(
         &self,
         tenant: &TenantId,
@@ -304,61 +305,71 @@ impl CredentialStore {
             ));
         }
 
-        let secret = self.key_bytes(tenant, category, name)?;
-        let secret_os = {
-            use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&secret).to_owned()
+        #[cfg(not(unix))]
+        let outcome = Err(CredentialStoreError::PermissionDenied(
+            "exec mode is unsupported on this platform".into(),
+        ));
+
+        #[cfg(unix)]
+        let outcome = {
+            let secret = self.key_bytes(tenant, category, name)?;
+            let secret_os = {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(&secret).to_owned()
+            };
+
+            let child = tokio::process::Command::new(argv0)
+                .args(&argv[1..])
+                .env_clear()
+                .env(env_var, &secret_os)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| {
+                    tracing::error!(error = %e, "exec spawn failed");
+                    CredentialStoreError::InvalidInput("command could not be started".into())
+                })?;
+
+            let output = match tokio::time::timeout(
+                std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
+                child.wait_with_output(),
+            )
+            .await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "exec wait failed");
+                    return Err(CredentialStoreError::Backend(
+                        "command execution failed".into(),
+                    ));
+                }
+                Err(_) => {
+                    // Deadline exceeded: the dropped future kills the child (kill_on_drop).
+                    return Ok(crate::model::ExecOutcome {
+                        timed_out: true,
+                        exit_code: None,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+            };
+
+            let mut stdout = scrub_secret(&output.stdout, &secret);
+            let mut stderr = scrub_secret(&output.stderr, &secret);
+            stdout.truncate(EXEC_OUTPUT_CAP);
+            stderr.truncate(EXEC_OUTPUT_CAP);
+
+            Ok(crate::model::ExecOutcome {
+                timed_out: false,
+                exit_code: output.status.code(),
+                stdout,
+                stderr,
+            })
         };
 
-        let child = tokio::process::Command::new(argv0)
-            .args(&argv[1..])
-            .env_clear()
-            .env(env_var, &secret_os)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                tracing::error!(error = %e, "exec spawn failed");
-                CredentialStoreError::InvalidInput("command could not be started".into())
-            })?;
-
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "exec wait failed");
-                return Err(CredentialStoreError::Backend(
-                    "command execution failed".into(),
-                ));
-            }
-            Err(_) => {
-                // Deadline exceeded: the dropped future kills the child (kill_on_drop).
-                return Ok(crate::model::ExecOutcome {
-                    timed_out: true,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                });
-            }
-        };
-
-        let mut stdout = scrub_secret(&output.stdout, &secret);
-        let mut stderr = scrub_secret(&output.stderr, &secret);
-        stdout.truncate(EXEC_OUTPUT_CAP);
-        stderr.truncate(EXEC_OUTPUT_CAP);
-
-        Ok(crate::model::ExecOutcome {
-            timed_out: false,
-            exit_code: output.status.code(),
-            stdout,
-            stderr,
-        })
+        outcome
     }
 }
 
@@ -518,6 +529,7 @@ mod functional_tests {
     }
 
     /// exec runs an allowlisted command, injects the secret, and scrubs it from output.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_runs_and_scrubs() {
         let s = store();
@@ -539,6 +551,30 @@ mod functional_tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("INJECTED=[redacted]"), "got: {stdout}");
         assert!(!stdout.contains("super-secret"));
+    }
+
+    /// Non-Unix platforms deny an otherwise authorized exec operation.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn exec_unsupported_platform_denied() {
+        let s = store();
+        let allow = vec!["/usr/bin/env".to_string()];
+        let (t, p) = fixture(&s, &[ResolveMode::Exec], Some(&allow));
+        let result = s
+            .resolve_exec(
+                &t,
+                &p,
+                "prod",
+                "db",
+                &["/usr/bin/env".to_string()],
+                "INJECTED",
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CredentialStoreError::PermissionDenied(reason))
+                if reason == "exec mode is unsupported on this platform"
+        ));
     }
 
     /// A command off the allowlist is denied, even with exec mode allowed.
