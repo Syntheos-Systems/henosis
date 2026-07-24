@@ -2448,12 +2448,14 @@ mod tests {
         loop {
             append_bash(&path, "git push --force", "live-1");
             match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-                Ok(Some(event)) => {
+                Ok(Ok(event)) => {
                     assert_eq!(event.rule_id, "no-force-push");
                     assert_eq!(event.session_id.as_deref(), Some("live-1"));
                     break;
                 }
-                Ok(None) => panic!("watcher event channel closed before readiness"),
+                Ok(Err(error)) => {
+                    panic!("watcher event reception failed before readiness: {error}")
+                }
                 Err(_) => {
                     assert!(
                         Instant::now() < readiness_deadline,
@@ -2494,12 +2496,14 @@ mod tests {
         loop {
             append_bash(&readiness_path, "git push --force", "readiness");
             match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-                Ok(Some(event)) => {
+                Ok(Ok(event)) => {
                     assert_eq!(event.rule_id, "no-force-push");
                     assert_eq!(event.session_id.as_deref(), Some("readiness"));
                     break;
                 }
-                Ok(None) => panic!("watcher event channel closed before readiness"),
+                Ok(Err(error)) => {
+                    panic!("watcher event reception failed before readiness: {error}")
+                }
                 Err(_) => {
                     assert!(
                         Instant::now() < readiness_deadline,
