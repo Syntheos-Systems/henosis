@@ -80,7 +80,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::{live_gate_chain, HenosisExecutor};
+    use crate::{live_gate_chain, HenosisExecutor, LiveGateDependencies};
     use henosis_broca::ActionFilter;
     use henosis_chiasm::{NewTask, TaskStatus};
     use henosis_credential_store::CredentialStore;
@@ -278,13 +278,17 @@ mod tests {
         let (pistis_source, pistis_trust) = authorized_probe_authority(tenant, principal);
         let gates = live_gate_chain(
             &EidolonPolicy::default(),
-            thymus,
-            pistis_source,
-            pistis_trust,
-            credential_store.clone(),
-            bus.clone(),
-            Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
-            plutus,
+            LiveGateDependencies {
+                thymus,
+                pistis_source,
+                pistis_trust,
+                credential_store: credential_store.clone(),
+                bus: bus.clone(),
+                human_approver: Arc::new(RegistryApprover::new(std::time::Duration::from_millis(
+                    10,
+                ))),
+                plutus,
+            },
         )
         .expect("five real gates");
         let axon = AxonPublisher::from_env();
@@ -404,13 +408,17 @@ mod tests {
         let (pistis_source, pistis_trust) = authorized_probe_authority(tenant, principal);
         let gates = live_gate_chain(
             &EidolonPolicy::default(),
-            thymus,
-            pistis_source,
-            pistis_trust,
-            credential_store.clone(),
-            bus.clone(),
-            Arc::new(RegistryApprover::new(std::time::Duration::from_millis(10))),
-            plutus,
+            LiveGateDependencies {
+                thymus,
+                pistis_source,
+                pistis_trust,
+                credential_store: credential_store.clone(),
+                bus: bus.clone(),
+                human_approver: Arc::new(RegistryApprover::new(std::time::Duration::from_millis(
+                    10,
+                ))),
+                plutus,
+            },
         )
         .expect("five real gates");
         let axon = AxonPublisher::from_env();

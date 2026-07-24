@@ -637,9 +637,9 @@ fn audit_boundary_from_env(local_mode: bool) -> Result<AuditBoundary, Box<dyn st
         load_verifying_key(Path::new(&witness_key_path))?,
         Duration::from_secs(5),
     )?;
-    Ok(AuditBoundary::Witnessed(WitnessedAudit::new(
+    Ok(AuditBoundary::Witnessed(Box::new(WitnessedAudit::new(
         store, origin, witness,
-    )))
+    ))))
 }
 
 /// Read one mandatory non-blank environment value without logging its contents.

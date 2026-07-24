@@ -50,10 +50,10 @@ pub use action_reactor::spawn_action_reactor;
 pub use app::{
     eidolon_gate, live_gate_chain, production_router, public_gate_chain, router, AppState,
     BrocaFeedQuery, BrocaLogRequest, BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery,
-    ChiasmOwnerQuery, EnrollRequest, LoomCompleteStep, LoomCreateRun, LoomCreateWorkflow,
-    LoomFailStep, LoomLogsQuery, LoomOwnerQuery, LoomRunsQuery, SomaHeartbeatRequest,
-    SomaListQuery, SomaQualityRequest, SomaQualitySink, SomaRegisterRequest, SomaStatsQuery,
-    ThymusCreateRubric, ThymusDriftQuery, ThymusDriftSignal, ThymusEvaluate,
+    ChiasmOwnerQuery, EnrollRequest, LiveGateDependencies, LoomCompleteStep, LoomCreateRun,
+    LoomCreateWorkflow, LoomFailStep, LoomLogsQuery, LoomOwnerQuery, LoomRunsQuery,
+    SomaHeartbeatRequest, SomaListQuery, SomaQualityRequest, SomaQualitySink, SomaRegisterRequest,
+    SomaStatsQuery, ThymusCreateRubric, ThymusDriftQuery, ThymusDriftSignal, ThymusEvaluate,
     ThymusEvaluationsQuery, ThymusMetricSummaryQuery, ThymusOwnerQuery, ThymusRecordDrift,
     ThymusRecordMetric,
 };

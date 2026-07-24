@@ -98,7 +98,7 @@ pub enum AuditBoundary {
     /// Local durable audit for loopback development.
     Local(AuditStore),
     /// Local durable audit plus mandatory off-host witness receipts.
-    Witnessed(WitnessedAudit),
+    Witnessed(Box<WitnessedAudit>),
 }
 
 /// Implements audit appends across the explicitly selected deployment boundary.
@@ -1323,11 +1323,11 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("witness client");
-        let audit = AuditBoundary::Witnessed(WitnessedAudit::new(
+        let audit = AuditBoundary::Witnessed(Box::new(WitnessedAudit::new(
             AuditStore::open_in_memory().expect("audit store"),
             origin_signer,
             witness_client,
-        ));
+        )));
         let dispatcher = Dispatcher::new(
             deny_gate_chain(),
             Box::new(DenyExecutor),

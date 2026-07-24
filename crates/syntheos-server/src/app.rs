@@ -133,6 +133,24 @@ pub fn eidolon_gate(
     EidolonGate::new(policy.clone(), Arc::new(ThymusDriftSignal(thymus)))
 }
 
+/// The dependencies used to construct the embedded compatibility gate chain.
+pub struct LiveGateDependencies {
+    /// The Thymus store read by the Eidolon persona-drift adapter.
+    pub thymus: Arc<ThymusStore>,
+    /// The authoritative room-state source read by the Pistis gate.
+    pub pistis_source: Arc<dyn RoomStateSource>,
+    /// The pinned room-trust store checked by the Pistis gate.
+    pub pistis_trust: Arc<RoomTrustStore>,
+    /// The embedded credential store enforced by the compatibility phylaxd gate.
+    pub credential_store: Arc<CredentialStore>,
+    /// The action bus used by the embedded human gate.
+    pub bus: Arc<AxonBus>,
+    /// The approval provider used by the embedded human gate.
+    pub human_approver: Arc<dyn Approver>,
+    /// The policy backend enforced by the Plutus gate.
+    pub plutus: Arc<dyn PolicyBackend>,
+}
+
 /// Build the embedded compatibility gate chain used by loopback integrations and tests.
 ///
 /// Slots remain in dispatcher order (`pistis -> plutus -> eidolon -> human -> phylaxd`):
@@ -148,14 +166,17 @@ pub fn eidolon_gate(
 /// `phylaxd` broker. `Dispatcher::new` validates gate order at construction.
 pub fn live_gate_chain(
     policy: &EidolonPolicy,
-    thymus: Arc<ThymusStore>,
-    pistis_source: Arc<dyn RoomStateSource>,
-    pistis_trust: Arc<RoomTrustStore>,
-    credential_store: Arc<CredentialStore>,
-    bus: Arc<AxonBus>,
-    human_approver: Arc<dyn Approver>,
-    plutus: Arc<dyn PolicyBackend>,
+    dependencies: LiveGateDependencies,
 ) -> Result<Vec<Box<dyn Gate>>, EidolonError> {
+    let LiveGateDependencies {
+        thymus,
+        pistis_source,
+        pistis_trust,
+        credential_store,
+        bus,
+        human_approver,
+        plutus,
+    } = dependencies;
     Ok(vec![
         Box::new(PistisGate::new(pistis_source, pistis_trust)),
         // Plutus enforces organization status, RBAC, hard quota, and token-bucket rate limits.
@@ -1997,15 +2018,17 @@ mod tests {
         let plutus_backend: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::allow_all());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
-            thymus,
-            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Arc::new(RoomTrustStore::new()),
-            test_credential_store(bus.clone()),
-            bus.clone(),
-            Arc::new(henosis_rift::RegistryApprover::new(
-                std::time::Duration::from_millis(5),
-            )),
-            plutus_backend,
+            LiveGateDependencies {
+                thymus,
+                pistis_source: Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+                pistis_trust: Arc::new(RoomTrustStore::new()),
+                credential_store: test_credential_store(bus.clone()),
+                bus: bus.clone(),
+                human_approver: Arc::new(henosis_rift::RegistryApprover::new(
+                    std::time::Duration::from_millis(5),
+                )),
+                plutus: plutus_backend,
+            },
         )
         .expect("valid default policy");
 
@@ -2025,15 +2048,17 @@ mod tests {
         let plutus_allow: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::allow_all());
         let chain2 = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
-            thymus2,
-            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Arc::new(RoomTrustStore::new()),
-            test_credential_store(bus2.clone()),
-            bus2.clone(),
-            Arc::new(henosis_rift::RegistryApprover::new(
-                std::time::Duration::from_millis(5),
-            )),
-            plutus_allow,
+            LiveGateDependencies {
+                thymus: thymus2,
+                pistis_source: Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+                pistis_trust: Arc::new(RoomTrustStore::new()),
+                credential_store: test_credential_store(bus2.clone()),
+                bus: bus2.clone(),
+                human_approver: Arc::new(henosis_rift::RegistryApprover::new(
+                    std::time::Duration::from_millis(5),
+                )),
+                plutus: plutus_allow,
+            },
         )
         .expect("valid default policy");
         let plutus_gate = &chain2[1];
@@ -2075,15 +2100,17 @@ mod tests {
         let plutus_backend: Arc<dyn PolicyBackend> = Arc::new(MockPolicyBackend::deny_no_org());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
-            thymus,
-            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Arc::new(RoomTrustStore::new()),
-            test_credential_store(bus.clone()),
-            bus.clone(),
-            Arc::new(henosis_rift::RegistryApprover::new(
-                std::time::Duration::from_millis(5),
-            )),
-            plutus_backend,
+            LiveGateDependencies {
+                thymus,
+                pistis_source: Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+                pistis_trust: Arc::new(RoomTrustStore::new()),
+                credential_store: test_credential_store(bus.clone()),
+                bus: bus.clone(),
+                human_approver: Arc::new(henosis_rift::RegistryApprover::new(
+                    std::time::Duration::from_millis(5),
+                )),
+                plutus: plutus_backend,
+            },
         )
         .expect("valid default policy");
 
@@ -2159,16 +2186,18 @@ mod tests {
 
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
-            thymus,
-            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Arc::new(RoomTrustStore::new()),
-            credential_store,
-            bus.clone(),
-            Arc::new(henosis_rift::RegistryApprover::new(
-                std::time::Duration::from_millis(5),
-            )),
-            // Use allow_all so the Plutus slot does not interfere with the broker-slot test.
-            Arc::new(henosis_plutus::MockPolicyBackend::allow_all()),
+            LiveGateDependencies {
+                thymus,
+                pistis_source: Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+                pistis_trust: Arc::new(RoomTrustStore::new()),
+                credential_store,
+                bus: bus.clone(),
+                human_approver: Arc::new(henosis_rift::RegistryApprover::new(
+                    std::time::Duration::from_millis(5),
+                )),
+                // Use allow_all so the Plutus slot does not interfere with the broker-slot test.
+                plutus: Arc::new(henosis_plutus::MockPolicyBackend::allow_all()),
+            },
         )
         .expect("valid default policy");
         // The broker slot is last; exercise its real embedded policy implementation.
@@ -2223,15 +2252,17 @@ mod tests {
             Arc::new(henosis_plutus::MockPolicyBackend::deny_no_org());
         let chain = live_gate_chain(
             &henosis_eidolon::EidolonPolicy::default(),
-            thymus,
-            Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
-            Arc::new(RoomTrustStore::new()),
-            test_credential_store(bus.clone()),
-            bus.clone(),
-            Arc::new(henosis_rift::RegistryApprover::new(
-                std::time::Duration::from_millis(5),
-            )),
-            plutus_backend,
+            LiveGateDependencies {
+                thymus,
+                pistis_source: Arc::new(henosis_pistis::InMemoryRoomStateSource::new()),
+                pistis_trust: Arc::new(RoomTrustStore::new()),
+                credential_store: test_credential_store(bus.clone()),
+                bus: bus.clone(),
+                human_approver: Arc::new(henosis_rift::RegistryApprover::new(
+                    std::time::Duration::from_millis(5),
+                )),
+                plutus: plutus_backend,
+            },
         )
         .expect("valid default policy");
         let dispatcher =

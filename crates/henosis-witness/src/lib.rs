@@ -275,7 +275,7 @@ impl WitnessStore {
     /// Loads the preserved head for one tenant.
     pub fn head(&self, tenant_id: &str) -> Result<Option<WitnessHead>, WitnessError> {
         let connection = self.lock_connection()?;
-        load_head_from_connection(&*connection, tenant_id)
+        load_head_from_connection(&connection, tenant_id)
     }
 
     /// Acquires the witness connection without panicking on poison.
