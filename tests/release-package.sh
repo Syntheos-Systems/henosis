@@ -30,4 +30,52 @@ tar -xOf "$archive" henosis-0.1.0-alpha.1-x86_64-unknown-linux-musl/README.md | 
 [ "$(tar -xOf "$archive" henosis-0.1.0-alpha.1-x86_64-unknown-linux-musl/HENOSIS_ARCHIVE)" = 'v0.1.0-alpha.1 x86_64-unknown-linux-musl' ] || fail 'archive marker is incorrect'
 grep -F 'aarch64-unknown-linux-musl' "$REPOSITORY_DIR/.github/workflows/ci.yml" >/dev/null || fail 'workflow lacks Linux arm64'
 grep -F 'henosis init --quick' "$REPOSITORY_DIR/install.sh" >/dev/null || fail 'installer lacks initialization contract'
+
+# Exercise the real promotion path with deterministic GitHub and Git boundaries.
+fake_bin="$TEST_DIRECTORY/fake-bin"
+promotion_log="$TEST_DIRECTORY/promotion.log"
+candidate_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+main_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+mkdir "$fake_bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$*" in' \
+    '    *check-runs*)' \
+    '        printf "Rust quality\tcompleted\tsuccess\n"' \
+    '        [ "${FAKE_COGNITION_STATUS:-missing}" = success ] && printf "Cognition quality\tcompleted\tsuccess\n"' \
+    '        printf "Dependency audit\tcompleted\tsuccess\n"' \
+    '        printf "Secret scan\tcompleted\tsuccess\n"' \
+    '        printf "Release package contract\tcompleted\tsuccess\n"' \
+    '        printf "Windows release package contract\tcompleted\tsuccess\n"' \
+    '        ;;' \
+    '    *) printf "%s\n" Ghost-Frame ;;' \
+    'esac' > "$fake_bin/gh"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '    rev-parse) printf "%s\n" "$FAKE_CANDIDATE_SHA" ;;' \
+    '    push) printf "%s\n" "$*" >> "$PROMOTION_LOG" ;;' \
+    '    ls-remote) printf "%s\trefs/heads/main\n" "$FAKE_MAIN_SHA" ;;' \
+    '    merge-base) exit 0 ;;' \
+    '    *) exit 1 ;;' \
+    'esac' > "$fake_bin/git"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/sleep"
+chmod 755 "$fake_bin/gh" "$fake_bin/git" "$fake_bin/sleep"
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=missing \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-missing.log" 2>&1
+then
+    fail 'promotion accepted a candidate without Cognition quality'
+fi
+grep -F 'required checks did not pass' "$TEST_DIRECTORY/promotion-missing.log" >/dev/null || fail 'promotion failed for the wrong reason'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed main without Cognition quality'
+fi
+
+: > "$promotion_log"
+PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-success.log" 2>&1 ||
+    fail 'promotion rejected six successful required checks'
+grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null || fail 'promotion did not push main after six successful checks'
 printf '%s\n' 'release package contract passed'

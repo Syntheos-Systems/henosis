@@ -24,7 +24,14 @@ wait_for_checks() {
     for attempt in $(seq 1 60); do
         checks=$(gh api "repos/$REPOSITORY/commits/$sha/check-runs?per_page=100" --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')
         complete=1
-        for required in 'Rust quality' 'Dependency audit' 'Secret scan' 'Release package contract' 'Windows release package contract'; do
+        for required in \
+            'Rust quality' \
+            'Cognition quality' \
+            'Dependency audit' \
+            'Secret scan' \
+            'Release package contract' \
+            'Windows release package contract'
+        do
             line=$(printf '%s\n' "$checks" | awk -F '\t' -v check="$required" '$1 == check { print; exit }')
             [ -n "$line" ] || complete=0
             [ "$(printf '%s' "$line" | awk -F '\t' '{print $2}')" = completed ] || complete=0
