@@ -23,7 +23,7 @@ use syntheos_contracts::PrincipalId;
 use time::{Duration, OffsetDateTime};
 
 use crate::model::{
-    ATTESTOR_CAP, DECAY_RATE_PER_DAY, FAILURE_RATE, NEUTRAL_TRUST, Outcome, OutcomeAttestation,
+    Outcome, OutcomeAttestation, ATTESTOR_CAP, DECAY_RATE_PER_DAY, FAILURE_RATE, NEUTRAL_TRUST,
     SUCCESS_RATE, WEIGHT_NORMALIZATION,
 };
 use crate::room::VerifiedRoomState;
@@ -457,30 +457,28 @@ mod tests {
         let mut room = admitted_state(&[target]);
         let (_, untrusted_principal_key) = crate::crypto::SecretKey::generate();
         let (_untrusted_pubkey, untrusted_key) = crate::crypto::SecretKey::generate();
-        assert!(
-            room.state
-                .admit(AdmittedPrincipal::new(
-                    room.scope.clone(),
-                    untrusted,
-                    untrusted_principal_key.public_key(),
-                    &untrusted_key,
-                    vec![],
-                ))
-                .is_err()
-        );
-        assert!(
-            room.state
-                .record_outcome(outcome(
-                    &room.scope,
-                    target,
-                    unadmitted,
-                    Outcome::Success,
-                    10,
-                    now,
-                    &untrusted_key,
-                ))
-                .is_err()
-        );
+        assert!(room
+            .state
+            .admit(AdmittedPrincipal::new(
+                room.scope.clone(),
+                untrusted,
+                untrusted_principal_key.public_key(),
+                &untrusted_key,
+                vec![],
+            ))
+            .is_err());
+        assert!(room
+            .state
+            .record_outcome(outcome(
+                &room.scope,
+                target,
+                unadmitted,
+                Outcome::Success,
+                10,
+                now,
+                &untrusted_key,
+            ))
+            .is_err());
         assert_eq!(compute_trust(&room.verified(), &target, now), NEUTRAL_TRUST);
     }
 
@@ -559,12 +557,10 @@ mod tests {
         );
         tampered.underlying_event_ref.push_str("-forged");
         clean_room.state.inject_outcome_for_test(tampered);
-        assert!(
-            clean_room
-                .state
-                .verify_for(&clean_room.scope, &clean_room.trust)
-                .is_err()
-        );
+        assert!(clean_room
+            .state
+            .verify_for(&clean_room.scope, &clean_room.trust)
+            .is_err());
     }
 
     /// Full-chain verification rejects every ambiguously replayed event.

@@ -1,7 +1,7 @@
 //! The principal directory trait gates resolve against, plus an in-memory implementation.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -144,12 +144,11 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_is_none() {
         let dir = InMemoryDirectory::new();
-        assert!(
-            dir.lookup(PrincipalId::new())
-                .await
-                .expect("lookup")
-                .is_none()
-        );
+        assert!(dir
+            .lookup(PrincipalId::new())
+            .await
+            .expect("lookup")
+            .is_none());
     }
 
     /// Verifies each enrollment receives a distinct principal id.

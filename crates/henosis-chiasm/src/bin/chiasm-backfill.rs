@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use henosis_chiasm::backfill::{BackfillOptions, backfill_from_kleos};
+use henosis_chiasm::backfill::{backfill_from_kleos, BackfillOptions};
 use syntheos_contracts::TenantId;
 use syntheos_identity::SqliteDirectory;
 

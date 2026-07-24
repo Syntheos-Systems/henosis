@@ -629,21 +629,15 @@ mod tests {
         let a = PrincipalId::new();
         let b = PrincipalId::new();
         let (pubkey, key) = SecretKey::generate();
-        assert!(
-            att(&scope, a, b, 7, &key)
-                .verify_attestation(&scope, &pubkey)
-                .is_ok()
-        );
-        assert!(
-            att(&scope, a, b, 0, &key)
-                .verify_attestation(&scope, &pubkey)
-                .is_err()
-        );
-        assert!(
-            att(&scope, a, b, 200, &key)
-                .verify_attestation(&scope, &pubkey)
-                .is_err()
-        );
+        assert!(att(&scope, a, b, 7, &key)
+            .verify_attestation(&scope, &pubkey)
+            .is_ok());
+        assert!(att(&scope, a, b, 0, &key)
+            .verify_attestation(&scope, &pubkey)
+            .is_err());
+        assert!(att(&scope, a, b, 200, &key)
+            .verify_attestation(&scope, &pubkey)
+            .is_err());
     }
 
     /// Outcome signatures bind scope and every statement field to one signer.
@@ -669,19 +663,15 @@ mod tests {
         );
         assert!(signed.verify_attestation(&scope, &attestor_pubkey).is_ok());
         assert!(signed.verify_attestation(&scope, &wrong_pubkey).is_err());
-        assert!(
-            signed
-                .verify_attestation(&RoomScope::new(scope.tenant, "!other"), &attestor_pubkey)
-                .is_err()
-        );
+        assert!(signed
+            .verify_attestation(&RoomScope::new(scope.tenant, "!other"), &attestor_pubkey)
+            .is_err());
 
         let mut tampered = signed;
         tampered.context.push_str("-forged");
-        assert!(
-            tampered
-                .verify_attestation(&scope, &attestor_pubkey)
-                .is_err()
-        );
+        assert!(tampered
+            .verify_attestation(&scope, &attestor_pubkey)
+            .is_err());
     }
 
     /// Action-kind tokens round-trip through `parse`, and junk is rejected.
@@ -721,11 +711,9 @@ mod tests {
         forged_capabilities
             .admitted_capabilities
             .push(cap("delete", &[ActionKind::Delete]));
-        assert!(
-            forged_capabilities
-                .verify_admission(&scope, &roots)
-                .is_err()
-        );
+        assert!(forged_capabilities
+            .verify_admission(&scope, &roots)
+            .is_err());
     }
 
     /// Reordering an otherwise identical capability set preserves its signature.
@@ -746,11 +734,9 @@ mod tests {
             ],
         );
         admission.admitted_capabilities.reverse();
-        assert!(
-            admission
-                .verify_admission(&scope, &BTreeSet::from([root_pubkey]))
-                .is_ok()
-        );
+        assert!(admission
+            .verify_admission(&scope, &BTreeSet::from([root_pubkey]))
+            .is_ok());
     }
 
     /// A manifest signature is exact-scope, exact-issuer, and generation bound.
@@ -768,11 +754,9 @@ mod tests {
         );
         assert!(manifest.verify(&scope, &issuer_pubkey, 8).is_ok());
         assert!(manifest.verify(&scope, &issuer_pubkey, 9).is_err());
-        assert!(
-            manifest
-                .verify(&RoomScope::new(scope.tenant, "!other"), &issuer_pubkey, 8,)
-                .is_err()
-        );
+        assert!(manifest
+            .verify(&RoomScope::new(scope.tenant, "!other"), &issuer_pubkey, 8,)
+            .is_err());
         let (wrong_issuer, _wrong_key) = SecretKey::generate();
         assert!(manifest.verify(&scope, &wrong_issuer, 8).is_err());
     }

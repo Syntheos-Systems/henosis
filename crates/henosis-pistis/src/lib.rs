@@ -26,7 +26,7 @@ pub mod room;
 pub mod trust;
 
 pub use authority::{
-    CapabilityCheckDecision, CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities,
+    authorize_capabilities, CapabilityCheckDecision, CapabilityCheckRequest, CapabilityRequirement,
 };
 pub use error::{PistisError, Result};
 pub use gate::{

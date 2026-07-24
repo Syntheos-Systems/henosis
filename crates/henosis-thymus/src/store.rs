@@ -1127,13 +1127,11 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(got, r);
-        assert!(
-            store
-                .get_rubric(tenant, PrincipalId::new(), r.id)
-                .await
-                .expect("get")
-                .is_none()
-        );
+        assert!(store
+            .get_rubric(tenant, PrincipalId::new(), r.id)
+            .await
+            .expect("get")
+            .is_none());
 
         // Empty criteria, duplicate names, bad weight/scale are rejected.
         let bad = |criteria: Vec<Criterion>| NewRubric {
@@ -1202,12 +1200,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            store
-                .delete_rubric(tenant, principal, r.id)
-                .await
-                .expect("delete")
-        );
+        assert!(store
+            .delete_rubric(tenant, principal, r.id)
+            .await
+            .expect("delete"));
     }
 
     /// Verifies weighted evaluation scores and propagation to the quality sink.
@@ -1356,13 +1352,11 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(mine.len(), 2);
-        assert!(
-            store
-                .list_evaluations(tenant, PrincipalId::new(), EvaluationFilter::default(),)
-                .await
-                .expect("list")
-                .is_empty()
-        );
+        assert!(store
+            .list_evaluations(tenant, PrincipalId::new(), EvaluationFilter::default(),)
+            .await
+            .expect("list")
+            .is_empty());
 
         let summary = store
             .agent_scores(tenant, principal, agent)
@@ -1495,25 +1489,21 @@ mod tests {
             .await
             .expect("tenant B rubric");
 
-        assert!(
-            store
-                .get_rubric(tenant_b, principal, rubric_a.id)
-                .await
-                .expect("foreign rubric read")
-                .is_none()
-        );
+        assert!(store
+            .get_rubric(tenant_b, principal, rubric_a.id)
+            .await
+            .expect("foreign rubric read")
+            .is_none());
         assert!(matches!(
             store
                 .update_rubric(tenant_b, principal, rubric_a.id, RubricPatch::default())
                 .await,
             Err(ThymusError::RubricNotFound(id)) if id == rubric_a.id
         ));
-        assert!(
-            !store
-                .delete_rubric(tenant_b, principal, rubric_a.id)
-                .await
-                .expect("foreign rubric delete")
-        );
+        assert!(!store
+            .delete_rubric(tenant_b, principal, rubric_a.id)
+            .await
+            .expect("foreign rubric delete"));
         assert!(matches!(
             store
                 .evaluate(NewEvaluation {
@@ -1563,13 +1553,11 @@ mod tests {
             .await
             .expect("tenant B evaluation");
 
-        assert!(
-            store
-                .get_evaluation(tenant_b, principal, evaluation_a.id)
-                .await
-                .expect("foreign evaluation read")
-                .is_none()
-        );
+        assert!(store
+            .get_evaluation(tenant_b, principal, evaluation_a.id)
+            .await
+            .expect("foreign evaluation read")
+            .is_none());
         assert_eq!(
             store
                 .list_evaluations(tenant_a, principal, EvaluationFilter::default())

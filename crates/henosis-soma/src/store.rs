@@ -1071,13 +1071,11 @@ mod tests {
         store.register(req.clone()).await.expect("register");
         let _ = drain_kinds(&mut rx);
 
-        assert!(
-            store
-                .get(tenant_b, principal)
-                .await
-                .expect("foreign get")
-                .is_none()
-        );
+        assert!(store
+            .get(tenant_b, principal)
+            .await
+            .expect("foreign get")
+            .is_none());
         assert!(matches!(
             store.heartbeat(tenant_b, principal, None).await,
             Err(SomaError::NotFound(id)) if id == principal
@@ -1101,12 +1099,10 @@ mod tests {
                 .await,
             Err(SomaError::NotFound(id)) if id == principal
         ));
-        assert!(
-            !store
-                .delete(tenant_b, principal)
-                .await
-                .expect("foreign delete")
-        );
+        assert!(!store
+            .delete(tenant_b, principal)
+            .await
+            .expect("foreign delete"));
 
         req.tenant = tenant_b;
         req.name = "foreign-rename".to_string();
@@ -1141,13 +1137,11 @@ mod tests {
             .expect("present");
         assert_eq!(got.principal_id, req.principal_id);
         // The label does not resolve in a different tenant.
-        assert!(
-            store
-                .get_by_name(TenantId::new(), "lookup-me")
-                .await
-                .expect("get")
-                .is_none()
-        );
+        assert!(store
+            .get_by_name(TenantId::new(), "lookup-me")
+            .await
+            .expect("get")
+            .is_none());
     }
 
     #[tokio::test]

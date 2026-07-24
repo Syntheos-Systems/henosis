@@ -40,8 +40,8 @@ pub mod outcome;
 #[cfg(any(test, feature = "stubs"))]
 pub mod stubs;
 
-pub use deny::{DenyExecutor, DenyGate, deny_gate_chain};
-pub use dispatcher::{CANONICAL_GATE_ORDER, Dispatcher};
+pub use deny::{deny_gate_chain, DenyExecutor, DenyGate};
+pub use dispatcher::{Dispatcher, CANONICAL_GATE_ORDER};
 pub use error::DispatchError;
 pub use executor::{Executor, ExecutorError};
 pub use guard::{ExecutionDecision, ExecutionGuard, ExecutionOutcome};

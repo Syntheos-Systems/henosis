@@ -18,7 +18,7 @@ use syntheos_contracts::{PrincipalId, TenantId, Timestamp, TypedEvent};
 use crate::error::BrocaError;
 use crate::events::ActionLogged;
 use crate::model::{ActionEntry, ActionFilter, BrocaStats, LogAction};
-use crate::narrate::{Narrator, narrate_from_template};
+use crate::narrate::{narrate_from_template, Narrator};
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__broca_actions.sql"))];
@@ -516,13 +516,11 @@ mod tests {
             .await
             .expect("log");
         assert!(store.get(tenant, entry.id).await.expect("get").is_some());
-        assert!(
-            store
-                .get(TenantId::new(), entry.id)
-                .await
-                .expect("get")
-                .is_none()
-        );
+        assert!(store
+            .get(TenantId::new(), entry.id)
+            .await
+            .expect("get")
+            .is_none());
     }
 
     #[tokio::test]
@@ -605,13 +603,11 @@ mod tests {
             .expect("query");
         assert_eq!(page2.len(), 1);
         // Another tenant sees nothing.
-        assert!(
-            store
-                .query(TenantId::new(), ActionFilter::default())
-                .await
-                .expect("query")
-                .is_empty()
-        );
+        assert!(store
+            .query(TenantId::new(), ActionFilter::default())
+            .await
+            .expect("query")
+            .is_empty());
     }
 
     #[tokio::test]

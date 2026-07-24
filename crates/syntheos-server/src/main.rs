@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use henosis_approval::ApprovalStore;
 use henosis_audit::{AuditStore, OriginSigner, WitnessClient, WitnessedAudit};
@@ -33,8 +33,8 @@ use syntheos_server::billing::BillingState;
 use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, InitMode, RunResult};
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{
-    AppState, HenosisExecutor, SomaQualitySink, production_router, public_gate_chain,
-    spawn_action_reactor,
+    production_router, public_gate_chain, spawn_action_reactor, AppState, HenosisExecutor,
+    SomaQualitySink,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -1698,26 +1698,22 @@ mod local_policy_tests {
     #[test]
     fn local_policy_requires_valid_identity() {
         let (_, principal) = local_ids();
-        assert!(
-            validated_local_policy_config(
-                Some("1"),
-                None,
-                "127.0.0.1:8088".parse().unwrap(),
-                None,
-                Some(&principal),
-            )
-            .is_err()
-        );
-        assert!(
-            validated_local_policy_config(
-                Some("1"),
-                None,
-                "127.0.0.1:8088".parse().unwrap(),
-                Some("invalid"),
-                Some(&principal),
-            )
-            .is_err()
-        );
+        assert!(validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            None,
+            Some(&principal),
+        )
+        .is_err());
+        assert!(validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            Some("invalid"),
+            Some(&principal),
+        )
+        .is_err());
     }
 }
 
@@ -1737,7 +1733,7 @@ async fn shutdown_signal() {
     /// Wait for SIGTERM on Unix; an install failure is logged and the arm never resolves.
     #[cfg(unix)]
     async fn sigterm() {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => {
                 term.recv().await;

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::tool::InvokeResponse;
 

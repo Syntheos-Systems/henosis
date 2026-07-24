@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use syntheos_contracts::{Gate, GateDecision, GateError, GateRequest};
 use time::OffsetDateTime;
 
-use crate::authority::{CapabilityCheckRequest, CapabilityRequirement, authorize_capabilities};
+use crate::authority::{authorize_capabilities, CapabilityCheckRequest, CapabilityRequirement};
 use crate::model::{ActionKind, RoomScope};
 use crate::room::{RoomState, RoomTrustStore};
 

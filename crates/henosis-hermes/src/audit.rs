@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::axon::AxonPublisher;

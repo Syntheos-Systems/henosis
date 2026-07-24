@@ -29,11 +29,11 @@ pub mod events;
 pub mod model;
 pub mod store;
 
-pub use backfill::{BackfillOptions, BackfillReport, backfill_from_kleos};
+pub use backfill::{backfill_from_kleos, BackfillOptions, BackfillReport};
 pub use error::SomaError;
 pub use events::{
-    AGENT_CHANNEL, AgentDeregistered, AgentHeartbeat, AgentQualityUpdated, AgentRegistered,
-    AgentStatusChanged,
+    AgentDeregistered, AgentHeartbeat, AgentQualityUpdated, AgentRegistered, AgentStatusChanged,
+    AGENT_CHANNEL,
 };
 pub use model::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaStats,

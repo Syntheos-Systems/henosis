@@ -5,7 +5,7 @@ use std::sync::Arc;
 use henosis_broca::{BrocaStore, LogAction};
 use henosis_chiasm::ChiasmStore;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{ACTION_CHANNEL, TaskId};
+use syntheos_contracts::{TaskId, ACTION_CHANNEL};
 use tokio::sync::broadcast::error::RecvError;
 
 /// Subscribe to the action channel and project each lifecycle envelope into downstream stores.
@@ -80,13 +80,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::{HenosisExecutor, live_gate_chain};
+    use crate::{live_gate_chain, HenosisExecutor};
     use henosis_broca::ActionFilter;
     use henosis_chiasm::{NewTask, TaskStatus};
     use henosis_credential_store::CredentialStore;
     use henosis_eidolon::EidolonPolicy;
     use henosis_hermes::{
-        AppState as HermesState,
         audit::AuditTrail,
         axon::AxonPublisher,
         build_registry,
@@ -95,6 +94,7 @@ mod tests {
         phylaxd_client::PhylaxdClient,
         rate_limit::{RateLimitConfig, RateLimiter},
         tenant_config::TenantConfigStore,
+        AppState as HermesState,
     };
     use henosis_pistis::crypto::SecretKey;
     use henosis_pistis::{

@@ -15,8 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use axum::Json;
 use axum::extract::State;
+use axum::Json;
 use henosis_broca::{ActionFilter, BrocaStore};
 use henosis_chiasm::ChiasmStore;
 use henosis_loom::LoomStore;
@@ -26,9 +26,9 @@ use henosis_thymus::ThymusStore;
 use serde::Serialize;
 use syntheos_contracts::{PrincipalId, TenantId};
 
-use super::OperatorState;
 use super::auth::OperatorError;
 use super::rbac::OperatorAuth;
+use super::OperatorState;
 
 /// The health status of one kernel store as seen from the dashboard composition.
 ///
@@ -365,10 +365,10 @@ pub async fn dashboard(
 mod tests {
     use std::sync::Arc;
 
-    use axum::Router;
-    use axum::body::{Body, to_bytes};
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
+    use axum::Router;
     use henosis_broca::{BrocaStore, LogAction};
     use henosis_chiasm::{ChiasmStore, NewTask};
     use henosis_loom::LoomStore;
@@ -380,8 +380,8 @@ mod tests {
     use syntheos_identity::{InMemoryDirectory, PrincipalDirectory};
     use tower::ServiceExt;
 
+    use super::super::auth::{sign, OperatorClaims};
     use super::super::OperatorState;
-    use super::super::auth::{OperatorClaims, sign};
     use super::dashboard;
 
     /// Build all in-memory stores and a seeded `OperatorState` for use in dashboard tests.

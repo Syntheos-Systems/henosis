@@ -9,8 +9,8 @@
 //! an account exists.
 
 use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordVerifier, SaltString},
     Argon2, PasswordHasher,
-    password_hash::{PasswordHash, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use rusqlite::OptionalExtension;
 use syntheos_contracts::PrincipalId;
@@ -234,10 +234,9 @@ mod tests {
         let p = PrincipalId::new();
         dir.create_account("Op@example.com", "hunter2", p)
             .expect("create");
-        assert!(
-            dir.has_operator_accounts()
-                .expect("populated account census")
-        );
+        assert!(dir
+            .has_operator_accounts()
+            .expect("populated account census"));
         // Email is case-insensitive; password must match.
         assert_eq!(
             dir.verify_login("op@example.com", "hunter2")
@@ -293,10 +292,9 @@ mod tests {
         assert_eq!(acct.email, "user@example.com");
         assert_eq!(acct.principal, p);
         assert!(!acct.disabled);
-        assert!(
-            dir.get_account("nobody@example.com")
-                .expect("get")
-                .is_none()
-        );
+        assert!(dir
+            .get_account("nobody@example.com")
+            .expect("get")
+            .is_none());
     }
 }

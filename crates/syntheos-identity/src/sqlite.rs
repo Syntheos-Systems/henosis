@@ -230,12 +230,11 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_is_none() {
         let dir = SqliteDirectory::open_in_memory().expect("open");
-        assert!(
-            dir.lookup(PrincipalId::new())
-                .await
-                .expect("lookup")
-                .is_none()
-        );
+        assert!(dir
+            .lookup(PrincipalId::new())
+            .await
+            .expect("lookup")
+            .is_none());
     }
 
     /// Principal kind and optional display values survive storage round trips.

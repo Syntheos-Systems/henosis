@@ -377,10 +377,10 @@ mod tests {
     use super::*;
     use crate::deny::deny_gate_chain;
     use crate::executor::ExecutorError;
-    use crate::stubs::{EchoExecutor, StubGate, stub_gate_chain};
+    use crate::stubs::{stub_gate_chain, EchoExecutor, StubGate};
     use async_trait::async_trait;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use syntheos_contracts::{AxonEnvelope, GateError, RequestContext, ToolInvocation};
 
     /// Build a minimal request for `tool`/`action`.
@@ -759,11 +759,9 @@ mod tests {
             .dispatch(retryable_request.clone())
             .await
             .expect_err("terminal persistence must fail");
-        assert!(
-            first_error
-                .to_string()
-                .contains("outcome persistence failed")
-        );
+        assert!(first_error
+            .to_string()
+            .contains("outcome persistence failed"));
         assert_eq!(*state.lock().unwrap(), RetryLedgerState::Indeterminate);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -771,11 +769,9 @@ mod tests {
             .dispatch(retryable_request)
             .await
             .expect_err("indeterminate retry must fail closed");
-        assert!(
-            retry_error
-                .to_string()
-                .contains("execution result is indeterminate")
-        );
+        assert!(retry_error
+            .to_string()
+            .contains("execution result is indeterminate"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

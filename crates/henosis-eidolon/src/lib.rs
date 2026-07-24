@@ -32,7 +32,7 @@ pub mod supervisor;
 pub use gate::EidolonGate;
 pub use output_filter::{EidolonOutputFilter, REDACTED};
 pub use policy::{
-    DriftSeverity, EidolonError, EidolonPolicy, default_injection_patterns,
-    default_sensitive_fields,
+    default_injection_patterns, default_sensitive_fields, DriftSeverity, EidolonError,
+    EidolonPolicy,
 };
 pub use signal::{DriftFlag, DriftSignal};

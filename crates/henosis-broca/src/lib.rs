@@ -27,5 +27,5 @@ pub mod store;
 pub use error::BrocaError;
 pub use events::{ActionLogged, NARRATION_CHANNEL};
 pub use model::{ActionEntry, ActionFilter, BrocaStats, LogAction};
-pub use narrate::{Narrator, narrate_from_template};
+pub use narrate::{narrate_from_template, Narrator};
 pub use store::BrocaStore;

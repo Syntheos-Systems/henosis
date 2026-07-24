@@ -487,11 +487,9 @@ mod tests {
             &room_root_key,
             &principal_key,
         );
-        assert!(
-            state
-                .record_outcome(outcome(&scope, target, attestor, &wrong_key))
-                .is_err()
-        );
+        assert!(state
+            .record_outcome(outcome(&scope, target, attestor, &wrong_key))
+            .is_err());
         let signed = outcome(&scope, target, attestor, &principal_key);
         state.record_outcome(signed.clone()).unwrap();
         assert!(state.record_outcome(signed).is_err());

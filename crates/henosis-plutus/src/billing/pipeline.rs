@@ -929,13 +929,11 @@ mod tests {
         );
 
         assert_eq!(run(&store, &event).await, BillingOutcome::UnknownCustomer);
-        assert!(
-            store
-                .entitlement_for_subscription(&sub)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .entitlement_for_subscription(&sub)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Live: replaying the same event id applies nothing a second time.

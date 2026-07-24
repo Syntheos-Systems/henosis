@@ -1700,10 +1700,10 @@ async fn thymus_stats(
 /// Unit tests for this module.
 mod tests {
     use super::*;
-    use axum::body::{Body, to_bytes};
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use syntheos_dispatch::deny::{DenyExecutor, deny_gate_chain};
-    use syntheos_dispatch::stubs::{EchoExecutor, stub_gate_chain};
+    use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
+    use syntheos_dispatch::stubs::{stub_gate_chain, EchoExecutor};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
