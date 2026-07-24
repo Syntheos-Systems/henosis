@@ -1,5 +1,7 @@
 //! File read tool.
 
+use crate::ToolExecutionContext;
+use crate::confined_fs::ConfinedPath;
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
@@ -31,7 +33,7 @@ impl AgentTool for ReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file."
+                    "description": "File path relative to the task root. Absolute paths and parent traversal are rejected."
                 },
                 "offset": {
                     "type": "number",
@@ -48,6 +50,16 @@ impl AgentTool for ReadTool {
 
     /// Reads the requested text range and renders it with one-based line numbers.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
+        let context = ToolExecutionContext::new(cwd.to_path_buf())?;
+        self.execute_with_context(params, &context).await
+    }
+
+    /// Reads through the task-root capability retained by the agent session.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
         let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => {
@@ -71,9 +83,17 @@ impl AgentTool for ReadTool {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        let path = resolve_path(cwd, &file_path);
+        let path = match ConfinedPath::new(context, &file_path, false) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Invalid file path: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
-        let bytes = match tokio::fs::read(&path).await {
+        let bytes = match path.read() {
             Ok(b) => b,
             Err(e) => {
                 return Ok(ToolResult {
@@ -117,15 +137,5 @@ impl AgentTool for ReadTool {
             content: output,
             is_error: false,
         })
-    }
-}
-
-/// Resolves a file path relative to the execution directory.
-fn resolve_path(cwd: &Path, file_path: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(file_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
     }
 }

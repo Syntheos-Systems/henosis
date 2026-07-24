@@ -8,7 +8,7 @@
 //!
 //! Provider resolution is kept local to the TUI and mirrors the CLI's provider match.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -17,7 +17,9 @@ use synapse_core::system_prompt::SystemPromptBuilder;
 use synapse_core::types::AgentConfig;
 use synapse_provider::{Provider, ProviderConfig, create_provider};
 use synapse_session::SessionStore;
-use synapse_tools::{ToolRegistry, ToolRegistryExecutor, default_tools};
+use synapse_tools::{
+    PermissiveGate, SharedGate, ToolRegistry, ToolRegistryExecutor, default_tools,
+};
 
 /// Adapts `Box<dyn Provider>` (from `create_provider`) into something `Arc`-able
 /// as `dyn Provider + Send + Sync`. Needed because `dyn Provider` and
@@ -126,14 +128,14 @@ fn foundry_creds() -> Result<(String, String)> {
 
 /// Build a `ProviderConfig` for `name`, reading credentials from config/env.
 /// Returns `Err` (never exits) on missing credentials or an unknown provider.
-fn provider_config_for(name: &str, cwd: &Path) -> Result<ProviderConfig> {
+fn provider_config_for(name: &str) -> Result<ProviderConfig> {
     let cfg = match name {
         "anthropic" => ProviderConfig::AnthropicAuto,
         "claude-max" => {
             // The provider is shared across sessions, so it cannot safely bind
             // MCP calls to a session's gate and working directory. Keep the
             // provider text-only until it is instantiated per session.
-            let executor = Arc::new(ToolRegistryExecutor::disabled(cwd.to_path_buf()));
+            let executor = Arc::new(ToolRegistryExecutor::disabled());
             // ClaudeMax takes an Option<model>; None lets the provider pick its
             // own default, so we do not reuse resolve_model() (which substitutes
             // a concrete fallback).
@@ -239,8 +241,7 @@ pub fn build() -> Result<Runtime> {
     let tools = Arc::new(default_tools());
     let name = resolve_provider_name();
     let model = resolve_model();
-    let cfg =
-        provider_config_for(&name, &cwd).with_context(|| format!("resolving provider {name:?}"))?;
+    let cfg = provider_config_for(&name).with_context(|| format!("resolving provider {name:?}"))?;
     let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ProviderWrapper(
         create_provider(cfg).with_context(|| format!("constructing provider {name:?}"))?,
     ));
@@ -274,7 +275,7 @@ fn build_runtime(
         compression: None,
         router: None,
         max_tool_result_tokens: 8000,
-        tool_gate: None,
+        tool_gate: Some(Arc::new(PermissiveGate) as SharedGate),
         hooks: None,
     };
     Runtime {
@@ -339,18 +340,18 @@ mod tests {
     /// Verifies unknown provider identifiers fail closed.
     #[test]
     fn unknown_provider_errors() {
-        assert!(provider_config_for("totally-unknown", Path::new("/tmp")).is_err());
+        assert!(provider_config_for("totally-unknown").is_err());
     }
 
     /// Verifies local credential-free providers remain selectable.
     #[test]
     fn anthropic_and_ollama_need_no_credentials() {
         assert!(matches!(
-            provider_config_for("anthropic", Path::new("/tmp")),
+            provider_config_for("anthropic"),
             Ok(ProviderConfig::AnthropicAuto)
         ));
         assert!(matches!(
-            provider_config_for("ollama", Path::new("/tmp")),
+            provider_config_for("ollama"),
             Ok(ProviderConfig::Ollama { .. })
         ));
     }
@@ -359,7 +360,7 @@ mod tests {
     #[test]
     fn claude_max_builds_in_text_only_mode() {
         assert!(matches!(
-            provider_config_for("claude-max", Path::new("/tmp")),
+            provider_config_for("claude-max"),
             Ok(ProviderConfig::ClaudeMax { .. })
         ));
     }

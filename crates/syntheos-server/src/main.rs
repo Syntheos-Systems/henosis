@@ -1,5 +1,6 @@
 //! `syntheos-server` binary: the single entry point that boots and serves Henosis.
 
+use std::collections::BTreeSet;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -20,7 +21,11 @@ use henosis_eidolon::{EidolonOutputFilter, EidolonPolicy};
 use henosis_loom::{
     CompositeStepExecutor, HephaestusDispatch, HephaestusStepExecutor, LoomStore, TransformExecutor,
 };
-use henosis_pistis::{InMemoryRoomStateSource, RoomStateSource, RoomTrustStore};
+use henosis_pistis::crypto::SecretKey as PistisSecretKey;
+use henosis_pistis::{
+    ActionKind, AdmittedPrincipal, Capability, InMemoryRoomStateSource, RoomPolicy, RoomScope,
+    RoomState, RoomStateSource, RoomTrustStore,
+};
 use henosis_plutus::{LocalPolicyBackend, PlutusStore, PolicyBackend, QuotaTier, Role};
 use henosis_soma::SomaStore;
 use henosis_thymus::ThymusStore;
@@ -141,6 +146,12 @@ const MAX_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 300;
 
 /// Largest local authority credential file read into memory.
 const MAX_AUTHORITY_FILE_BYTES: u64 = 4096;
+
+/// Stable synthetic room identifier used only by explicit loopback local policy.
+const LOCAL_PISTIS_ROOM_ID: &str = "!henosis-local:loopback";
+
+/// Initial signed generation for the ephemeral loopback Pistis room.
+const LOCAL_PISTIS_ROOM_GENERATION: u64 = 1;
 
 /// Validated identity pair for the explicit loopback-only policy backend.
 #[derive(Debug)]
@@ -329,11 +340,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // downstream projections required by the kernel definition of done.
     let _action_reactor = spawn_action_reactor(bus.clone(), chiasm.clone(), broca.clone());
 
-    // The Pistis capability authority is a real gate in the Pistis slot. Until live Matrix room
-    // materialization lands, its room-state source is empty, so every invocation fails closed at
-    // Pistis because no trusted authority state can prove admission and capability.
-    let pistis_source: Arc<dyn RoomStateSource> = Arc::new(InMemoryRoomStateSource::new());
-    let pistis_trust = Arc::new(RoomTrustStore::new());
+    // Explicit loopback local policy receives one signed compatibility room for the documented
+    // probe. Production keeps an empty source and trust store so capability requests fail closed
+    // until a deployment supplies trusted Pistis room state.
+    let (pistis_source, pistis_trust) = pistis_authority_from_local_policy(local_config.as_ref())?;
 
     let policy = EidolonPolicy::default();
     let execution_guard = Arc::new(AuditExecutionGuard::new(approvals.clone(), audit.clone()));
@@ -545,6 +555,43 @@ fn validated_local_policy_config(
         .parse::<syntheos_contracts::PrincipalId>()
         .map_err(|error| format!("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL: {error}"))?;
     Ok(Some(LocalPolicyConfig { tenant, principal }))
+}
+
+/// Build the ephemeral signed Pistis room only from validated loopback local policy.
+fn pistis_authority_from_local_policy(
+    config: Option<&LocalPolicyConfig>,
+) -> Result<(Arc<dyn RoomStateSource>, Arc<RoomTrustStore>), henosis_pistis::PistisError> {
+    let mut source = InMemoryRoomStateSource::new();
+    let mut trust = RoomTrustStore::new();
+    if let Some(config) = config {
+        let scope = RoomScope::new(config.tenant, LOCAL_PISTIS_ROOM_ID);
+        let (_, issuer_key) = PistisSecretKey::generate();
+        let (_, room_root_key) = PistisSecretKey::generate();
+        let (_, principal_key) = PistisSecretKey::generate();
+        let admission = AdmittedPrincipal::new(
+            scope.clone(),
+            config.principal,
+            principal_key.public_key(),
+            &room_root_key,
+            vec![Capability {
+                name: "henosis".to_string(),
+                action_kinds: BTreeSet::from([ActionKind::Message]),
+                granted_by: "local-policy".to_string(),
+                expires_at: None,
+            }],
+        );
+        let state = RoomState::from_genesis(
+            scope.clone(),
+            LOCAL_PISTIS_ROOM_GENERATION,
+            RoomPolicy::default(),
+            BTreeSet::from([room_root_key.public_key()]),
+            &issuer_key,
+            vec![admission],
+        )?;
+        trust.pin(scope, issuer_key.public_key(), LOCAL_PISTIS_ROOM_GENERATION)?;
+        source.insert(state);
+    }
+    Ok((Arc::new(source), Arc::new(trust)))
 }
 
 /// Validate the outbound credential-broker URL and mode-specific authentication boundary.
@@ -1624,6 +1671,8 @@ mod auto_init_tests {
 /// Unit tests for the explicit local Plutus policy boundary.
 mod local_policy_tests {
     use super::*;
+    use henosis_pistis::PistisGate;
+    use syntheos_contracts::{Gate, GateDecision, GateRequest, RequestContext, ToolInvocation};
 
     /// Build valid local identity strings for pure configuration tests.
     fn local_ids() -> (String, String) {
@@ -1714,6 +1763,119 @@ mod local_policy_tests {
             Some(&principal),
         )
         .is_err());
+    }
+
+    /// Validated local policy produces one verified admission with only the probe capability.
+    #[tokio::test]
+    async fn local_policy_builds_probe_only_pistis_room() {
+        let (tenant, principal) = local_ids();
+        let config = validated_local_policy_config(
+            Some("1"),
+            None,
+            "127.0.0.1:8088".parse().unwrap(),
+            Some(&tenant),
+            Some(&principal),
+        )
+        .unwrap()
+        .expect("validated local policy");
+        let (source, trust) =
+            pistis_authority_from_local_policy(Some(&config)).expect("build local Pistis room");
+        let scope = RoomScope::new(config.tenant, LOCAL_PISTIS_ROOM_ID);
+        let state = source.room_state(&scope).expect("local room state");
+        let verified = state
+            .verify_for(&scope, trust.as_ref())
+            .expect("verify signed local room");
+        let admission = verified
+            .trusted_admission(&config.principal)
+            .expect("configured principal admission");
+
+        assert_eq!(admission.admitted_capabilities.len(), 1);
+        assert_eq!(admission.admitted_capabilities[0].name, "henosis");
+        assert_eq!(
+            admission.admitted_capabilities[0].action_kinds,
+            BTreeSet::from([ActionKind::Message])
+        );
+        assert!(admission.admitted_capabilities[0].expires_at.is_none());
+
+        let gate = PistisGate::new(source, trust);
+        let probe = GateRequest {
+            context: RequestContext {
+                tenant: config.tenant,
+                principal: config.principal,
+                persona: None,
+                session: None,
+                room: Some(LOCAL_PISTIS_ROOM_ID.to_string()),
+                task: None,
+                workflow: None,
+                authority: None,
+            },
+            invocation: ToolInvocation {
+                tool: "henosis".to_string(),
+                action: "probe".to_string(),
+                args: serde_json::json!({}),
+            },
+        };
+        assert_eq!(gate.check(&probe).await.unwrap(), GateDecision::Allow);
+
+        let mut wrong_room = probe.clone();
+        wrong_room.context.room = Some("!other-local:loopback".to_string());
+        assert!(matches!(
+            gate.check(&wrong_room).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+
+        let mut wrong_tenant = probe.clone();
+        wrong_tenant.context.tenant = TenantId::new();
+        assert!(matches!(
+            gate.check(&wrong_tenant).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+
+        let mut wrong_principal = probe.clone();
+        wrong_principal.context.principal = syntheos_contracts::PrincipalId::new();
+        assert!(matches!(
+            gate.check(&wrong_principal).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+
+        let mut unknown_action = probe.clone();
+        unknown_action.invocation.action = "unknown".to_string();
+        assert!(matches!(
+            gate.check(&unknown_action).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+
+        let mut unrelated = probe;
+        unrelated.invocation = ToolInvocation {
+            tool: "gmail".to_string(),
+            action: "read".to_string(),
+            args: serde_json::json!({}),
+        };
+        assert!(matches!(
+            gate.check(&unrelated).await.unwrap(),
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    /// Absent local policy leaves both production Pistis authority inputs empty.
+    #[test]
+    fn production_builds_empty_fail_closed_pistis_authority() {
+        let (tenant, principal) = local_ids();
+        let local_config = LocalPolicyConfig {
+            tenant: tenant.parse().unwrap(),
+            principal: principal.parse().unwrap(),
+        };
+        let (local_source, _) = pistis_authority_from_local_policy(Some(&local_config))
+            .expect("build local comparison room");
+        let scope = RoomScope::new(local_config.tenant, LOCAL_PISTIS_ROOM_ID);
+        let state = local_source
+            .room_state(&scope)
+            .expect("local comparison state");
+        let (production_source, production_trust) =
+            pistis_authority_from_local_policy(None).expect("build production Pistis authority");
+
+        assert!(production_source.room_state(&scope).is_none());
+        assert!(state.verify_for(&scope, production_trust.as_ref()).is_err());
     }
 }
 

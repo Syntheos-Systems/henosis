@@ -40,7 +40,7 @@ pub struct AgentConfig {
     /// Optional tool gate. When set, wraps every tool execution with
     /// `before_execute` / `after_execute` callbacks (permission gates,
     /// PreToolUse/PostToolUse hooks, audit). When unset, the agent loop
-    /// uses a permissive gate that allows everything.
+    /// denies every tool call until the embedding host grants authority.
     pub tool_gate: Option<SharedGate>,
     /// Optional hook configuration. Loaded from `~/.synapse/hooks.toml`
     /// or constructed programmatically. Drives SessionStart, Stop, and
@@ -49,12 +49,15 @@ pub struct AgentConfig {
     pub hooks: Option<Arc<HookConfig>>,
 }
 
+/// Exposes constants shared by every agent-loop configuration.
 impl AgentConfig {
     /// Maximum delegation depth.
     pub const MAX_DEPTH: u8 = 2;
 }
 
+/// Redacts complex runtime handles while rendering diagnostic configuration state.
 impl fmt::Debug for AgentConfig {
+    /// Formats safe scalar fields and the presence of optional runtime integrations.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentConfig")
             .field("model", &self.model)
@@ -116,9 +119,11 @@ pub enum AgentEvent {
 }
 
 #[cfg(test)]
+/// Exercises stable serialization contracts for public agent events.
 mod tests {
     use super::*;
 
+    /// Confirms tool-start events retain their externally tagged JSON shape.
     #[test]
     fn agent_event_serializes_to_json() {
         let ev = AgentEvent::ToolStart {

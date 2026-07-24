@@ -71,7 +71,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (unavailable in alpha)\n  henosis uninstall (unavailable in alpha)\n  henosis token create <label> | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (unavailable in alpha)\n  henosis uninstall (unavailable in alpha)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -121,6 +121,15 @@ pub enum DoctorOutputFormat {
     Json,
 }
 
+/// The terminal representation requested for a newly issued machine token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenOutputFormat {
+    /// Preserve the explanatory one-time credential message for interactive operators.
+    Human,
+    /// Print only the credential for safe shell command substitution.
+    TokenOnly,
+}
+
 /// A typed token-management operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenCommand {
@@ -128,6 +137,8 @@ pub enum TokenCommand {
     Create {
         /// Non-empty label attached to the created token.
         label: String,
+        /// Terminal representation selected for the one-time credential.
+        output: TokenOutputFormat,
     },
     /// List active token metadata without exposing token secrets.
     List,
@@ -177,7 +188,7 @@ pub enum ControlRequest {
 pub struct ControlOutput {
     /// Stable operation name returned by the live control plane.
     pub operation: String,
-    /// Human-readable result, with a one-time token shown only for token creation.
+    /// Terminal result, with a one-time token shown only for token creation.
     pub message: String,
 }
 
@@ -329,8 +340,12 @@ impl HttpControlApi {
         })
     }
 
-    /// Creates a one-time machine token and deliberately returns only its credential to the terminal.
-    fn create_token(&self, label: &str) -> Result<ControlOutput, CliError> {
+    /// Creates a one-time machine token and renders it in the explicitly selected format.
+    fn create_token(
+        &self,
+        label: &str,
+        output: TokenOutputFormat,
+    ) -> Result<ControlOutput, CliError> {
         let operation = "henosis token create";
         let response = self.request(
             Method::POST,
@@ -341,13 +356,22 @@ impl HttpControlApi {
         let issued: IssuedTokenResponse =
             serde_json::from_value(self.response_json(response, operation)?)
                 .map_err(|_| CliError::InvalidControlResponse { operation })?;
+        let token = validate_bearer_token(issued.token)
+            .map_err(|_| CliError::InvalidControlResponse { operation })?;
         Ok(ControlOutput {
             operation: operation.to_string(),
-            message: format!(
-                "token created; save this one-time credential now:\n{}",
-                issued.token
-            ),
+            message: render_created_token(token, output),
         })
+    }
+}
+
+/// Render one issued credential without changing the established human output.
+fn render_created_token(token: String, output: TokenOutputFormat) -> String {
+    match output {
+        TokenOutputFormat::Human => {
+            format!("token created; save this one-time credential now:\n{token}")
+        }
+        TokenOutputFormat::TokenOnly => token,
     }
 }
 
@@ -370,7 +394,9 @@ impl ControlApi for HttpControlApi {
             ControlRequest::Uninstall => Err(CliError::UnsupportedControlOperation {
                 operation: "henosis uninstall",
             }),
-            ControlRequest::Token(TokenCommand::Create { label }) => self.create_token(&label),
+            ControlRequest::Token(TokenCommand::Create { label, output }) => {
+                self.create_token(&label, output)
+            }
             ControlRequest::Token(TokenCommand::List) => {
                 let operation = "henosis token list";
                 self.json_output(
@@ -832,7 +858,9 @@ pub enum CliError {
         message: String,
     },
     /// The caller omitted an explicit initialization mode.
-    #[error("`henosis init` requires `--quick` or `--production`; interactive initialization is not available")]
+    #[error(
+        "`henosis init` requires `--quick` or `--production`; interactive initialization is not available"
+    )]
     InitModeRequired,
     /// The execution environment supplied no usable user home directory.
     #[error("cannot resolve a local Henosis home; set HENOSIS_HOME to an explicit directory")]
@@ -907,7 +935,9 @@ pub enum CliError {
         path: PathBuf,
     },
     /// Production initialization refused to create state or proceed with missing authority values.
-    #[error("production initialization refused because required configuration is incomplete: {missing:?}")]
+    #[error(
+        "production initialization refused because required configuration is incomplete: {missing:?}"
+    )]
     ProductionConfigurationIncomplete {
         /// Missing local paths or non-secret required configuration key names.
         missing: Vec<String>,
@@ -916,7 +946,9 @@ pub enum CliError {
     #[error("cannot encode the doctor report as JSON: {0}")]
     Serialization(#[source] serde_json::Error),
     /// A live command was requested without binary integration supplying an authenticated client.
-    #[error("`{operation}` requires a live authenticated control API; start the server with operator control enabled and configure a typed client")]
+    #[error(
+        "`{operation}` requires a live authenticated control API; start the server with operator control enabled and configure a typed client"
+    )]
     ControlApiUnavailable {
         /// Stable operation name that needs live control-plane integration.
         operation: String,
@@ -1013,15 +1045,28 @@ fn parse_empty(arguments: &[String], command: Command) -> Result<Command, CliErr
 /// Parses `token create`, `token list`, and `token revoke` with strict arity checks.
 fn parse_token(arguments: &[String]) -> Result<TokenCommand, CliError> {
     match arguments {
-        [subcommand, label] if subcommand == "create" => Ok(TokenCommand::Create {
-            label: nonempty_argument("token label", label)?,
-        }),
+        [subcommand, label] if subcommand == "create" && !label.starts_with('-') => {
+            Ok(TokenCommand::Create {
+                label: nonempty_argument("token label", label)?,
+                output: TokenOutputFormat::Human,
+            })
+        }
+        [subcommand, label, flag]
+            if subcommand == "create" && !label.starts_with('-') && flag == "--token-only" =>
+        {
+            Ok(TokenCommand::Create {
+                label: nonempty_argument("token label", label)?,
+                output: TokenOutputFormat::TokenOnly,
+            })
+        }
         [subcommand] if subcommand == "list" => Ok(TokenCommand::List),
         [subcommand, token_id] if subcommand == "revoke" => Ok(TokenCommand::Revoke {
             token_id: nonempty_argument("token identifier", token_id)?,
         }),
         _ => Err(CliError::Usage {
-            message: "usage: henosis token create <label> | list | revoke <token-id>".to_string(),
+            message:
+                "usage: henosis token create <label> [--token-only] | list | revoke <token-id>"
+                    .to_string(),
         }),
     }
 }
@@ -1812,7 +1857,8 @@ mod tests {
             Command::parse(&["token".into(), "create".into(), "operator".into()])
                 .expect("parse token create"),
             Command::Token(TokenCommand::Create {
-                label: "operator".into()
+                label: "operator".into(),
+                output: TokenOutputFormat::Human,
             })
         );
         assert_eq!(
@@ -1851,6 +1897,55 @@ mod tests {
         assert_eq!(
             Command::parse(&["serve".into()]).expect("parse serve"),
             Command::Serve
+        );
+    }
+
+    /// Parses the exact trailing token-only flag without changing default token creation.
+    #[test]
+    fn token_create_parses_explicit_output_format() {
+        assert_eq!(
+            Command::parse(&[
+                "token".into(),
+                "create".into(),
+                "first-agent".into(),
+                "--token-only".into(),
+            ])
+            .expect("parse token-only creation"),
+            Command::Token(TokenCommand::Create {
+                label: "first-agent".into(),
+                output: TokenOutputFormat::TokenOnly,
+            })
+        );
+        assert!(Command::parse(&[
+            "token".into(),
+            "create".into(),
+            "first-agent".into(),
+            "--unknown".into(),
+        ])
+        .is_err());
+        assert!(
+            Command::parse(&["token".into(), "create".into(), "--token-only".into(),]).is_err()
+        );
+        assert!(Command::parse(&[
+            "token".into(),
+            "create".into(),
+            "--token-only".into(),
+            "first-agent".into(),
+        ])
+        .is_err());
+    }
+
+    /// Renders token-only output raw while preserving the established human message byte-for-byte.
+    #[test]
+    fn token_create_renders_selected_output_format() {
+        let token = "henosis-machine-token";
+        assert_eq!(
+            render_created_token(token.to_string(), TokenOutputFormat::Human),
+            "token created; save this one-time credential now:\nhenosis-machine-token"
+        );
+        assert_eq!(
+            render_created_token(token.to_string(), TokenOutputFormat::TokenOnly),
+            token
         );
     }
 

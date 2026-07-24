@@ -1,11 +1,12 @@
 //! File pattern matching (glob) tool.
 
+use crate::ToolExecutionContext;
+use crate::confined_fs::{ConfinedPath, visit_files};
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 use std::time::SystemTime;
-use walkdir::WalkDir;
 
 /// Finds files whose relative paths match a glob expression.
 pub struct GlobTool;
@@ -35,7 +36,7 @@ impl AgentTool for GlobTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Root directory to search from. Defaults to cwd."
+                    "description": "Root directory relative to the task root. Defaults to the task root; absolute paths and parent traversal are rejected."
                 }
             },
             "required": ["pattern"]
@@ -44,6 +45,16 @@ impl AgentTool for GlobTool {
 
     /// Searches the requested root and returns matches ordered by modification time.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
+        let context = ToolExecutionContext::new(cwd.to_path_buf())?;
+        self.execute_with_context(params, &context).await
+    }
+
+    /// Searches through the task-root capability retained by the agent session.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
         let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => {
@@ -55,34 +66,45 @@ impl AgentTool for GlobTool {
         };
 
         let search_root_str = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let search_root = resolve_path(cwd, search_root_str);
+        let search_root = match ConfinedPath::new(context, search_root_str, true) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Invalid search root: {e}"),
+                    is_error: true,
+                });
+            }
+        };
+        let directory = match search_root.open_dir() {
+            Ok(directory) => directory,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Error opening search root: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
         let mut matches: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
-
-        for entry in WalkDir::new(&search_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let file_path = entry.path();
-
-            // Get path relative to search root for matching
-            let rel = match file_path.strip_prefix(&search_root) {
-                Ok(r) => r,
-                Err(_) => file_path,
-            };
-
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-
+        let base_display = search_root.display().to_path_buf();
+        let walk_result = visit_files(&directory, Path::new(""), &mut |entry, relative| {
+            let rel_str = relative.to_string_lossy().replace('\\', "/");
             if glob_path_matches(&pattern, &rel_str) {
-                let mtime = entry
+                let modified = entry
                     .metadata()
                     .ok()
-                    .and_then(|m| m.modified().ok())
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(cap_std::time::SystemTime::into_std)
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                matches.push((mtime, file_path.to_path_buf()));
+                matches.push((modified, base_display.join(relative)));
             }
+            false
+        });
+        if let Err(e) = walk_result {
+            return Ok(ToolResult {
+                content: format!("Error walking search root: {e}"),
+                is_error: true,
+            });
         }
 
         // Sort newest first
@@ -159,15 +181,5 @@ fn glob_path_chars(pat: &[char], txt: &[char]) -> bool {
         (Some(&'?'), Some(t)) if *t != '/' => glob_path_chars(&pat[1..], &txt[1..]),
         (Some(p), Some(t)) if p == t => glob_path_chars(&pat[1..], &txt[1..]),
         _ => false,
-    }
-}
-
-/// Resolves a search root relative to the execution directory.
-fn resolve_path(cwd: &Path, p: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(p);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
     }
 }

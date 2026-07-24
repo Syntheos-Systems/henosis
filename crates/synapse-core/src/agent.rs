@@ -7,7 +7,7 @@ use futures::StreamExt;
 use futures::future::join_all;
 use synapse_provider::{ChatMessage, ContentBlock, Provider, Role, StopReason, StreamEvent};
 use synapse_tools::tool::ToolRegistry;
-use synapse_tools::{GateDecision, PermissiveGate, SharedGate};
+use synapse_tools::{DenyAllGate, GateDecision, SharedGate, ToolExecutionContext};
 use tokio_stream::Stream;
 
 use crate::compression;
@@ -89,6 +89,16 @@ pub fn agent_turn_with_pricing(
     pricing: Option<Arc<PricingTable>>,
 ) -> impl Stream<Item = AgentEvent> + Send {
     stream! {
+        // Bind filesystem authority before the first provider call so model-driven
+        // path replacement cannot redirect later tool execution.
+        let execution_context = match ToolExecutionContext::new(config.cwd.clone()) {
+            Ok(context) => Arc::new(context),
+            Err(error) => {
+                yield AgentEvent::Error(format!("failed to open task root: {error}"));
+                return;
+            }
+        };
+
         // Persist and add the user message
         {
             let user_msg = ChatMessage {
@@ -273,19 +283,19 @@ pub fn agent_turn_with_pricing(
 
             // Execute tool calls
             if !tool_uses.is_empty() {
-                let cwd = config.cwd.clone();
+                let cwd = execution_context.cwd().to_path_buf();
                 // Resolve the gate once per turn so each tool execution shares
-                // the same auditor/hook context. Default to PermissiveGate
-                // when the host did not install one.
+                // the same auditor/hook context. Missing host authority fails closed.
                 let gate: SharedGate = config
                     .tool_gate
                     .clone()
-                    .unwrap_or_else(|| Arc::new(PermissiveGate) as SharedGate);
+                    .unwrap_or_else(|| Arc::new(DenyAllGate) as SharedGate);
                 let futures: Vec<_> = tool_uses
                     .iter()
                     .map(|(id, name, args)| {
                         let tools = Arc::clone(&tools);
                         let gate = Arc::clone(&gate);
+                        let execution_context = Arc::clone(&execution_context);
                         let id = id.clone();
                         let name = name.clone();
                         let input: serde_json::Value = serde_json::from_str(args)
@@ -306,7 +316,10 @@ pub fn agent_turn_with_pricing(
                                     }
                                 }
                                 GateDecision::Allow => match tools.get(&name) {
-                                    Some(tool) => match tool.execute(input.clone(), &cwd).await {
+                                    Some(tool) => match tool
+                                        .execute_with_context(input.clone(), &execution_context)
+                                        .await
+                                    {
                                         Ok(r) => r,
                                         Err(e) => synapse_tools::ToolResult {
                                             content: e.to_string(),

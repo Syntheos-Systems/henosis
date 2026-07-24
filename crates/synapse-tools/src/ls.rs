@@ -1,5 +1,7 @@
 //! Directory listing tool.
 
+use crate::ToolExecutionContext;
+use crate::confined_fs::ConfinedPath;
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
@@ -29,7 +31,7 @@ impl AgentTool for LsTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory to list. Defaults to cwd."
+                    "description": "Directory relative to the task root. Defaults to the task root; absolute paths and parent traversal are rejected."
                 }
             }
         })
@@ -37,11 +39,29 @@ impl AgentTool for LsTool {
 
     /// Reads, orders, and renders entries from the requested directory.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
+        let context = ToolExecutionContext::new(cwd.to_path_buf())?;
+        self.execute_with_context(params, &context).await
+    }
+
+    /// Lists through the task-root capability retained by the agent session.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
         let dir_str = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let dir = resolve_path(cwd, dir_str);
+        let path = match ConfinedPath::new(context, dir_str, true) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Invalid directory path: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
-        let mut rd = match tokio::fs::read_dir(&dir).await {
+        let dir = match path.open_dir() {
             Ok(rd) => rd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -52,31 +72,43 @@ impl AgentTool for LsTool {
         };
 
         let mut entries: Vec<(String, u64, EntryKind)> = Vec::new();
+        let rd = match dir.entries() {
+            Ok(rd) => rd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Error listing directory: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
-        loop {
-            match rd.next_entry().await {
-                Ok(Some(entry)) => {
+        for entry in rd {
+            match entry {
+                Ok(entry) => {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    let meta = match entry.metadata().await {
-                        Ok(m) => m,
+                    let file_type = match entry.file_type() {
+                        Ok(file_type) => file_type,
                         Err(_) => {
                             entries.push((name, 0, EntryKind::Unknown));
                             continue;
                         }
                     };
 
-                    let kind = if meta.is_symlink() {
+                    let kind = if file_type.is_symlink() {
                         EntryKind::Symlink
-                    } else if meta.is_dir() {
+                    } else if file_type.is_dir() {
                         EntryKind::Dir
                     } else {
                         EntryKind::File
                     };
 
-                    let size = if meta.is_file() { meta.len() } else { 0 };
+                    let size = if file_type.is_file() {
+                        entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
                     entries.push((name, size, kind));
                 }
-                Ok(None) => break,
                 Err(e) => {
                     entries.push((format!("<error: {e}>"), 0, EntryKind::Unknown));
                 }
@@ -101,7 +133,7 @@ impl AgentTool for LsTool {
             });
         }
 
-        let mut lines = vec![format!("{}:", dir.display())];
+        let mut lines = vec![format!("{}:", path.display().display())];
         for (name, size, kind) in &entries {
             let display_name = match kind {
                 EntryKind::Dir => format!("{name}/"),
@@ -146,15 +178,5 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-/// Resolves a directory path relative to the execution directory.
-fn resolve_path(cwd: &Path, p: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(p);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
     }
 }

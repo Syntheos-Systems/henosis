@@ -17,7 +17,7 @@ regex = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
-walkdir = "2"
+cap-std = "4.0.2"
 hostname = { workspace = true }
 # Workspace memory client for signed Kleos requests.
 henosis-memory-client = { path = "../henosis-memory-client" }
@@ -30,6 +30,9 @@ henosis-pistis = { path = "../henosis-pistis", optional = true }
 syntheos-contracts = { path = "../syntheos-contracts", optional = true }
 # Only used by the henosis-pistis-backed authority tests (clock construction).
 time = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Back PistisGate with the in-process henosis-pistis room-state authority.

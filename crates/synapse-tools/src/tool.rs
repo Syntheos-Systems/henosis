@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::ToolExecutionContext;
+
 /// Result returned by a tool execution.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -22,6 +24,15 @@ pub trait AgentTool: Send + Sync {
     fn schema(&self) -> Value;
     /// Executes this component with the provided JSON parameters.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult>;
+
+    /// Executes with authority retained before untrusted model output was accepted.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        self.execute(params, context.cwd()).await
+    }
 }
 
 /// Decision returned by a ToolGate before a tool runs.
@@ -37,8 +48,8 @@ pub enum GateDecision {
 /// Tauri app) impose confirmation prompts, hook scripts, or auditing without
 /// modifying individual tools.
 ///
-/// The default `PermissiveGate` allows everything. Hosts can add confirmation
-/// or hook-executing gates without modifying individual tools.
+/// `PermissiveGate` allows everything only when a host installs it explicitly.
+/// Hosts can add confirmation or hook-executing gates without modifying tools.
 #[async_trait::async_trait]
 pub trait ToolGate: Send + Sync {
     /// Called before a tool runs. Return `Deny` to short-circuit with an
@@ -56,13 +67,24 @@ pub trait ToolGate: Send + Sync {
     }
 }
 
-/// Default gate that allows all tool executions. Used when no host-provided
-/// gate is installed; preserves the pre-gate behavior.
+/// Explicit gate that allows all tool executions for trusted embedding hosts.
 pub struct PermissiveGate;
 
 /// Implements `ToolGate` behavior for `PermissiveGate`.
 #[async_trait::async_trait]
 impl ToolGate for PermissiveGate {}
+
+/// Explicit fail-closed gate used when an embedding host grants no tool authority.
+pub struct DenyAllGate;
+
+/// Denies every tool call until a host deliberately installs another gate.
+#[async_trait::async_trait]
+impl ToolGate for DenyAllGate {
+    /// Rejects execution because no host authority was configured.
+    async fn before_execute(&self, _name: &str, _params: &Value, _cwd: &Path) -> GateDecision {
+        GateDecision::Deny("no explicit tool gate was configured".to_string())
+    }
+}
 
 /// Convenience type for callers that want to pass a gate around.
 pub type SharedGate = Arc<dyn ToolGate>;
@@ -113,5 +135,21 @@ impl Default for ToolRegistry {
     /// Handles `default` behavior.
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Exercises explicit allow and deny gate behavior.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Confirms the fail-closed gate rejects a tool without consulting ambient state.
+    #[tokio::test]
+    async fn deny_all_gate_rejects_every_call() {
+        let decision = DenyAllGate
+            .before_execute("bash", &Value::Null, Path::new("/tmp"))
+            .await;
+
+        assert!(matches!(decision, GateDecision::Deny(_)));
     }
 }

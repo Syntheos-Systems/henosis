@@ -136,7 +136,9 @@ const OLLAMA_SYSTEM_PROMPT: &str = "\
 You are Synapse, a local coding agent. Execute tasks directly. Be concise.
 
 You have tools: bash (run commands), read/write/edit (files), glob/grep (search).
-Work in the current directory. No hedging, no asking permission.
+File tools accept only task-root-relative paths and cannot traverse outside the task root.
+Bash is a separate capability and has the host access granted to this process.
+Work in the task root. No hedging, no asking permission.
 
 Focus: git operations, file management, code tasks. Run commands and report results.
 ";
@@ -1362,15 +1364,15 @@ async fn main() -> anyhow::Result<()> {
     let hooks_config = load_hooks_config();
     // Install a HookGate that wraps PermissiveGate so configured hooks run
     // around tool execution.
-    let tool_gate: Option<synapse_tools::SharedGate> = if hooks_config.hooks.is_empty() {
-        None
+    let tool_gate: synapse_tools::SharedGate = if hooks_config.hooks.is_empty() {
+        Arc::new(synapse_tools::PermissiveGate) as synapse_tools::SharedGate
     } else {
         let inner: synapse_tools::SharedGate =
             Arc::new(synapse_tools::PermissiveGate) as synapse_tools::SharedGate;
-        Some(Arc::new(synapse_core::HookGate::new(
+        Arc::new(synapse_core::HookGate::new(
             Arc::clone(&hooks_config),
             inner,
-        )) as synapse_tools::SharedGate)
+        )) as synapse_tools::SharedGate
     };
 
     let mut config = AgentConfig {
@@ -1392,7 +1394,7 @@ async fn main() -> anyhow::Result<()> {
         },
         router: router.clone(),
         max_tool_result_tokens: 4000,
-        tool_gate: tool_gate.clone(),
+        tool_gate: Some(tool_gate.clone()),
         hooks: Some(Arc::clone(&hooks_config)),
     };
 

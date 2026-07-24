@@ -30,7 +30,10 @@ pub fn build_synapse_executor(
     max_turns: Option<usize>,
     cwd: Option<PathBuf>,
 ) -> Result<SynapseExecutor> {
-    let working_dir = cwd.unwrap_or_else(|| PathBuf::from("/tmp"));
+    let working_dir = match cwd {
+        Some(path) => path,
+        None => std::env::current_dir().context("resolving the default task root")?,
+    };
     let model_str = model.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
     // Build tool registry for execution mode.
@@ -53,8 +56,7 @@ pub fn build_synapse_executor(
             // loop cannot inherit this executor's per-task Pistis gate or
             // worktree safely, so keep it text-only until providers are scoped
             // to one authorized task.
-            let tool_executor: Arc<dyn ToolExecutor> =
-                Arc::new(ToolRegistryExecutor::disabled(working_dir.clone()));
+            let tool_executor: Arc<dyn ToolExecutor> = Arc::new(ToolRegistryExecutor::disabled());
             ProviderConfig::ClaudeMax {
                 model: Some(model_str.clone()),
                 cli_path: None,

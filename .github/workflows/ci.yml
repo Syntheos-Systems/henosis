@@ -93,6 +93,10 @@ jobs:
         run: |
           rustup toolchain install 1.88.0 --profile minimal
           rustup target add --toolchain 1.88.0 x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: cargo +1.88.0 test --locked -p synapse-tools confined_fs::tests --target x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: |
           cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target x86_64-pc-windows-msvc
       - shell: powershell
         run: ./tests/install.ps1

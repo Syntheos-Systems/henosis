@@ -215,22 +215,23 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         ("fsrs_review", vec![network()]),
         ("prompt_generate", vec![network()]),
         ("prompt_header", vec![network()]),
-        // Agent-forge -- mix of network and local execution
-        ("repo_map", vec![fs_read()]),
-        ("search_code", vec![fs_read()]),
+        // Agent-forge structural tools execute outside the retained directory
+        // capability, so they require the same ambient authority as a shell.
+        ("repo_map", vec![fs_read(), bash()]),
+        ("search_code", vec![fs_read(), bash()]),
         ("execute", vec![bash()]),
         ("verify", vec![bash()]),
-        ("ast_search", vec![fs_read()]),
+        ("ast_search", vec![fs_read(), bash()]),
         ("log_hypothesis", vec![network()]),
         ("log_outcome", vec![network()]),
         ("recall_errors", vec![network()]),
-        ("test_impact", vec![fs_read()]),
-        ("session_diff", vec![network()]),
+        ("test_impact", vec![fs_read(), bash()]),
+        ("session_diff", vec![fs_read(), bash(), network()]),
         ("prose_analyze", vec![network()]),
         ("prose_learn", vec![network()]),
         // LSP -- diagnostics launch language-specific local processes
         ("lsp_diagnostics", vec![fs_read(), bash()]),
-        ("lsp_symbol_search", vec![fs_read()]),
+        ("lsp_symbol_search", vec![fs_read(), bash()]),
         // Session search -- reads local SQLite
         ("session_search", vec![fs_read()]),
         ("session_list", vec![fs_read()]),
@@ -573,7 +574,18 @@ mod tests {
     #[tokio::test]
     async fn denies_sensitive_builtins_without_their_grants() {
         let gate = read_only_gate();
-        for tool in &["execute", "verify", "skill_invoke", "lsp_diagnostics"] {
+        for tool in &[
+            "execute",
+            "verify",
+            "repo_map",
+            "search_code",
+            "ast_search",
+            "test_impact",
+            "session_diff",
+            "skill_invoke",
+            "lsp_diagnostics",
+            "lsp_symbol_search",
+        ] {
             let decision = gate
                 .before_execute(tool, &Value::Null, Path::new("/tmp"))
                 .await;

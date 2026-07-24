@@ -1,5 +1,7 @@
 //! File edit (string replacement) tool.
 
+use crate::ToolExecutionContext;
+use crate::confined_fs::ConfinedPath;
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
@@ -30,7 +32,7 @@ impl AgentTool for EditTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file to edit."
+                    "description": "File path relative to the task root. Absolute paths and parent traversal are rejected."
                 },
                 "old_string": {
                     "type": "string",
@@ -51,6 +53,16 @@ impl AgentTool for EditTool {
 
     /// Applies the requested replacement and returns a unified diff snippet.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
+        let context = ToolExecutionContext::new(cwd.to_path_buf())?;
+        self.execute_with_context(params, &context).await
+    }
+
+    /// Edits through the task-root capability retained by the agent session.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
         let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => {
@@ -86,9 +98,17 @@ impl AgentTool for EditTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let path = resolve_path(cwd, &file_path);
+        let path = match ConfinedPath::new(context, &file_path, false) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Invalid file path: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
-        let original = match tokio::fs::read_to_string(&path).await {
+        let original = match path.read_to_string() {
             Ok(s) => s,
             Err(e) => {
                 return Ok(ToolResult {
@@ -123,7 +143,7 @@ impl AgentTool for EditTool {
             original.replacen(old_string.as_str(), new_string.as_str(), 1)
         };
 
-        if let Err(e) = tokio::fs::write(&path, new_content.as_bytes()).await {
+        if let Err(e) = path.write(new_content.as_bytes()) {
             return Ok(ToolResult {
                 content: format!("Failed to write file: {e}"),
                 is_error: true,
@@ -191,14 +211,4 @@ fn unified_diff_snippet(original: &str, new_content: &str, path: &str) -> String
     }
 
     out
-}
-
-/// Resolves a user-supplied file path relative to the execution directory.
-fn resolve_path(cwd: &Path, file_path: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(file_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    }
 }

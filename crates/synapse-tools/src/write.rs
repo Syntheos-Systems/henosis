@@ -1,5 +1,7 @@
 //! File write tool.
 
+use crate::ToolExecutionContext;
+use crate::confined_fs::ConfinedPath;
 use crate::tool::{AgentTool, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
@@ -29,7 +31,7 @@ impl AgentTool for WriteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file to write."
+                    "description": "File path relative to the task root. Absolute paths and parent traversal are rejected."
                 },
                 "content": {
                     "type": "string",
@@ -42,6 +44,16 @@ impl AgentTool for WriteTool {
 
     /// Writes the requested content and reports the resulting byte count.
     async fn execute(&self, params: Value, cwd: &Path) -> Result<ToolResult> {
+        let context = ToolExecutionContext::new(cwd.to_path_buf())?;
+        self.execute_with_context(params, &context).await
+    }
+
+    /// Writes through the task-root capability retained by the agent session.
+    async fn execute_with_context(
+        &self,
+        params: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
         let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => {
@@ -62,19 +74,18 @@ impl AgentTool for WriteTool {
             }
         };
 
-        let path = resolve_path(cwd, &file_path);
-
-        if let Some(parent) = path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            return Ok(ToolResult {
-                content: format!("Failed to create parent directories: {e}"),
-                is_error: true,
-            });
-        }
+        let path = match ConfinedPath::new(context, &file_path, false) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ToolResult {
+                    content: format!("Invalid file path: {e}"),
+                    is_error: true,
+                });
+            }
+        };
 
         let byte_count = content.len();
-        if let Err(e) = tokio::fs::write(&path, content.as_bytes()).await {
+        if let Err(e) = path.write(content.as_bytes()) {
             return Ok(ToolResult {
                 content: format!("Failed to write file: {e}"),
                 is_error: true,
@@ -82,18 +93,12 @@ impl AgentTool for WriteTool {
         }
 
         Ok(ToolResult {
-            content: format!("Written {} bytes to {}", byte_count, path.display()),
+            content: format!(
+                "Written {} bytes to {}",
+                byte_count,
+                path.display().display()
+            ),
             is_error: false,
         })
-    }
-}
-
-/// Resolves a file path relative to the execution directory.
-fn resolve_path(cwd: &Path, file_path: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(file_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
     }
 }

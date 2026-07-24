@@ -11,25 +11,32 @@ Henosis is built around one rule: an agent action is not complete merely because
 - a credential boundary that exposes named broker operations without returning raw secrets; and
 - one `henosis` executable for initialization, diagnostics, control, and serving.
 
-## Public alpha
+## Install the public alpha
 
 Native release archives contain one launch executable: `henosis`. The installers select the host
 platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account,
 run `henosis init --quick`, and restore the prior executable if initialization fails.
 
-Install on Linux or macOS:
+On Linux or macOS, copy and run this command:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.sh \
-  | sh -s -- --version v0.1.0-alpha.2
+  | sh -s -- --version v0.1.0-alpha.3
 ```
 
-Install from PowerShell on Windows:
+On Windows, open PowerShell, copy this command, and press Enter:
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1'))) `
-  -Version 'v0.1.0-alpha.2'
+$installer = Join-Path ([IO.Path]::GetTempPath()) "henosis-install-$([guid]::NewGuid().ToString('N')).ps1"
+try {
+  irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1' -OutFile $installer
+  $powerShell = (Get-Process -Id $PID).Path
+  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-alpha.3'
+  if ($LASTEXITCODE -ne 0) { throw "Henosis installer exited with code $LASTEXITCODE" }
+} finally {
+  Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+}
 ```
 
 Both commands pin the reviewed installer script to its full Git commit while selecting the release
@@ -38,28 +45,70 @@ binary, the installer requires GitHub to report that release as published and im
 `HENOSIS_VERSION`, `HENOSIS_RELEASE_BASE`, `HENOSIS_RELEASE_API`, or `HENOSIS_INSTALL_DIR` to
 override installer defaults.
 
-The installer creates private local configuration without asking for or generating a user password. Start the loopback service:
+That is the complete install and initialization path for local mode. It does not require a source
+checkout, Rust toolchain, container runtime, database server, account, password, or API key.
+
+The installer creates private local configuration without asking for or generating a user
+password. Start the loopback service and keep that terminal open:
 
 ```sh
-henosis serve
+$HOME/.local/bin/henosis serve
 ```
 
-The first boot creates a private local owner token under `HENOSIS_HOME`. Live CLI commands read that token automatically and never print it except when a newly requested token must be shown once.
+On Windows:
 
-Create a scoped machine token for an agent or integration:
+```powershell
+& "$HOME\.local\bin\henosis.exe" serve
+```
+
+Henosis is ready when `http://127.0.0.1:8088/health` returns `ok`. Stop it with `Ctrl+C`.
+Open a second terminal for the remaining commands. The first boot creates a private local owner
+token under `HENOSIS_HOME`. Live CLI commands read that token automatically and never print it
+except when a newly requested token must be shown once.
+
+Create a scoped machine token for an agent or integration and capture its one-time credential:
 
 ```sh
-henosis token create first-agent
+export HENOSIS_AGENT_TOKEN="$($HOME/.local/bin/henosis token create first-agent --token-only)"
 ```
 
-Every public dispatch requires a unique retry identity in `X-Henosis-Idempotency-Key`. Keys are scoped to the authenticated tenant and principal. Repeating the same key and exact request returns the stored filtered result without running the tool again. Reusing the key with different content returns a conflict.
+On Windows:
+
+```powershell
+$env:HENOSIS_AGENT_TOKEN = & "$HOME\.local\bin\henosis.exe" token create first-agent --token-only
+```
+
+The loopback compatibility authority recognizes only `henosis.probe` in the stable local room
+`!henosis-local:loopback`. Supply that room through `context.room`.
+
+Every public dispatch requires a unique retry identity in `X-Henosis-Idempotency-Key`. Keys are
+scoped to the authenticated tenant and principal. Repeating the same key and exact request returns
+the stored filtered result without running the tool again. Reusing the key with different content
+returns a conflict.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8088/api/v1/dispatch \
   -H "Authorization: Bearer $HENOSIS_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-Henosis-Idempotency-Key: first-agent-probe-1" \
-  --data '{"tool":"henosis","action":"probe","args":{}}'
+  --data '{"tool":"henosis","action":"probe","args":{},"context":{"room":"!henosis-local:loopback"}}'
+```
+
+On Windows:
+
+```powershell
+$headers = @{
+  Authorization = "Bearer $env:HENOSIS_AGENT_TOKEN"
+  "X-Henosis-Idempotency-Key" = "first-agent-probe-1"
+}
+$body = @{
+  tool = "henosis"
+  action = "probe"
+  args = @{}
+  context = @{ room = "!henosis-local:loopback" }
+} | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8088/api/v1/dispatch" `
+  -Headers $headers -ContentType "application/json" -Body $body
 ```
 
 Operations that require approval return `202 Accepted` with an approval ID. Approve that ID with `henosis approvals approve <approval-id>`, then repeat the exact dispatch with both the original idempotency key and `X-Henosis-Approval-Id`.
@@ -79,9 +128,16 @@ The Compose service runs the same idempotent `henosis init --quick` path as the 
 
 ## Production prerequisites
 
-Production requires a managed PostgreSQL authority, protected persistent storage, TLS termination, authenticated ingress with source-aware login rate limiting, backups, an independent audit witness, and the proprietary `phylaxd` credential broker. `phylaxd` is a separately deployed dependency and must be reachable through a private, authenticated endpoint.
+Production requires a managed PostgreSQL authority, protected persistent storage, TLS termination,
+authenticated ingress with source-aware login rate limiting, backups, an independent audit
+witness, and the proprietary `phylaxd` credential broker. Operators manage credentials through
+`cred`; `phylaxd` brokers them, and Henosis contacts its separately deployed service over a
+private, authenticated endpoint.
 
-The full Pistis service is proprietary and is not distributed in this repository. Henosis contains a narrow fail-closed compatibility decision core. Capability-bearing requests remain denied until a deployment supplies trusted room-state integration.
+The full Pistis service is a private, proprietary integration and is not distributed in this
+repository. Henosis contains a narrow fail-closed compatibility decision core for loopback local
+mode. Capability-bearing production requests remain denied until a deployment supplies trusted
+room-state from Pistis.
 
 ### Integration boundaries
 
@@ -90,8 +146,13 @@ Henosis keeps model selection and capability authorization behind interfaces. Pr
 | Boundary | Choices | Deployment contract |
 | --- | --- | --- |
 | Model provider | Anthropic, Ollama, an OpenAI-compatible proxy, OpenCode Zen, OpenAI Codex, Azure OpenAI, Foundry, or Claude Max CLI | Select a provider through `ProviderConfig`. The OpenAI-compatible path supports additional services without a Henosis code change. |
-| Capability authority | Standalone local policy or the feature-gated Henosis room-state adapter | Select an authority through `PistisAuthority`. Restricted tools fail closed when trusted state is absent or invalid. |
+| Capability authority | Embedded loopback compatibility policy or the feature-gated Henosis room-state adapter | Select an authority through `PistisAuthority`. Restricted tools fail closed when trusted state is absent or invalid. |
 | Proprietary services | `phylaxd` and the full Pistis service | Production credentials require `phylaxd`. Deployments using managed room trust supply trusted room-state integration from the full Pistis service. Neither service ships in this repository. |
+
+The `read`, `write`, `edit`, `ls`, `grep`, and `glob` tools accept only paths relative to the
+task root. They reject absolute paths, parent traversal, and symlink escapes. `bash` is a separate,
+explicit capability and is not a filesystem sandbox; it runs with the operating-system access
+granted to the Henosis process.
 
 Use `containers/compose.production.yml` only after:
 
@@ -117,7 +178,7 @@ Every release publishes platform archives, `SHA256SUMS`, SPDX SBOMs, and Sigstor
 bundles. Verify an archive before use:
 
 ```sh
-grep -F '  henosis-0.1.0-alpha.2-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
+grep -F '  henosis-0.1.0-alpha.3-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -125,7 +186,7 @@ GitHub also stores OIDC-backed provenance for each archive. The GitHub CLI verif
 repository identity, and release workflow:
 
 ```sh
-gh attestation verify henosis-0.1.0-alpha.2-x86_64-unknown-linux-musl.tar.gz \
+gh attestation verify henosis-0.1.0-alpha.3-x86_64-unknown-linux-musl.tar.gz \
   --repo Syntheos-Systems/henosis \
   --signer-workflow Syntheos-Systems/henosis/.github/workflows/ci.yml
 ```
