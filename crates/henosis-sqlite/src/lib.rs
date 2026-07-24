@@ -755,6 +755,7 @@ fn validate_platform_path_encoding(_path: &Path) -> Result<(), OpenError> {
 }
 
 /// Compare one raw byte prefix using ASCII case folding only.
+#[cfg(not(windows))]
 fn starts_with_ascii_case_insensitive(value: &[u8], prefix: &[u8]) -> bool {
     value.len() >= prefix.len()
         && value[..prefix.len()]
@@ -1264,7 +1265,7 @@ fn with_private_windows_security_io<T>(
     inherit: bool,
     action: impl FnOnce(*const windows_sys::Win32::Security::SECURITY_ATTRIBUTES) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    with_current_user_sid_io(path, |sid| {
+    with_current_identity_sids_io(path, |sid, _default_owner_sid| {
         use std::ptr::{null, null_mut};
         use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
         use windows_sys::Win32::Security::Authorization::{
@@ -1366,15 +1367,20 @@ fn with_private_windows_security_io<T>(
     })
 }
 
-/// Run one Windows operation while the current token user's SID remains live.
+/// Run one Windows operation while the token user and default-owner SIDs remain live.
 #[cfg(windows)]
-fn with_current_user_sid_io<T>(
+fn with_current_identity_sids_io<T>(
     _path: &Path,
-    action: impl FnOnce(windows_sys::Win32::Security::PSID) -> std::io::Result<T>,
+    action: impl FnOnce(
+        windows_sys::Win32::Security::PSID,
+        windows_sys::Win32::Security::PSID,
+    ) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenOwner, TokenUser, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = null_mut();
@@ -1383,32 +1389,62 @@ fn with_current_user_sid_io<T>(
         return Err(std::io::Error::last_os_error());
     }
     let result = (|| {
-        let mut required = 0_u32;
+        let mut user_required = 0_u32;
         // SAFETY: a null buffer intentionally queries the required token information size.
         unsafe {
-            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required);
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut user_required);
         }
-        if required == 0 {
+        if user_required == 0 {
             return Err(std::io::Error::last_os_error());
         }
         let word_size = std::mem::size_of::<usize>();
-        let mut token_data = vec![0_usize; (required as usize).div_ceil(word_size)];
-        // SAFETY: the aligned vector has at least `required` writable bytes.
+        let mut user_data = vec![0_usize; (user_required as usize).div_ceil(word_size)];
+        // SAFETY: the aligned vector has at least `user_required` writable bytes.
         if unsafe {
             GetTokenInformation(
                 token,
                 TokenUser,
-                token_data.as_mut_ptr().cast(),
-                required,
-                &mut required,
+                user_data.as_mut_ptr().cast(),
+                user_required,
+                &mut user_required,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut owner_required = 0_u32;
+        // SAFETY: a null buffer intentionally queries the required token information size.
+        unsafe {
+            GetTokenInformation(token, TokenOwner, null_mut(), 0, &mut owner_required);
+        }
+        if owner_required == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut owner_data = vec![0_usize; (owner_required as usize).div_ceil(word_size)];
+        // SAFETY: the aligned vector has at least `owner_required` writable bytes.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenOwner,
+                owner_data.as_mut_ptr().cast(),
+                owner_required,
+                &mut owner_required,
             )
         } == 0
         {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: the successful query initialized `TOKEN_USER` at the buffer start.
-        let user = unsafe { &*(token_data.as_ptr().cast::<TOKEN_USER>()) };
-        action(user.User.Sid)
+        let user = unsafe { &*(user_data.as_ptr().cast::<TOKEN_USER>()) };
+        // SAFETY: the successful query initialized `TOKEN_OWNER` at the buffer start.
+        let default_owner = unsafe { &*(owner_data.as_ptr().cast::<TOKEN_OWNER>()) };
+        if user.User.Sid.is_null() || default_owner.Owner.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the Windows process token returned a null identity SID",
+            ));
+        }
+        action(user.User.Sid, default_owner.Owner)
     })();
     // SAFETY: `token` was initialized by the successful `OpenProcessToken` call.
     unsafe {
@@ -1417,7 +1453,7 @@ fn with_current_user_sid_io<T>(
     result
 }
 
-/// Validate one Windows object as current-user-owned with exactly one private ACE.
+/// Validate one Windows object as safely owned with exactly one current-user ACE.
 #[cfg(windows)]
 fn validate_private_windows_object(
     file: &File,
@@ -1436,7 +1472,7 @@ fn validate_private_windows_object(
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
-    with_current_user_sid_io(path, |current_sid| {
+    with_current_identity_sids_io(path, |current_sid, default_owner_sid| {
         let mut owner: PSID = null_mut();
         let mut dacl = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -1458,10 +1494,21 @@ fn validate_private_windows_object(
         }
 
         let result = (|| {
-            if owner.is_null() || unsafe { EqualSid(owner, current_sid) } == 0 {
+            if owner.is_null() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "the Windows object is not owned by the current user",
+                    "the Windows object has no owner SID",
+                ));
+            }
+            // SAFETY: all non-null SIDs remain live for the duration of this validation.
+            let owned_by_current_user = unsafe { EqualSid(owner, current_sid) } != 0;
+            // SAFETY: all non-null SIDs remain live for the duration of this validation.
+            let owned_by_token_default = matches!(kind, WindowsAclKind::Sidecar)
+                && unsafe { EqualSid(owner, default_owner_sid) } != 0;
+            if !owned_by_current_user && !owned_by_token_default {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the Windows object has an unapproved owner SID",
                 ));
             }
             if dacl.is_null() || unsafe { (*dacl).AceCount } != 1 {
@@ -1492,31 +1539,15 @@ fn validate_private_windows_object(
                 ));
             }
 
-            let allowed_flags = match kind {
+            let required_flags = match kind {
                 WindowsAclKind::Directory => OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
                 WindowsAclKind::Leaf => 0,
-                WindowsAclKind::Sidecar => {
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERITED_ACE
-                }
+                WindowsAclKind::Sidecar => INHERITED_ACE,
             };
-            if u32::from(ace.Header.AceFlags) & !allowed_flags != 0 {
+            if u32::from(ace.Header.AceFlags) != required_flags {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "the Windows object ACE has unexpected flags",
-                ));
-            }
-            if matches!(kind, WindowsAclKind::Directory)
-                && u32::from(ace.Header.AceFlags) != OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "the Windows state directory ACE is not inheritable",
-                ));
-            }
-            if matches!(kind, WindowsAclKind::Leaf) && ace.Header.AceFlags != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "the Windows database leaf ACE is not exact",
+                    "the Windows object ACE flags are not exact",
                 ));
             }
 
