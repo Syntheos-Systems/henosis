@@ -79,6 +79,10 @@ async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Windows descriptor flags reject reparse-point leaves before configuration reads.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # ServiceExt::oneshot drives the router in handler tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }

@@ -3609,6 +3609,9 @@ name = "henosis-eidolon"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cap-primitives",
+ "cap-std",
+ "libc",
  "lru 0.16.4",
  "notify",
  "notify-debouncer-mini",
@@ -3616,12 +3619,14 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "same-file",
  "syntheos-axon",
  "syntheos-contracts",
  "syntheos-dispatch",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8470,6 +8475,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -147,6 +147,9 @@ const MAX_LOOM_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 300;
 /// Largest local authority credential file read into memory.
 const MAX_AUTHORITY_FILE_BYTES: u64 = 4096;
 
+/// Largest supervisor rules document accepted during startup.
+const MAX_SUPERVISOR_RULES_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Stable synthetic room identifier used only by explicit loopback local policy.
 const LOCAL_PISTIS_ROOM_ID: &str = "!henosis-local:loopback";
 
@@ -728,6 +731,64 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, Box<dyn std::error::E
     Ok(VerifyingKey::from_bytes(&key)?)
 }
 
+/// Open a local operator-selected file with platform-native leaf and special-file defenses.
+#[cfg(any(unix, windows))]
+fn open_regular_readonly(
+    path: &Path,
+    label: &str,
+) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} must be a regular file").into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileType, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_DISK,
+        };
+
+        // SAFETY: the raw handle remains owned and valid for the duration of this call.
+        let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || file_type != FILE_TYPE_DISK
+        {
+            return Err(format!("{label} must be a non-reparse local disk file").into());
+        }
+    }
+    Ok(file)
+}
+
+/// Fail closed where the runtime has no descriptor-level no-follow implementation.
+#[cfg(not(any(unix, windows)))]
+fn open_regular_readonly(
+    _path: &Path,
+    label: &str,
+) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    Err(format!("{label} cannot be opened safely on this platform").into())
+}
+
 /// Open, validate, and read one bounded authority file through the same descriptor.
 #[cfg(unix)]
 fn read_owned_regular_text(
@@ -736,12 +797,9 @@ fn read_owned_regular_text(
     label: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = open_regular_readonly(path, label)?;
     let metadata = file.metadata()?;
     // SAFETY: `geteuid` has no preconditions and does not dereference memory.
     let effective_uid = unsafe { libc::geteuid() };
@@ -773,16 +831,10 @@ fn read_owned_regular_text(
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::Read;
 
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(format!("{label} must be a regular file, not a symlink").into());
-    }
+    let file = open_regular_readonly(path, label)?;
+    let metadata = file.metadata()?;
     if metadata.len() > MAX_AUTHORITY_FILE_BYTES {
         return Err(format!("{label} exceeds the maximum size").into());
-    }
-    let file = std::fs::OpenOptions::new().read(true).open(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(format!("{label} must be a regular file").into());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(MAX_AUTHORITY_FILE_BYTES + 1)
@@ -801,6 +853,27 @@ fn authority_text(mut bytes: Vec<u8>, label: &str) -> Result<String, Box<dyn std
         .map_err(|_| format!("{label} must contain valid UTF-8"));
     bytes.zeroize();
     text.map_err(Into::into)
+}
+
+/// Open and read one bounded regular text file through a validated descriptor.
+fn read_bounded_regular_text(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let file = open_regular_readonly(path, label)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes {
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{label} exceeds the maximum size").into());
+    }
+    authority_text(bytes, label)
 }
 
 /// Confirm that witnessed-audit key permissions can be enforced on this platform.
@@ -900,6 +973,13 @@ fn set_private_directory_mode(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Load a bounded supervisor rule set from a stable regular file.
+fn load_supervisor_rules(path: &Path) -> Result<Vec<supervisor::Rule>, Box<dyn std::error::Error>> {
+    let content =
+        read_bounded_regular_text(path, MAX_SUPERVISOR_RULES_FILE_BYTES, "supervisor rules")?;
+    Ok(supervisor::rules_from_json(&content)?)
+}
+
 /// Build the supervisor from the environment, when enabled.
 ///
 /// `SYNTHEOS_SUPERVISOR_WATCH_DIR` unset = disabled (`Ok(None)`). When set, the identity the
@@ -923,11 +1003,8 @@ fn supervisor_from_env(
         .parse()
         .map_err(|e| format!("SYNTHEOS_SUPERVISOR_PRINCIPAL: {e}"))?;
     let rules = match std::env::var("SYNTHEOS_SUPERVISOR_RULES") {
-        Ok(path) if !path.is_empty() => {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("SYNTHEOS_SUPERVISOR_RULES {path:?}: {e}"))?;
-            supervisor::rules_from_json(&content)?
-        }
+        Ok(path) if !path.is_empty() => load_supervisor_rules(Path::new(&path))
+            .map_err(|e| format!("SYNTHEOS_SUPERVISOR_RULES {path:?}: {e}"))?,
         _ => supervisor::default_rules(),
     };
     let allowed_paths: Vec<String> = std::env::var("SYNTHEOS_SUPERVISOR_ALLOWED_PATHS")
@@ -1664,6 +1741,134 @@ mod auto_init_tests {
     #[test]
     fn unknown_switch_is_rejected() {
         assert!(auto_init_requested(Some("1")).is_err());
+    }
+}
+
+#[cfg(test)]
+/// Unit tests for bounded, no-follow supervisor rule loading.
+mod supervisor_rules_file_tests {
+    use super::*;
+
+    /// Create a unique directory and return it with a child rules path.
+    fn temporary_rules_path() -> (std::path::PathBuf, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "henosis-supervisor-rules-{}",
+            syntheos_contracts::EventId::new()
+        ));
+        std::fs::create_dir(&directory).expect("create rules directory");
+        let path = directory.join("rules.json");
+        (directory, path)
+    }
+
+    /// A regular, bounded rules document loads successfully.
+    #[test]
+    fn regular_rules_file_loads() {
+        let (directory, path) = temporary_rules_path();
+        let encoded =
+            serde_json::to_vec(&supervisor::default_rules()).expect("encode default rules");
+        std::fs::write(&path, encoded).expect("write rules");
+
+        let loaded = load_supervisor_rules(&path).expect("load regular rules");
+        assert_eq!(loaded.len(), supervisor::default_rules().len());
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A rules document larger than the fixed startup budget is rejected.
+    #[test]
+    fn oversized_rules_file_is_rejected() {
+        let (directory, path) = temporary_rules_path();
+        std::fs::write(
+            &path,
+            vec![b' '; MAX_SUPERVISOR_RULES_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversized rules");
+
+        let error = load_supervisor_rules(&path).expect_err("oversized rules must fail");
+        assert!(error.to_string().contains("maximum size"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Invalid JSON remains a startup error after the descriptor hardening.
+    #[test]
+    fn malformed_rules_file_is_rejected() {
+        let (directory, path) = temporary_rules_path();
+        std::fs::write(&path, b"{not-json").expect("write malformed rules");
+
+        load_supervisor_rules(&path).expect_err("malformed rules must fail");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A non-regular rules path is rejected before parsing.
+    #[test]
+    fn non_regular_rules_path_is_rejected() {
+        let (directory, path) = temporary_rules_path();
+        std::fs::create_dir(&path).expect("create directory at rules path");
+
+        load_supervisor_rules(&path).expect_err("directory rules path must fail");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A symbolic-link rules leaf is never followed.
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_rules_path_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, path) = temporary_rules_path();
+        let target = directory.join("target.json");
+        let encoded =
+            serde_json::to_vec(&supervisor::default_rules()).expect("encode default rules");
+        std::fs::write(&target, encoded).expect("write target rules");
+        symlink(&target, &path).expect("create rules symlink");
+
+        load_supervisor_rules(&path).expect_err("symbolic-link rules path must fail");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A Windows file reparse point is rejected without parsing its target.
+    #[cfg(windows)]
+    #[test]
+    fn windows_symbolic_link_rules_path_is_rejected() {
+        use std::os::windows::fs::symlink_file;
+
+        let (directory, path) = temporary_rules_path();
+        let target = directory.join("target.json");
+        let encoded =
+            serde_json::to_vec(&supervisor::default_rules()).expect("encode default rules");
+        std::fs::write(&target, encoded).expect("write target rules");
+        symlink_file(&target, &path).expect("create rules symlink");
+
+        load_supervisor_rules(&path).expect_err("Windows symbolic-link rules path must fail");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A Unix FIFO is rejected through a nonblocking open.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_rules_path_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (directory, path) = temporary_rules_path();
+        let encoded = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `encoded` is a live NUL-terminated path and the mode is valid.
+        let result = unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        load_supervisor_rules(&path).expect_err("FIFO rules path must fail");
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
 

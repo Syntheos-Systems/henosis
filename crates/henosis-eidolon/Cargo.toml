@@ -27,10 +27,22 @@ notify.workspace = true
 notify-debouncer-mini.workspace = true
 # Supervisor: bounded session-file -> read-offset cache (heap stays flat over long runs).
 lru.workspace = true
+# Supervisor: retained directory capabilities confine every event-file open beneath the watch root.
+cap-std = "4.0.2"
+# Supervisor: explicit no-follow policy for the capability-relative session leaf.
+cap-primitives = "4.0.2"
 # Supervisor: the async watch loop (mpsc from the watcher thread, sleep on a missing dir).
 tokio = { workspace = true }
 # Supervisor: violation logging.
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Supervisor: retained file handles make offset identity replacement-safe on Unix.
+same-file = "1.0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Supervisor: full 128-bit FILE_ID_INFO identity avoids ReFS replacement false matches.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Workspace tokio is "full" -- runtime + macros for #[tokio::test] and the proptest block_on runtime.
@@ -41,3 +53,7 @@ proptest = { workspace = true }
 syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
 # The in-process bus the integration-test dispatcher narrates onto.
 syntheos-axon = { path = "../syntheos-axon" }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Supervisor regression tests create FIFOs to prove special files cannot block the scanner.
+libc = "0.2"

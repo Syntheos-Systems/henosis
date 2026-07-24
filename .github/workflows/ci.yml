@@ -25,6 +25,7 @@ jobs:
       - run: cargo +1.88.0 fmt --all --check
       - run: cargo +1.88.0 clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
       - run: cargo +1.88.0 test --locked --workspace --exclude henosis-cognition
+      - run: cargo +1.88.0 test --locked -p synapse-tools --features henosis-pistis henosis_tests
       - run: ./scripts/stub-scan.sh
 
   cognition:
@@ -95,6 +96,10 @@ jobs:
           rustup target add --toolchain 1.88.0 x86_64-pc-windows-msvc
       - shell: pwsh
         run: cargo +1.88.0 test --locked -p synapse-tools confined_fs::tests --target x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: cargo +1.88.0 test --locked -p henosis-eidolon supervisor::tests --target x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: cargo +1.88.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
       - shell: pwsh
         run: |
           cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target x86_64-pc-windows-msvc

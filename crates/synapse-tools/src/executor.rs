@@ -187,6 +187,47 @@ mod tests {
         assert!(!root.path().join("denied.txt").exists());
     }
 
+    /// A write-only edit grant cannot inspect, disclose, or modify target contents.
+    #[tokio::test]
+    async fn write_only_edit_cannot_disclose_file_contents() {
+        let root = tempfile::tempdir().expect("task root");
+        let secret_path = root.path().join("secret.txt");
+        std::fs::write(&secret_path, "TOP_SECRET").expect("write secret");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::edit::EditTool));
+        let gate = crate::PistisGate::from_granted_capabilities(
+            [crate::Capability::new(crate::Capability::FS_WRITE)],
+            Arc::new(crate::tool::PermissiveGate),
+        );
+        let executor = ToolRegistryExecutor::new(
+            Arc::new(registry),
+            root.path().to_path_buf(),
+            Arc::new(gate),
+        )
+        .expect("provider executor");
+
+        let result = executor
+            .execute_tool(
+                "edit",
+                serde_json::json!({
+                    "file_path": "secret.txt",
+                    "old_string": "",
+                    "new_string": "",
+                    "replace_all": true
+                }),
+            )
+            .await
+            .expect("provider result");
+
+        assert!(result.is_error);
+        assert!(result.output.contains(crate::Capability::FS_READ));
+        assert!(!result.output.contains("TOP_SECRET"));
+        assert_eq!(
+            std::fs::read_to_string(secret_path).expect("read unchanged secret"),
+            "TOP_SECRET"
+        );
+    }
+
     /// Confirms provider tools keep the original root after its ambient path is replaced.
     #[cfg(unix)]
     #[tokio::test]

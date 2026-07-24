@@ -12,10 +12,11 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Capability(pub String);
 
+/// Provides construction and string access for named capabilities.
 impl Capability {
-    /// Filesystem read access (read, grep, glob, ls, lsp, session).
+    /// Filesystem read access (read, edit, grep, glob, ls, lsp, session).
     pub const FS_READ: &'static str = "fs_read";
-    /// Filesystem write access (write, edit).
+    /// Filesystem write access (write and edit).
     pub const FS_WRITE: &'static str = "fs_write";
     /// Shell command execution (bash, delegate, forge_execute).
     pub const BASH: &'static str = "bash";
@@ -33,7 +34,9 @@ impl Capability {
     }
 }
 
+/// Renders a capability as its stable authorization name.
 impl std::fmt::Display for Capability {
+    /// Write the capability name without additional formatting.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }

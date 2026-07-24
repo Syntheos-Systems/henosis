@@ -148,8 +148,9 @@ pub(crate) fn capability_map() -> HashMap<&'static str, Vec<Capability>> {
         ("ls", vec![fs_read()]),
         // Filesystem writes
         ("write", vec![fs_write()]),
-        ("edit", vec![fs_write()]),
-        // Filesystem read+write (delegate may read and write)
+        // Filesystem reads and writes
+        ("edit", vec![fs_read(), fs_write()]),
+        // Delegation may read, write, and execute commands
         ("delegate_task", vec![fs_read(), fs_write(), bash()]),
         // Network
         ("web_fetch", vec![network()]),
@@ -503,11 +504,20 @@ pub mod henosis {
             if decision.allowed {
                 AuthorizationOutcome::Allow
             } else {
-                AuthorizationOutcome::Deny(
-                    decision
-                        .reason
-                        .unwrap_or_else(|| "capability denied".to_owned()),
-                )
+                let mut reason = decision
+                    .reason
+                    .unwrap_or_else(|| "capability denied".to_owned());
+                if !decision.missing.is_empty() {
+                    let missing = decision
+                        .missing
+                        .iter()
+                        .map(|requirement| requirement.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    reason.push_str(": ");
+                    reason.push_str(&missing);
+                }
+                AuthorizationOutcome::Deny(reason)
             }
         }
     }
@@ -568,6 +578,43 @@ mod tests {
             .before_execute("delegate_task", &Value::Null, Path::new("/tmp"))
             .await;
         assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+
+    /// Edit requires independent read and write grants before it may inspect a target.
+    #[tokio::test]
+    async fn edit_requires_read_and_write_capabilities() {
+        let write_only = PistisGate::from_granted_capabilities(
+            [Capability::new(Capability::FS_WRITE)],
+            Arc::new(PermissiveGate),
+        );
+        let write_only_decision = write_only
+            .before_execute("edit", &Value::Null, Path::new("/tmp"))
+            .await;
+        match write_only_decision {
+            GateDecision::Deny(reason) => assert!(reason.contains(Capability::FS_READ)),
+            GateDecision::Allow => panic!("write-only edit must be denied"),
+        }
+
+        let read_only = read_only_gate();
+        let read_only_decision = read_only
+            .before_execute("edit", &Value::Null, Path::new("/tmp"))
+            .await;
+        match read_only_decision {
+            GateDecision::Deny(reason) => assert!(reason.contains(Capability::FS_WRITE)),
+            GateDecision::Allow => panic!("read-only edit must be denied"),
+        }
+
+        let read_write = PistisGate::from_granted_capabilities(
+            [
+                Capability::new(Capability::FS_READ),
+                Capability::new(Capability::FS_WRITE),
+            ],
+            Arc::new(PermissiveGate),
+        );
+        let read_write_decision = read_write
+            .before_execute("edit", &Value::Null, Path::new("/tmp"))
+            .await;
+        assert!(matches!(read_write_decision, GateDecision::Allow));
     }
 
     /// Process and network tools cannot run with only filesystem-read access.
@@ -690,9 +737,12 @@ mod henosis_tests {
         }
     }
 
-    /// A room admitting `principal` holding the synapse `fs_read` and `bash`
-    /// capabilities under `ActionKind::Message`.
-    fn room_with(tenant: TenantId, principal: PrincipalId) -> (RoomState, RoomTrustStore) {
+    /// A room admitting `principal` with explicit capabilities under `ActionKind::Message`.
+    fn room_with_capabilities(
+        tenant: TenantId,
+        principal: PrincipalId,
+        capabilities: &[&str],
+    ) -> (RoomState, RoomTrustStore) {
         let scope = RoomScope::new(tenant, "!r");
         let (_, issuer_key) = SecretKey::generate();
         let (_, root_key) = SecretKey::generate();
@@ -714,7 +764,7 @@ mod henosis_tests {
                 principal,
                 principal_key.public_key(),
                 &root_key,
-                vec![mk(Capability::FS_READ), mk(Capability::BASH)],
+                capabilities.iter().map(|name| mk(name)).collect(),
             )],
         )
         .unwrap();
@@ -723,16 +773,26 @@ mod henosis_tests {
         (state, trust)
     }
 
-    /// Build a Henosis-backed gate whose room "!r" admits `principal`.
-    fn gate_for(principal: PrincipalId) -> PistisGate {
+    /// A room admitting `principal` with the baseline read and shell capabilities.
+    fn room_with(tenant: TenantId, principal: PrincipalId) -> (RoomState, RoomTrustStore) {
+        room_with_capabilities(tenant, principal, &[Capability::FS_READ, Capability::BASH])
+    }
+
+    /// Build a Henosis-backed gate with an explicit room capability set.
+    fn gate_for_capabilities(principal: PrincipalId, capabilities: &[&str]) -> PistisGate {
         let tenant = TenantId::new();
-        let (state, trust) = room_with(tenant, principal);
+        let (state, trust) = room_with_capabilities(tenant, principal, capabilities);
         let mut source = InMemoryRoomStateSource::new();
         source.insert(state);
         let authority =
             HenosisAuthority::new(Arc::new(source), Arc::new(trust), tenant, principal, "!r")
                 .with_clock(Arc::new(FixedClock(OffsetDateTime::now_utc())));
         PistisGate::with_authority(Arc::new(authority), Arc::new(PermissiveGate))
+    }
+
+    /// Build a Henosis-backed gate whose room "!r" admits `principal`.
+    fn gate_for(principal: PrincipalId) -> PistisGate {
+        gate_for_capabilities(principal, &[Capability::FS_READ, Capability::BASH])
     }
 
     /// A held capability (`read` -> `fs_read`) is allowed.
@@ -755,6 +815,38 @@ mod henosis_tests {
             .before_execute("write", &Value::Null, Path::new("/tmp"))
             .await;
         assert!(matches!(decision, GateDecision::Deny(_)));
+    }
+
+    /// Room-backed edit authorization requires both independent filesystem grants.
+    #[tokio::test]
+    async fn henosis_edit_requires_read_and_write_capabilities() {
+        let principal = PrincipalId::new();
+        let write_only = gate_for_capabilities(principal, &[Capability::FS_WRITE]);
+        match write_only
+            .before_execute("edit", &Value::Null, Path::new("/tmp"))
+            .await
+        {
+            GateDecision::Deny(reason) => assert!(reason.contains(Capability::FS_READ)),
+            GateDecision::Allow => panic!("room-backed write-only edit must be denied"),
+        }
+
+        let read_only = gate_for_capabilities(principal, &[Capability::FS_READ]);
+        match read_only
+            .before_execute("edit", &Value::Null, Path::new("/tmp"))
+            .await
+        {
+            GateDecision::Deny(reason) => assert!(reason.contains(Capability::FS_WRITE)),
+            GateDecision::Allow => panic!("room-backed read-only edit must be denied"),
+        }
+
+        let read_write =
+            gate_for_capabilities(principal, &[Capability::FS_READ, Capability::FS_WRITE]);
+        assert!(matches!(
+            read_write
+                .before_execute("edit", &Value::Null, Path::new("/tmp"))
+                .await,
+            GateDecision::Allow
+        ));
     }
 
     /// A tool with no mapped policy is denied regardless of room state.

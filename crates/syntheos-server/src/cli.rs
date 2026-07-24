@@ -1416,38 +1416,86 @@ fn valid_environment_key(key: &str) -> bool {
     characters.all(|character| character.is_ascii_alphanumeric() || character == b'_')
 }
 
-/// Opens an existing configuration only after proving its path names a stable regular file.
+/// Opens an operator-selected local configuration through one validated descriptor.
+#[cfg(any(unix, windows))]
 fn open_regular_config(path: &Path) -> Result<File, CliError> {
-    let before = fs::symlink_metadata(path).map_err(|source| CliError::Filesystem {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| classify_config_open_error(path, source))?;
+    let opened = file.metadata().map_err(|source| CliError::Filesystem {
         path: path.to_path_buf(),
         source,
     })?;
-    if !before.file_type().is_file() {
+    if !opened.file_type().is_file() {
         return Err(unexpected_path_type(
             path,
             "regular file",
             LocalPathState::UnsafeOrUnexpected,
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|source| CliError::Filesystem {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let opened = file.metadata().map_err(|source| CliError::Filesystem {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !opened.file_type().is_file() || !metadata_identity_matches(&before, &opened) {
-        return Err(unexpected_path_type(
-            path,
-            "stable regular file",
-            LocalPathState::UnsafeOrUnexpected,
-        ));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileType, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_DISK,
+        };
+
+        // SAFETY: the raw handle remains owned and valid for the duration of this call.
+        let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || file_type != FILE_TYPE_DISK
+        {
+            return Err(unexpected_path_type(
+                path,
+                "non-reparse local disk file",
+                LocalPathState::UnsafeOrUnexpected,
+            ));
+        }
     }
     Ok(file)
+}
+
+/// Fails closed where the runtime has no descriptor-level no-follow implementation.
+#[cfg(not(any(unix, windows)))]
+fn open_regular_config(path: &Path) -> Result<File, CliError> {
+    Err(CliError::InvalidConfiguration {
+        path: path.to_path_buf(),
+        line: 0,
+        reason: "secure configuration opens are unsupported on this platform",
+    })
+}
+
+/// Classify no-follow rejections without performing a pathname precheck.
+#[cfg(any(unix, windows))]
+fn classify_config_open_error(path: &Path, source: io::Error) -> CliError {
+    #[cfg(unix)]
+    if source.raw_os_error() == Some(libc::ELOOP) {
+        return unexpected_path_type(path, "regular file", LocalPathState::UnsafeOrUnexpected);
+    }
+    CliError::Filesystem {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// Opens a stable regular configuration and rejects non-owner Unix permission bits.
@@ -1573,20 +1621,6 @@ fn unexpected_path_type(path: &Path, expected: &'static str, state: LocalPathSta
         expected,
         found,
     }
-}
-
-/// Confirms an opened Unix file is the same inode observed before opening its path.
-#[cfg(unix)]
-fn metadata_identity_matches(before: &fs::Metadata, opened: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    before.dev() == opened.dev() && before.ino() == opened.ino()
-}
-
-/// Uses regular-file checks as the stable identity boundary where inode metadata is unavailable.
-#[cfg(not(unix))]
-fn metadata_identity_matches(_before: &fs::Metadata, _opened: &fs::Metadata) -> bool {
-    true
 }
 
 /// Rejects Unix configuration files accessible by group or other users.
@@ -2146,6 +2180,47 @@ mod tests {
             load_local_environment(&paths),
             Err(CliError::UnexpectedPathType { .. })
         ));
+        remove_temporary_home(&home);
+    }
+
+    /// Refuses a Windows file reparse point before reading its target as configuration.
+    #[cfg(windows)]
+    #[test]
+    fn local_environment_loader_refuses_windows_symbolic_link() {
+        use std::os::windows::fs::symlink_file;
+
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        fs::create_dir_all(&paths.home).expect("create test home");
+        let target = paths.home.join("target.env");
+        fs::write(&target, "SAFE=value\n").expect("write target");
+        symlink_file(&target, &paths.config).expect("create config symlink");
+
+        load_local_environment(&paths).expect_err("Windows config symlink must be rejected");
+
+        remove_temporary_home(&home);
+    }
+
+    /// Refuses a Unix FIFO through a nonblocking configuration open.
+    #[cfg(unix)]
+    #[test]
+    fn local_environment_loader_refuses_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        fs::create_dir_all(&paths.home).expect("create test home");
+        let encoded =
+            CString::new(paths.config.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `encoded` is a live NUL-terminated path and the mode is valid.
+        let result = unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "create FIFO: {}", io::Error::last_os_error());
+        assert!(matches!(
+            load_local_environment(&paths),
+            Err(CliError::UnexpectedPathType { .. })
+        ));
+
         remove_temporary_home(&home);
     }
 
