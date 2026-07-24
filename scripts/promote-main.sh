@@ -12,10 +12,33 @@ die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
 # Require the GitHub CLI before changing any remote references.
 require_gh() { command -v gh >/dev/null 2>&1 || die 'gh CLI is required'; }
 
-# Verify that the GitHub-attributed author of the exact commit is Ghost-Frame.
+# Verify the local candidate has the exact trusted identity and signature.
+verify_local_identity() {
+    sha=$1
+    [ "$(git show -s --format='%an <%ae>' "$sha")" = 'GhostFrame <ghostframe@girbox.org>' ] ||
+        die "candidate $sha has the wrong author identity"
+    [ "$(git show -s --format='%cn <%ce>' "$sha")" = 'GhostFrame <ghostframe@girbox.org>' ] ||
+        die "candidate $sha has the wrong committer identity"
+    git verify-commit "$sha" >/dev/null 2>&1 ||
+        die "candidate $sha lacks a trusted GhostFrame signature"
+}
+
+# Verify that GitHub attributes the remotely visible exact commit to Ghost-Frame.
 verify_actor() {
-    actor=$(gh api "repos/$REPOSITORY/commits/$1" --jq '.author.login // empty')
-    [ "$actor" = Ghost-Frame ] || die "candidate $1 is not attributed to Ghost-Frame"
+    for attempt in $(seq 1 10); do
+        if actor=$(gh api "repos/$REPOSITORY/commits/$1" --jq '.author.login // empty' 2>/dev/null); then
+            [ "$actor" = Ghost-Frame ]
+            return
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Remove only the isolated candidate ref after a remote trust failure.
+discard_candidate() {
+    git push origin --delete "candidate/$1" ||
+        die "candidate $1 failed attribution and its remote ref could not be removed"
 }
 
 # Wait until each named check reaches a successful terminal conclusion.
@@ -48,8 +71,12 @@ main() {
     [ "$#" -eq 1 ] || die "usage: $0 CANDIDATE_SHA"
     sha=$(git rev-parse --verify "$1^{commit}") || die 'candidate must resolve to a commit'
     require_gh
-    verify_actor "$sha"
+    verify_local_identity "$sha"
     git push origin "$sha:refs/heads/candidate/$sha"
+    if ! verify_actor "$sha"; then
+        discard_candidate "$sha"
+        die "candidate $sha is not attributed to Ghost-Frame"
+    fi
     wait_for_checks "$sha"
     main_sha=$(git ls-remote origin refs/heads/main | awk '{print $1}')
     git merge-base --is-ancestor "$main_sha" "$sha" || die 'candidate is not a fast-forward of main'

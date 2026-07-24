@@ -48,12 +48,17 @@ printf '%s\n' \
     '        printf "Release package contract\tcompleted\tsuccess\n"' \
     '        printf "Windows release package contract\tcompleted\tsuccess\n"' \
     '        ;;' \
-    '    *) printf "%s\n" Ghost-Frame ;;' \
+    '    *)' \
+    '        grep -F "push origin $FAKE_CANDIDATE_SHA:refs/heads/candidate/$FAKE_CANDIDATE_SHA" "$PROMOTION_LOG" >/dev/null || exit 70' \
+    '        printf "%s\n" "${FAKE_GITHUB_ACTOR:-Ghost-Frame}"' \
+    '        ;;' \
     'esac' > "$fake_bin/gh"
 printf '%s\n' \
     '#!/bin/sh' \
     'case "$1" in' \
     '    rev-parse) printf "%s\n" "$FAKE_CANDIDATE_SHA" ;;' \
+    '    show) printf "%s\n" "GhostFrame <ghostframe@girbox.org>" ;;' \
+    '    verify-commit) [ "${FAKE_SIGNATURE_STATUS:-valid}" = valid ] ;;' \
     '    push) printf "%s\n" "$*" >> "$PROMOTION_LOG" ;;' \
     '    ls-remote) printf "%s\trefs/heads/main\n" "$FAKE_MAIN_SHA" ;;' \
     '    merge-base) exit 0 ;;' \
@@ -61,6 +66,30 @@ printf '%s\n' \
     'esac' > "$fake_bin/git"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/sleep"
 chmod 755 "$fake_bin/gh" "$fake_bin/git" "$fake_bin/sleep"
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_SIGNATURE_STATUS=invalid \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-signature.log" 2>&1
+then
+    fail 'promotion accepted an untrusted local signature'
+fi
+grep -F 'lacks a trusted GhostFrame signature' "$TEST_DIRECTORY/promotion-signature.log" >/dev/null || fail 'local signature check failed for the wrong reason'
+if grep -F 'refs/heads/candidate/' "$promotion_log" >/dev/null; then
+    fail 'promotion pushed an untrusted local candidate'
+fi
+
+: > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_GITHUB_ACTOR=Other-User \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-actor.log" 2>&1
+then
+    fail 'promotion accepted the wrong GitHub-attributed actor'
+fi
+grep -F 'is not attributed to Ghost-Frame' "$TEST_DIRECTORY/promotion-actor.log" >/dev/null || fail 'GitHub actor check failed for the wrong reason'
+grep -F "push origin $candidate_sha:refs/heads/candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not publish the isolated candidate before remote attribution'
+grep -F 'push origin --delete candidate/' "$promotion_log" >/dev/null || fail 'promotion did not remove the rejected candidate'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed main for the wrong GitHub-attributed actor'
+fi
 
 : > "$promotion_log"
 if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=missing \
