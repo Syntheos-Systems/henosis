@@ -26,7 +26,6 @@ use cap_primitives::fs::FollowSymlinks;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use lru::LruCache;
-use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
 use syntheos_axon::AxonBus;
 use syntheos_contracts::{PrincipalId, TenantId, TypedEvent};
