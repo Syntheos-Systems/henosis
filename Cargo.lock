@@ -8451,7 +8451,7 @@ dependencies = [
 
 [[package]]
 name = "syntheos-server"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "axum",

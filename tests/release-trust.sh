@@ -24,6 +24,11 @@ require_line() { grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"; }
 [ "$(grep -Fc 'git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main' "$WORKFLOW")" -eq 2 ] ||
     fail 'release ancestry must be verified before build and publication'
 require_line "$WORKFLOW" 'environment: release'
+[ "$(grep -Fc "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" "$WORKFLOW")" -eq 3 ] ||
+    fail 'release jobs must run only for v-tag push events'
+if grep -F 'workflow_dispatch:' "$WORKFLOW" >/dev/null; then
+    fail 'release workflow must not expose a manual dispatch path'
+fi
 require_line "$WORKFLOW" 'RELEASE_ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}'
 require_line "$WORKFLOW" 'gpg.ssh.allowedSignersFile "$RUNNER_TEMP/release-allowed-signers"'
 require_line "$WORKFLOW" 'attestations: write'
@@ -41,19 +46,27 @@ require_line "$WORKFLOW" 'push-to-registry: true'
 require_line "$WORKFLOW" 'HENOSIS_IMAGE_REFERENCE=%s@sha256:%s'
 require_line "$WORKFLOW" 'container-image.env'
 require_line "$WORKFLOW" '--generate-notes --verify-tag'
-require_line "$WORKFLOW" 'immutable-releases" --jq .enabled'
+require_line "$WORKFLOW" 'v0.1.0-alpha.3 was not published because its release workflow failed before asset upload.'
+require_line "$WORKFLOW" '--notes-start-tag v0.1.0-alpha.2'
 require_line "$WORKFLOW" 'git ls-remote --exit-code --tags origin "refs/tags/$GITHUB_REF_NAME"'
 require_line "$WORKFLOW" '--jq .immutable'
+if grep -F 'repos/$GITHUB_REPOSITORY/immutable-releases' "$WORKFLOW" >/dev/null; then
+    fail 'workflow token cannot read the immutable release administration endpoint'
+fi
 require_line "$REPOSITORY_DIR/install.sh" 'release_metadata_fields'
+require_line "$REPOSITORY_DIR/install.sh" 'VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.4}'
 require_line "$REPOSITORY_DIR/install.ps1" '$metadata.immutable -ne $true'
+require_line "$REPOSITORY_DIR/install.ps1" "else { 'v0.1.0-alpha.4' }"
+require_line "$REPOSITORY_DIR/crates/syntheos-server/Cargo.toml" 'version = "0.1.0-alpha.4"'
+require_line "$REPOSITORY_DIR/Cargo.lock" 'version = "0.1.0-alpha.4"'
 require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.sh"
 require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.ps1"
-require_line "$README" '| sh -s -- --version v0.1.0-alpha.3'
+require_line "$README" '| sh -s -- --version v0.1.0-alpha.4'
 require_line "$README" '-OutFile $installer'
 require_line "$README" '$powerShell = (Get-Process -Id $PID).Path'
 require_line "$README" '& $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version'
 require_line "$README" 'if ($LASTEXITCODE -ne 0)'
-require_line "$README" "-Version 'v0.1.0-alpha.3'"
+require_line "$README" "-Version 'v0.1.0-alpha.4'"
 if sed -n 's/.*uses:[[:space:]]*[^@]*@\([^ #]*\).*/\1/p' "$WORKFLOW" |
     grep -Ev '^[0-9a-f]{40}$' >/dev/null; then
     fail 'workflow contains an action that is not pinned to a full commit'
