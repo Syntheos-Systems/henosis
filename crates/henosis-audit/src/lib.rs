@@ -660,10 +660,7 @@ impl AuditStore {
         let connection = self.lock_connection()?;
         connection
             .query_row(
-                &format!(
-                    "{} WHERE tenant_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                    SELECT_RECORD
-                ),
+                &format!("{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence DESC LIMIT 1"),
                 [tenant_id],
                 record_from_row,
             )
@@ -676,8 +673,7 @@ impl AuditStore {
         validate_identifier("tenant id", tenant_id)?;
         let connection = self.lock_connection()?;
         let mut statement = connection.prepare(&format!(
-            "{} WHERE tenant_id = ?1 ORDER BY sequence ASC",
-            SELECT_RECORD
+            "{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence ASC"
         ))?;
         let records = statement
             .query_map([tenant_id], record_from_row)?
@@ -1143,7 +1139,7 @@ fn load_record(
 ) -> Result<Option<AuditRecord>, AuditError> {
     connection
         .query_row(
-            &format!("{} WHERE tenant_id = ?1 AND sequence = ?2", SELECT_RECORD),
+            &format!("{SELECT_RECORD} WHERE tenant_id = ?1 AND sequence = ?2"),
             params![tenant_id, sequence],
             record_from_row,
         )
@@ -1162,9 +1158,8 @@ fn load_by_idempotency(
     transaction
         .query_row(
             &format!(
-                "{} WHERE tenant_id = ?1 AND principal_id = ?2 AND phase = ?3
-                    AND idempotency_key = ?4",
-                SELECT_RECORD
+                "{SELECT_RECORD} WHERE tenant_id = ?1 AND principal_id = ?2 AND phase = ?3
+                    AND idempotency_key = ?4"
             ),
             params![tenant_id, principal_id, phase_name(phase), idempotency_key],
             record_from_row,
@@ -1183,8 +1178,7 @@ fn load_execution_record(
     connection
         .query_row(
             &format!(
-                "{} WHERE tenant_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3",
-                SELECT_EXECUTION_RECORD
+                "{SELECT_EXECUTION_RECORD} WHERE tenant_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3"
             ),
             params![tenant_id, principal_id, idempotency_key],
             execution_record_from_row,
