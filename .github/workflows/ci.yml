@@ -30,6 +30,8 @@ jobs:
   cognition:
     name: Cognition quality
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -y libpcsclite-dev libpq-dev libssl-dev pkg-config protobuf-compiler ripgrep
@@ -46,8 +48,8 @@ jobs:
             echo "Henosis source reached into an excluded Kleos execution module" >&2
             exit 1
           fi
-      - name: Test default Kleos surface
-        run: cargo +1.94.0 test --locked --manifest-path vendor/kleos/Cargo.toml -p kleos-lib
+      - name: Test default Kleos library surface
+        run: cargo +1.94.0 test --locked --manifest-path vendor/kleos/Cargo.toml -p kleos-lib --lib
       - run: cargo +1.94.0 test --locked -p henosis-cognition -p syntheos-server -p henosis-rift-bridge --features syntheos-server/cognition,henosis-rift-bridge/cognition
 
   dependencies:
