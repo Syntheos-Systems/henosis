@@ -834,6 +834,18 @@ async fn run_task_loop(
     }
 }
 
+/// Build a short, Unicode-safe title for a human-in-the-loop alert.
+fn hitl_title(question: &str) -> String {
+    format!("HITL: {}", question.chars().take(80).collect::<String>())
+}
+
+/// Convenience: fetch the current record and mirror it to Kleos.
+async fn mirror_to_kleos(clients: &Clients, store: &TaskStore, id: &str) {
+    if let Some(rec) = store.get(id).await {
+        clients.kleos_store_task(&rec).await;
+    }
+}
+
 #[cfg(test)]
 /// Focused task presentation tests.
 mod tests {
@@ -845,17 +857,5 @@ mod tests {
 
         assert_eq!(title, format!("HITL: {}", "💥".repeat(80)));
         assert_eq!(title.chars().count(), 86);
-    }
-}
-
-/// Build a short, Unicode-safe title for a human-in-the-loop alert.
-fn hitl_title(question: &str) -> String {
-    format!("HITL: {}", question.chars().take(80).collect::<String>())
-}
-
-/// Convenience: fetch the current record and mirror it to Kleos.
-async fn mirror_to_kleos(clients: &Clients, store: &TaskStore, id: &str) {
-    if let Some(rec) = store.get(id).await {
-        clients.kleos_store_task(&rec).await;
     }
 }

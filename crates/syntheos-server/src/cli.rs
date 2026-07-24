@@ -1892,7 +1892,7 @@ mod tests {
             assert!(configured.is_absolute());
             assert_eq!(configured, canonical_data.join(filename));
         }
-        assert_eq!(doctor(&paths).expect("doctor").local_ready, true);
+        assert!(doctor(&paths).expect("doctor").local_ready);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

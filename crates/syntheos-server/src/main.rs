@@ -562,7 +562,7 @@ fn validate_phylaxd_config(local_mode: bool) -> Result<(), String> {
     }
     let loopback_host = is_loopback_url_host(url.host_str().unwrap_or_default());
     let secure_transport = url.scheme() == "https";
-    if !secure_transport && !(url.scheme() == "http" && loopback_host) {
+    if !(secure_transport || url.scheme() == "http" && loopback_host) {
         return Err("PHYLAXD_URL must use HTTPS unless it targets loopback".to_string());
     }
     match config.phylaxd_token.as_deref() {
