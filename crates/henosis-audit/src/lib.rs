@@ -685,9 +685,8 @@ impl AuditStore {
             .query_map([tenant_id], record_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut expected_sequence = 1_u64;
         let mut expected_previous = GENESIS_HASH.to_owned();
-        for record in &records {
+        for (expected_sequence, record) in (1_u64..).zip(records.iter()) {
             if record.sequence != expected_sequence {
                 return Err(verification_error(record.sequence, "sequence gap"));
             }
@@ -715,7 +714,6 @@ impl AuditStore {
                 return Err(verification_error(record.sequence, "event hash mismatch"));
             }
             expected_previous.clone_from(&record.event_hash);
-            expected_sequence += 1;
         }
         Ok(records.len() as u64)
     }

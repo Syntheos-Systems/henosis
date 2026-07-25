@@ -313,11 +313,11 @@ impl CronScheduler {
             }
         }
 
-        if !due.is_empty() {
-            if let Err(error) = self.save() {
-                self.jobs = prior_jobs;
-                return Err(error);
-            }
+        if !due.is_empty()
+            && let Err(error) = self.save()
+        {
+            self.jobs = prior_jobs;
+            return Err(error);
         }
 
         Ok(due)

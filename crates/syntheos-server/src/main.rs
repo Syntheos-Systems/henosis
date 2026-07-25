@@ -38,7 +38,7 @@ use syntheos_server::billing::BillingState;
 use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, InitMode, RunResult};
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{
-    production_router, public_gate_chain, spawn_action_reactor, AppState, HenosisExecutor,
+    public_gate_chain, runtime_router, spawn_action_reactor, AppState, HenosisExecutor,
     SomaQualitySink,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -459,7 +459,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resource limits around the whole surface: cap the body size, time out slow requests, and
     // bound how many run concurrently.
-    let app = production_router(state)
+    let app = runtime_router(state, local_mode)
         .layer(GlobalConcurrencyLimitLayer::new(MAX_IN_FLIGHT))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

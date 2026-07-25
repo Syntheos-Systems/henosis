@@ -167,10 +167,7 @@ fn parse_origin_keys(
                 .try_into()
                 .map_err(|_| invalid_data("origin public key must contain 32 bytes"))?;
             let verifying_key = VerifyingKey::from_bytes(&key)?;
-            Ok((
-                key_id,
-                TrustedOrigin::new(verifying_key, tenant_ids.into_iter())?,
-            ))
+            Ok((key_id, TrustedOrigin::new(verifying_key, tenant_ids)?))
         })
         .collect()
 }

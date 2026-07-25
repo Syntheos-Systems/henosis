@@ -74,6 +74,11 @@ case "$method $url" in
             "${FAKE_TASK_ID:-33333333-3333-8333-8333-333333333333}"
         ;;
     'POST http://127.0.0.1:8088/dispatch')
+        printf '%s' "$body" | grep -F '"room": "!henosis-local:loopback"' >/dev/null \
+            || {
+                printf 'dispatch payload omitted the stable local room\n' >&2
+                exit 2
+            }
         if printf '%s' "$body" | grep -F 'ignore previous instructions' >/dev/null; then
             gate=${FAKE_DENIED_GATE:-eidolon}
             printf '{"Denied":{"gate":"%s","reason":"hostile input"}}' "$gate"

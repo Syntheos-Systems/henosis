@@ -40,8 +40,14 @@ const SERVER_NAME: &str = "hermes";
 /// Return `true` when `HERMES_MCP_ENABLED` is set to a truthy value. Off by
 /// default so the bridge must be explicitly opted into.
 pub fn is_enabled() -> bool {
-    std::env::var("HERMES_MCP_ENABLED")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    let value = std::env::var("HERMES_MCP_ENABLED").ok();
+    value_is_enabled(value.as_deref())
+}
+
+/// Interpret an optional Unicode environment value using the MCP opt-in policy.
+fn value_is_enabled(value: Option<&str>) -> bool {
+    value
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
 
@@ -356,22 +362,16 @@ mod tests {
     #[test]
     /// Verifies enabled default off.
     fn enabled_default_off() {
-        std::env::remove_var("HERMES_MCP_ENABLED");
-        assert!(!is_enabled());
+        assert!(!value_is_enabled(None));
     }
 
     #[test]
     /// Verifies enabled when true.
     fn enabled_when_true() {
-        std::env::set_var("HERMES_MCP_ENABLED", "true");
-        assert!(is_enabled());
-        std::env::set_var("HERMES_MCP_ENABLED", "1");
-        assert!(is_enabled());
-        std::env::set_var("HERMES_MCP_ENABLED", "0");
-        assert!(!is_enabled());
-        std::env::set_var("HERMES_MCP_ENABLED", "false");
-        assert!(!is_enabled());
-        std::env::remove_var("HERMES_MCP_ENABLED");
+        assert!(value_is_enabled(Some("true")));
+        assert!(value_is_enabled(Some("1")));
+        assert!(!value_is_enabled(Some("0")));
+        assert!(!value_is_enabled(Some("false")));
     }
 
     /// Both legacy aliases are stripped and cannot select a foreign tenant.

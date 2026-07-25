@@ -32,10 +32,11 @@ use henosis_thymus::{
 };
 use serde::Deserialize;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{Gate, RunId, Timestamp, WorkflowId};
+use syntheos_contracts::{AuthorityContext, Gate, RunId, Timestamp, WorkflowId};
 use syntheos_contracts::{GateRequest, Principal, PrincipalId, PrincipalKind, TaskId, TenantId};
 use syntheos_dispatch::{DispatchOutcome, Dispatcher};
 use syntheos_identity::PrincipalDirectory;
+use uuid::Uuid;
 
 use crate::authority::{DurableHumanGate, PhylaxdGate};
 
@@ -44,6 +45,9 @@ const DEFAULT_TASK_ACTIVITY_LIMIT: usize = 100;
 
 /// Hard ceiling for one task activity response.
 const MAX_TASK_ACTIVITY_LIMIT: usize = 500;
+
+/// Server-owned token identity attached only to trusted loopback compatibility dispatches.
+const LOCAL_COMPATIBILITY_TOKEN_IDENTITY: &str = "local-loopback-compatibility";
 
 /// The foundation wired together once at boot and shared with every handler.
 ///
@@ -417,6 +421,19 @@ pub fn router(state: AppState) -> Router {
     app
 }
 
+/// Select the HTTP surface for a validated runtime policy mode.
+///
+/// Explicit local policy mode receives the loopback-compatible kernel routes used by the
+/// installer workflow. Every other boot receives the restricted production surface so an
+/// invalid or absent local configuration cannot expose caller-asserted compatibility routes.
+pub fn runtime_router(state: AppState, local_mode: bool) -> Router {
+    if local_mode {
+        router(state)
+    } else {
+        production_router(state)
+    }
+}
+
 /// Build the public production router without caller-asserted legacy kernel routes.
 ///
 /// Only liveness, version, authenticated operator routes, authenticated `/api/v1` authority
@@ -582,8 +599,13 @@ async fn enroll(
 /// only a genuine execution failure returns `500`.
 async fn dispatch(
     State(state): State<AppState>,
-    Json(req): Json<GateRequest>,
+    Json(mut req): Json<GateRequest>,
 ) -> Result<Json<DispatchOutcome>, (StatusCode, String)> {
+    req.context.authority = Some(AuthorityContext {
+        token_identity: LOCAL_COMPATIBILITY_TOKEN_IDENTITY.to_string(),
+        idempotency_key: Uuid::new_v4().to_string(),
+        approval_id: None,
+    });
     state
         .dispatcher
         .dispatch(req)
@@ -1725,6 +1747,7 @@ mod tests {
     use axum::http::Request;
     use syntheos_dispatch::deny::{deny_gate_chain, DenyExecutor};
     use syntheos_dispatch::stubs::{stub_gate_chain, EchoExecutor};
+    use syntheos_dispatch::{Executor, ExecutorError};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
 
@@ -1791,6 +1814,60 @@ mod tests {
             #[cfg(feature = "cognition")]
             test_cognition(),
         )
+    }
+
+    /// Test executor that returns the authority facts received from the compatibility handler.
+    struct AuthorityEchoExecutor;
+
+    #[async_trait]
+    /// Echoes only server-derived authority facts for compatibility-boundary assertions.
+    impl Executor for AuthorityEchoExecutor {
+        /// Return the authority context or fail when the handler omitted it.
+        async fn execute(
+            &self,
+            context: &syntheos_contracts::RequestContext,
+            _invocation: &syntheos_contracts::ToolInvocation,
+        ) -> Result<serde_json::Value, ExecutorError> {
+            let authority = context
+                .authority
+                .as_ref()
+                .ok_or_else(|| ExecutorError::new("authority missing"))?;
+            Ok(serde_json::json!({
+                "token_identity": authority.token_identity,
+                "idempotency_key": authority.idempotency_key,
+                "approval_id": authority.approval_id,
+            }))
+        }
+    }
+
+    /// Runtime selection exposes task compatibility routes only in validated local mode.
+    #[tokio::test]
+    async fn runtime_router_mounts_kernel_routes_only_in_local_mode() {
+        let local_response = runtime_router(test_state(), true)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chiasm/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("local request"),
+            )
+            .await
+            .expect("local response");
+        assert_ne!(local_response.status(), StatusCode::NOT_FOUND);
+
+        let production_response = runtime_router(test_state(), false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chiasm/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("production request"),
+            )
+            .await
+            .expect("production response");
+        assert_eq!(production_response.status(), StatusCode::NOT_FOUND);
     }
 
     /// Build an explicit deny-by-default app state for fallback-path tests.
@@ -2435,6 +2512,67 @@ mod tests {
         // DispatchOutcome::Executed { result } serializes externally-tagged.
         assert_eq!(out["Executed"]["result"]["echoed"], true);
         assert_eq!(out["Executed"]["result"]["tool"], "kleos");
+    }
+
+    #[tokio::test]
+    /// Compatibility dispatch replaces caller authority with server-owned local facts.
+    async fn dispatch_replaces_caller_authority() {
+        let mut state = test_state();
+        state.dispatcher = Arc::new(
+            Dispatcher::new(
+                stub_gate_chain(),
+                Box::new(AuthorityEchoExecutor),
+                state.bus.clone(),
+            )
+            .expect("authority echo dispatcher"),
+        );
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let body = serde_json::json!({
+            "context": {
+                "tenant": tenant,
+                "principal": principal,
+                "persona": null,
+                "session": null,
+                "room": "!henosis-local:loopback",
+                "task": null,
+                "workflow": null,
+                "authority": {
+                    "token_identity": "caller-controlled",
+                    "idempotency_key": "caller-controlled",
+                    "approval_id": null
+                }
+            },
+            "invocation": {
+                "tool": "henosis",
+                "action": "probe",
+                "args": {}
+            }
+        });
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dispatch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("compatibility request"),
+            )
+            .await
+            .expect("compatibility response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).expect("outcome json");
+        let result = &outcome["Executed"]["result"];
+        assert_eq!(result["token_identity"], LOCAL_COMPATIBILITY_TOKEN_IDENTITY);
+        assert_ne!(result["idempotency_key"], "caller-controlled");
+        assert!(Uuid::parse_str(
+            result["idempotency_key"]
+                .as_str()
+                .expect("idempotency key string")
+        )
+        .is_ok());
+        assert!(result["approval_id"].is_null());
     }
 
     #[test]

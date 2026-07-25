@@ -3621,9 +3621,9 @@ dependencies = [
  "notify-debouncer-mini",
  "proptest",
  "regex",
+ "same-file",
  "serde",
  "serde_json",
- "same-file",
  "syntheos-axon",
  "syntheos-contracts",
  "syntheos-dispatch",
@@ -8451,7 +8451,7 @@ dependencies = [
 
 [[package]]
 name = "syntheos-server"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "async-trait",
  "axum",

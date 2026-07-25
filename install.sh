@@ -6,7 +6,7 @@ set -eu
 PROGRAM=henosis-installer
 RELEASE_BASE=${HENOSIS_RELEASE_BASE:-https://github.com/Syntheos-Systems/henosis/releases/download}
 RELEASE_API=${HENOSIS_RELEASE_API:-https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags}
-VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.5}
+VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.6}
 INSTALL_DIR=${HENOSIS_INSTALL_DIR:-"${HOME}/.local/bin"}
 HEADLESS=0
 
@@ -35,7 +35,7 @@ verifies its mandatory SHA-256 checksum, installs it per-user, and runs:
   henosis init --quick
 
 Environment:
-  HENOSIS_VERSION       Release tag, default v0.1.0-alpha.5
+  HENOSIS_VERSION       Release tag, default v0.1.0-alpha.6
   HENOSIS_RELEASE_BASE  Release download base URL
   HENOSIS_RELEASE_API   Release metadata API base URL
   HENOSIS_INSTALL_DIR   Destination directory, default ~/.local/bin

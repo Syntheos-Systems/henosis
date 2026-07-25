@@ -48,8 +48,8 @@ pub mod operator;
 
 pub use action_reactor::spawn_action_reactor;
 pub use app::{
-    eidolon_gate, live_gate_chain, production_router, public_gate_chain, router, AppState,
-    BrocaFeedQuery, BrocaLogRequest, BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery,
+    eidolon_gate, live_gate_chain, production_router, public_gate_chain, router, runtime_router,
+    AppState, BrocaFeedQuery, BrocaLogRequest, BrocaTenantQuery, ChiasmCreateTask, ChiasmListQuery,
     ChiasmOwnerQuery, EnrollRequest, LiveGateDependencies, LoomCompleteStep, LoomCreateRun,
     LoomCreateWorkflow, LoomFailStep, LoomLogsQuery, LoomOwnerQuery, LoomRunsQuery,
     SomaHeartbeatRequest, SomaListQuery, SomaQualityRequest, SomaQualitySink, SomaRegisterRequest,
