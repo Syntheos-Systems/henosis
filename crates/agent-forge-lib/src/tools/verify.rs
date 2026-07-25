@@ -55,6 +55,15 @@ struct StepResult {
     stderr: String,
 }
 
+/// Return the longest prefix no larger than `max_bytes` that ends on a UTF-8 boundary.
+fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
+    let mut end = input.len().min(max_bytes);
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
+
 /// Execute one `VerifyStep` directly (no shell), honouring an optional timeout.
 fn run_step(step: &VerifyStep, timeout_secs: Option<u64>) -> Result<StepResult, ToolError> {
     // SECURITY (SEC-C1): parse command into argv and execute directly without
@@ -187,8 +196,8 @@ pub fn verify(
                 rusqlite::params![
                     id, sid, now, r.command, r.exit_code,
                     r.success as i32, r.duration_ms, criteria_index,
-                    &r.stdout[..r.stdout.len().min(4096)],
-                    &r.stderr[..r.stderr.len().min(4096)],
+                    truncate_utf8(&r.stdout, 4096),
+                    truncate_utf8(&r.stderr, 4096),
                 ],
             );
         }
@@ -391,4 +400,36 @@ pub fn session_diff(_db: &Database, input: SessionDiffInput) -> ToolResult {
     }));
 
     Ok(result)
+}
+
+/// Focused regression tests for UTF-8-safe verification output persistence.
+#[cfg(test)]
+mod tests {
+    use super::truncate_utf8;
+
+    /// ASCII output at the limit remains unchanged.
+    #[test]
+    fn truncate_utf8_preserves_ascii_at_limit() {
+        let input = "a".repeat(4096);
+
+        assert_eq!(truncate_utf8(&input, 4096), input);
+    }
+
+    /// A multibyte scalar crossing the limit is omitted instead of being split.
+    #[test]
+    fn truncate_utf8_stops_before_crossing_scalar() {
+        let input = format!("{}é", "a".repeat(4095));
+        let truncated = truncate_utf8(&input, 4096);
+
+        assert_eq!(truncated, "a".repeat(4095));
+        assert!(truncated.len() <= 4096);
+    }
+
+    /// A multibyte scalar ending exactly at the limit remains intact.
+    #[test]
+    fn truncate_utf8_keeps_scalar_ending_at_limit() {
+        let input = format!("{}é", "a".repeat(4094));
+
+        assert_eq!(truncate_utf8(&input, 4096), input);
+    }
 }
