@@ -1,4 +1,4 @@
-//! JSON input/output helpers for the agent-forge CLI. Every tool reads a
+//! JSON input/output helpers for the Crucible CLI. Every tool reads a
 //! typed input struct from a file on disk and writes a uniform `Output` JSON
 //! struct back. This module owns those read/write operations and the error
 //! types they produce.

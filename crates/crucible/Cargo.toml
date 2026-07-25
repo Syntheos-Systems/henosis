@@ -1,12 +1,12 @@
 [package]
-name = "agent-forge-lib"
+name = "crucible"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 # Copied code keeps its license (the rest of the workspace may differ).
 license = "Elastic-2.0"
 repository.workspace = true
-description = "Agent-Forge as a library: the structured-reasoning gate tools (spec/hypothesis/verify/challenge, Tree-sitter AST, skills), callable in-process, with a thin CLI wrapper."
+description = "Crucible structured-reasoning and code-quality gates for Henosis."
 
 [features]
 # The CLI ships with the HTTP skills bridge; in-process consumers (syntheos-server) can opt out
@@ -15,6 +15,11 @@ default = ["http-bridge"]
 # Blocking reqwest implementation of SkillsBridge against the Kleos skills API through
 # KLEOS_URL and optional KLEOS_API_KEY environment variables.
 http-bridge = ["dep:reqwest"]
+
+[[bin]]
+name = "crucible"
+path = "src/bin/crucible.rs"
+required-features = ["http-bridge"]
 
 [[bin]]
 name = "agent-forge"

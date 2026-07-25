@@ -1,4 +1,4 @@
-//! Skills tools -- thin wrappers that translate agent-forge CLI calls into
+//! Skills tools -- thin wrappers that translate Crucible CLI calls into
 //! Kleos skill API requests. Each public function corresponds to one CLI
 //! subcommand (SkillSearch, SkillCapture, SkillRecordExec, SkillFix,
 //! SkillDerive, SkillLineage).

@@ -1,20 +1,19 @@
-//! `agent-forge`: the thin CLI wrapper over `agent-forge-lib`.
+//! Shared command-line adapter for the `crucible` and legacy `agent-forge` binaries.
 //!
 //! Every invocation names a subcommand, reads a JSON input file, runs one tool against the
 //! on-disk SQLite forge database, and writes the JSON `Output` envelope back. All tool logic
 //! lives in the library; this file only parses arguments, performs file IO, and wires the HTTP
 //! skills bridge through `KLEOS_URL` and `KLEOS_API_KEY`.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
-use agent_forge_lib::bridge::HttpSkillsBridge;
-use agent_forge_lib::json_io::{read_input, write_output, Output};
-use agent_forge_lib::{run_tool, Database, SkillsBridge, Tool};
+use crate::bridge::HttpSkillsBridge;
+use crate::json_io::{read_input, write_output, Output};
+use crate::{run_tool, Database, SkillsBridge, Tool};
 
 /// Top-level CLI: every invocation specifies a subcommand plus input/output JSON paths.
 #[derive(Parser)]
-#[command(name = "agent-forge")]
 #[command(about = "Structured reasoning and code quality workflow")]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +32,7 @@ struct Cli {
     db: String,
 }
 
-/// One enum variant per agent-forge tool. Names map 1:1 to the agent-forge tool reference
+/// One enum variant per Crucible tool. Names map 1:1 to the Crucible tool reference
 /// (and to [`Tool`]; clap needs its own derive-friendly enum).
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -109,10 +108,10 @@ fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Parse args, open the forge DB, dispatch through the library, and write the JSON result to
-/// `--output`. Any error becomes an `Output::error` payload (the upstream contract).
-fn main() {
-    let cli = Cli::parse();
+/// Parse arguments for `program_name`, dispatch through the library, and write the JSON result.
+pub fn run(program_name: &'static str) {
+    let matches = Cli::command().name(program_name).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
     let db_path = expand_path(&cli.db);
     let db = match Database::open(&db_path) {

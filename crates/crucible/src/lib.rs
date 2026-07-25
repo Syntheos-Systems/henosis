@@ -1,11 +1,11 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
-//! # agent-forge-lib
+//! # Crucible
 //!
 //! Reusable structured-reasoning gates for specifications, hypotheses, approach comparison,
 //! verification, adversarial review, Tree-sitter search, repository maps, session learning,
-//! and skill discovery. `syntheos-server` calls the library in process, while the thin
-//! `agent-forge` binary preserves the JSON-file CLI contract used by automation.
+//! and skill discovery. Henosis calls the library in process, while the `crucible` binary
+//! exposes the JSON-file CLI contract used by automation.
 //!
 //! Optional skill operations cross the [`SkillsBridge`] seam instead of depending on a
 //! hardwired remote client. The CLI wires the feature-gated
@@ -13,6 +13,9 @@
 //! bridge retain every local reasoning and repository-analysis tool.
 
 pub mod bridge;
+/// Shared command-line entry point used by the primary and compatibility binaries.
+#[cfg(feature = "http-bridge")]
+pub mod cli;
 pub mod db;
 pub mod json_io;
 pub mod tools;
@@ -25,7 +28,7 @@ pub use tools::{ToolError, ToolResult};
 
 use serde_json::Value;
 
-/// Every agent-forge tool, with one variant per CLI subcommand.
+/// Every Crucible tool, with one variant per CLI subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)] // Variant names mirror the documented CLI verbs.
 pub enum Tool {

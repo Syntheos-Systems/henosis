@@ -22,7 +22,7 @@ members = [
     "crates/henosis-credential-store",
     "crates/henosis-pistis",
     "crates/henosis-memory-client",
-    "crates/agent-forge-lib",
+    "crates/crucible",
     "crates/synapse-provider",
     "crates/synapse-session",
     "crates/synapse-tools",
