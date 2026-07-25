@@ -1,4 +1,4 @@
-//! Agent-forge tool registry. Each submodule implements one CLI subcommand.
+//! Crucible tool registry. Each submodule implements one CLI subcommand.
 //! Shared types (`ToolResult`, `ToolError`) and the session-active marker live here.
 
 pub mod approaches;
@@ -51,25 +51,33 @@ impl std::error::Error for ToolError {}
 /// enforcement hooks. Best-effort: failures here must not abort the caller,
 /// since the DB record (the source of truth) is already committed.
 ///
-/// Writes a marker file `<dir>/agent-forge-active` containing "<id>:<kind>".
-/// `<dir>` is the value of `AGENT_FORGE_STATE_DIR` if set, otherwise
-/// `${XDG_STATE_HOME:-$HOME/.local/state}/agent-forge`.
+/// Writes `crucible-active` and a legacy compatibility marker containing "<id>:<kind>".
+/// `<dir>` prefers `CRUCIBLE_STATE_DIR`, then `AGENT_FORGE_STATE_DIR`, then an existing
+/// legacy state directory, and otherwise uses `${XDG_STATE_HOME}/crucible`.
 pub fn set_session_active(id: &str, kind: &str) {
-    let dir = match std::env::var("AGENT_FORGE_STATE_DIR") {
-        Ok(d) => std::path::PathBuf::from(d),
-        Err(_) => {
-            let base = match std::env::var("XDG_STATE_HOME") {
-                Ok(x) => std::path::PathBuf::from(x),
-                Err(_) => {
-                    let Ok(home) = std::env::var("HOME") else {
-                        return;
-                    };
-                    std::path::PathBuf::from(home).join(".local").join("state")
-                }
-            };
-            base.join("agent-forge")
-        }
+    let explicit_dir = std::env::var_os("CRUCIBLE_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("AGENT_FORGE_STATE_DIR").map(std::path::PathBuf::from));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".local").join("state")));
+    let dir = explicit_dir.or_else(|| {
+        base.map(|base| {
+            let new_default = base.join("crucible");
+            let legacy_default = base.join("agent-forge");
+            if new_default.exists() || !legacy_default.exists() {
+                new_default
+            } else {
+                legacy_default
+            }
+        })
+    });
+    let Some(dir) = dir else {
+        return;
     };
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("agent-forge-active"), format!("{id}:{kind}"));
+    let payload = format!("{id}:{kind}");
+    let _ = std::fs::write(dir.join("crucible-active"), &payload);
+    let _ = std::fs::write(dir.join("agent-forge-active"), payload);
 }

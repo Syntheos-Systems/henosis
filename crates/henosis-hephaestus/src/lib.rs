@@ -4,11 +4,11 @@
 //!
 //! Maintained in-tree as an owned Henosis component.
 
-pub mod agent_forge;
 pub mod anthropic_auth;
 pub mod checkpoint;
 pub mod clients;
 pub mod config;
+pub mod crucible;
 pub mod gate;
 pub mod hermes_client;
 pub mod orchestrator;

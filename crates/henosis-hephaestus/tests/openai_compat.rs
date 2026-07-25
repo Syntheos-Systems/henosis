@@ -125,9 +125,8 @@ impl Mocks {
             max_tool_turns: 6,
             sandbox_timeout: 5,
             sandbox_memory: "64m".into(),
-            agent_forge_bin: PathBuf::from("/nonexistent/agent-forge"),
-            agent_forge_db: None,
-            agent_forge_enabled: false,
+            crucible_db: self._tmp.path().join("crucible.db"),
+            crucible_enabled: false,
             cred_enabled: false,
             // The OpenAI-compat factory branch is what this test exercises.
             provider_kind: henosis_hephaestus::config::ProviderKind::OpenAiCompat,

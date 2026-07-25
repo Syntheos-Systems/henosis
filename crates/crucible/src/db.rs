@@ -4,12 +4,62 @@
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Thin wrapper around a `rusqlite::Connection` that owns the forge DB file.
 /// Callers borrow the inner connection via `conn()` to execute queries.
 pub struct Database {
     conn: Connection,
+}
+
+/// Resolve the Crucible database path with new names first and legacy state preserved.
+pub fn default_database_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let state_base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let new_default = state_base.join("crucible").join("crucible.db");
+    let legacy_default = home
+        .as_ref()
+        .map(|path| path.join(".agent-forge").join("forge.db"))
+        .unwrap_or_else(|| PathBuf::from(".agent-forge/forge.db"));
+
+    select_database_path(
+        std::env::var_os("CRUCIBLE_DB")
+            .map(|path| expand_home(PathBuf::from(path), home.as_deref())),
+        std::env::var_os("AGENT_FORGE_DB")
+            .map(|path| expand_home(PathBuf::from(path), home.as_deref())),
+        new_default,
+        legacy_default,
+    )
+}
+
+/// Expand an explicit `~/` prefix without changing absolute or ordinary relative paths.
+fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
+    let Some(path_text) = path.to_str() else {
+        return path;
+    };
+    let Some(relative) = path_text.strip_prefix("~/") else {
+        return path;
+    };
+    home.map(|base| base.join(relative)).unwrap_or(path)
+}
+
+/// Apply environment precedence and reuse existing legacy state when no override is present.
+fn select_database_path(
+    crucible_override: Option<PathBuf>,
+    legacy_override: Option<PathBuf>,
+    new_default: PathBuf,
+    legacy_default: PathBuf,
+) -> PathBuf {
+    crucible_override.or(legacy_override).unwrap_or_else(|| {
+        if new_default.exists() || !legacy_default.exists() {
+            new_default
+        } else {
+            legacy_default
+        }
+    })
 }
 
 /// Open, initialise, and migrate the forge database.
@@ -141,5 +191,64 @@ impl Database {
     /// direct query execution by callers.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+}
+
+/// Regression tests for Crucible database-path migration behavior.
+#[cfg(test)]
+mod tests {
+    use super::{expand_home, select_database_path};
+    use std::path::PathBuf;
+
+    /// The primary override takes precedence over every legacy location.
+    #[test]
+    fn primary_override_wins() {
+        let selected = select_database_path(
+            Some(PathBuf::from("/new/explicit.db")),
+            Some(PathBuf::from("/legacy/explicit.db")),
+            PathBuf::from("/new/default.db"),
+            PathBuf::from("/legacy/default.db"),
+        );
+
+        assert_eq!(selected, PathBuf::from("/new/explicit.db"));
+    }
+
+    /// The legacy override remains supported when no primary override is set.
+    #[test]
+    fn legacy_override_is_compatible() {
+        let selected = select_database_path(
+            None,
+            Some(PathBuf::from("/legacy/explicit.db")),
+            PathBuf::from("/new/default.db"),
+            PathBuf::from("/legacy/default.db"),
+        );
+
+        assert_eq!(selected, PathBuf::from("/legacy/explicit.db"));
+    }
+
+    /// Existing legacy state is reused when the new default has not been created.
+    #[test]
+    fn existing_legacy_default_is_reused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let new_default = directory.path().join("new/crucible.db");
+        let legacy_default = directory.path().join("legacy/forge.db");
+        std::fs::create_dir_all(legacy_default.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&legacy_default, b"existing").expect("write");
+
+        let selected = select_database_path(None, None, new_default, legacy_default.clone());
+
+        assert_eq!(selected, legacy_default);
+    }
+
+    /// Explicit home-relative paths expand consistently for CLI and in-process consumers.
+    #[test]
+    fn expands_home_relative_override() {
+        assert_eq!(
+            expand_home(
+                PathBuf::from("~/.config/crucible.db"),
+                Some(std::path::Path::new("/home/tester")),
+            ),
+            PathBuf::from("/home/tester/.config/crucible.db"),
+        );
     }
 }

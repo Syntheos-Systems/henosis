@@ -21,10 +21,10 @@ use henosis_hermes::{
     tool::{InvokeContext, ProviderBases},
 };
 
-use crate::agent_forge::AgentForgeClient;
 use crate::anthropic_auth::{AuthError, ProviderChain};
 use crate::checkpoint::Checkpoint;
 use crate::config::Config;
+use crate::crucible::CrucibleClient;
 use crate::gate::GateClient;
 use crate::hermes_client::{HermesClient, ToolDef};
 use crate::orchestrator::{self, OrchestratorError, OrchestratorResult};
@@ -95,7 +95,7 @@ impl From<OrchestratorError> for ClientError {
 pub type AnthropicResult = OrchestratorResult;
 
 /// Aggregated client bundle. Owns config, provider auth chain, Hermes,
-/// Eidolon gate, agent-forge wrapper, and the coordination services bundle.
+/// Eidolon gate, Crucible service, and the coordination services bundle.
 /// Handed to handlers via `AppState`.
 pub struct Clients {
     /// Runtime configuration.
@@ -106,8 +106,8 @@ pub struct Clients {
     hermes: HermesClient,
     /// Eidolon gate client.
     gate: GateClient,
-    /// agent-forge CLI wrapper.
-    agent_forge: AgentForgeClient,
+    /// In-process Crucible quality-gate service.
+    crucible: CrucibleClient,
     /// Coordination service bundle (Kleos, Chiasm, Axon, cred).
     services: Services,
 }
@@ -151,15 +151,15 @@ impl Clients {
         let hermes = HermesClient::new(registry, circuits, ctx);
 
         let gate = GateClient::new(&cfg.eidolon_url, http.clone());
-        let agent_forge =
-            AgentForgeClient::new(cfg.agent_forge_bin.clone(), cfg.agent_forge_db.clone());
+        let crucible = CrucibleClient::open(cfg.crucible_enabled, &cfg.crucible_db)
+            .expect("Crucible database initialization failed");
         let services = Services::new(http, cfg.clone());
         Self {
             cfg,
             auth,
             hermes,
             gate,
-            agent_forge,
+            crucible,
             services,
         }
     }
@@ -169,9 +169,9 @@ impl Clients {
         &self.cfg
     }
 
-    /// Borrow the agent-forge client.
-    pub fn agent_forge(&self) -> &AgentForgeClient {
-        &self.agent_forge
+    /// Borrow the in-process Crucible service.
+    pub fn crucible(&self) -> &CrucibleClient {
+        &self.crucible
     }
 
     /// Borrow the Services bundle.

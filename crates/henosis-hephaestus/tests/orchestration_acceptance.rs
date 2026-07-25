@@ -114,8 +114,7 @@ impl Mocks {
         }
     }
 
-    /// Build a `Config` wired to all mock servers with agent-forge and cred
-    /// disabled so the test runs fully in-process without external binaries.
+    /// Build a `Config` wired to all mock servers with Crucible and cred disabled.
     fn config(&self) -> Config {
         Config {
             port: 0,
@@ -139,9 +138,8 @@ impl Mocks {
             max_tool_turns: 6,
             sandbox_timeout: 5,
             sandbox_memory: "64m".into(),
-            agent_forge_bin: PathBuf::from("/nonexistent/agent-forge"),
-            agent_forge_db: None,
-            agent_forge_enabled: false,
+            crucible_db: self._tmp.path().join("crucible.db"),
+            crucible_enabled: false,
             cred_enabled: false,
             provider_kind: henosis_hephaestus::config::ProviderKind::Anthropic,
             provider_url: None,

@@ -92,12 +92,10 @@ pub struct Config {
     pub sandbox_timeout: u64,
     /// Podman container memory limit (e.g. "256m").
     pub sandbox_memory: String,
-    /// Path to the `agent-forge` CLI binary.
-    pub agent_forge_bin: PathBuf,
-    /// Optional path to the agent-forge SQLite database.
-    pub agent_forge_db: Option<PathBuf>,
-    /// Whether agent-forge integration (spec_task, verify) is active.
-    pub agent_forge_enabled: bool,
+    /// Path to the Crucible SQLite database.
+    pub crucible_db: PathBuf,
+    /// Whether Crucible specification and verification gates are active.
+    pub crucible_enabled: bool,
     /// Whether the `cred` CLI is available for credential lookups.
     pub cred_enabled: bool,
     /// Which provider implementation to build via `providers::build_provider`.
@@ -243,11 +241,9 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             sandbox_memory: env_or("HEPHAESTUS_SANDBOX_MEMORY", "256m"),
-            agent_forge_bin: std::env::var("AGENT_FORGE_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("agent-forge")),
-            agent_forge_db: std::env::var("AGENT_FORGE_DB").ok().map(PathBuf::from),
-            agent_forge_enabled: std::env::var("AGENT_FORGE_ENABLED")
+            crucible_db: crucible::db::default_database_path(),
+            crucible_enabled: std::env::var("CRUCIBLE_ENABLED")
+                .or_else(|_| std::env::var("AGENT_FORGE_ENABLED"))
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
             cred_enabled: std::env::var("HEPHAESTUS_CRED_ENABLED")

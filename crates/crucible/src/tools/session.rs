@@ -145,7 +145,7 @@ pub fn session_learn(
     let mut skill_info = None;
     if capture_as_skill.unwrap_or(false) {
         if let Some(bridge) = bridge {
-            match bridge.capture_skill(&discovery, Some("agent-forge")) {
+            match bridge.capture_skill(&discovery, Some("crucible")) {
                 Ok(v) => {
                     skill_info = Some(v);
                 }

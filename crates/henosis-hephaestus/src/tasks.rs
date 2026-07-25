@@ -64,10 +64,10 @@ pub struct TaskRecord {
     pub error: Option<String>,
     /// Chiasm task id for output submission, set once the task starts.
     pub chiasm_id: Option<i64>,
-    /// agent-forge spec id, set at creation if agent-forge is enabled.
+    /// Crucible specification id, set at creation when Crucible is enabled.
     #[serde(default)]
     pub spec_id: Option<String>,
-    /// Optional shell command to run via agent-forge `verify` before the
+    /// Optional shell command to run via Crucible `verify` before the
     /// task transitions to Completed. If verify exits non-zero the task
     /// is marked Failed.
     #[serde(default)]
@@ -93,7 +93,7 @@ pub struct CreateTaskBody {
     pub system: Option<String>,
     /// User prompt that drives the agent loop.
     pub input: String,
-    /// Optional shell command to run via agent-forge `verify` before the
+    /// Optional shell command to run via Crucible `verify` before the
     /// task transitions to Completed. If verify exits non-zero the task
     /// is marked Failed.
     pub verify_command: Option<String>,
@@ -166,14 +166,14 @@ pub struct AppState {
 
 /// Core task setup and execution, shared by [`create_task`] and [`run_task_to_completion`].
 ///
-/// Creates the task record (including agent-forge spec registration), inserts it into the
+/// Creates the task record (including Crucible spec registration), inserts it into the
 /// store, mirrors it to Kleos, pre-registers the SSE sink, and then drives [`run_task`] to
 /// completion. Returns when the task reaches a terminal state (Completed or Failed).
 ///
 /// Callers are responsible for computing `agent`, `project`, and `title` from the body
 /// and config before calling this function, and for performing any pre-flight validation
 /// (empty-input check, provider-token check) so HTTP callers get immediate errors.
-/// Synchronous task setup: registers the agent-forge spec, builds and stores the
+/// Synchronous task setup: registers the Crucible spec, builds and stores the
 /// [`TaskRecord`], mirrors it to Kleos, and pre-registers the SSE broadcast sink.
 ///
 /// This is the part that MUST complete before the HTTP `POST /tasks` handler returns,
@@ -190,13 +190,13 @@ async fn setup_task(
     let cfg = state.clients.config();
     let now = Utc::now();
 
-    // Register the task in agent-forge before any work begins. Best-effort:
+    // Register the task in Crucible before any work begins. Best-effort:
     // a failure does not prevent the task from running, but the spec_id is
     // captured on the record so the audit trail links back.
-    let spec_id = if cfg.agent_forge_enabled {
+    let spec_id = if cfg.crucible_enabled {
         state
             .clients
-            .agent_forge()
+            .crucible()
             .spec_task(id, title, &body.input)
             .await
     } else {
@@ -630,12 +630,12 @@ async fn run_task_loop(
             Ok(AnthropicResult::Complete(output)) => {
                 info!(task_id = %id, len = output.len(), "task llm ok");
 
-                // Run the optional agent-forge `verify` gate before marking
+                // Run the optional Crucible `verify` gate before marking
                 // Complete. If verify fails the task is Failed, not Completed.
                 let verify_command = store.get(&id).await.and_then(|r| r.verify_command.clone());
                 let verify_passed = match verify_command.as_deref() {
-                    Some(cmd) if clients.config().agent_forge_enabled => {
-                        let ok = clients.agent_forge().verify(cmd).await;
+                    Some(cmd) if clients.config().crucible_enabled => {
+                        let ok = clients.crucible().verify(cmd).await;
                         if !ok {
                             warn!(task_id = %id, command = cmd, "verify failed");
                         }

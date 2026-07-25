@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 # Tool input structs and the Output envelope.
 serde = { workspace = true }
 serde_json.workspace = true
+tokio.workspace = true
 # The forge database (bundled = no system libsqlite, matching the kernel crates).
 rusqlite = { workspace = true, features = ["bundled"] }
 # Artifact ids use UUID v4 as required by the forge tool contract.

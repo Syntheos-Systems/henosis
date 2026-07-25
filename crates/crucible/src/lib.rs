@@ -27,6 +27,8 @@ pub use json_io::Output;
 pub use tools::{ToolError, ToolResult};
 
 use serde_json::Value;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Every Crucible tool, with one variant per CLI subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,52 @@ pub enum Tool {
     SkillFix,
     SkillDerive,
     SkillLineage,
+}
+
+/// Cloneable in-process Crucible service that serializes access to its SQLite connection.
+#[derive(Clone)]
+pub struct Crucible {
+    /// Shared database ownership permits blocking tool calls to leave the async executor.
+    db: Arc<Mutex<Database>>,
+    /// Optional skills backend used by tools that integrate with the Kleos skill catalog.
+    bridge: Option<Arc<dyn SkillsBridge>>,
+}
+
+/// Constructs and executes the in-process Crucible service.
+impl Crucible {
+    /// Open a Crucible database without a remote skills bridge.
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        Self::open_with_bridge(path, None)
+    }
+
+    /// Open a Crucible database with an optional shared skills backend.
+    pub fn open_with_bridge(
+        path: &Path,
+        bridge: Option<Arc<dyn SkillsBridge>>,
+    ) -> rusqlite::Result<Self> {
+        Ok(Self {
+            db: Arc::new(Mutex::new(Database::open(path)?)),
+            bridge,
+        })
+    }
+
+    /// Run one synchronous Crucible tool on the blocking pool without stalling Tokio workers.
+    pub async fn run(&self, tool: Tool, input: Value) -> Output {
+        let db = Arc::clone(&self.db);
+        let bridge = self.bridge.clone();
+        match tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|_| "Crucible database lock is poisoned".to_string())?;
+            Ok::<Output, String>(run_tool(&db, tool, input, bridge.as_deref()))
+        })
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => Output::error(error),
+            Err(error) => Output::error(format!("Crucible worker failed: {error}")),
+        }
+    }
 }
 
 /// Deserialize `input` into the tool's typed input and run it, used by both the CLI and
@@ -186,5 +234,35 @@ mod tests {
         );
         assert!(!out.success);
         assert!(out.message.contains("parse"), "{}", out.message);
+    }
+
+    /// The async service executes tools in process and preserves the standard output envelope.
+    #[tokio::test]
+    async fn crucible_service_runs_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = Crucible::open(&dir.path().join("crucible.db")).expect("open");
+
+        let output = service
+            .run(
+                Tool::SpecTask,
+                serde_json::json!({
+                    "task_description": "exercise in-process Crucible",
+                    "task_type": "test",
+                    "acceptance_criteria": [
+                        "service returns a spec id",
+                        "service preserves the standard output envelope"
+                    ],
+                    "interface_contract": "Crucible::run returns Output",
+                    "edge_cases": [
+                        "no skills bridge",
+                        "database access runs on the blocking pool",
+                        "worker errors preserve the output envelope"
+                    ],
+                }),
+            )
+            .await;
+
+        assert!(output.success, "{}", output.message);
+        assert!(output.id.is_some());
     }
 }

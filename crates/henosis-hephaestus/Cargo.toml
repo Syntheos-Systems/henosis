@@ -14,6 +14,8 @@ synapse-provider = { path = "../synapse-provider" }
 
 # Hermes tool gateway for in-process dispatch. The HTTP path is removed.
 henosis-hermes = { path = "../henosis-hermes" }
+# Crucible runs specifications and completion gates in-process.
+crucible = { path = "../crucible", default-features = false }
 
 # Web + async runtime
 axum = { workspace = true, features = ["macros"] }

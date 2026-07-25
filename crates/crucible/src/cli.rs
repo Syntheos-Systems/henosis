@@ -9,8 +9,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::bridge::HttpSkillsBridge;
-use crate::json_io::{read_input, write_output, Output};
-use crate::{run_tool, Database, SkillsBridge, Tool};
+use crate::json_io::{Output, read_input, write_output};
+use crate::{Database, SkillsBridge, Tool, run_tool};
 
 /// Top-level CLI: every invocation specifies a subcommand plus input/output JSON paths.
 #[derive(Parser)]
@@ -27,9 +27,9 @@ struct Cli {
     #[arg(long)]
     output: PathBuf,
 
-    /// Path to database file
-    #[arg(long, default_value = "~/.agent-forge/forge.db")]
-    db: String,
+    /// Path to database file; defaults through CRUCIBLE_DB with legacy state migration.
+    #[arg(long)]
+    db: Option<String>,
 }
 
 /// One enum variant per Crucible tool. Names map 1:1 to the Crucible tool reference
@@ -113,7 +113,11 @@ pub fn run(program_name: &'static str) {
     let matches = Cli::command().name(program_name).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
-    let db_path = expand_path(&cli.db);
+    let db_path = cli
+        .db
+        .as_deref()
+        .map(expand_path)
+        .unwrap_or_else(crate::db::default_database_path);
     let db = match Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
