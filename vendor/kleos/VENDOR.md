@@ -3,7 +3,7 @@
 Mode: PATCHED
 Pin: 77cfffad8d3231b292eb03f4cc93757b8df7e2f7
 Upstream: kleos
-Content-SHA256: 6eba963557f55ad634efd0eaaaae386e72acb3286d8f9b318904e9516d81a474
+Content-SHA256: 56c91ea8eed955aaa2c40563fb6fe7f513561990d94ee34dad18eb3cb784079d
 Ref: origin/main
 Mirror: kleos-config=kleos-config
 Mirror: kleos-lib=kleos-lib
