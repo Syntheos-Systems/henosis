@@ -8455,6 +8455,7 @@ dependencies = [
 name = "syntheos-server"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -8474,6 +8475,8 @@ dependencies = [
  "henosis-pistis",
  "henosis-plutus",
  "henosis-rift",
+ "henosis-rift-bridge",
+ "henosis-rift-server",
  "henosis-soma",
  "henosis-sqlite",
  "henosis-thymus",

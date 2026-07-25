@@ -46,6 +46,10 @@ pub mod billing;
 /// The default kernel server is unchanged when [`operator::OperatorState`] is not constructed.
 pub mod operator;
 
+/// Managed Rift room and Synapse bridge lifecycle owned by Henosis.
+#[cfg(feature = "cognition")]
+pub mod room_runtime;
+
 pub use action_reactor::spawn_action_reactor;
 pub use app::{
     eidolon_gate, live_gate_chain, production_router, public_gate_chain, router, runtime_router,

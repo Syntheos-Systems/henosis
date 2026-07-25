@@ -37,13 +37,17 @@ henosis-pistis = { path = "../henosis-pistis" }
 henosis-credential-store = { path = "../henosis-credential-store" }
 # Rift-backed human approval authority.
 henosis-rift = { path = "../henosis-rift" }
+# Persistent Rift room server and its Synapse agent bridge.
+henosis-rift-server = { path = "../henosis-rift-server" }
+henosis-rift-bridge = { path = "../henosis-rift-bridge" }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
 # Plutus policy authority.
 henosis-plutus = { path = "../henosis-plutus" }
-# Optional cognitive-core facade over vendored kleos-lib. Only the `cognition` feature pulls in
-# the heavy ML stack, so the default Henosis build excludes ort, tokenizers, and LanceDB.
+# Cognitive-core facade over vendored kleos-lib.
 henosis-cognition = { path = "../henosis-cognition", optional = true }
+# Component lifecycle errors from the embedded Rift bridge.
+anyhow.workspace = true
 # JWT session tokens for the operator API surface (HS256 via pure-Rust crypto).
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 # Structured error types for the operator surface.
@@ -101,7 +105,7 @@ syntheos-dispatch = { path = "../syntheos-dispatch", features = ["stubs"] }
 henosis-plutus = { path = "../henosis-plutus", features = ["test-helpers"] }
 
 [features]
-default = []
-# The in-process cognitive core is off by default so standard builds do not compile the
-# vendored kleos-lib ML stack. Enabling it adds the cognition field to AppState.
-cognition = ["dep:henosis-cognition"]
+default = ["cognition"]
+# The public Henosis binary includes the in-process cognitive core by default. This feature remains
+# named so specialized developers can still compile the kernel library without the ML stack.
+cognition = ["dep:henosis-cognition", "henosis-rift-bridge/cognition"]

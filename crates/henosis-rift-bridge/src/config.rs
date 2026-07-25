@@ -12,6 +12,7 @@ use crate::error::BridgeError;
 #[derive(Debug, Deserialize)]
 pub struct BridgeConfig {
     /// Connection settings for the Rift server.
+    #[serde(default)]
     pub rift: RiftConfig,
     /// Bridge daemon behavior settings.
     pub bridge: BridgeDaemonConfig,
@@ -218,19 +219,25 @@ pub struct KleosBackendConfig {
 }
 
 /// Connection to the Rift server.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RiftConfig {
     /// Rift server base URL (e.g., http://localhost:3200).
+    #[serde(default)]
     pub api_url: String,
     /// WebSocket URL (e.g., ws://localhost:3200/ws).
+    #[serde(default)]
     pub ws_url: String,
     /// JWT secret shared with Rift server for agent token issuance.
+    #[serde(default)]
     pub jwt_secret: String,
     /// Dedicated bearer secret for bridge-only Rift routes.
+    #[serde(default)]
     pub bridge_secret: String,
     /// Rift server ID to join agents to.
+    #[serde(default)]
     pub server_id: Uuid,
     /// Channel ID for the team room.
+    #[serde(default)]
     pub channel_id: Uuid,
     /// How often to poll bridge pause status in seconds.
     pub pause_poll_secs: Option<u64>,
@@ -378,14 +385,41 @@ pub enum ExecutorConfig {
 impl BridgeConfig {
     /// Load configuration from a TOML file at the given path.
     pub fn load(path: &std::path::Path) -> Result<Self, BridgeError> {
+        let config = Self::parse(path)?;
+        config.validate_security()?;
+        config.validate_rift_target()?;
+        Ok(config)
+    }
+
+    /// Load agent behavior while Henosis supplies the managed Rift connection.
+    pub fn load_for_managed_room(
+        path: &std::path::Path,
+        api_url: String,
+        ws_url: String,
+        jwt_secret: String,
+        bridge_secret: String,
+        server_id: Uuid,
+        channel_id: Uuid,
+    ) -> Result<Self, BridgeError> {
+        let mut config = Self::parse(path)?;
+        config.rift.api_url = api_url;
+        config.rift.ws_url = ws_url;
+        config.rift.jwt_secret = jwt_secret;
+        config.rift.bridge_secret = bridge_secret;
+        config.rift.server_id = server_id;
+        config.rift.channel_id = channel_id;
+        config.validate_security()?;
+        config.validate_rift_target()?;
+        Ok(config)
+    }
+
+    /// Parse one bridge file before applying deployment-owned connection data.
+    fn parse(path: &std::path::Path) -> Result<Self, BridgeError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             BridgeError::Config(format!("failed to read {}: {}", path.display(), e))
         })?;
-        let config: Self = toml::from_str(&content).map_err(|e| {
-            BridgeError::Config(format!("failed to parse {}: {}", path.display(), e))
-        })?;
-        config.validate_security()?;
-        Ok(config)
+        toml::from_str(&content)
+            .map_err(|e| BridgeError::Config(format!("failed to parse {}: {}", path.display(), e)))
     }
 
     /// Reject unsafe listener and secret settings before the bridge connects.
@@ -403,6 +437,21 @@ impl BridgeConfig {
         }
         if let Some(control) = &self.control {
             control.validate(&[&self.rift.jwt_secret, &self.rift.bridge_secret])?;
+        }
+        Ok(())
+    }
+
+    /// Reject missing connection coordinates on every runnable configuration.
+    fn validate_rift_target(&self) -> Result<(), BridgeError> {
+        if self.rift.api_url.trim().is_empty() || self.rift.ws_url.trim().is_empty() {
+            return Err(BridgeError::Config(
+                "rift.api_url and rift.ws_url must be configured".to_string(),
+            ));
+        }
+        if self.rift.server_id.is_nil() || self.rift.channel_id.is_nil() {
+            return Err(BridgeError::Config(
+                "rift.server_id and rift.channel_id must be configured".to_string(),
+            ));
         }
         Ok(())
     }
@@ -516,6 +565,7 @@ impl ControlConfig {
 /// Unit tests for bridge configuration parsing.
 mod tests {
     use super::BridgeConfig;
+    use uuid::Uuid;
 
     /// Verifies the new execution-mode config blocks parse and are optional.
     #[test]
@@ -743,5 +793,48 @@ mod tests {
         assert!(emb.url.is_none());
         assert_eq!(emb.model, "bge-m3");
         assert!((emb.semantic_threshold - 0.85).abs() < 1e-9);
+    }
+
+    /// Managed loading supplies every connection coordinate without TOML placeholders.
+    #[test]
+    fn managed_room_config_needs_only_agent_behavior() {
+        let path = std::env::temp_dir().join(format!(
+            "henosis-managed-room-config-{}.toml",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [bridge]
+                cooldown_secs = 30
+                turn_budget = 5
+                thread_ceiling = 30
+                context_window = 50
+
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "You are an architect."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        )
+        .expect("write temporary managed config");
+        let server_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let config = BridgeConfig::load_for_managed_room(
+            &path,
+            "http://127.0.0.1:3200".to_string(),
+            "ws://127.0.0.1:3200/ws".to_string(),
+            "j".repeat(32),
+            "b".repeat(32),
+            server_id,
+            channel_id,
+        )
+        .expect("managed configuration");
+        std::fs::remove_file(&path).expect("remove temporary managed config");
+        assert_eq!(config.rift.server_id, server_id);
+        assert_eq!(config.rift.channel_id, channel_id);
+        assert_eq!(config.agents.len(), 1);
     }
 }
