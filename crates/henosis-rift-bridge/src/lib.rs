@@ -44,6 +44,8 @@ pub mod rift_client;
 pub mod room;
 /// Agent roster provisioning and runtime state.
 pub mod roster;
+/// Reusable Rift bridge and Synapse room lifecycle.
+pub mod runtime;
 /// Stimulus injection (reflection, task, and git signals).
 pub mod stimulus;
 /// Turn interleaving, compose slots, and the compose floor.
