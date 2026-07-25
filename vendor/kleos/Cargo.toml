@@ -6,7 +6,7 @@
 # `{ workspace = true }` dependency refs against this root rather than the Henosis root.
 # Everything under both crate directories is a pristine copy and must never be hand-edited.
 #
-# Source: Kleos `main` at commit 4c7206bbbc661d936c46ae05a839118e905257d4
+# Source: Kleos `main` at commit 77cfffad8d3231b292eb03f4cc93757b8df7e2f7
 # Upstream mirror: git@github.com:Ghost-Frame/Kleos.git
 #
 # The `[workspace.dependencies]` table below is copied VERBATIM (versions and

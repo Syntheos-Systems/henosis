@@ -1,9 +1,9 @@
 # Vendored Kleos configuration and cognitive core
 
 Mode: PATCHED
-Pin: 4c7206bbbc661d936c46ae05a839118e905257d4
+Pin: 77cfffad8d3231b292eb03f4cc93757b8df7e2f7
 Upstream: kleos
-Content-SHA256: 2e942416aa8e1958ba56665529b7540dcced18655ec90a07bf3d2a865c4d2123
+Content-SHA256: 6eba963557f55ad634efd0eaaaae386e72acb3286d8f9b318904e9516d81a474
 Ref: origin/main
 Mirror: kleos-config=kleos-config
 Mirror: kleos-lib=kleos-lib
@@ -16,7 +16,7 @@ workspace. The crates build against their own vendored workspace root
 ## Source
 
 - Libraries: Kleos `kleos-config` and `kleos-lib` at `main`, commit
-  `4c7206bbbc661d936c46ae05a839118e905257d4`.
+  `77cfffad8d3231b292eb03f4cc93757b8df7e2f7`.
 - Canonical upstream: `git@github.com:Ghost-Frame/Kleos.git`.
 - Import only reviewed commits from the canonical mirror's `main` branch or a release tag.
 

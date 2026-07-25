@@ -1,6 +1,6 @@
 [package]
 name = "kleos-lib"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Core library for Kleos -- persistent semantic memory and cognitive infrastructure for AI agents"
@@ -43,7 +43,7 @@ bundled-sqlite = ["rusqlite/bundled"]
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
-kleos-config = { path = "../kleos-config", version = "1.9.0" }
+kleos-config = { path = "../kleos-config", version = "1.10.0" }
 rusqlite = { workspace = true }
 tokio-rusqlite = { workspace = true }
 deadpool-sqlite = { workspace = true, features = ["tracing"] }
