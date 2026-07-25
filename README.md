@@ -1,8 +1,39 @@
+<div align="center">
+
+<img src="docs/assets/banner.svg" width="100%" alt="Henosis persistent agent runtime banner" />
+
 # Henosis
 
-Henosis is a source-available persistent-agent runtime in active public-alpha development. It is distributed under the [Elastic License 2.0](LICENSE), not an open-source license.
+**Persistent infrastructure for AI agents that need to carry real work across sessions without carrying unchecked authority.**
 
-Henosis is built around one rule: an agent action is not complete merely because a model asked for it. Every public action crosses server-owned identity, policy, approval, credential, execution, and audit boundaries. The alpha includes:
+[![CI](https://github.com/Syntheos-Systems/henosis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Syntheos-Systems/henosis/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Syntheos-Systems/henosis?include_prereleases&sort=semver&color=f05a42)](https://github.com/Syntheos-Systems/henosis/releases)
+[![License: Elastic 2.0](https://img.shields.io/badge/license-Elastic--2.0-7b5740)](LICENSE)
+[![Language: Rust](https://img.shields.io/github/languages/top/Syntheos-Systems/henosis?logo=rust&color=b7410e)](Cargo.toml)
+[![GHCR: public](https://img.shields.io/badge/GHCR-public-657f77?logo=github)](https://github.com/orgs/Syntheos-Systems/packages/container/package/henosis)
+
+[Website](https://henosis.syntheos.dev/) · [Install](#install-the-public-alpha) · [Proof](https://henosis.syntheos.dev/proof) · [Releases](https://github.com/Syntheos-Systems/henosis/releases) · [Security](SECURITY.md) · [Limitations](scripts/known-incomplete.md) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+---
+
+Henosis gives persistent AI agents a durable runtime for real work. It carries identity, policy,
+approval, execution, audit, task continuity, and memory across sessions, while server-owned gates
+decide which actions may run.
+
+The public alpha installs as one executable with local initialization, diagnostics, serving,
+tokens, approvals, and dispatch. Model providers remain swappable behind a stable interface.
+Production credential brokerage through `phylaxd` and managed room trust from the proprietary
+Pistis service are deployment boundaries and do not ship in this repository.
+
+> [!IMPORTANT]
+> Henosis is source-available under the [Elastic License 2.0](LICENSE) and remains in public alpha.
+> Local mode is loopback-only. Review the [limitations ledger](scripts/known-incomplete.md) before
+> any network exposure.
+
+Every public action crosses server-owned identity, policy, approval, credential, execution, and
+audit boundaries. The alpha includes:
 
 - machine and human operator authentication with live tenant membership checks;
 - request-bound, one-use approvals stored durably in SQLite;

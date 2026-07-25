@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title description">
+  <title id="title">Henosis persistent agent runtime</title>
+  <desc id="description">Five governed action gates converge through the Henosis union mark beside the Henosis wordmark.</desc>
+
+  <rect width="1200" height="300" rx="22" fill="#0e0f0d"/>
+  <rect x="1" y="1" width="1198" height="298" rx="21" fill="none" stroke="#e8e0d1" stroke-opacity=".16" stroke-width="2"/>
+
+  <g fill="none" stroke="#e8e0d1" stroke-opacity=".08">
+    <path d="M30 60H1170M30 120H1170M30 180H1170M30 240H1170"/>
+    <path d="M120 24V276M240 24V276M360 24V276M480 24V276"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" letter-spacing="2.2" fill="#e8e0d1">
+    <g opacity=".74">
+      <circle cx="54" cy="54" r="4" fill="#f05a42"/>
+      <text x="68" y="58">IDENTITY</text>
+      <circle cx="54" cy="102" r="4" fill="#7b5740"/>
+      <text x="68" y="106">POLICY</text>
+      <circle cx="54" cy="150" r="4" fill="#657f77"/>
+      <text x="68" y="154">APPROVAL</text>
+      <circle cx="54" cy="198" r="4" fill="#7b5740"/>
+      <text x="68" y="202">EXECUTION</text>
+      <circle cx="54" cy="246" r="4" fill="#f05a42"/>
+      <text x="68" y="250">AUDIT</text>
+    </g>
+
+    <g stroke-width="1.5">
+      <path d="M148 54C240 54 267 120 356 143" stroke="#f05a42"/>
+      <path d="M148 102C241 102 277 130 356 146" stroke="#7b5740"/>
+      <path d="M148 150H356" stroke="#657f77"/>
+      <path d="M148 198C241 198 277 170 356 154" stroke="#7b5740"/>
+      <path d="M148 246C240 246 267 180 356 157" stroke="#f05a42"/>
+    </g>
+
+    <g transform="translate(396 150)">
+      <circle r="49" fill="#171714" stroke="#e8e0d1" stroke-width="1.5"/>
+      <circle r="39" fill="none" stroke="#f05a42" stroke-width="1"/>
+      <path d="M-21-16L0 0M-21 16L0 0M0 0H23" fill="none" stroke="#e8e0d1" stroke-width="3" stroke-linecap="round"/>
+      <circle r="5" fill="#f05a42"/>
+    </g>
+
+    <path d="M446 150H500" stroke="#e8e0d1" stroke-width="1.5"/>
+    <circle cx="500" cy="150" r="4" fill="#f05a42"/>
+    <text x="459" y="137" font-size="8" fill="#657f77">VERIFIED</text>
+  </g>
+
+  <path d="M530 38V262" stroke="#e8e0d1" stroke-opacity=".18"/>
+
+  <g fill="#e8e0d1">
+    <text x="576" y="67" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" letter-spacing="4" fill="#f05a42">PUBLIC ALPHA / 01</text>
+    <text x="570" y="171" font-family="Georgia, 'Times New Roman', serif" font-size="92" letter-spacing="7">HENOSIS</text>
+    <text x="576" y="207" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15" letter-spacing="6" fill="#657f77">PERSISTENT AGENT RUNTIME</text>
+  </g>
+
+  <g transform="translate(576 244)" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="9" letter-spacing="2.2">
+    <text fill="#e8e0d1">PUBLIC SOURCE</text>
+    <circle cx="122" cy="-3" r="2.5" fill="#f05a42"/>
+    <text x="138" fill="#e8e0d1">GOVERNED ACTION</text>
+    <circle cx="288" cy="-3" r="2.5" fill="#f05a42"/>
+    <text x="304" fill="#e8e0d1">VERIFIABLE RELEASE</text>
+  </g>
+</svg>
