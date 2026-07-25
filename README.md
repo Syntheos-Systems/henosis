@@ -22,7 +22,7 @@ On Linux or macOS, copy and run this command:
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.sh \
-  | sh -s -- --version v0.1.0-alpha.4
+  | sh -s -- --version v0.1.0-alpha.5
 ```
 
 On Windows, open PowerShell, copy this command, and press Enter:
@@ -32,7 +32,7 @@ $installer = Join-Path ([IO.Path]::GetTempPath()) "henosis-install-$([guid]::New
 try {
   irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1' -OutFile $installer
   $powerShell = (Get-Process -Id $PID).Path
-  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-alpha.4'
+  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-alpha.5'
   if ($LASTEXITCODE -ne 0) { throw "Henosis installer exited with code $LASTEXITCODE" }
 } finally {
   Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
@@ -178,7 +178,7 @@ Every release publishes platform archives, `SHA256SUMS`, SPDX SBOMs, and Sigstor
 bundles. Verify an archive before use:
 
 ```sh
-grep -F '  henosis-0.1.0-alpha.4-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
+grep -F '  henosis-0.1.0-alpha.5-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
   | sha256sum --check
 ```
 
@@ -186,7 +186,7 @@ GitHub also stores OIDC-backed provenance for each archive. The GitHub CLI verif
 repository identity, and release workflow:
 
 ```sh
-gh attestation verify henosis-0.1.0-alpha.4-x86_64-unknown-linux-musl.tar.gz \
+gh attestation verify henosis-0.1.0-alpha.5-x86_64-unknown-linux-musl.tar.gz \
   --repo Syntheos-Systems/henosis \
   --signer-workflow Syntheos-Systems/henosis/.github/workflows/ci.yml
 ```
