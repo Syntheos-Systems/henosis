@@ -396,7 +396,7 @@ verify_release_metadata() {
         die 'selected release is not immutable'
 }
 
-# Resolve the adjacent binary from a verified release archive, when present.
+# Resolve the adjacent Henosis and Crucible binaries from a verified release archive.
 archive_binary() {
     target=$1
     case "$0" in
@@ -418,18 +418,29 @@ archive_binary() {
         [ "$marker_target" = "$target" ] ||
         die 'release archive marker does not match this installer'
     candidate="$installer_dir/henosis"
+    crucible_candidate="$installer_dir/crucible"
     [ -f "$candidate" ] && [ -x "$candidate" ] ||
         die 'release archive does not contain an executable adjacent henosis'
+    [ -f "$crucible_candidate" ] && [ -x "$crucible_candidate" ] ||
+        die 'release archive does not contain an executable adjacent crucible'
     ARCHIVE_BINARY=$candidate
+    ARCHIVE_CRUCIBLE=$crucible_candidate
 }
 
-# Restore the previous installation after a failed transactional activation.
+# Restore both previous executables after a failed transactional activation.
 rollback() {
-    if [ "${ACTIVATED:-0}" -eq 1 ]; then
-        if [ -n "${BACKUP:-}" ] && [ -f "$BACKUP" ]; then
-            mv -f "$BACKUP" "$DESTINATION"
+    if [ "${HENOSIS_ACTIVATED:-0}" -eq 1 ]; then
+        if [ -n "${HENOSIS_BACKUP:-}" ] && [ -f "$HENOSIS_BACKUP" ]; then
+            mv -f "$HENOSIS_BACKUP" "$HENOSIS_DESTINATION"
         else
-            rm -f "$DESTINATION"
+            rm -f "$HENOSIS_DESTINATION"
+        fi
+    fi
+    if [ "${CRUCIBLE_ACTIVATED:-0}" -eq 1 ]; then
+        if [ -n "${CRUCIBLE_BACKUP:-}" ] && [ -f "$CRUCIBLE_BACKUP" ]; then
+            mv -f "$CRUCIBLE_BACKUP" "$CRUCIBLE_DESTINATION"
+        else
+            rm -f "$CRUCIBLE_DESTINATION"
         fi
     fi
 }
@@ -440,26 +451,35 @@ cleanup() {
     [ -n "${WORK_DIR:-}" ] && rm -rf "$WORK_DIR"
 }
 
-# Activate and initialize one already verified executable.
+# Activate both verified executables and initialize Henosis as one transaction.
 install_candidate() {
-    candidate=$1
-    target=$2
-    DESTINATION="$INSTALL_DIR/henosis"
-    BACKUP="$WORK_DIR/henosis.previous"
-    ACTIVATED=0
-    if [ -f "$DESTINATION" ]; then cp -p "$DESTINATION" "$BACKUP"; fi
-    install -m 755 "$candidate" "$WORK_DIR/henosis.new"
-    mv -f "$WORK_DIR/henosis.new" "$DESTINATION"
-    ACTIVATED=1
-    if ! "$DESTINATION" init --quick; then
-        die 'henosis init --quick failed; restored the previous installation'
+    henosis_candidate=$1
+    crucible_candidate=$2
+    target=$3
+    HENOSIS_DESTINATION="$INSTALL_DIR/henosis"
+    CRUCIBLE_DESTINATION="$INSTALL_DIR/crucible"
+    HENOSIS_BACKUP="$WORK_DIR/henosis.previous"
+    CRUCIBLE_BACKUP="$WORK_DIR/crucible.previous"
+    HENOSIS_ACTIVATED=0
+    CRUCIBLE_ACTIVATED=0
+    if [ -f "$HENOSIS_DESTINATION" ]; then cp -p "$HENOSIS_DESTINATION" "$HENOSIS_BACKUP"; fi
+    if [ -f "$CRUCIBLE_DESTINATION" ]; then cp -p "$CRUCIBLE_DESTINATION" "$CRUCIBLE_BACKUP"; fi
+    install -m 755 "$henosis_candidate" "$WORK_DIR/henosis.new"
+    install -m 755 "$crucible_candidate" "$WORK_DIR/crucible.new"
+    mv -f "$WORK_DIR/henosis.new" "$HENOSIS_DESTINATION"
+    HENOSIS_ACTIVATED=1
+    mv -f "$WORK_DIR/crucible.new" "$CRUCIBLE_DESTINATION"
+    CRUCIBLE_ACTIVATED=1
+    if ! "$HENOSIS_DESTINATION" init --quick; then
+        die 'henosis init --quick failed; restored the previous Henosis and Crucible installation'
     fi
-    ACTIVATED=0
-    rm -f "$BACKUP"
+    HENOSIS_ACTIVATED=0
+    CRUCIBLE_ACTIVATED=0
+    rm -f "$HENOSIS_BACKUP" "$CRUCIBLE_BACKUP"
     if [ "$HEADLESS" -eq 1 ]; then
-        printf '{"ok":true,"binary":"%s","version":"%s","target":"%s"}\n' "$DESTINATION" "$VERSION" "$target"
+        printf '{"ok":true,"binary":"%s","crucible":"%s","version":"%s","target":"%s"}\n' "$HENOSIS_DESTINATION" "$CRUCIBLE_DESTINATION" "$VERSION" "$target"
     else
-        info "installed $DESTINATION"
+        info "installed $HENOSIS_DESTINATION and $CRUCIBLE_DESTINATION"
     fi
 }
 
@@ -478,9 +498,11 @@ main() {
     mkdir -p "$INSTALL_DIR"
     [ -d "$INSTALL_DIR" ] || die "install directory is not a directory: $INSTALL_DIR"
     ARCHIVE_BINARY=
+    ARCHIVE_CRUCIBLE=
     if archive_binary "$target"; then
         candidate=$ARCHIVE_BINARY
-        info "installing the verified adjacent $VERSION binary"
+        crucible_candidate=$ARCHIVE_CRUCIBLE
+        info "installing the verified adjacent $VERSION binaries"
     else
         archive_name="henosis-${VERSION#v}-${target}.tar.gz"
         archive="$WORK_DIR/$archive_name"
@@ -497,9 +519,11 @@ main() {
         verify_archive "$manifest" "$archive" "$archive_name"
         tar -xzf "$archive" -C "$WORK_DIR" || die 'could not extract verified archive'
         candidate="$WORK_DIR/henosis-${VERSION#v}-${target}/henosis"
+        crucible_candidate="$WORK_DIR/henosis-${VERSION#v}-${target}/crucible"
         [ -f "$candidate" ] && [ -x "$candidate" ] || die 'verified archive does not contain an executable henosis'
+        [ -f "$crucible_candidate" ] && [ -x "$crucible_candidate" ] || die 'verified archive does not contain an executable crucible'
     fi
-    install_candidate "$candidate" "$target"
+    install_candidate "$candidate" "$crucible_candidate" "$target"
 }
 
 main "$@"

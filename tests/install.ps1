@@ -34,5 +34,6 @@ Assert-InstallerText 'ConvertFrom-Json'
 Assert-InstallerText 'selected release is not immutable'
 Assert-InstallerText "Join-Path `$PSScriptRoot 'HENOSIS_ARCHIVE'"
 Assert-InstallerText "Join-Path `$PSScriptRoot 'henosis.exe'"
+Assert-InstallerText "Join-Path `$PSScriptRoot 'crucible.exe'"
 Assert-InstallerText 'release archive marker does not match this installer'
 Write-Output 'Windows installer contract passed'

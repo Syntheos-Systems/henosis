@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package one Unix Henosis executable into a reproducible native archive.
+# Package the Unix Henosis and Crucible executables into a reproducible native archive.
 
 set -eu
 
@@ -27,18 +27,19 @@ write_install_readme() {
     cat > "$1" <<EOF
 # Henosis $2
 
-This archive contains the native \`henosis\` executable for \`$3\`.
+This archive contains the native \`henosis\` runtime and \`crucible\` quality-gate executable for \`$3\`.
 
 Verify this archive with the release \`SHA256SUMS\` manifest before installing.
 Run \`./install.sh --headless\` from the extracted archive for a per-user offline installation.
-The archive marker binds the installer to the adjacent verified \`henosis\` executable.
-The installer runs \`henosis init --quick\` and rolls back if initialization fails.
+The archive marker binds the installer to both adjacent verified executables.
+The installer activates both programs, runs \`henosis init --quick\`, and rolls back both if initialization fails.
 EOF
 }
 
-[ "$#" -eq 4 ] || die "usage: $0 BINARY VERSION TARGET OUTPUT_DIRECTORY"
-binary_path=$1; version=$2; target=$3; output_directory=$4
-[ -f "$binary_path" ] && [ -x "$binary_path" ] || die "binary is missing or not executable: $binary_path"
+[ "$#" -eq 5 ] || die "usage: $0 HENOSIS_BINARY CRUCIBLE_BINARY VERSION TARGET OUTPUT_DIRECTORY"
+henosis_binary_path=$1; crucible_binary_path=$2; version=$3; target=$4; output_directory=$5
+[ -f "$henosis_binary_path" ] && [ -x "$henosis_binary_path" ] || die "Henosis binary is missing or not executable: $henosis_binary_path"
+[ -f "$crucible_binary_path" ] && [ -x "$crucible_binary_path" ] || die "Crucible binary is missing or not executable: $crucible_binary_path"
 [ -f "$REPOSITORY_DIR/LICENSE" ] || die 'repository LICENSE is missing'
 [ -f "$REPOSITORY_DIR/install.sh" ] || die 'repository Unix installer is missing'
 case "$SOURCE_DATE_EPOCH" in ''|*[!0-9]*) die 'SOURCE_DATE_EPOCH must be a non-negative integer' ;; esac
@@ -53,7 +54,8 @@ cleanup() { rm -rf "$stage_parent"; }
 trap cleanup EXIT HUP INT TERM
 stage="$stage_parent/$root"
 mkdir -p "$stage" "$output_directory"
-install -m 755 "$binary_path" "$stage/henosis"
+install -m 755 "$henosis_binary_path" "$stage/henosis"
+install -m 755 "$crucible_binary_path" "$stage/crucible"
 install -m 755 "$REPOSITORY_DIR/install.sh" "$stage/install.sh"
 install -m 644 "$REPOSITORY_DIR/LICENSE" "$stage/LICENSE"
 printf 'v%s %s\n' "$version" "$target" > "$stage/HENOSIS_ARCHIVE"

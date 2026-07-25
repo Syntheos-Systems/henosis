@@ -17,6 +17,7 @@ production_compose="$REPOSITORY_DIR/containers/compose.production.yml"
 production_environment="$REPOSITORY_DIR/containers/production.env.example"
 for file in "$dockerfile" "$local_compose" "$production_compose" "$production_environment" "$REPOSITORY_DIR/.dockerignore"; do [ -f "$file" ] || fail "missing $file"; done
 require_line "$dockerfile" 'USER 10001:10001'
+require_line "$dockerfile" 'COPY --from=build /src/target/release/crucible /usr/local/bin/crucible'
 require_line "$dockerfile" 'HEALTHCHECK'
 require_line "$dockerfile" 'FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS build'
 require_line "$dockerfile" 'FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818'

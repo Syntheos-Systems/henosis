@@ -24,7 +24,8 @@ make_release() {
 printf '%s' "\$*" > "\${HENOSIS_INIT_LOG:?}"
 $behavior
 EOF
-    chmod 755 "$stage/henosis"
+    printf '#!/bin/sh\nexit 0\n' > "$stage/crucible"
+    chmod 755 "$stage/henosis" "$stage/crucible"
     tar -C "$(dirname "$stage")" -czf "$release_dir/$version/$root.tar.gz" "$root"
     (CDPATH= cd -- "$release_dir/$version" && sha256sum "$root.tar.gz" > SHA256SUMS)
 }
@@ -93,6 +94,7 @@ test_verified_install() {
         "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" --headless > "$case_root/result.json"
     grep -F '"ok":true' "$case_root/result.json" >/dev/null || fail 'headless install did not report success'
     [ -x "$case_root/bin/henosis" ] || fail 'henosis was not installed'
+    [ -x "$case_root/bin/crucible" ] || fail 'Crucible was not installed'
     [ "$(cat "$case_root/init.log")" = 'init --quick' ] || fail 'installer did not run henosis init --quick'
 }
 
@@ -103,9 +105,11 @@ test_rollback() {
     make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version" "$case_root/bin"
     cp "$release/$version"/* "$case_root/remote/$version/"
     printf '#!/bin/sh\nprintf previous\n' > "$case_root/bin/henosis"; chmod 755 "$case_root/bin/henosis"
+    printf '#!/bin/sh\nprintf previous-crucible\n' > "$case_root/bin/crucible"; chmod 755 "$case_root/bin/crucible"
     if HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
         "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" --headless > "$case_root/result.json" 2>&1; then fail 'failed initialization succeeded'; fi
     [ "$("$case_root/bin/henosis")" = previous ] || fail 'previous executable was not restored'
+    [ "$("$case_root/bin/crucible")" = previous-crucible ] || fail 'previous Crucible executable was not restored'
     grep -F '"ok":false' "$case_root/result.json" >/dev/null || fail 'headless rollback did not report failure'
 }
 
@@ -161,14 +165,16 @@ test_archive_local_install() {
 #!/bin/sh
 printf '%s' "$*" > "${HENOSIS_INIT_LOG:?}"
 EOF
+    printf '#!/bin/sh\nexit 0\n' > "$case_root/archive/crucible"
     cat > "$case_root/tools/curl" <<'EOF'
 #!/bin/sh
 exit 99
 EOF
-    chmod 755 "$case_root/archive/install.sh" "$case_root/archive/henosis" "$case_root/tools/curl"
+    chmod 755 "$case_root/archive/install.sh" "$case_root/archive/henosis" "$case_root/archive/crucible" "$case_root/tools/curl"
     HENOSIS_INIT_LOG="$case_root/init.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
         "$case_root/archive/install.sh" --version "$version" --install-dir "$case_root/bin" --headless > "$case_root/result.json"
     [ -x "$case_root/bin/henosis" ] || fail 'archive-local installer did not install the adjacent binary'
+    [ -x "$case_root/bin/crucible" ] || fail 'archive-local installer did not install adjacent Crucible'
     [ "$(cat "$case_root/init.log")" = 'init --quick' ] || fail 'archive-local installer did not initialize'
 }
 
@@ -178,8 +184,9 @@ test_archive_marker_mismatch() {
     mkdir -p "$case_root/archive" "$case_root/bin"
     cp "$REPOSITORY_DIR/install.sh" "$case_root/archive/install.sh"
     cp /bin/true "$case_root/archive/henosis"
+    cp /bin/true "$case_root/archive/crucible"
     printf '%s\n' 'v9.9.9 x86_64-unknown-linux-musl' > "$case_root/archive/HENOSIS_ARCHIVE"
-    chmod 755 "$case_root/archive/install.sh" "$case_root/archive/henosis"
+    chmod 755 "$case_root/archive/install.sh" "$case_root/archive/henosis" "$case_root/archive/crucible"
     if "$case_root/archive/install.sh" --version v0.1.0-alpha.6 --install-dir "$case_root/bin" --headless > "$case_root/result.json" 2>&1; then
         fail 'mismatched archive marker succeeded'
     fi

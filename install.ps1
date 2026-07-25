@@ -105,8 +105,8 @@ function Assert-ImmutableRelease {
     if ($metadata.immutable -ne $true) { Stop-Install 'selected release is not immutable' }
 }
 
-# Resolve the adjacent binary from a verified release archive, when present.
-function Get-ArchiveBinary {
+# Resolve adjacent Henosis and Crucible binaries from a verified release archive.
+function Get-ArchiveBinaries {
     param([Parameter(Mandatory = $true)][string]$Target)
 
     $marker = Join-Path $PSScriptRoot 'HENOSIS_ARCHIVE'
@@ -115,11 +115,15 @@ function Get-ArchiveBinary {
     if ($parts.Count -ne 2 -or $parts[0] -ne $Version -or $parts[1] -ne $Target) {
         Stop-Install 'release archive marker does not match this installer'
     }
-    $candidate = Join-Path $PSScriptRoot 'henosis.exe'
-    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    $henosisCandidate = Join-Path $PSScriptRoot 'henosis.exe'
+    $crucibleCandidate = Join-Path $PSScriptRoot 'crucible.exe'
+    if (-not (Test-Path -LiteralPath $henosisCandidate -PathType Leaf)) {
         Stop-Install 'release archive does not contain an adjacent henosis.exe'
     }
-    return $candidate
+    if (-not (Test-Path -LiteralPath $crucibleCandidate -PathType Leaf)) {
+        Stop-Install 'release archive does not contain an adjacent crucible.exe'
+    }
+    return [pscustomobject]@{ Henosis = $henosisCandidate; Crucible = $crucibleCandidate }
 }
 
 # Install the archive transactionally and initialize the binary before committing it.
@@ -129,12 +133,15 @@ function Install-Release {
     $archiveName = "henosis-$($Version.TrimStart('v'))-$target.zip"
     $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("henosis-install-" + [guid]::NewGuid().ToString('N'))
     $destination = Join-Path $InstallDirectory 'henosis.exe'
+    $crucibleDestination = Join-Path $InstallDirectory 'crucible.exe'
     $backup = Join-Path $workDirectory 'henosis.previous.exe'
+    $crucibleBackup = Join-Path $workDirectory 'crucible.previous.exe'
     $activated = $false
+    $crucibleActivated = $false
     try {
         New-Item -ItemType Directory -Force -Path $workDirectory, $InstallDirectory | Out-Null
-        $candidate = Get-ArchiveBinary -Target $target
-        if ($null -eq $candidate) {
+        $candidates = Get-ArchiveBinaries -Target $target
+        if ($null -eq $candidates) {
             $releaseBase = Get-ReleaseBase
             $releaseApi = Get-ReleaseApi
             $metadataPath = Join-Path $workDirectory 'release.json'
@@ -145,17 +152,25 @@ function Install-Release {
             Get-ReleaseFile -Uri "$releaseBase/$Version/$archiveName" -OutFile $archivePath
             Assert-ArchiveChecksum -ManifestPath (Join-Path $workDirectory 'SHA256SUMS') -ArchivePath $archivePath -ArchiveName $archiveName
             Expand-Archive -LiteralPath $archivePath -DestinationPath $workDirectory -Force
-            $candidate = Join-Path $workDirectory "henosis-$($Version.TrimStart('v'))-$target\\henosis.exe"
+            $contentDirectory = Join-Path $workDirectory "henosis-$($Version.TrimStart('v'))-$target"
+            $candidate = Join-Path $contentDirectory 'henosis.exe'
+            $crucibleCandidate = Join-Path $contentDirectory 'crucible.exe'
             if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { Stop-Install 'verified archive does not contain henosis.exe' }
+            if (-not (Test-Path -LiteralPath $crucibleCandidate -PathType Leaf)) { Stop-Install 'verified archive does not contain crucible.exe' }
+            $candidates = [pscustomobject]@{ Henosis = $candidate; Crucible = $crucibleCandidate }
         }
         if (Test-Path -LiteralPath $destination -PathType Leaf) { Copy-Item -LiteralPath $destination -Destination $backup -Force }
-        Copy-Item -LiteralPath $candidate -Destination $destination -Force
+        if (Test-Path -LiteralPath $crucibleDestination -PathType Leaf) { Copy-Item -LiteralPath $crucibleDestination -Destination $crucibleBackup -Force }
+        Copy-Item -LiteralPath $candidates.Henosis -Destination $destination -Force
         $activated = $true
+        Copy-Item -LiteralPath $candidates.Crucible -Destination $crucibleDestination -Force
+        $crucibleActivated = $true
         & $destination init --quick
-        if ($LASTEXITCODE -ne 0) { Stop-Install 'henosis init --quick failed; restored the previous installation' }
+        if ($LASTEXITCODE -ne 0) { Stop-Install 'henosis init --quick failed; restored the previous Henosis and Crucible installation' }
         $activated = $false
+        $crucibleActivated = $false
         if ($Headless) {
-            [pscustomobject]@{ ok = $true; binary = $destination; version = $Version; target = $target } | ConvertTo-Json -Compress
+            [pscustomobject]@{ ok = $true; binary = $destination; crucible = $crucibleDestination; version = $Version; target = $target } | ConvertTo-Json -Compress
         }
         else { Write-Host "henosis-installer: installed $destination" }
     }
@@ -163,6 +178,10 @@ function Install-Release {
         if ($activated) {
             if (Test-Path -LiteralPath $backup -PathType Leaf) { Move-Item -LiteralPath $backup -Destination $destination -Force }
             else { Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue }
+        }
+        if ($crucibleActivated) {
+            if (Test-Path -LiteralPath $crucibleBackup -PathType Leaf) { Move-Item -LiteralPath $crucibleBackup -Destination $crucibleDestination -Force }
+            else { Remove-Item -LiteralPath $crucibleDestination -Force -ErrorAction SilentlyContinue }
         }
         Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }

@@ -1,8 +1,9 @@
-# Package one Windows Henosis executable into a reproducible native archive.
+# Package the Windows Henosis and Crucible executables into a reproducible native archive.
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$HenosisBinaryPath,
+    [Parameter(Mandatory = $true)][string]$CrucibleBinaryPath,
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$Target,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
@@ -44,16 +45,17 @@ function Write-InstallReadme {
     @"
 # Henosis $ReleaseVersion
 
-This archive contains the native ``henosis.exe`` executable for ``$ReleaseTarget``.
+This archive contains the native ``henosis.exe`` runtime and ``crucible.exe`` quality gate for ``$ReleaseTarget``.
 
 Verify this archive with the release ``SHA256SUMS`` manifest before installing.
 Run ``.\\install.ps1 -Headless`` from the extracted archive for a per-user offline installation.
-The archive marker binds the installer to the adjacent verified ``henosis.exe`` executable.
-The installer runs ``henosis init --quick`` and rolls back if initialization fails.
+The archive marker binds the installer to both adjacent verified executables.
+The installer activates both programs, runs ``henosis init --quick``, and rolls back both if initialization fails.
 "@ | Set-Content -LiteralPath $Path -NoNewline -Encoding utf8
 }
 
-if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) { Stop-ReleasePackaging "binary does not exist: $BinaryPath" }
+if (-not (Test-Path -LiteralPath $HenosisBinaryPath -PathType Leaf)) { Stop-ReleasePackaging "Henosis binary does not exist: $HenosisBinaryPath" }
+if (-not (Test-Path -LiteralPath $CrucibleBinaryPath -PathType Leaf)) { Stop-ReleasePackaging "Crucible binary does not exist: $CrucibleBinaryPath" }
 if ($SourceDateEpoch -lt 315532800) { Stop-ReleasePackaging 'SOURCE_DATE_EPOCH must not predate 1980-01-01 for ZIP compatibility' }
 Assert-ReleaseComponent -Name version -Value $Version
 Assert-ReleaseComponent -Name target -Value $Target
@@ -66,7 +68,8 @@ $archivePath = Join-Path $OutputDirectory "$root.zip"
 try {
     $content = Join-Path $stage $root
     New-Item -ItemType Directory -Force -Path $content, $OutputDirectory | Out-Null
-    Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $content 'henosis.exe') -Force
+    Copy-Item -LiteralPath $HenosisBinaryPath -Destination (Join-Path $content 'henosis.exe') -Force
+    Copy-Item -LiteralPath $CrucibleBinaryPath -Destination (Join-Path $content 'crucible.exe') -Force
     Copy-Item -LiteralPath $installer -Destination (Join-Path $content 'install.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryDirectory 'LICENSE') -Destination (Join-Path $content 'LICENSE') -Force
     "v$Version $Target" | Set-Content -LiteralPath (Join-Path $content 'HENOSIS_ARCHIVE') -NoNewline -Encoding ascii
@@ -77,7 +80,7 @@ try {
     $stream = [System.IO.File]::Open($archivePath, [System.IO.FileMode]::Create)
     try {
         $archive = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create)
-        try { foreach ($name in @('HENOSIS_ARCHIVE', 'LICENSE', 'README.md', 'henosis.exe', 'install.ps1')) { Add-ReleaseEntry -Archive $archive -EntryName "$root/$name" -SourcePath (Join-Path $content $name) -Timestamp $timestamp } } finally { $archive.Dispose() }
+        try { foreach ($name in @('HENOSIS_ARCHIVE', 'LICENSE', 'README.md', 'crucible.exe', 'henosis.exe', 'install.ps1')) { Add-ReleaseEntry -Archive $archive -EntryName "$root/$name" -SourcePath (Join-Path $content $name) -Timestamp $timestamp } } finally { $archive.Dispose() }
     } finally { $stream.Dispose() }
 } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Output $archivePath

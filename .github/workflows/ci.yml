@@ -104,7 +104,7 @@ jobs:
         run: cargo +1.88.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
       - shell: pwsh
         run: |
-          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target x86_64-pc-windows-msvc
+          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target x86_64-pc-windows-msvc
       - shell: powershell
         run: ./tests/install.ps1
       - shell: pwsh
@@ -157,14 +157,14 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup target add --toolchain 1.88.0 ${{ matrix.target }}
       - if: runner.os != 'Windows'
-        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
+        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
       - if: runner.os != 'Windows'
-        run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" ./scripts/package-release.sh "target/${{ matrix.target }}/release/henosis" "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" dist
+        run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" ./scripts/package-release.sh "target/${{ matrix.target }}/release/henosis" "target/${{ matrix.target }}/release/crucible" "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" dist
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server --target ${{ matrix.target }}
-          & .\scripts\package-release.ps1 -BinaryPath "target\${{ matrix.target }}\release\henosis.exe" -Version $env:GITHUB_REF_NAME.Substring(1) -Target '${{ matrix.target }}' -OutputDirectory dist -SourceDateEpoch ([long](git log -1 --format=%ct))
+          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
+          & .\scripts\package-release.ps1 -HenosisBinaryPath "target\${{ matrix.target }}\release\henosis.exe" -CrucibleBinaryPath "target\${{ matrix.target }}\release\crucible.exe" -Version $env:GITHUB_REF_NAME.Substring(1) -Target '${{ matrix.target }}' -OutputDirectory dist -SourceDateEpoch ([long](git log -1 --format=%ct))
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: henosis-${{ matrix.target }}
