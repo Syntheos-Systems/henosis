@@ -33,6 +33,9 @@ const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
 /// Failures returned while initializing or serving the Rift runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    /// Environment-backed Rift configuration was missing or invalid.
+    #[error("Rift configuration failed: {0}")]
+    Config(#[from] crate::config::ConfigError),
     /// PostgreSQL connection or migration failed.
     #[error("Rift database initialization failed: {0}")]
     Database(#[from] sqlx::Error),
@@ -51,6 +54,34 @@ struct AppState {
     config: Config,
     gateway: Gateway,
     pending_uploads: PendingUploads,
+}
+
+/// Initialized Rift resources that Henosis may inspect before binding the listener.
+pub struct InitializedRuntime {
+    /// Complete HTTP and WebSocket router over the initialized persistence layer.
+    app: Router,
+    /// Shared PostgreSQL pool used by routes and room bootstrap.
+    pool: sqlx::PgPool,
+    /// Validated listener address retained from configuration.
+    listen_addr: String,
+}
+
+/// Exposes initialized Rift resources to the unified Henosis supervisor.
+impl InitializedRuntime {
+    /// Borrow the PostgreSQL pool for idempotent room bootstrap.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
+    /// Consume the initialized runtime into the listener address and router.
+    pub fn into_parts(self) -> (String, Router) {
+        (self.listen_addr, self.app)
+    }
+
+    /// Consume the initialized runtime and return only its router.
+    pub fn into_router(self) -> Router {
+        self.app
+    }
 }
 
 /// Extracts the shared PostgreSQL pool from the Rift application state.
@@ -87,6 +118,11 @@ impl axum::extract::FromRef<AppState> for PendingUploads {
 
 /// Initialize Rift persistence and construct its complete HTTP router.
 pub async fn build_router(config: Config) -> Result<Router, RuntimeError> {
+    Ok(initialize(config).await?.into_router())
+}
+
+/// Initialize Rift persistence and retain the pool for unified room bootstrap.
+pub async fn initialize(config: Config) -> Result<InitializedRuntime, RuntimeError> {
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&config.database_url)
@@ -103,7 +139,13 @@ pub async fn build_router(config: Config) -> Result<Router, RuntimeError> {
 
     tokio::fs::create_dir_all(&config.upload_dir).await?;
 
-    Ok(router(config, pool))
+    let listen_addr = config.listen_addr.clone();
+    let app = router(config, pool.clone());
+    Ok(InitializedRuntime {
+        app,
+        pool,
+        listen_addr,
+    })
 }
 
 /// Construct Rift's complete router over an initialized PostgreSQL pool.

@@ -14,5 +14,5 @@ async fn main() -> Result<(), runtime::RuntimeError> {
         )
         .init();
 
-    runtime::serve(Config::from_env()).await
+    runtime::serve(Config::try_from_env()?).await
 }

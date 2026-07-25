@@ -1,6 +1,22 @@
 use axum::http::HeaderValue;
 use std::env;
 
+/// Configuration failures detected before the Rift runtime binds a listener.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// A required environment variable was not present or contained invalid Unicode.
+    #[error("{name}: {source}")]
+    Environment {
+        /// Name of the environment variable that could not be read.
+        name: &'static str,
+        /// Standard-library reason the environment lookup failed.
+        source: env::VarError,
+    },
+    /// A present setting violated a Rift security or parsing invariant.
+    #[error("{0}")]
+    Invalid(String),
+}
+
 /// Default attachment request ceiling: 25 MiB.
 pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
@@ -28,26 +44,35 @@ pub struct Config {
 
 /// Loads Rift server settings from environment variables.
 impl Config {
-    /// Resolve the complete runtime configuration or fail on missing security settings.
-    pub fn from_env() -> Self {
-        let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET required");
-        let bridge_secret = env::var("RIFT_BRIDGE_SECRET").expect("RIFT_BRIDGE_SECRET required");
-        validate_secrets(&jwt_secret, &bridge_secret)
-            .expect("JWT_SECRET and RIFT_BRIDGE_SECRET must be strong and independent");
-        Self {
-            database_url: env::var("DATABASE_URL").expect("DATABASE_URL required"),
+    /// Resolve the complete runtime configuration as a typed startup result.
+    pub fn try_from_env() -> Result<Self, ConfigError> {
+        let jwt_secret = required_env("JWT_SECRET")?;
+        let bridge_secret = required_env("RIFT_BRIDGE_SECRET")?;
+        validate_secrets(&jwt_secret, &bridge_secret).map_err(ConfigError::Invalid)?;
+        Ok(Self {
+            database_url: required_env("DATABASE_URL")?,
             jwt_secret,
             bridge_secret,
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3200".into()),
             cors_origins: parse_cors_origins(&env::var("RIFT_CORS_ORIGINS").unwrap_or_else(|_| {
                 "http://localhost:5173,http://127.0.0.1:5173,tauri://localhost".into()
             }))
-            .expect("RIFT_CORS_ORIGINS must contain valid HTTP header values"),
+            .map_err(ConfigError::Invalid)?,
             upload_dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".into()),
             max_upload_bytes: parse_upload_limit(env::var("MAX_UPLOAD_BYTES").ok().as_deref())
-                .expect("MAX_UPLOAD_BYTES must be between 1 and 104857600"),
-        }
+                .map_err(ConfigError::Invalid)?,
+        })
     }
+
+    /// Resolve the complete runtime configuration or fail on missing security settings.
+    pub fn from_env() -> Self {
+        Self::try_from_env().expect("Rift runtime configuration is invalid")
+    }
+}
+
+/// Read one mandatory Unicode environment setting without collapsing failure modes.
+fn required_env(name: &'static str) -> Result<String, ConfigError> {
+    env::var(name).map_err(|source| ConfigError::Environment { name, source })
 }
 
 /// Parse an optional attachment limit and enforce the server's allocation ceiling.

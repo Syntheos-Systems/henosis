@@ -53,6 +53,13 @@ struct EmbeddingRuntime {
 use crate::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use crate::room::Room;
 
+/// Dependencies a unified Henosis process may inject into the room bridge.
+#[derive(Default)]
+pub struct RuntimeDependencies {
+    /// Existing kernel client sharing Henosis's Chiasm, Broca, and cognition state.
+    pub kleos: Option<Arc<dyn crate::kleos::KleosClient>>,
+}
+
 /// Run the complete Rift bridge until its process is terminated.
 pub async fn run(config: BridgeConfig) -> anyhow::Result<()> {
     run_until(config, std::future::pending()).await
@@ -60,6 +67,18 @@ pub async fn run(config: BridgeConfig) -> anyhow::Result<()> {
 
 /// Run the complete Rift bridge until the supplied stop signal resolves.
 pub async fn run_until<F>(config: BridgeConfig, stop: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    run_with_dependencies(config, RuntimeDependencies::default(), stop).await
+}
+
+/// Run the bridge with caller-owned kernel dependencies until its stop signal resolves.
+pub async fn run_with_dependencies<F>(
+    config: BridgeConfig,
+    dependencies: RuntimeDependencies,
+    stop: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -77,7 +96,13 @@ where
         config.rift.bridge_secret.clone(),
     );
     let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
-    let kleos = build_kleos_client(&config, &embedding_runtime).await?;
+    let kleos = match dependencies.kleos {
+        Some(kleos) => {
+            tracing::info!("kleos backend: injected Henosis kernel stores");
+            kleos
+        }
+        None => build_kleos_client(&config, &embedding_runtime).await?,
+    };
 
     // Wire execution-mode dependencies from config.
     let oracle: Arc<dyn crate::capability::CapabilityOracle> = match &config.pistis {
