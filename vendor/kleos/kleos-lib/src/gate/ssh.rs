@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::gate::parser::parse_ssh_target;
+use crate::gate::parser::{analyze_ssh_command, parse_ssh_target};
 
 /// Check if an SSH target is a reserved/internal address (SSRF prevention).
 /// Parses IPs properly including octal, hex, and decimal-encoded representations.
@@ -72,6 +72,7 @@ pub fn is_reserved_ssh_target(host: &str) -> bool {
     false
 }
 
+/// Return whether either address family is reserved for SSH SSRF purposes.
 pub(crate) fn is_ip_reserved(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_ipv4_reserved(v4),
@@ -151,10 +152,32 @@ pub async fn check_ssh_dns_rebind(host: &str, port: u16) -> Option<String> {
 
 /// Validate an SSH command against static rules.
 /// Returns Some(block_reason) if the command should be blocked, None if it passes.
-/// Checks SSRF targets, reserved IPs, and config reserved_targets list.
-/// Note: DNS rebinding resolution is async and must be done at the server layer.
+/// Checks invocation count, transport-altering options, SSRF targets, reserved
+/// IPs, and the configured reserved target list.
 pub fn check_ssh_command(command: &str, config: &Config) -> Option<String> {
-    let target = parse_ssh_target(command)?;
+    let analysis = analyze_ssh_command(command);
+    if analysis.invocation_count > 1 {
+        return Some(
+            "Multiple SSH invocations in one command are blocked because every target must be validated independently"
+                .to_string(),
+        );
+    }
+    if let Some(option) = analysis.unsafe_option {
+        return Some(format!(
+            "SSH option {} is blocked because it can bypass target validation",
+            option
+        ));
+    }
+
+    let Some(target) = analysis.target else {
+        if analysis.invocation_count == 0 {
+            return None;
+        }
+        return Some(
+            "SSH invocation could not be parsed safely, so target validation cannot be guaranteed"
+                .to_string(),
+        );
+    };
     let host = &target.host;
     let port = target.port;
 
@@ -183,12 +206,25 @@ pub fn check_ssh_command(command: &str, config: &Config) -> Option<String> {
     None
 }
 
+/// Validate static SSH rules and resolve the selected hostname before the
+/// command gate permits execution.
+pub(crate) async fn check_ssh_command_with_dns(command: &str, config: &Config) -> Option<String> {
+    if let Some(reason) = check_ssh_command(command, config) {
+        return Some(reason);
+    }
+
+    let target = parse_ssh_target(command)?;
+    check_ssh_dns_rebind(&target.host, target.port.unwrap_or(22)).await
+}
+
 #[cfg(test)]
+/// Tests for SSH address classification and command validation.
 mod tests {
     use super::*;
 
     // These assertions assume the default deployment posture
     // (`KLEOS_NET_ALLOW_PRIVATE` unset), which is the test environment.
+    /// Metadata, loopback, unspecified, and link-local addresses stay reserved.
     #[test]
     fn metadata_and_loopback_always_reserved() {
         assert!(is_ipv4_reserved("169.254.169.254".parse().unwrap()));
@@ -197,6 +233,7 @@ mod tests {
         assert!(is_ipv4_reserved("169.254.10.1".parse().unwrap()));
     }
 
+    /// Private and carrier-grade NAT ranges are reserved by default.
     #[test]
     fn rfc1918_and_cgnat_reserved_by_default() {
         // The prior implementation let these through -- the SSRF gap this fix closes.
@@ -218,17 +255,90 @@ mod tests {
         );
     }
 
+    /// Documentation-only public ranges remain valid external targets.
     #[test]
     fn public_targets_not_reserved() {
         assert!(!is_ipv4_reserved("8.8.8.8".parse().unwrap()));
         assert!(!is_ipv4_reserved("203.0.113.7".parse().unwrap()));
     }
 
+    /// Static target parsing rejects RFC1918 addresses in host form.
     #[test]
     fn reserved_ssh_target_blocks_rfc1918_hostform() {
         // Encoded-IP evasions resolve through is_ipv4_reserved too.
         assert!(is_reserved_ssh_target("10.0.0.5"));
         assert!(is_reserved_ssh_target("192.168.0.1"));
         assert!(!is_reserved_ssh_target("example.com"));
+    }
+
+    /// Proxy, custom configuration, and forwarding options cannot alter the
+    /// validated transport path.
+    #[test]
+    fn transport_altering_options_are_blocked() {
+        let config = Config::default();
+        for command in [
+            "ssh -J jump.example public.example",
+            "ssh -Jjump.example public.example",
+            "ssh -L 8080:127.0.0.1:80 public.example",
+            "ssh -R9000:127.0.0.1:90 public.example",
+            "ssh -D 1080 public.example",
+            "ssh -W internal.example:22 public.example",
+            "ssh -F ./alternate_config public.example",
+            "ssh -o ProxyCommand='nc 127.0.0.1 22' public.example",
+            "ssh -oProxyJump=jump.example public.example",
+            "ssh -o LocalForward=8080:127.0.0.1:80 public.example",
+            "ssh -oHostname=127.0.0.1 public.example",
+        ] {
+            assert!(
+                check_ssh_command(command, &config).is_some(),
+                "unsafe SSH option passed: {command}"
+            );
+        }
+        assert!(
+            check_ssh_command("ssh -o StrictHostKeyChecking=yes public.example", &config).is_none()
+        );
+    }
+
+    /// Every local SSH token in a shell chain is detected, including pathed
+    /// invocations with no surrounding whitespace.
+    #[test]
+    fn multiple_ssh_invocations_are_blocked() {
+        let config = Config::default();
+        for command in [
+            "ssh public.example; ssh 127.0.0.1",
+            "ssh public.example && /usr/bin/ssh 127.0.0.1",
+            "ssh public.example||ssh 127.0.0.1",
+            "ssh public.example | ssh 127.0.0.1",
+        ] {
+            let reason = check_ssh_command(command, &config).expect("chain must be blocked");
+            assert!(reason.contains("Multiple SSH invocations"));
+        }
+    }
+
+    /// Shell wrappers and command substitutions cannot hide an unparsed local
+    /// SSH invocation from target validation.
+    #[test]
+    fn hidden_ssh_invocations_are_blocked() {
+        let config = Config::default();
+        for command in [
+            "sh -c 'ssh 127.0.0.1'",
+            "bash -c \"/usr/bin/ssh 127.0.0.1\"",
+            "result=$(ssh 127.0.0.1)",
+            "result=`ssh 127.0.0.1`",
+        ] {
+            assert!(
+                check_ssh_command(command, &config).is_some(),
+                "hidden SSH invocation passed: {command}"
+            );
+        }
+    }
+
+    /// The async validator resolves hostnames and rejects reserved results.
+    #[tokio::test]
+    async fn dns_validation_blocks_localhost_alias() {
+        let reason = check_ssh_command_with_dns("ssh localhost.", &Config::default())
+            .await
+            .expect("localhost DNS result must be blocked");
+        assert!(reason.contains("resolves to reserved/internal address"));
     }
 }

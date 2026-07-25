@@ -3,7 +3,7 @@
 Mode: PATCHED
 Pin: 4c7206bbbc661d936c46ae05a839118e905257d4
 Upstream: kleos
-Content-SHA256: 08be87fe13559006697496fd88cc2033e1c93c338cdfd1c248e92404028ea450
+Content-SHA256: 2e942416aa8e1958ba56665529b7540dcced18655ec90a07bf3d2a865c4d2123
 Ref: origin/main
 Mirror: kleos-config=kleos-config
 Mirror: kleos-lib=kleos-lib
@@ -31,6 +31,8 @@ workspace. The crates build against their own vendored workspace root
   enables only `brain_hopfield` and `ml`. Session output scrubbing lives in `sessions::scrub`
   and `gate::scrub_output` re-exports it to preserve the default standalone API. Minimal
   no-default consumers must now select any execution modules they use.
+- Henosis hardens the standalone SSH command gate against chained invocations, transport-altering
+  options, shell-wrapped targets, and DNS rebinding before a command is allowed.
 - `vendor/kleos/Cargo.toml` remains a hand-maintained trimmed workspace root. Its
   `[workspace.dependencies]` table is copied verbatim from the upstream Kleos root and must
   stay in sync on every pull.

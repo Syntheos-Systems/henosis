@@ -151,31 +151,29 @@ pub async fn check_command_with_context(
         });
     }
 
-    // 2. SSH command static validation (SSRF prevention, reserved IPs)
-    if command_for_checks.contains("ssh ") || command_for_checks.starts_with("ssh") {
-        if let Some(block_reason) = check_ssh_command(command_for_checks, config) {
-            let gate_id = store_gate_request(
-                db,
-                GateRequestInsert {
-                    user_id,
-                    agent: &req.agent,
-                    command: &req.command,
-                    context: req.context.as_deref(),
-                    status: "blocked",
-                    reason: Some(&block_reason),
-                    session_id,
-                },
-            )
-            .await?;
-            return Ok(GateCheckResult {
-                allowed: false,
-                reason: Some(block_reason),
-                resolved_command: Some(req.command.clone()),
-                gate_id,
-                requires_approval: false,
-                enrichment: None,
-            });
-        }
+    // 2. SSH validation, including request-time DNS resolution.
+    if let Some(block_reason) = check_ssh_command_with_dns(command_for_checks, config).await {
+        let gate_id = store_gate_request(
+            db,
+            GateRequestInsert {
+                user_id,
+                agent: &req.agent,
+                command: &req.command,
+                context: req.context.as_deref(),
+                status: "blocked",
+                reason: Some(&block_reason),
+                session_id,
+            },
+        )
+        .await?;
+        return Ok(GateCheckResult {
+            allowed: false,
+            reason: Some(block_reason),
+            resolved_command: Some(req.command.clone()),
+            gate_id,
+            requires_approval: false,
+            enrichment: None,
+        });
     }
 
     // 3. Systemctl enrichment context
@@ -755,6 +753,27 @@ mod tests {
         let result = check_command(&db, &req, 1).await.unwrap();
         assert!(!result.allowed);
         assert!(result.reason.is_some());
+    }
+
+    #[tokio::test]
+    /// Verifies DNS resolution in the real gate path blocks a loopback alias.
+    async fn test_check_command_blocks_dns_rebinding() {
+        use crate::db::Database;
+        let db = Database::connect_memory().await.expect("in-memory db");
+        let req = GateCheckRequest {
+            command: "ssh localhost.".to_string(),
+            agent: "test-agent".to_string(),
+            context: None,
+            tool_name: None,
+            session_id: None,
+            skip_approval: false,
+        };
+        let result = check_command(&db, &req, 1).await.expect("gate result");
+        assert!(!result.allowed);
+        assert!(result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("resolves to reserved/internal address")));
     }
 
     #[tokio::test]
