@@ -385,7 +385,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // background loops. It opens a persistent path-backed store at `SYNTHEOS_COGNITION_DB`
     // (default `data/cognition.db`) for the `/cognition/memory*` routes. The parent directory
     // is created on boot. See scripts/known-incomplete.md for the remaining facade limits.
-    #[cfg(feature = "cognition")]
     let cognition = {
         let db_path = std::env::var("SYNTHEOS_COGNITION_DB")
             .unwrap_or_else(|_| "data/cognition.db".to_string());
@@ -409,8 +408,31 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         loom.clone(),
         thymus.clone(),
         #[cfg(feature = "cognition")]
-        cognition,
+        cognition.clone(),
     );
+
+    let room_runtime = match syntheos_server::room_runtime::room_runtime_from_environment()? {
+        syntheos_server::room_runtime::RoomRuntimeSelection::Disabled if local_mode => {
+            tracing::warn!(
+                "managed Rift and Synapse room explicitly disabled for local development"
+            );
+            None
+        }
+        syntheos_server::room_runtime::RoomRuntimeSelection::Disabled => {
+            return Err(
+                "HENOSIS_ROOM_MODE=disabled is allowed only with SYNTHEOS_LOCAL_POLICY=1".into(),
+            );
+        }
+        syntheos_server::room_runtime::RoomRuntimeSelection::Required(config) => Some(
+            syntheos_server::room_runtime::prepare_room_runtime(
+                config,
+                chiasm.clone(),
+                broca.clone(),
+                cognition.clone(),
+            )
+            .await?,
+        ),
+    };
 
     // The authenticated public API and operator surface share one verified signing key. Public
     // runtime startup never silently drops either authentication boundary.
@@ -467,6 +489,21 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
+    let mut room_task = room_runtime.map(|room| {
+        tokio::spawn(async move {
+            let (room_stop_tx, room_stop_rx) = tokio::sync::watch::channel(false);
+            let mut room_run = Box::pin(room.run(room_stop_rx));
+            tokio::select! {
+                result = &mut room_run => result.map_err(|error| error.to_string()),
+                _ = room_stop_signal() => {
+                    room_stop_tx.send_replace(true);
+                    room_run.await.map_err(|error| error.to_string())?;
+                    std::future::pending::<Result<(), String>>().await
+                }
+            }
+        })
+    });
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "henosis listening with authenticated authority, phylaxd broker, and durable audit");
 
@@ -491,6 +528,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     tokio::select! {
+        room_result = wait_for_room_task(&mut room_task) => {
+            match room_result {
+                Ok(Ok(())) => Err("managed Rift and Synapse room exited before Henosis".into()),
+                Ok(Err(error)) => Err(format!("managed Rift and Synapse room failed: {error}").into()),
+                Err(error) => Err(format!("managed room task failed: {error}").into()),
+            }
+        }
         server_result = &mut server => {
             loom_sweeper_shutdown.send_replace(true);
             let sweeper_result = loom_sweeper.await;
@@ -508,6 +552,53 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => Err(format!("Loom timeout sweeper task failed: {error}").into()),
             }
         }
+    }
+}
+
+/// Resolve when the operating system asks the managed room to stop.
+async fn room_stop_signal() {
+    /// Resolve on a terminal interrupt or remain pending if handler installation fails.
+    async fn interrupt() {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install room interrupt handler");
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Resolve on the service-manager termination signal on Unix.
+    #[cfg(unix)]
+    async fn terminate() {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install room termination handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Remain pending where service-manager termination signals do not exist.
+    #[cfg(not(unix))]
+    async fn terminate() {
+        std::future::pending::<()>().await;
+    }
+
+    tokio::select! {
+        _ = interrupt() => {}
+        _ = terminate() => {}
+    }
+}
+
+/// Await the managed room task or remain dormant in explicit local development mode.
+async fn wait_for_room_task(
+    task: &mut Option<tokio::task::JoinHandle<Result<(), String>>>,
+) -> Result<Result<(), String>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 

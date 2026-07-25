@@ -47,7 +47,6 @@ pub mod billing;
 pub mod operator;
 
 /// Managed Rift room and Synapse bridge lifecycle owned by Henosis.
-#[cfg(feature = "cognition")]
 pub mod room_runtime;
 
 pub use action_reactor::spawn_action_reactor;

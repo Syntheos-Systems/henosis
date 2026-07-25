@@ -39,13 +39,13 @@ henosis-credential-store = { path = "../henosis-credential-store" }
 henosis-rift = { path = "../henosis-rift" }
 # Persistent Rift room server and its Synapse agent bridge.
 henosis-rift-server = { path = "../henosis-rift-server" }
-henosis-rift-bridge = { path = "../henosis-rift-bridge" }
+henosis-rift-bridge = { path = "../henosis-rift-bridge", features = ["cognition"] }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
 # Plutus policy authority.
 henosis-plutus = { path = "../henosis-plutus" }
 # Cognitive-core facade over vendored kleos-lib.
-henosis-cognition = { path = "../henosis-cognition", optional = true }
+henosis-cognition = { path = "../henosis-cognition" }
 # Component lifecycle errors from the embedded Rift bridge.
 anyhow.workspace = true
 # JWT session tokens for the operator API surface (HS256 via pure-Rust crypto).
@@ -106,6 +106,6 @@ henosis-plutus = { path = "../henosis-plutus", features = ["test-helpers"] }
 
 [features]
 default = ["cognition"]
-# The public Henosis binary includes the in-process cognitive core by default. This feature remains
-# named so specialized developers can still compile the kernel library without the ML stack.
-cognition = ["dep:henosis-cognition", "henosis-rift-bridge/cognition"]
+# The public Henosis binary exposes cognition routes by default. Cognition itself remains compiled
+# in every binary because the managed Synapse room uses it as its memory backend.
+cognition = []
