@@ -1,4 +1,6 @@
 pub mod auth;
+/// Transactional creation of the managed Henosis room.
+pub mod bootstrap;
 pub mod config;
 pub mod db;
 pub mod error;
