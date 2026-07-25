@@ -1661,8 +1661,9 @@ mod loom_timeout_sweeper_tests {
             })
             .await
             .expect("create workflow");
+        let tenant = workflow.tenant;
         let run = loom
-            .create_run(principal, workflow.id, None)
+            .create_run(tenant, principal, workflow.id, None)
             .await
             .expect("create run");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1674,7 +1675,10 @@ mod loom_timeout_sweeper_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let steps = loom.get_steps(principal, run.id).await.expect("read steps");
+                let steps = loom
+                    .get_steps(tenant, principal, run.id)
+                    .await
+                    .expect("read steps");
                 if steps.iter().any(|step| step.status == StepStatus::Failed) {
                     break;
                 }

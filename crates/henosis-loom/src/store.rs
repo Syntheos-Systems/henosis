@@ -1,8 +1,8 @@
 //! The SQLite-backed Loom workflow store and its dependency-driven step engine.
 //!
-//! Workflows and runs are owner-scoped on [`PrincipalId`], use [`WorkflowId`]/[`RunId`] (UUID
-//! v8), and publish typed lifecycle events on the in-process [`AxonBus`]. The versioned SQLite
-//! schema uses one `Connection` behind a `Mutex`.
+//! Workflows and runs are scoped on both [`TenantId`] and [`PrincipalId`], use
+//! [`WorkflowId`]/[`RunId`] (UUID v8), and publish typed lifecycle events on the in-process
+//! [`AxonBus`]. The versioned SQLite schema uses one `Connection` behind a `Mutex`.
 //!
 //! The engine (`advance_run`) advances a run by starting every pending step whose dependencies
 //! are all completed, handing it the run input overlaid with its
@@ -36,7 +36,10 @@ use crate::model::{
 };
 
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__loom_workflows.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__loom_workflows.sql")),
+    (2, include_str!("../migrations/V2__loom_tenant_indexes.sql")),
+];
 
 /// The columns of `loom_workflows`, in the order [`read_raw_workflow`] reads them.
 const WORKFLOW_COLUMNS: &str =
@@ -586,19 +589,23 @@ impl LoomStore {
         Ok(workflow)
     }
 
-    /// Look up an owned workflow by id. `Ok(None)` if absent or owned by another principal.
+    /// Look up an owned workflow by id within a tenant.
+    ///
+    /// Returns `Ok(None)` when the workflow is absent or belongs to another tenant or principal.
     pub async fn get_workflow(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: WorkflowId,
     ) -> Result<Option<Workflow>, LoomError> {
         let conn = self.lock();
-        Self::get_workflow_in(&conn, principal, id)
+        Self::get_workflow_in(&conn, tenant, principal, id)
     }
 
-    /// Owner-scoped workflow lookup against an arbitrary connection.
+    /// Tenant-and-owner-scoped workflow lookup against an arbitrary connection.
     fn get_workflow_in(
         conn: &Connection,
+        tenant: TenantId,
         principal: PrincipalId,
         id: WorkflowId,
     ) -> Result<Option<Workflow>, LoomError> {
@@ -606,9 +613,9 @@ impl LoomStore {
             .query_row(
                 &format!(
                     "SELECT {WORKFLOW_COLUMNS} FROM loom_workflows \
-                     WHERE id = ?1 AND principal_id = ?2"
+                     WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3"
                 ),
-                rusqlite::params![id.to_string(), principal.to_string()],
+                rusqlite::params![id.to_string(), tenant.to_string(), principal.to_string()],
                 read_raw_workflow,
             )
             .optional()
@@ -616,9 +623,10 @@ impl LoomStore {
         raw.map(RawWorkflow::into_workflow).transpose()
     }
 
-    /// Look up an owned workflow by its per-owner-unique name.
+    /// Look up an owned workflow by name within a tenant.
     pub async fn get_workflow_by_name(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         name: &str,
     ) -> Result<Option<Workflow>, LoomError> {
@@ -627,9 +635,9 @@ impl LoomStore {
             .query_row(
                 &format!(
                     "SELECT {WORKFLOW_COLUMNS} FROM loom_workflows \
-                     WHERE principal_id = ?1 AND name = ?2"
+                     WHERE tenant = ?1 AND principal_id = ?2 AND name = ?3"
                 ),
-                rusqlite::params![principal.to_string(), name],
+                rusqlite::params![tenant.to_string(), principal.to_string(), name],
                 read_raw_workflow,
             )
             .optional()
@@ -637,17 +645,24 @@ impl LoomStore {
         raw.map(RawWorkflow::into_workflow).transpose()
     }
 
-    /// List a principal's workflows, newest-updated first.
-    pub async fn list_workflows(&self, principal: PrincipalId) -> Result<Vec<Workflow>, LoomError> {
+    /// List a principal's workflows within a tenant, newest-updated first.
+    pub async fn list_workflows(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<Vec<Workflow>, LoomError> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {WORKFLOW_COLUMNS} FROM loom_workflows \
-                 WHERE principal_id = ?1 ORDER BY updated_at DESC"
+                 WHERE tenant = ?1 AND principal_id = ?2 ORDER BY updated_at DESC"
             ))
             .map_err(berr)?;
         let rows = stmt
-            .query_map(rusqlite::params![principal.to_string()], read_raw_workflow)
+            .query_map(
+                rusqlite::params![tenant.to_string(), principal.to_string()],
+                read_raw_workflow,
+            )
             .map_err(berr)?;
         let mut out = Vec::new();
         for row in rows {
@@ -660,6 +675,7 @@ impl LoomStore {
     /// Existing runs keep the step instances they were created with.
     pub async fn update_workflow(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: WorkflowId,
         patch: WorkflowPatch,
@@ -669,8 +685,8 @@ impl LoomStore {
             validate_limits(steps)?;
         }
         let conn = self.lock();
-        let mut workflow =
-            Self::get_workflow_in(&conn, principal, id)?.ok_or(LoomError::WorkflowNotFound(id))?;
+        let mut workflow = Self::get_workflow_in(&conn, tenant, principal, id)?
+            .ok_or(LoomError::WorkflowNotFound(id))?;
         if let Some(name) = patch.name {
             workflow.name = name;
         }
@@ -683,7 +699,7 @@ impl LoomStore {
         workflow.updated_at = Timestamp::now();
         conn.execute(
             "UPDATE loom_workflows SET name = ?1, description = ?2, steps = ?3, updated_at = ?4 \
-             WHERE id = ?5 AND principal_id = ?6",
+             WHERE id = ?5 AND tenant = ?6 AND principal_id = ?7",
             rusqlite::params![
                 &workflow.name,
                 &workflow.description,
@@ -691,6 +707,7 @@ impl LoomStore {
                     .map_err(|e| LoomError::Backend(format!("steps serialize: {e}")))?,
                 ts_to_db(&workflow.updated_at)?,
                 id.to_string(),
+                tenant.to_string(),
                 principal.to_string(),
             ],
         )
@@ -702,14 +719,16 @@ impl LoomStore {
     /// removed.
     pub async fn delete_workflow(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: WorkflowId,
     ) -> Result<bool, LoomError> {
         let conn = self.lock();
         let n = conn
             .execute(
-                "DELETE FROM loom_workflows WHERE id = ?1 AND principal_id = ?2",
-                rusqlite::params![id.to_string(), principal.to_string()],
+                "DELETE FROM loom_workflows \
+                 WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3",
+                rusqlite::params![id.to_string(), tenant.to_string(), principal.to_string()],
             )
             .map_err(berr)?;
         Ok(n > 0)
@@ -722,6 +741,7 @@ impl LoomStore {
     /// any run rows are written. A workflow with no steps cannot run.
     pub async fn create_run(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         workflow_id: WorkflowId,
         input: Option<serde_json::Value>,
@@ -736,7 +756,7 @@ impl LoomStore {
         let (run, workflow_name) = {
             let mut conn = self.lock();
             let tx = conn.transaction().map_err(berr)?;
-            let workflow = Self::get_workflow_in(&tx, principal, workflow_id)?
+            let workflow = Self::get_workflow_in(&tx, tenant, principal, workflow_id)?
                 .ok_or(LoomError::WorkflowNotFound(workflow_id))?;
             validate_steps(&workflow.steps)?;
             validate_limits(&workflow.steps)?;
@@ -746,7 +766,7 @@ impl LoomStore {
             let run = Run {
                 id: RunId::new(),
                 workflow_id,
-                tenant: workflow.tenant,
+                tenant,
                 principal_id: principal,
                 status: RunStatus::Pending,
                 input: input.clone(),
@@ -816,22 +836,28 @@ impl LoomStore {
         );
         self.advance_inner(run.id).await?;
         // Re-read: the advance pass may have started (or even completed) the run.
-        self.get_run(principal, run.id)
+        self.get_run(tenant, principal, run.id)
             .await?
             .ok_or(LoomError::RunNotFound(run.id))
     }
 
-    /// Look up an owned run by id. `Ok(None)` if absent or owned by another principal.
+    /// Look up an owned run by id within a tenant.
+    ///
+    /// Returns `Ok(None)` when the run is absent or belongs to another tenant or principal.
     pub async fn get_run(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         id: RunId,
     ) -> Result<Option<Run>, LoomError> {
         let conn = self.lock();
         let raw = conn
             .query_row(
-                &format!("SELECT {RUN_COLUMNS} FROM loom_runs WHERE id = ?1 AND principal_id = ?2"),
-                rusqlite::params![id.to_string(), principal.to_string()],
+                &format!(
+                    "SELECT {RUN_COLUMNS} FROM loom_runs \
+                     WHERE id = ?1 AND tenant = ?2 AND principal_id = ?3"
+                ),
+                rusqlite::params![id.to_string(), tenant.to_string(), principal.to_string()],
                 read_raw_run,
             )
             .optional()
@@ -852,15 +878,18 @@ impl LoomStore {
         raw.map(RawRun::into_run).transpose()
     }
 
-    /// List a principal's runs, newest first, AND-filtered by [`RunFilter`].
+    /// List a principal's runs within a tenant, newest first, AND-filtered by [`RunFilter`].
     pub async fn list_runs(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         filter: RunFilter,
     ) -> Result<Vec<Run>, LoomError> {
-        let mut sql = format!("SELECT {RUN_COLUMNS} FROM loom_runs WHERE principal_id = ?1");
-        let mut args: Vec<rusqlite::types::Value> = vec![principal.to_string().into()];
-        let mut n = 1;
+        let mut sql =
+            format!("SELECT {RUN_COLUMNS} FROM loom_runs WHERE tenant = ?1 AND principal_id = ?2");
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![tenant.to_string().into(), principal.to_string().into()];
+        let mut n = 2;
         if let Some(workflow_id) = &filter.workflow_id {
             n += 1;
             sql.push_str(&format!(" AND workflow_id = ?{n}"));
@@ -893,12 +922,17 @@ impl LoomStore {
     /// Cancel an owned, non-terminal run: pending/running steps become `skipped`, the run
     /// becomes `cancelled`, and `workflow.run.cancelled` is emitted. Returns whether anything
     /// was cancelled (a terminal run returns `false`).
-    pub async fn cancel_run(&self, principal: PrincipalId, id: RunId) -> Result<bool, LoomError> {
+    pub async fn cancel_run(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+        id: RunId,
+    ) -> Result<bool, LoomError> {
         let run = {
             let mut conn = self.lock();
             let tx = conn.transaction().map_err(berr)?;
             let run = Self::get_run_any(&tx, id)?
-                .filter(|r| r.principal_id == principal)
+                .filter(|r| r.tenant == tenant && r.principal_id == principal)
                 .ok_or(LoomError::RunNotFound(id))?;
             if run.status.is_terminal() {
                 return Ok(false);
@@ -906,8 +940,13 @@ impl LoomStore {
             let now = ts_to_db(&Timestamp::now())?;
             tx.execute(
                 "UPDATE loom_runs SET status = 'cancelled', completed_at = ?2, updated_at = ?2 \
-                 WHERE id = ?1",
-                rusqlite::params![id.to_string(), now],
+                 WHERE id = ?1 AND tenant = ?3 AND principal_id = ?4",
+                rusqlite::params![
+                    id.to_string(),
+                    now,
+                    tenant.to_string(),
+                    principal.to_string()
+                ],
             )
             .map_err(berr)?;
             tx.execute(
@@ -930,10 +969,10 @@ impl LoomStore {
         Ok(true)
     }
 
-    /// List a run's steps in definition order, owner-scoped (another principal's run yields an
-    /// empty list).
+    /// List a run's steps in definition order within a tenant.
     pub async fn get_steps(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         run_id: RunId,
     ) -> Result<Vec<Step>, LoomError> {
@@ -942,13 +981,18 @@ impl LoomStore {
             .prepare(&format!(
                 "SELECT {STEP_COLUMNS} FROM loom_steps s WHERE s.run_id = ?1 \
                  AND EXISTS (SELECT 1 FROM loom_runs r \
-                             WHERE r.id = s.run_id AND r.principal_id = ?2) \
+                             WHERE r.id = s.run_id AND r.tenant = ?2 \
+                               AND r.principal_id = ?3) \
                  ORDER BY s.id ASC"
             ))
             .map_err(berr)?;
         let rows = stmt
             .query_map(
-                rusqlite::params![run_id.to_string(), principal.to_string()],
+                rusqlite::params![
+                    run_id.to_string(),
+                    tenant.to_string(),
+                    principal.to_string()
+                ],
                 read_raw_step,
             )
             .map_err(berr)?;
@@ -983,12 +1027,13 @@ impl LoomStore {
     /// Fetch one step by id, owner-scoped through its run.
     pub async fn get_step(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         step_id: i64,
     ) -> Result<Option<Step>, LoomError> {
         let conn = self.lock();
         Ok(Self::get_step_with_run(&conn, step_id)?
-            .filter(|(_, run)| run.principal_id == principal)
+            .filter(|(_, run)| run.tenant == tenant && run.principal_id == principal)
             .map(|(step, _)| step))
     }
 
@@ -999,6 +1044,7 @@ impl LoomStore {
     /// `expected_started_at` must match the attempt the caller actually executed.
     pub async fn complete_step(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         step_id: i64,
         expected_retry_count: i32,
@@ -1010,7 +1056,7 @@ impl LoomStore {
         let (step, run) = {
             let conn = self.lock();
             Self::get_step_with_run(&conn, step_id)?
-                .filter(|(_, run)| run.principal_id == principal)
+                .filter(|(_, run)| run.tenant == tenant && run.principal_id == principal)
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
         match self.complete_step_inner(
@@ -1042,6 +1088,7 @@ impl LoomStore {
     /// whose work produced the failure.
     pub async fn fail_step(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         step_id: i64,
         expected_retry_count: i32,
@@ -1051,7 +1098,7 @@ impl LoomStore {
         let (step, run) = {
             let conn = self.lock();
             Self::get_step_with_run(&conn, step_id)?
-                .filter(|(_, run)| run.principal_id == principal)
+                .filter(|(_, run)| run.tenant == tenant && run.principal_id == principal)
                 .ok_or(LoomError::StepNotFound(step_id))?
         };
         match self.fail_step_inner(
@@ -1296,13 +1343,14 @@ impl LoomStore {
     /// Advance an owned run: the public nudge for externally driven graphs.
     pub async fn advance_run(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         run_id: RunId,
     ) -> Result<(), LoomError> {
         {
             let conn = self.lock();
             Self::get_run_any(&conn, run_id)?
-                .filter(|r| r.principal_id == principal)
+                .filter(|r| r.tenant == tenant && r.principal_id == principal)
                 .ok_or(LoomError::RunNotFound(run_id))?;
         }
         self.advance_inner(run_id).await
@@ -1619,9 +1667,10 @@ impl LoomStore {
         Ok(timed_out)
     }
 
-    /// Read a run's execution log, oldest first, capped at `limit`. Owner-scoped.
+    /// Read a run's execution log within a tenant, oldest first, capped at `limit`.
     pub async fn logs(
         &self,
+        tenant: TenantId,
         principal: PrincipalId,
         run_id: RunId,
         limit: usize,
@@ -1631,12 +1680,18 @@ impl LoomStore {
             .prepare(
                 "SELECT l.id, l.run_id, l.step_id, l.level, l.message, l.data, l.created_at \
                  FROM loom_logs l JOIN loom_runs r ON r.id = l.run_id \
-                 WHERE l.run_id = ?1 AND r.principal_id = ?2 ORDER BY l.id ASC LIMIT ?3",
+                 WHERE l.run_id = ?1 AND r.tenant = ?2 AND r.principal_id = ?3 \
+                 ORDER BY l.id ASC LIMIT ?4",
             )
             .map_err(berr)?;
         let rows = stmt
             .query_map(
-                rusqlite::params![run_id.to_string(), principal.to_string(), limit as i64],
+                rusqlite::params![
+                    run_id.to_string(),
+                    tenant.to_string(),
+                    principal.to_string(),
+                    limit as i64
+                ],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -1669,25 +1724,32 @@ impl LoomStore {
         Ok(out)
     }
 
-    /// Aggregate workflow/run counts for a principal.
-    pub async fn stats(&self, principal: PrincipalId) -> Result<LoomStats, LoomError> {
+    /// Aggregate workflow/run counts for a principal within a tenant.
+    pub async fn stats(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<LoomStats, LoomError> {
         let conn = self.lock();
         let workflows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM loom_workflows WHERE principal_id = ?1",
-                rusqlite::params![principal.to_string()],
+                "SELECT COUNT(*) FROM loom_workflows \
+                 WHERE tenant = ?1 AND principal_id = ?2",
+                rusqlite::params![tenant.to_string(), principal.to_string()],
                 |r| r.get(0),
             )
             .map_err(berr)?;
         let mut stmt = conn
             .prepare(
-                "SELECT status, COUNT(*) FROM loom_runs WHERE principal_id = ?1 GROUP BY status",
+                "SELECT status, COUNT(*) FROM loom_runs \
+                 WHERE tenant = ?1 AND principal_id = ?2 GROUP BY status",
             )
             .map_err(berr)?;
         let rows = stmt
-            .query_map(rusqlite::params![principal.to_string()], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_map(
+                rusqlite::params![tenant.to_string(), principal.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
             .map_err(berr)?;
         let mut runs = 0;
         let mut active_runs = 0;
@@ -1742,6 +1804,38 @@ mod tests {
             .expect("open")
             .with_executor(Box::new(TransformExecutor));
         (store, bus)
+    }
+
+    #[test]
+    /// The forward migration upgrades V1 databases with tenant-aware query indexes.
+    fn tenant_indexes_upgrade_existing_v1_database() {
+        let mut database = OpenedDatabase::open_in_memory().expect("open V1 database");
+        database
+            .execute_batch(include_str!("../migrations/V1__loom_workflows.sql"))
+            .expect("apply V1 schema");
+        database
+            .pragma_update(None, "user_version", 1)
+            .expect("mark V1 schema");
+
+        apply_migrations(&mut database).expect("upgrade to V2");
+
+        let version: i64 = database
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, 2);
+        for index in [
+            "idx_loom_workflows_tenant_principal_updated",
+            "idx_loom_runs_tenant_principal_status",
+        ] {
+            let count: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![index],
+                    |row| row.get(0),
+                )
+                .expect("read tenant index");
+            assert_eq!(count, 1, "missing {index}");
+        }
     }
 
     /// A transform StepDef with the given name, deps, and config.
@@ -1809,21 +1903,21 @@ mod tests {
         let (store, _bus) = store();
         let (principal, wf) = workflow_with(&store, vec![action("a", &[])]).await;
         let got = store
-            .get_workflow(principal, wf.id)
+            .get_workflow(wf.tenant, principal, wf.id)
             .await
             .expect("get")
             .expect("present");
         assert_eq!(got, wf);
         assert!(
             store
-                .get_workflow(PrincipalId::new(), wf.id)
+                .get_workflow(wf.tenant, PrincipalId::new(), wf.id)
                 .await
                 .expect("get")
                 .is_none(),
             "owner-scoped"
         );
         let by_name = store
-            .get_workflow_by_name(principal, &wf.name)
+            .get_workflow_by_name(wf.tenant, principal, &wf.name)
             .await
             .expect("get")
             .expect("present");
@@ -1831,6 +1925,7 @@ mod tests {
 
         let updated = store
             .update_workflow(
+                wf.tenant,
                 principal,
                 wf.id,
                 WorkflowPatch {
@@ -1843,17 +1938,232 @@ mod tests {
         assert_eq!(updated.description.as_deref(), Some("now described"));
 
         assert_eq!(
-            store.list_workflows(principal).await.expect("list").len(),
+            store
+                .list_workflows(wf.tenant, principal)
+                .await
+                .expect("list")
+                .len(),
             1
         );
-        assert!(store
-            .delete_workflow(principal, wf.id)
+        assert!(
+            store
+                .delete_workflow(wf.tenant, principal, wf.id)
+                .await
+                .expect("delete")
+        );
+        assert!(
+            !store
+                .delete_workflow(wf.tenant, principal, wf.id)
+                .await
+                .expect("delete")
+        );
+    }
+
+    #[tokio::test]
+    /// Tenant boundaries isolate every owner-scoped workflow and run operation.
+    async fn same_principal_cannot_cross_tenant_boundaries() {
+        let (store, _bus) = store();
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let principal = PrincipalId::new();
+        let workflow_a = store
+            .create_workflow(NewWorkflow {
+                tenant: tenant_a,
+                principal_id: principal,
+                name: "tenant-a-workflow".to_string(),
+                description: None,
+                steps: vec![action("approve-a", &[])],
+            })
             .await
-            .expect("delete"));
-        assert!(!store
-            .delete_workflow(principal, wf.id)
+            .expect("tenant A workflow");
+        let workflow_b = store
+            .create_workflow(NewWorkflow {
+                tenant: tenant_b,
+                principal_id: principal,
+                name: "tenant-b-workflow".to_string(),
+                description: None,
+                steps: vec![action("approve-b", &[])],
+            })
             .await
-            .expect("delete"));
+            .expect("tenant B workflow");
+        let run_a = store
+            .create_run(tenant_a, principal, workflow_a.id, None)
+            .await
+            .expect("tenant A run");
+        let run_b = store
+            .create_run(tenant_b, principal, workflow_b.id, None)
+            .await
+            .expect("tenant B run");
+        let step_a = store
+            .get_steps(tenant_a, principal, run_a.id)
+            .await
+            .expect("tenant A steps")
+            .into_iter()
+            .next()
+            .expect("tenant A step");
+        let step_a_started = step_a.started_at.expect("tenant A attempt start");
+
+        assert!(
+            store
+                .get_workflow(tenant_b, principal, workflow_a.id)
+                .await
+                .expect("cross-tenant workflow lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_workflow_by_name(tenant_b, principal, &workflow_a.name)
+                .await
+                .expect("cross-tenant workflow name lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_workflows(tenant_b, principal)
+                .await
+                .expect("tenant B workflows")
+                .into_iter()
+                .map(|workflow| workflow.id)
+                .collect::<Vec<_>>(),
+            vec![workflow_b.id]
+        );
+        assert!(matches!(
+            store
+                .update_workflow(
+                    tenant_b,
+                    principal,
+                    workflow_a.id,
+                    WorkflowPatch {
+                        description: Some("forbidden".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            Err(LoomError::WorkflowNotFound(id)) if id == workflow_a.id
+        ));
+        assert!(
+            !store
+                .delete_workflow(tenant_b, principal, workflow_a.id)
+                .await
+                .expect("cross-tenant workflow delete")
+        );
+        assert!(matches!(
+            store
+                .create_run(tenant_b, principal, workflow_a.id, None)
+                .await,
+            Err(LoomError::WorkflowNotFound(id)) if id == workflow_a.id
+        ));
+
+        assert!(
+            store
+                .get_run(tenant_b, principal, run_a.id)
+                .await
+                .expect("cross-tenant run lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_runs(tenant_b, principal, RunFilter::default())
+                .await
+                .expect("tenant B runs")
+                .into_iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![run_b.id]
+        );
+        assert!(matches!(
+            store.cancel_run(tenant_b, principal, run_a.id).await,
+            Err(LoomError::RunNotFound(id)) if id == run_a.id
+        ));
+        assert!(
+            store
+                .get_steps(tenant_b, principal, run_a.id)
+                .await
+                .expect("cross-tenant steps")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_step(tenant_b, principal, step_a.id)
+                .await
+                .expect("cross-tenant step lookup")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .complete_step(
+                    tenant_b,
+                    principal,
+                    step_a.id,
+                    step_a.retry_count,
+                    step_a_started,
+                    serde_json::json!({"forbidden": true}),
+                )
+                .await,
+            Err(LoomError::StepNotFound(id)) if id == step_a.id
+        ));
+        assert!(matches!(
+            store
+                .fail_step(
+                    tenant_b,
+                    principal,
+                    step_a.id,
+                    step_a.retry_count,
+                    step_a_started,
+                    "forbidden",
+                )
+                .await,
+            Err(LoomError::StepNotFound(id)) if id == step_a.id
+        ));
+        assert!(matches!(
+            store.advance_run(tenant_b, principal, run_a.id).await,
+            Err(LoomError::RunNotFound(id)) if id == run_a.id
+        ));
+        assert!(
+            store
+                .logs(tenant_b, principal, run_a.id, 100)
+                .await
+                .expect("cross-tenant logs")
+                .is_empty()
+        );
+
+        let stats_b = store
+            .stats(tenant_b, principal)
+            .await
+            .expect("tenant B stats");
+        assert_eq!(stats_b.workflows, 1);
+        assert_eq!(stats_b.runs, 1);
+        assert_eq!(stats_b.active_runs, 1);
+
+        store
+            .complete_step(
+                tenant_a,
+                principal,
+                step_a.id,
+                step_a.retry_count,
+                step_a_started,
+                serde_json::json!({"allowed": true}),
+            )
+            .await
+            .expect("tenant A completion");
+        assert_eq!(
+            store
+                .get_run(tenant_a, principal, run_a.id)
+                .await
+                .expect("tenant A run lookup")
+                .expect("tenant A run")
+                .status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            store
+                .get_run(tenant_b, principal, run_b.id)
+                .await
+                .expect("tenant B run lookup")
+                .expect("tenant B run")
+                .status,
+            RunStatus::Running
+        );
     }
 
     #[tokio::test]
@@ -2049,6 +2359,7 @@ mod tests {
         assert!(matches!(
             store
                 .update_workflow(
+                    update_target.tenant,
                     principal,
                     update_target.id,
                     WorkflowPatch {
@@ -2074,7 +2385,7 @@ mod tests {
         }
         assert!(matches!(
             store
-                .create_run(principal, update_target.id, None)
+                .create_run(update_target.tenant, principal, update_target.id, None)
                 .await
                 .expect_err("oversized legacy definition"),
             LoomError::InvalidInput(_)
@@ -2108,7 +2419,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .create_run(principal, workflow.id, None)
+                .create_run(workflow.tenant, principal, workflow.id, None)
                 .await
                 .expect_err("legacy definition"),
             LoomError::InvalidInput(_)
@@ -2149,6 +2460,7 @@ mod tests {
 
         let run = store
             .create_run(
+                wf.tenant,
                 principal,
                 wf.id,
                 Some(serde_json::json!({"src": {"value": 41}})),
@@ -2174,7 +2486,10 @@ mod tests {
             ]
         );
         // The log recorded the journey.
-        let logs = store.logs(principal, run.id, 50).await.expect("logs");
+        let logs = store
+            .logs(run.tenant, principal, run.id, 50)
+            .await
+            .expect("logs");
         assert!(logs.iter().any(|l| l.message.contains("run completed")));
     }
 
@@ -2191,7 +2506,10 @@ mod tests {
             ],
         )
         .await;
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         assert_eq!(
             run.status,
             RunStatus::Running,
@@ -2199,7 +2517,10 @@ mod tests {
         );
         let _ = drain_kinds(&mut rx);
 
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         let approve = steps.iter().find(|s| s.name == "approve").expect("step");
         assert_eq!(approve.status, StepStatus::Running);
         let approve_started_at = approve.started_at.expect("attempt start");
@@ -2207,6 +2528,7 @@ mod tests {
         // A stranger cannot complete it.
         let err = store
             .complete_step(
+                run.tenant,
                 PrincipalId::new(),
                 approve.id,
                 approve.retry_count,
@@ -2220,6 +2542,7 @@ mod tests {
         // The owner completes it; the dependent transform runs and the run finishes.
         store
             .complete_step(
+                run.tenant,
                 principal,
                 approve.id,
                 approve.retry_count,
@@ -2229,7 +2552,7 @@ mod tests {
             .await
             .expect("complete");
         let run = store
-            .get_run(principal, run.id)
+            .get_run(run.tenant, principal, run.id)
             .await
             .expect("get")
             .expect("present");
@@ -2246,11 +2569,11 @@ mod tests {
         let mut rx = bus.subscribe("workflow");
         let (principal, workflow) = workflow_with(&store, vec![action("external", &[])]).await;
         let run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("run");
         let attempt_zero = store
-            .get_steps(principal, run.id)
+            .get_steps(run.tenant, principal, run.id)
             .await
             .expect("steps")
             .into_iter()
@@ -2260,6 +2583,7 @@ mod tests {
 
         let attempt_one = store
             .fail_step(
+                run.tenant,
                 principal,
                 attempt_zero.id,
                 attempt_zero.retry_count,
@@ -2273,7 +2597,7 @@ mod tests {
         let attempt_one_started = attempt_one.started_at.expect("attempt one start");
         let _ = drain_kinds(&mut rx);
         let log_count = store
-            .logs(principal, run.id, 100)
+            .logs(run.tenant, principal, run.id, 100)
             .await
             .expect("logs")
             .len();
@@ -2281,6 +2605,7 @@ mod tests {
         assert!(matches!(
             store
                 .complete_step(
+                    run.tenant,
                     principal,
                     attempt_zero.id,
                     attempt_zero.retry_count,
@@ -2294,6 +2619,7 @@ mod tests {
         assert!(matches!(
             store
                 .fail_step(
+                    run.tenant,
                     principal,
                     attempt_zero.id,
                     attempt_zero.retry_count,
@@ -2306,7 +2632,7 @@ mod tests {
         ));
 
         let current = store
-            .get_step(principal, attempt_zero.id)
+            .get_step(run.tenant, principal, attempt_zero.id)
             .await
             .expect("read current")
             .expect("current attempt");
@@ -2316,7 +2642,7 @@ mod tests {
         assert_eq!(current.output, serde_json::json!({}));
         assert_eq!(
             store
-                .logs(principal, run.id, 100)
+                .logs(run.tenant, principal, run.id, 100)
                 .await
                 .expect("logs")
                 .len(),
@@ -2326,6 +2652,7 @@ mod tests {
 
         let completed = store
             .complete_step(
+                run.tenant,
                 principal,
                 current.id,
                 current.retry_count,
@@ -2343,12 +2670,19 @@ mod tests {
         let (store, _bus) = store();
         let (principal, wf) =
             workflow_with(&store, vec![action("a", &[]), action("b", &["a"])]).await;
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         let b = steps.iter().find(|s| s.name == "b").expect("step");
         assert_eq!(b.status, StepStatus::Pending, "deps unmet");
         let err = store
             .complete_step(
+                run.tenant,
                 principal,
                 b.id,
                 b.retry_count,
@@ -2472,12 +2806,12 @@ mod tests {
             .expect("create workflow");
 
         let run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("execute workflow");
         assert_eq!(run.status, RunStatus::Completed);
         let persisted = store
-            .get_steps(principal, run.id)
+            .get_steps(run.tenant, principal, run.id)
             .await
             .expect("read steps");
         assert!(persisted.iter().all(|step| {
@@ -2532,7 +2866,7 @@ mod tests {
             .expect("create workflow");
 
         let run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("execute workflow");
         assert_eq!(run.status, RunStatus::Failed);
@@ -2541,7 +2875,7 @@ mod tests {
             vec!["fail".to_string()]
         );
         let steps = store
-            .get_steps(principal, run.id)
+            .get_steps(run.tenant, principal, run.id)
             .await
             .expect("read steps");
         assert_eq!(steps[0].status, StepStatus::Failed);
@@ -2574,7 +2908,10 @@ mod tests {
             })
             .await
             .expect("workflow");
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         // Inline failure loops through the retry budget synchronously: 1 try + 2 retries.
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.error.as_deref(), Some("boom"));
@@ -2588,7 +2925,10 @@ mod tests {
             "one per attempt"
         );
         assert!(kinds.contains(&"workflow.run.failed".to_string()));
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         assert_eq!(steps[0].status, StepStatus::Failed);
         assert_eq!(steps[0].retry_count, 2);
     }
@@ -2600,21 +2940,37 @@ mod tests {
         let mut rx = bus.subscribe("workflow");
         let (principal, wf) =
             workflow_with(&store, vec![action("a", &[]), action("b", &["a"])]).await;
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         let _ = drain_kinds(&mut rx);
 
-        assert!(store.cancel_run(principal, run.id).await.expect("cancel"));
+        assert!(
+            store
+                .cancel_run(run.tenant, principal, run.id)
+                .await
+                .expect("cancel")
+        );
         assert_eq!(drain_kinds(&mut rx), ["workflow.run.cancelled"]);
         let run = store
-            .get_run(principal, run.id)
+            .get_run(run.tenant, principal, run.id)
             .await
             .expect("get")
             .expect("present");
         assert_eq!(run.status, RunStatus::Cancelled);
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         assert!(steps.iter().all(|s| s.status == StepStatus::Skipped));
         // Cancelling again is a no-op.
-        assert!(!store.cancel_run(principal, run.id).await.expect("cancel"));
+        assert!(
+            !store
+                .cancel_run(run.tenant, principal, run.id)
+                .await
+                .expect("cancel")
+        );
     }
 
     #[tokio::test]
@@ -2643,16 +2999,27 @@ mod tests {
             })
             .await
             .expect("workflow");
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         assert_eq!(run.status, RunStatus::Running);
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         let running = steps
             .into_iter()
             .find(|s| s.status == StepStatus::Running)
             .expect("a running step");
 
         // Concurrent cancel: the running step becomes 'skipped'.
-        assert!(store.cancel_run(principal, run.id).await.expect("cancel"));
+        assert!(
+            store
+                .cancel_run(run.tenant, principal, run.id)
+                .await
+                .expect("cancel")
+        );
 
         // Completing with the now-stale 'running' snapshot must be refused.
         let result = store
@@ -2667,7 +3034,10 @@ mod tests {
         assert_eq!(result, StepTransition::Stale);
 
         // The step must remain skipped, not flipped to completed.
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         let s = steps.iter().find(|s| s.id == running.id).expect("step");
         assert_eq!(s.status, StepStatus::Skipped);
     }
@@ -2699,11 +3069,11 @@ mod tests {
             .await
             .expect("workflow");
         let run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("run");
         let first = store
-            .get_steps(principal, run.id)
+            .get_steps(run.tenant, principal, run.id)
             .await
             .expect("steps")
             .into_iter()
@@ -2711,7 +3081,7 @@ mod tests {
             .expect("first step");
         let first_started = first.started_at.expect("attempt start");
         let initial_log_count = store
-            .logs(principal, run.id, 100)
+            .logs(run.tenant, principal, run.id, 100)
             .await
             .expect("logs")
             .len();
@@ -2729,6 +3099,7 @@ mod tests {
         assert!(matches!(
             store
                 .complete_step(
+                    run.tenant,
                     principal,
                     first.id,
                     first.retry_count,
@@ -2746,7 +3117,7 @@ mod tests {
         }
 
         let after_completion = store
-            .get_step(principal, first.id)
+            .get_step(run.tenant, principal, first.id)
             .await
             .expect("read step")
             .expect("step");
@@ -2765,6 +3136,7 @@ mod tests {
         assert!(matches!(
             store
                 .fail_step(
+                    run.tenant,
                     principal,
                     first.id,
                     first.retry_count,
@@ -2782,18 +3154,23 @@ mod tests {
         }
 
         let persisted_run = store
-            .get_run(principal, run.id)
+            .get_run(run.tenant, principal, run.id)
             .await
             .expect("read run")
             .expect("run");
         assert_eq!(persisted_run.status, RunStatus::Running);
-        let persisted_steps = store.get_steps(principal, run.id).await.expect("steps");
-        assert!(persisted_steps
-            .iter()
-            .all(|step| step.status == StepStatus::Running));
+        let persisted_steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
+        assert!(
+            persisted_steps
+                .iter()
+                .all(|step| step.status == StepStatus::Running)
+        );
         assert_eq!(
             store
-                .logs(principal, run.id, 100)
+                .logs(run.tenant, principal, run.id, 100)
                 .await
                 .expect("logs")
                 .len(),
@@ -2825,23 +3202,27 @@ mod tests {
             })
             .await
             .expect("workflow");
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         assert_eq!(run.status, RunStatus::Running);
 
         let timed_out = store.sweep_timeouts().await.expect("sweep");
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].status, StepStatus::Failed);
         let run = store
-            .get_run(principal, run.id)
+            .get_run(run.tenant, principal, run.id)
             .await
             .expect("get")
             .expect("present");
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(run
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("timed out"));
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out")
+        );
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
     }
@@ -2869,22 +3250,22 @@ mod tests {
             .await
             .expect("workflow");
         let stale_run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("stale run");
         let live_run = store
-            .create_run(principal, workflow.id, None)
+            .create_run(workflow.tenant, principal, workflow.id, None)
             .await
             .expect("live run");
         let stale_step = store
-            .get_steps(principal, stale_run.id)
+            .get_steps(stale_run.tenant, principal, stale_run.id)
             .await
             .expect("stale steps")
             .into_iter()
             .next()
             .expect("stale step");
         let live_step = store
-            .get_steps(principal, live_run.id)
+            .get_steps(live_run.tenant, principal, live_run.id)
             .await
             .expect("live steps")
             .into_iter()
@@ -2898,10 +3279,12 @@ mod tests {
                 + time::Duration::nanoseconds(1),
         );
 
-        assert!(store
-            .cancel_run(principal, stale_run.id)
-            .await
-            .expect("cancel stale run"));
+        assert!(
+            store
+                .cancel_run(stale_run.tenant, principal, stale_run.id)
+                .await
+                .expect("cancel stale run")
+        );
         let timed_out = store
             .sweep_timeout_candidates(
                 vec![(stale_step, stale_run), (live_step.clone(), live_run)],
@@ -2920,17 +3303,27 @@ mod tests {
     async fn list_runs_filters_and_stats_count() {
         let (store, _bus) = store();
         let (principal, wf) = workflow_with(&store, vec![action("a", &[])]).await;
-        let r1 = store.create_run(principal, wf.id, None).await.expect("run");
-        store.create_run(principal, wf.id, None).await.expect("run");
-        store.cancel_run(principal, r1.id).await.expect("cancel");
+        let r1 = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
+        store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
+        store
+            .cancel_run(r1.tenant, principal, r1.id)
+            .await
+            .expect("cancel");
 
         let all = store
-            .list_runs(principal, RunFilter::default())
+            .list_runs(wf.tenant, principal, RunFilter::default())
             .await
             .expect("list");
         assert_eq!(all.len(), 2);
         let cancelled = store
             .list_runs(
+                wf.tenant,
                 principal,
                 RunFilter {
                     status: Some(RunStatus::Cancelled),
@@ -2940,13 +3333,15 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(cancelled.len(), 1);
-        assert!(store
-            .list_runs(PrincipalId::new(), RunFilter::default())
-            .await
-            .expect("list")
-            .is_empty());
+        assert!(
+            store
+                .list_runs(wf.tenant, PrincipalId::new(), RunFilter::default())
+                .await
+                .expect("list")
+                .is_empty()
+        );
 
-        let stats = store.stats(principal).await.expect("stats");
+        let stats = store.stats(wf.tenant, principal).await.expect("stats");
         assert_eq!(stats.workflows, 1);
         assert_eq!(stats.runs, 2);
         assert_eq!(stats.active_runs, 1);
@@ -2958,6 +3353,7 @@ mod tests {
     async fn runs_persist_across_reopen() {
         let root = std::env::temp_dir().join(format!("henosis-loom-{}", RunId::new()));
         let tmp = root.join("state").join("loom.sqlite");
+        let tenant = TenantId::new();
         let principal = PrincipalId::new();
         let run_id;
         {
@@ -2966,7 +3362,7 @@ mod tests {
                 .with_executor(Box::new(TransformExecutor));
             let wf = store
                 .create_workflow(NewWorkflow {
-                    tenant: TenantId::new(),
+                    tenant,
                     principal_id: principal,
                     name: "durable".to_string(),
                     description: None,
@@ -2975,7 +3371,7 @@ mod tests {
                 .await
                 .expect("workflow");
             run_id = store
-                .create_run(principal, wf.id, None)
+                .create_run(tenant, principal, wf.id, None)
                 .await
                 .expect("run")
                 .id;
@@ -2983,7 +3379,7 @@ mod tests {
         {
             let store = LoomStore::open(&tmp, Arc::new(AxonBus::new())).expect("reopen");
             let got = store
-                .get_run(principal, run_id)
+                .get_run(tenant, principal, run_id)
                 .await
                 .expect("get")
                 .expect("present after reopen");
@@ -3022,7 +3418,7 @@ mod tests {
 
         // Reload the workflow definition and verify the step type survived the round-trip.
         let reloaded = store
-            .get_workflow(principal, wf.id)
+            .get_workflow(wf.tenant, principal, wf.id)
             .await
             .expect("get")
             .expect("present");
@@ -3033,11 +3429,17 @@ mod tests {
         );
 
         // Create a run: the engine starts the step (no executor claims it, so it stays Running).
-        let run = store.create_run(principal, wf.id, None).await.expect("run");
+        let run = store
+            .create_run(wf.tenant, principal, wf.id, None)
+            .await
+            .expect("run");
         assert_eq!(run.status, RunStatus::Running, "waiting on unclaimed step");
 
         // Verify the step instance row carries the hephaestus token.
-        let steps = store.get_steps(principal, run.id).await.expect("steps");
+        let steps = store
+            .get_steps(run.tenant, principal, run.id)
+            .await
+            .expect("steps");
         assert_eq!(steps.len(), 1);
         assert_eq!(
             steps[0].step_type,
