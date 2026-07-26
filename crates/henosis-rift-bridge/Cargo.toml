@@ -52,6 +52,7 @@ sha2.workspace = true
 
 # Synapse agent loop engine (local development path dependency)
 synapse-core = { path = "../synapse-core" }
+synapse-cron = { path = "../synapse-cron" }
 synapse-provider = { path = "../synapse-provider" }
 synapse-tools = { path = "../synapse-tools" }
 

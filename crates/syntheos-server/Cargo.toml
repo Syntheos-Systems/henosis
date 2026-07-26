@@ -40,6 +40,8 @@ henosis-rift = { path = "../henosis-rift" }
 # Persistent Rift room server and its Synapse agent bridge.
 henosis-rift-server = { path = "../henosis-rift-server" }
 henosis-rift-bridge = { path = "../henosis-rift-bridge", features = ["cognition"] }
+# Persistent scheduled jobs routed through the managed Rift/Synapse room.
+synapse-cron = { path = "../synapse-cron" }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
 # Plutus policy authority.

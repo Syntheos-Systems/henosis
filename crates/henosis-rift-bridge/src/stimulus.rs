@@ -41,6 +41,8 @@ const RATE_WINDOW: Duration = Duration::from_secs(3600);
 pub enum StimulusKind {
     /// Scheduled "what should we focus on?" prompt after room inactivity.
     Reflection,
+    /// A configured Synapse cron job became due.
+    CronTask,
     /// Chiasm active-task state changed.
     ChiasmTasks,
     /// A declared workspace's git HEAD moved.
@@ -57,6 +59,7 @@ impl StimulusKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Reflection => "reflection",
+            Self::CronTask => "cron-task",
             Self::ChiasmTasks => "chiasm-tasks",
             Self::GitCommit => "git-commit",
             Self::AxonEvents => "axon-events",

@@ -19,6 +19,7 @@ use henosis_rift_server::config::{
     parse_cors_origins, parse_upload_limit, validate_secrets, Config as RiftConfig,
 };
 use henosis_rift_server::runtime::{initialize, InitializedRuntime, RuntimeError};
+use synapse_cron::CronScheduler;
 use tokio::sync::watch;
 
 /// Environment value enabling the complete managed room.
@@ -30,6 +31,9 @@ const DISABLED_MODE: &str = "disabled";
 /// Default browser clients allowed to connect to the local Rift API.
 const DEFAULT_CORS_ORIGINS: &str = "http://localhost:5173,http://127.0.0.1:5173,tauri://localhost";
 
+/// Default persistent directory for managed scheduled jobs and their results.
+const DEFAULT_CRON_DIR: &str = "data/synapse-cron";
+
 /// Complete room configuration after environment validation.
 pub struct RoomRuntimeConfig {
     /// Rift HTTP server settings.
@@ -38,6 +42,8 @@ pub struct RoomRuntimeConfig {
     bridge_config_path: PathBuf,
     /// Persistent room display settings.
     room: ManagedRoomConfig,
+    /// Persistent Synapse cron state owned by this managed runtime.
+    cron_dir: PathBuf,
 }
 
 /// Whether this Henosis process owns the full room stack.
@@ -81,6 +87,15 @@ pub enum RoomRuntimeError {
     /// Synapse bridge configuration could not be loaded.
     #[error("Synapse room configuration failed: {0}")]
     BridgeConfig(#[from] henosis_rift_bridge::error::BridgeError),
+    /// Persistent scheduled-job state could not be opened.
+    #[error("Synapse cron state at {} failed: {source}", path.display())]
+    Cron {
+        /// Scheduler directory that failed to open.
+        path: PathBuf,
+        /// Underlying filesystem or serialization failure.
+        #[source]
+        source: anyhow::Error,
+    },
     /// Rift listener setup failed.
     #[error("Rift listener failed: {0}")]
     Listener(#[from] std::io::Error),
@@ -129,6 +144,11 @@ pub async fn prepare_room_runtime(
         room.server_id,
         room.channel_id,
     )?;
+    let cron_scheduler =
+        CronScheduler::open(&config.cron_dir).map_err(|source| RoomRuntimeError::Cron {
+            path: config.cron_dir.clone(),
+            source,
+        })?;
     let memory: Arc<dyn BridgeMemory> = Arc::new(CognitionMemoryBackend::new(cognition));
     let kleos: Arc<dyn KleosClient> = Arc::new(InProcessKleosClient::new(
         chiasm,
@@ -140,7 +160,10 @@ pub async fn prepare_room_runtime(
     Ok(PreparedRoomRuntime {
         rift,
         bridge,
-        dependencies: RuntimeDependencies { kleos: Some(kleos) },
+        dependencies: RuntimeDependencies {
+            kleos: Some(kleos),
+            cron_scheduler: Some(cron_scheduler),
+        },
     })
 }
 
@@ -247,7 +270,17 @@ impl RoomRuntimeConfig {
                 channel_name: env::var("HENOSIS_RIFT_CHANNEL_NAME")
                     .unwrap_or_else(|_| "general".to_string()),
             },
+            cron_dir: PathBuf::from(env_or_default("HENOSIS_CRON_DIR", DEFAULT_CRON_DIR)?),
         })
+    }
+}
+
+/// Read one optional Unicode environment setting with a deterministic default.
+fn env_or_default(name: &'static str, default: &str) -> Result<String, RoomRuntimeError> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(source) => Err(RoomRuntimeError::Environment { name, source }),
     }
 }
 
@@ -311,7 +344,7 @@ where
 /// Pure configuration and endpoint tests.
 #[cfg(test)]
 mod tests {
-    use super::{internal_urls, parse_room_mode, RoomMode};
+    use super::{internal_urls, parse_room_mode, RoomMode, DEFAULT_CRON_DIR};
 
     /// Production room startup is the default contract value.
     #[test]
@@ -324,6 +357,12 @@ mod tests {
     fn invalid_mode_fails_closed() {
         assert!(parse_room_mode("off").is_err());
         assert!(parse_room_mode("disabled ").is_err());
+    }
+
+    /// Managed cron state defaults beneath the runtime's existing data directory.
+    #[test]
+    fn cron_state_uses_runtime_local_default() {
+        assert_eq!(DEFAULT_CRON_DIR, "data/synapse-cron");
     }
 
     /// Wildcard listeners produce loopback internal bridge endpoints.
