@@ -51,7 +51,7 @@ pub enum RoomRuntimeSelection {
     /// Explicit developer-only mode without Rift or Synapse room services.
     Disabled,
     /// Required production room configuration.
-    Required(RoomRuntimeConfig),
+    Required(Box<RoomRuntimeConfig>),
 }
 
 /// Prepared server, bridge configuration, and shared kernel dependencies.
@@ -117,9 +117,9 @@ pub fn room_runtime_from_environment() -> Result<RoomRuntimeSelection, RoomRunti
     let mode = env::var("HENOSIS_ROOM_MODE").unwrap_or_else(|_| REQUIRED_MODE.to_string());
     match parse_room_mode(&mode)? {
         RoomMode::Disabled => Ok(RoomRuntimeSelection::Disabled),
-        RoomMode::Required => Ok(RoomRuntimeSelection::Required(
+        RoomMode::Required => Ok(RoomRuntimeSelection::Required(Box::new(
             RoomRuntimeConfig::from_environment()?,
-        )),
+        ))),
     }
 }
 

@@ -639,7 +639,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         syntheos_server::room_runtime::RoomRuntimeSelection::Required(config) => Some(
             syntheos_server::room_runtime::prepare_room_runtime(
-                config,
+                *config,
                 chiasm.clone(),
                 broca.clone(),
                 cognition.clone(),
