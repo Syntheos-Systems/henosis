@@ -48,6 +48,9 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     /// Optional tenant scope for multi-tenant credential resolution.
     pub tenant_id: Option<String>,
+    /// Optional principal scope used by an injected in-process policy authority.
+    #[serde(default)]
+    pub principal_id: Option<String>,
     /// Agent name forwarded to Chiasm when creating tasks.
     pub agent: String,
     /// Project name forwarded to Chiasm.
@@ -89,6 +92,8 @@ pub struct CreateTaskBody {
     pub title: Option<String>,
     /// Optional tenant scope for multi-tenant credential resolution.
     pub tenant_id: Option<String>,
+    /// Optional principal scope established by an authenticated embedding runtime.
+    pub principal_id: Option<String>,
     /// Optional extra system prompt appended to the identity block.
     pub system: Option<String>,
     /// User prompt that drives the agent loop.
@@ -207,6 +212,7 @@ async fn setup_task(
         id: id.to_string(),
         status: TaskStatus::Accepted,
         tenant_id: body.tenant_id.clone(),
+        principal_id: body.principal_id.clone(),
         agent,
         project: project.to_string(),
         title: title.to_string(),
@@ -245,6 +251,7 @@ async fn execute_task(
         project,
         title,
         body.tenant_id,
+        body.principal_id,
         body.system,
         body.input,
     )
@@ -365,6 +372,7 @@ pub async fn create_task(
             project_spawn,
             title_spawn,
             body.tenant_id,
+            body.principal_id,
             body.system,
             body.input,
         )
@@ -437,6 +445,7 @@ async fn run_task(
     project: String,
     title: String,
     tenant_id: Option<String>,
+    principal_id: Option<String>,
     system: Option<String>,
     input: String,
 ) {
@@ -467,6 +476,7 @@ async fn run_task(
     let llm_result = clients
         .anthropic_complete(
             tenant_id.as_deref(),
+            principal_id.as_deref(),
             Some(&id),
             &input,
             system.as_deref(),
@@ -477,7 +487,17 @@ async fn run_task(
         .await;
 
     run_task_loop(
-        state, id, project, chiasm_id, tenant_id, system, input, tools, max_turns, llm_result,
+        state,
+        id,
+        project,
+        chiasm_id,
+        tenant_id,
+        principal_id,
+        system,
+        input,
+        tools,
+        max_turns,
+        llm_result,
         false,
     )
     .await;
@@ -492,6 +512,8 @@ async fn run_task(
 pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
     let clients = state.clients.clone();
     let id = rec.id.clone();
+    let tenant_id = rec.tenant_id.clone();
+    let principal_id = rec.principal_id.clone();
 
     if matches!(rec.status, TaskStatus::Completed | TaskStatus::Failed) {
         return;
@@ -517,7 +539,8 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
             id,
             rec.project,
             rec.title,
-            rec.tenant_id,
+            tenant_id,
+            principal_id,
             rec.system,
             rec.input,
         )
@@ -534,7 +557,8 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
                 id,
                 rec.project,
                 rec.title,
-                rec.tenant_id,
+                tenant_id,
+                principal_id,
                 rec.system,
                 rec.input,
             )
@@ -561,7 +585,8 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
             id,
             rec.project,
             rec.chiasm_id,
-            cp.tenant_id,
+            tenant_id,
+            principal_id,
             cp.system,
             rec.input,
             tools,
@@ -576,7 +601,8 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
         let sink = state.streams.sink(&id).await;
         let llm_result = clients
             .anthropic_resume(
-                cp.tenant_id.as_deref(),
+                tenant_id.as_deref(),
+                principal_id.as_deref(),
                 Some(&id),
                 cp.system.as_deref(),
                 cp.messages,
@@ -591,7 +617,8 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
             id,
             rec.project,
             rec.chiasm_id,
-            cp.tenant_id,
+            tenant_id,
+            principal_id,
             cp.system,
             rec.input,
             tools,
@@ -613,6 +640,7 @@ async fn run_task_loop(
     project: String,
     chiasm_id: Option<i64>,
     tenant_id: Option<String>,
+    principal_id: Option<String>,
     system: Option<String>,
     input: String,
     tools: Vec<ToolDef>,
@@ -784,6 +812,7 @@ async fn run_task_loop(
                 llm_result = clients
                     .anthropic_resume(
                         tenant_id.as_deref(),
+                        principal_id.as_deref(),
                         Some(&id),
                         system.as_deref(),
                         resumed_messages,

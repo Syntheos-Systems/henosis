@@ -113,6 +113,15 @@ pub fn build_state(cfg: Config) -> AppState {
     }
 }
 
+/// Construct application state with an injected in-process authorization authority.
+pub fn build_state_with_gate(cfg: Config, gate: Arc<dyn gate::GateAuthority>) -> AppState {
+    AppState {
+        clients: Arc::new(Clients::with_gate(cfg, gate)),
+        store: Arc::new(TaskStore::default()),
+        streams: Arc::new(streaming::StreamHub::new()),
+    }
+}
+
 /// Replay tasks that were in flight when the binary last shut down. For each
 /// recoverable record, hydrate the TaskRecord, insert it into the in-memory
 /// store, and spawn `resume_task_from_kleos`. Returns the number of tasks

@@ -1,8 +1,10 @@
-//! Eidolon gate client. Every unavailable or invalid gate response fails
-//! closed so the pipeline cannot proceed without an explicit authorization.
+//! Hephaestus authorization seam and standalone Eidolon HTTP client.
+//! Every unavailable or invalid verdict fails closed so the pipeline cannot proceed without an
+//! explicit authorization. Embedded runtimes inject their in-process authority through the seam.
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -21,6 +23,22 @@ pub enum GateVerdict {
     Deny(String),
     /// Gate check failed (network, response body, status, or parse error).
     Error(String),
+}
+
+/// Server-owned identity scope attached to one Hephaestus authorization check.
+#[derive(Clone, Copy, Debug)]
+pub struct GateScope<'a> {
+    /// Tenant identifier established by the calling runtime.
+    pub tenant_id: Option<&'a str>,
+    /// Principal identifier established by the calling runtime.
+    pub principal_id: Option<&'a str>,
+}
+
+#[async_trait]
+/// Authorization seam used by the orchestrator for every provider call and tool-result handoff.
+pub trait GateAuthority: Send + Sync {
+    /// Return the gate verdict for `action` under server-owned `scope` and request `context`.
+    async fn check(&self, scope: GateScope<'_>, action: &str, context: &Value) -> GateVerdict;
 }
 
 /// HTTP client for the Eidolon gate service.
@@ -105,6 +123,15 @@ impl GateClient {
                 GateVerdict::Error(detail)
             }
         }
+    }
+}
+
+#[async_trait]
+/// Preserve the standalone Hephaestus HTTP authority behind the injected gate seam.
+impl GateAuthority for GateClient {
+    /// The remote protocol predates principal scope, so it retains its exact bounded request shape.
+    async fn check(&self, _scope: GateScope<'_>, action: &str, context: &Value) -> GateVerdict {
+        GateClient::check(self, action, context).await
     }
 }
 

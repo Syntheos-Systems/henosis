@@ -1542,6 +1542,8 @@ impl LoomStore {
                 let result = executor
                     .execute(StepContext {
                         run_id,
+                        tenant: run.tenant,
+                        principal: run.principal_id,
                         step_id: step.id,
                         name: &step.name,
                         step_type: step.step_type,
