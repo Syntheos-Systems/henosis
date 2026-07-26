@@ -23,10 +23,10 @@ use synapse_cron::CronScheduler;
 use tokio::sync::watch;
 
 /// Environment value enabling the complete managed room.
-const REQUIRED_MODE: &str = "required";
+pub(crate) const REQUIRED_MODE: &str = "required";
 
 /// Environment value reserved for explicit developer-only room suppression.
-const DISABLED_MODE: &str = "disabled";
+pub(crate) const DISABLED_MODE: &str = "disabled";
 
 /// Default browser clients allowed to connect to the local Rift API.
 const DEFAULT_CORS_ORIGINS: &str = "http://localhost:5173,http://127.0.0.1:5173,tauri://localhost";
@@ -218,7 +218,7 @@ impl PreparedRoomRuntime {
 
 /// Internal room mode after strict parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoomMode {
+pub(crate) enum RoomMode {
     /// The complete room is required.
     Required,
     /// A developer explicitly suppressed room startup.
@@ -226,7 +226,7 @@ enum RoomMode {
 }
 
 /// Parse an exact room mode without silently accepting typos.
-fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError> {
+pub(crate) fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError> {
     match value {
         REQUIRED_MODE => Ok(RoomMode::Required),
         DISABLED_MODE => Ok(RoomMode::Disabled),

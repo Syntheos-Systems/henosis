@@ -20,6 +20,8 @@ use syntheos_contracts::{PrincipalId, TenantId};
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::room_runtime::{parse_room_mode, RoomMode, DISABLED_MODE, REQUIRED_MODE};
+
 /// Relative configuration file created by `henosis init --quick`.
 const CONFIG_FILE: &str = "config.env";
 
@@ -61,6 +63,10 @@ const LOCAL_DATABASES: &[(&str, &str)] = &[
 const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
     "SYNTHEOS_PLUTUS_DB",
     "SYNTHEOS_OPERATOR_JWT_SECRET",
+    "HENOSIS_RIFT_JWT_SECRET",
+    "HENOSIS_RIFT_BRIDGE_SECRET",
+    "HENOSIS_RIFT_DATABASE_URL",
+    "HENOSIS_RIFT_BRIDGE_CONFIG",
     "PHYLAXD_URL",
     "HERMES_PHYLAXD_TOKEN",
     "HENOSIS_WITNESS_URL",
@@ -942,6 +948,12 @@ pub enum CliError {
         /// Missing local paths or non-secret required configuration key names.
         missing: Vec<String>,
     },
+    /// Quick initialization preserved an existing configuration that cannot boot local mode.
+    #[error("quick initialization found incomplete local configuration: {next_step}")]
+    QuickConfigurationIncomplete {
+        /// Non-secret repair instruction produced by the same doctor contract.
+        next_step: String,
+    },
     /// JSON encoding of a local diagnostic report failed.
     #[error("cannot encode the doctor report as JSON: {0}")]
     Serialization(#[source] serde_json::Error),
@@ -1125,6 +1137,12 @@ fn initialize_quick(paths: &CliPaths) -> Result<InitResult, CliError> {
     ensure_private_directory(&paths.home)?;
     ensure_private_database_directory(&paths.data)?;
     create_private_config(paths)?;
+    let report = doctor(paths)?;
+    if !report.local_ready {
+        return Err(CliError::QuickConfigurationIncomplete {
+            next_step: report.next_step,
+        });
+    }
     Ok(InitResult {
         mode: InitMode::Quick,
         config: paths.config.clone(),
@@ -1174,10 +1192,15 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
             "SYNTHEOS_LOCAL_POLICY (remove this local-only setting for production)".to_string(),
         );
     }
+    let room_mode = effective_room_mode(&values);
+    if room_mode != Some(RoomMode::Required) {
+        missing_production_keys
+            .push("HENOSIS_ROOM_MODE (must be required for production)".to_string());
+    }
     let local_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
-        && local_configuration_ready(&values);
+        && local_configuration_ready(&values, room_mode);
     let production_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
@@ -1189,12 +1212,12 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
         "run `henosis init --quick` to create only missing local paths".to_string()
     } else if !local_ready {
         format!(
-            "repair the required local identity, JWT, and database values in {}",
+            "repair the required local identity, JWT, room mode, and database values in {}",
             paths.config.display()
         )
     } else if !production_ready {
         format!(
-            "set the required PostgreSQL, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, then run `henosis init --production`",
+            "set the required PostgreSQL, managed-room, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, select HENOSIS_ROOM_MODE=required, then run `henosis init --production`",
             paths.config.display()
         )
     } else {
@@ -1290,6 +1313,7 @@ fn render_quick_config(paths: &CliPaths) -> Result<String, CliError> {
          # This file contains local authority material. Do not share it.\n\
          SYNTHEOS_ADDR=127.0.0.1:8088\n\
          SYNTHEOS_LOCAL_POLICY=1\n\
+         HENOSIS_ROOM_MODE={DISABLED_MODE}\n\
          SYNTHEOS_PLUTUS_OPERATOR_TENANT={tenant}\n\
          SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL={principal}\n\
          SYNTHEOS_OPERATOR_JWT_SECRET={jwt_secret}\n"
@@ -1555,8 +1579,24 @@ fn config_value_present(values: &BTreeMap<String, String>, key: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Resolves room mode with the same process-environment precedence used by server startup.
+fn effective_room_mode(values: &BTreeMap<String, String>) -> Option<RoomMode> {
+    let mode = match env::var("HENOSIS_ROOM_MODE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => values
+            .get("HENOSIS_ROOM_MODE")
+            .cloned()
+            .unwrap_or_else(|| REQUIRED_MODE.to_string()),
+        Err(env::VarError::NotUnicode(_)) => return None,
+    };
+    parse_room_mode(&mode).ok()
+}
+
 /// Validates every generated local value needed for the private runtime to boot.
-fn local_configuration_ready(values: &BTreeMap<String, String>) -> bool {
+fn local_configuration_ready(
+    values: &BTreeMap<String, String>,
+    room_mode: Option<RoomMode>,
+) -> bool {
     if values
         .get("SYNTHEOS_LOCAL_POLICY")
         .is_none_or(|value| value != "1")
@@ -1579,7 +1619,8 @@ fn local_configuration_ready(values: &BTreeMap<String, String>) -> bool {
     let local_token_ready = values
         .get(LOCAL_TOKEN_KEY)
         .is_some_and(|value| Path::new(value).is_absolute());
-    jwt_ready
+    room_mode == Some(RoomMode::Disabled)
+        && jwt_ready
         && local_token_ready
         && LOCAL_DATABASES.iter().all(|(key, _)| {
             values
@@ -2018,6 +2059,7 @@ mod tests {
             .expect("generated JWT secret is hex");
         assert!(jwt.len() >= 32);
         assert!(!values.contains_key("SYNTHEOS_OPERATOR_PASSWORD"));
+        assert_eq!(values["HENOSIS_ROOM_MODE"], DISABLED_MODE);
 
         let canonical_data = fs::canonicalize(&paths.data).expect("canonical data path");
         assert_eq!(
@@ -2044,7 +2086,7 @@ mod tests {
         remove_temporary_home(&home);
     }
 
-    /// Creates the same local bootstrap state twice without overwriting any configuration byte.
+    /// Preserves every byte of a complete existing local configuration across repeated initialization.
     #[test]
     fn quick_init_is_idempotent() {
         let home = temporary_home();
@@ -2053,8 +2095,9 @@ mod tests {
         let first = runner
             .run(Command::Init(InitMode::Quick))
             .expect("first initialization");
-        let preserved = b"OPERATOR_NOTE=preserve-me\nBINARYISH=\0tail\n";
-        fs::write(&paths.config, preserved).expect("modify configuration");
+        let mut preserved = fs::read(&paths.config).expect("read generated configuration");
+        preserved.extend_from_slice(b"OPERATOR_NOTE=preserve-me\n");
+        fs::write(&paths.config, &preserved).expect("extend configuration");
         #[cfg(unix)]
         set_unix_mode(&paths.config, 0o644).expect("make permissions repairable");
         let before = fs::read(&paths.config).expect("read first configuration");
@@ -2079,6 +2122,34 @@ mod tests {
                 0o600
             );
         }
+        remove_temporary_home(&home);
+    }
+
+    /// Preserves a legacy local file but refuses to call it ready when room mode is absent.
+    #[test]
+    fn quick_init_rejects_incomplete_existing_configuration_without_overwrite() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths).expect("initial quick configuration");
+        let legacy = fs::read_to_string(&paths.config)
+            .expect("read generated configuration")
+            .lines()
+            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&paths.config, &legacy).expect("write legacy configuration");
+
+        let error =
+            initialize_quick(&paths).expect_err("legacy configuration must not claim ready");
+
+        assert!(matches!(
+            error,
+            CliError::QuickConfigurationIncomplete { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(&paths.config).expect("read preserved legacy configuration"),
+            legacy
+        );
         remove_temporary_home(&home);
     }
 
@@ -2265,6 +2336,10 @@ mod tests {
         assert!(missing.iter().any(|key| key == "SYNTHEOS_PLUTUS_DB"));
         assert!(missing.iter().any(|key| key == "PHYLAXD_URL"));
         assert!(missing.iter().any(|key| key == "HENOSIS_WITNESS_URL"));
+        assert!(missing.iter().any(|key| key == "HENOSIS_RIFT_JWT_SECRET"));
+        assert!(missing
+            .iter()
+            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
         assert!(missing
             .iter()
             .any(|key| key.starts_with("SYNTHEOS_LOCAL_POLICY")));
@@ -2283,9 +2358,12 @@ mod tests {
         let generated = fs::read_to_string(&paths.config).expect("read generated configuration");
         let mut production = generated
             .lines()
-            .filter(|line| *line != "SYNTHEOS_LOCAL_POLICY=1")
+            .filter(|line| {
+                *line != "SYNTHEOS_LOCAL_POLICY=1" && *line != "HENOSIS_ROOM_MODE=disabled"
+            })
             .map(|line| format!("{line}\n"))
             .collect::<String>();
+        production.push_str("HENOSIS_ROOM_MODE=required\n");
         for key in PRODUCTION_REQUIRED_KEYS {
             if !production
                 .lines()
@@ -2299,6 +2377,40 @@ mod tests {
         let result = initialize_production(&paths).expect("production initialization");
 
         assert_eq!(result.mode, InitMode::Production);
+        remove_temporary_home(&home);
+    }
+
+    /// Refuses to call local configuration ready when its room mode is absent or invalid.
+    #[test]
+    fn doctor_requires_explicit_disabled_room_mode_for_local_readiness() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths).expect("quick initialization");
+        let generated = fs::read_to_string(&paths.config).expect("read generated configuration");
+
+        let without_room_mode = generated
+            .lines()
+            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&paths.config, without_room_mode).expect("remove room mode");
+        assert!(
+            !doctor(&paths)
+                .expect("doctor without room mode")
+                .local_ready
+        );
+
+        fs::write(
+            &paths.config,
+            generated.replace("HENOSIS_ROOM_MODE=disabled", "HENOSIS_ROOM_MODE=invalid"),
+        )
+        .expect("write invalid room mode");
+        let report = doctor(&paths).expect("doctor with invalid room mode");
+        assert!(!report.local_ready);
+        assert!(report
+            .missing_production_keys
+            .iter()
+            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
         remove_temporary_home(&home);
     }
 
