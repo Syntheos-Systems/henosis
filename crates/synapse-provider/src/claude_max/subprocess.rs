@@ -169,8 +169,20 @@ fn build_spawn_command(cli_path: &str, model: &str, oauth_token: &str) -> Comman
         model,
     ]);
     cmd.env("CLAUDE_CODE_OAUTH_TOKEN", oauth_token);
-    // SD1: Token visible in /proc/<pid>/environ for subprocess lifetime.
-    // Accepted risk per security definition -- single-user machine.
+    // KNOWN LIMITATION: the token is readable from /proc/<pid>/environ by any
+    // process sharing this UID, for the subprocess lifetime.
+    //
+    // The original note here justified this as an accepted risk on a "single-user
+    // machine". That premise does not hold: `build_synapse_executor` selects this
+    // provider for the "claude-max"/"claude-cli" types inside henosis-rift-bridge,
+    // where several agent tasks run concurrently as the same OS user, so a sibling
+    // task can read a live token belonging to another.
+    //
+    // It is not fixable here. The `claude` CLI takes its credential from this
+    // variable, so the value cannot move to stdin without changing that CLI, and
+    // PR_SET_DUMPABLE does not survive execve. Closing it requires running each
+    // task under its own UID or PID namespace, which is a deployment change.
+    // Tracked in scripts/known-incomplete.md.
     cmd
 }
 

@@ -56,11 +56,19 @@ impl ClaudeCodeExecutor {
         }
     }
 
-    /// Build a Command with common flags applied.
-    fn base_cmd(&self) -> Command {
+    /// Build a command with common flags and an explicit tool-access mode.
+    fn base_cmd(&self, tools_enabled: bool) -> Command {
         let mut cmd = Command::new(&self.binary);
+        // Dropping the output future on timeout must terminate the CLI. Without
+        // this the process survives its deadline, keeps mutating the sandbox
+        // worktree after the bridge considers the session over, and races the
+        // retry attempt that reuses that same worktree.
+        cmd.kill_on_drop(true);
         cmd.arg("-p");
         cmd.arg("--output-format").arg("text");
+        if !tools_enabled {
+            cmd.arg("--tools").arg("");
+        }
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -94,7 +102,7 @@ impl AgentExecutor for ClaudeCodeExecutor {
     async fn discuss(&self, context: DiscussionContext) -> Result<Option<AgentResponse>> {
         let prompt = to_cli_prompt(&context);
 
-        let mut cmd = self.base_cmd();
+        let mut cmd = self.base_cmd(false);
         cmd.arg(&prompt);
 
         let output = cmd.output().await?;
@@ -132,7 +140,7 @@ impl AgentExecutor for ClaudeCodeExecutor {
         // actually advanced it (committed work), not just echo the worktree's base commit.
         let head_before = git_head(&task.sandbox.working_dir).await;
 
-        let mut cmd = self.base_cmd();
+        let mut cmd = self.base_cmd(true);
         cmd.arg(&task.description);
         cmd.current_dir(&task.sandbox.working_dir);
         // Honor the workspace's configured CARGO_TARGET_DIR so the agent's cargo builds write
@@ -141,7 +149,24 @@ impl AgentExecutor for ClaudeCodeExecutor {
             cmd.env("CARGO_TARGET_DIR", target_dir);
         }
 
-        let output = cmd.output().await?;
+        // Enforce the sandbox's wall-clock ceiling here rather than trusting the
+        // CLI to honour it. On expiry the future is dropped and `kill_on_drop`
+        // terminates the process instead of leaving it running in the worktree.
+        let deadline = std::time::Duration::from_secs(task.sandbox.max_runtime_secs);
+        let output = match tokio::time::timeout(deadline, cmd.output()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = progress_tx.send(ProgressUpdate::Done).await;
+                let advanced = git_head(&task.sandbox.working_dir).await != head_before;
+                return Ok(ExecutionResult::Failed {
+                    reason: format!(
+                        "claude exceeded its {}s execution limit and was terminated",
+                        task.sandbox.max_runtime_secs
+                    ),
+                    partial_work: advanced,
+                });
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let _ = progress_tx.send(ProgressUpdate::Done).await;
@@ -180,5 +205,32 @@ impl AgentExecutor for ClaudeCodeExecutor {
                 self.binary.display()
             )))
         }
+    }
+}
+
+/// Verifies discussion and approved execution use different Claude tool modes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Discussion disables built-in tools while approved execution leaves them available.
+    #[test]
+    fn tool_access_is_disabled_only_for_discussion() {
+        let executor = ClaudeCodeExecutor::new(PathBuf::from("claude"), None, None);
+        let discussion: Vec<String> = executor
+            .base_cmd(false)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let execution: Vec<String> = executor
+            .base_cmd(true)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(discussion.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(!execution.iter().any(|arg| arg == "--tools"));
     }
 }

@@ -36,6 +36,26 @@ use crate::model::{
     AgentPresence, PresenceFilter, PresenceStatus, QualityPatch, RegisterAgent, SomaStats,
 };
 
+/// Maximum rows one list or query call may return.
+///
+/// Enforced by the store rather than trusted from the caller, so an omitted or
+/// oversized limit cannot turn a listing into an unbounded scan.
+const MAX_LIST_LIMIT: usize = 500;
+
+/// Escape caller text before using it inside a SQL `LIKE` contains pattern.
+fn literal_like_contains(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len().saturating_add(2));
+    escaped.push('%');
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped.push('%');
+    escaped
+}
+
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__soma_presence.sql")),
@@ -386,9 +406,9 @@ impl SomaStore {
             args.push(status.as_str().to_string().into());
         }
         sql.push_str(" ORDER BY created_at DESC");
-        if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
+        // A caller-supplied limit is advisory; see MAX_LIST_LIMIT.
+        let limit = filter.limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        sql.push_str(&format!(" LIMIT {limit}"));
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql).map_err(berr)?;
         let rows = stmt
@@ -578,28 +598,29 @@ impl SomaStore {
         tenant: TenantId,
         capability: &str,
     ) -> Result<Vec<AgentPresence>, SomaError> {
-        let like = format!("%{capability}%");
-        let candidates: Vec<AgentPresence> = {
-            let conn = self.lock();
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT {PRESENCE_COLUMNS} FROM soma_presence \
-                     WHERE tenant = ?1 AND capabilities LIKE ?2"
-                ))
-                .map_err(berr)?;
-            let rows = stmt
-                .query_map(rusqlite::params![tenant.to_string(), like], read_raw)
-                .map_err(berr)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(berr)?.into_presence()?);
+        let like = literal_like_contains(capability);
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {PRESENCE_COLUMNS} FROM soma_presence \
+                 WHERE tenant = ?1 AND capabilities LIKE ?2 ESCAPE '\\' \
+                 ORDER BY created_at DESC"
+            ))
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(rusqlite::params![tenant.to_string(), like], read_raw)
+            .map_err(berr)?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let presence = row.map_err(berr)?.into_presence()?;
+            if presence.capabilities.iter().any(|item| item == capability) {
+                matches.push(presence);
+                if matches.len() == MAX_LIST_LIMIT {
+                    break;
+                }
             }
-            out
-        };
-        Ok(candidates
-            .into_iter()
-            .filter(|p| p.capabilities.iter().any(|c| c == capability))
-            .collect())
+        }
+        Ok(matches)
     }
 
     /// Apply a quality-signal update (Thymus evaluation / supervision) and emit
@@ -1217,6 +1238,18 @@ mod tests {
                 .len(),
             0
         );
+
+        // LIKE metacharacters are literal capability text, not wildcard controls.
+        let mut wildcard = enrolled_agent(&directory, tenant, "wildcard").await;
+        wildcard.capabilities = Some(vec!["%_\\".to_string()]);
+        let wildcard_principal = wildcard.principal_id;
+        store.register(wildcard).await.expect("register wildcard");
+        let found = store
+            .find_by_capability(tenant, "%_\\")
+            .await
+            .expect("find literal metacharacters");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].principal_id, wildcard_principal);
     }
 
     #[tokio::test]

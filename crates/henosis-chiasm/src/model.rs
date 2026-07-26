@@ -182,7 +182,7 @@ pub struct TaskFilter {
     pub status: Option<TaskStatus>,
     /// Only tasks in this project.
     pub project: Option<String>,
-    /// Maximum rows to return (`None` = no limit).
+    /// Maximum rows to return (`None` or an oversized value uses the store ceiling).
     pub limit: Option<usize>,
     /// Rows to skip (for pagination).
     pub offset: Option<usize>,

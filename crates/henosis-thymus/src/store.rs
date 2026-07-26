@@ -33,8 +33,25 @@ use crate::model::{
     RubricPatch, ThymusStats,
 };
 
+/// Maximum rows one list or query call may return.
+///
+/// Enforced by the store rather than trusted from the caller, so an omitted or
+/// oversized limit cannot turn a listing into an unbounded scan.
+const MAX_LIST_LIMIT: usize = 500;
+
+/// Applies the store-wide list ceiling to an optional caller request.
+fn bounded_list_limit(requested: Option<usize>) -> usize {
+    requested.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT)
+}
+
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__thymus_quality.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/V1__thymus_quality.sql")),
+    (
+        2,
+        include_str!("../migrations/V2__thymus_rubric_tenant_unique.sql"),
+    ),
+];
 
 /// Where evaluation/drift outcomes propagate to (Soma's presence projection, at wiring time).
 ///
@@ -308,12 +325,17 @@ impl ThymusStore {
         self
     }
 
-    /// Enable foreign keys and apply migrations while the database retains its path guard.
+    /// Apply migrations, then enable foreign keys, while the database retains its path guard.
+    ///
+    /// Order matters. SQLite cannot drop an inline `UNIQUE`, so a constraint change
+    /// has to rebuild the table, and `DROP TABLE` with foreign keys enabled performs
+    /// an implicit delete that enforces `thymus_evaluations`' ON DELETE RESTRICT.
+    /// Migrating first, with enforcement still off, lets the rebuild proceed.
     fn from_database(mut database: OpenedDatabase, bus: Arc<AxonBus>) -> Result<Self, ThymusError> {
+        apply_migrations(&mut database)?;
         database
             .pragma_update(None, "foreign_keys", true)
             .map_err(berr)?;
-        apply_migrations(&mut database)?;
         Ok(Self {
             conn: Mutex::new(database),
             bus,
@@ -440,12 +462,16 @@ impl ThymusStore {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {RUBRIC_COLUMNS} FROM thymus_rubrics \
-                 WHERE tenant = ?1 AND principal_id = ?2 ORDER BY updated_at DESC"
+                 WHERE tenant = ?1 AND principal_id = ?2 ORDER BY updated_at DESC LIMIT ?3"
             ))
             .map_err(berr)?;
         let rows = stmt
             .query_map(
-                rusqlite::params![tenant.to_string(), principal.to_string()],
+                rusqlite::params![
+                    tenant.to_string(),
+                    principal.to_string(),
+                    bounded_list_limit(None) as i64
+                ],
                 read_raw_rubric,
             )
             .map_err(berr)?;
@@ -648,11 +674,13 @@ impl ThymusStore {
             args.push(rubric_id.into());
         }
         sql.push_str(" ORDER BY id DESC");
-        match (filter.limit, filter.offset) {
-            (Some(l), Some(o)) => sql.push_str(&format!(" LIMIT {l} OFFSET {o}")),
-            (Some(l), None) => sql.push_str(&format!(" LIMIT {l}")),
-            (None, Some(o)) => sql.push_str(&format!(" LIMIT -1 OFFSET {o}")),
-            (None, None) => {}
+        // A caller-supplied limit is advisory. An omitted or oversized value would
+        // otherwise scan and serialize every row this tenant has accumulated while
+        // holding the process-wide connection mutex, stalling every other tenant.
+        let limit = bounded_list_limit(filter.limit);
+        match filter.offset {
+            Some(offset) => sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}")),
+            None => sql.push_str(&format!(" LIMIT {limit}")),
         }
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql).map_err(berr)?;
@@ -674,26 +702,34 @@ impl ThymusStore {
         principal: PrincipalId,
         agent: PrincipalId,
     ) -> Result<AgentScores, ThymusError> {
-        let evaluations = self
-            .list_evaluations(
-                tenant,
-                principal,
-                EvaluationFilter {
-                    agent: Some(agent),
-                    ..Default::default()
-                },
+        let conn = self.lock();
+        let (count, overall_avg) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(AVG(overall_score), 0.0) \
+                 FROM thymus_evaluations \
+                 WHERE tenant = ?1 AND principal_id = ?2 AND agent = ?3",
+                rusqlite::params![tenant.to_string(), principal.to_string(), agent.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
             )
-            .await?;
-        let count = evaluations.len() as i64;
-        let overall_avg = if count == 0 {
-            0.0
-        } else {
-            evaluations.iter().map(|e| e.overall_score).sum::<f64>() / count as f64
-        };
+            .map_err(berr)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT scores FROM thymus_evaluations \
+                 WHERE tenant = ?1 AND principal_id = ?2 AND agent = ?3",
+            )
+            .map_err(berr)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![tenant.to_string(), principal.to_string(), agent.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(berr)?;
         let mut sums: BTreeMap<String, (f64, i64)> = BTreeMap::new();
-        for evaluation in &evaluations {
-            for (name, score) in &evaluation.scores {
-                let entry = sums.entry(name.clone()).or_insert((0.0, 0));
+        for row in rows {
+            let scores: BTreeMap<String, f64> = serde_json::from_str(&row.map_err(berr)?)
+                .map_err(|error| ThymusError::Backend(format!("corrupt scores: {error}")))?;
+            for (name, score) in scores {
+                let entry = sums.entry(name).or_insert((0.0, 0));
                 entry.0 += score;
                 entry.1 += 1;
             }
@@ -885,6 +921,7 @@ impl ThymusStore {
             sql.push_str(" AND agent = ?3");
             args.push(agent.to_string().into());
         }
+        let limit = bounded_list_limit(Some(limit));
         sql.push_str(&format!(" ORDER BY id DESC LIMIT {limit}"));
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql).map_err(berr)?;
@@ -1013,17 +1050,44 @@ fn apply_migrations(conn: &mut OpenedDatabase) -> Result<(), ThymusError> {
     let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(berr)?;
-    for (v, sql) in MIGRATIONS {
-        if *v > version {
-            let tx = conn.transaction().map_err(berr)?;
-            tx.execute_batch(sql)
-                .map_err(|e| ThymusError::Backend(format!("migration V{v} failed: {e}")))?;
-            tx.pragma_update(None, "user_version", *v).map_err(berr)?;
-            tx.commit().map_err(berr)?;
-            version = *v;
+
+    // Foreign keys default ON in this build. A migration that rebuilds a table --
+    // the only way SQLite can change an inline UNIQUE -- must DROP the original,
+    // and DROP TABLE under enforcement performs an implicit delete that trips
+    // `thymus_evaluations`' ON DELETE RESTRICT. The pragma is a no-op inside a
+    // transaction, so it has to be cleared around the whole loop and restored
+    // before any caller query runs.
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(berr)?;
+
+    let outcome = (|| {
+        for (v, sql) in MIGRATIONS {
+            if *v > version {
+                let tx = conn.transaction().map_err(berr)?;
+                tx.execute_batch(sql)
+                    .map_err(|e| ThymusError::Backend(format!("migration V{v} failed: {e}")))?;
+                tx.pragma_update(None, "user_version", *v).map_err(berr)?;
+                tx.commit().map_err(berr)?;
+                version = *v;
+            }
         }
-    }
-    Ok(())
+        // A rebuild that left a dangling reference must not be committed silently.
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .map_err(berr)?;
+        if violations > 0 {
+            return Err(ThymusError::Backend(format!(
+                "migration left {violations} foreign-key violations"
+            )));
+        }
+        Ok(())
+    })();
+
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(berr)?;
+    outcome
 }
 
 /// Quality-store behavior tests.
@@ -1069,6 +1133,70 @@ mod tests {
             .expect("open")
             .with_quality_sink(Box::new(sink));
         (store, sink, bus)
+    }
+
+    /// List ceilings handle absent and overflowing caller limits without wrapping.
+    #[test]
+    fn list_limits_are_store_bounded() {
+        assert_eq!(bounded_list_limit(None), MAX_LIST_LIMIT);
+        assert_eq!(bounded_list_limit(Some(0)), 0);
+        assert_eq!(bounded_list_limit(Some(usize::MAX)), MAX_LIST_LIMIT);
+    }
+
+    /// The V2 rebuild preserves evaluations and scopes rubric names by tenant.
+    #[test]
+    fn tenant_unique_upgrade_preserves_existing_evaluations() {
+        let mut database = OpenedDatabase::open_in_memory().expect("open V1 database");
+        database
+            .execute_batch(include_str!("../migrations/V1__thymus_quality.sql"))
+            .expect("apply V1 schema");
+        database
+            .pragma_update(None, "user_version", 1)
+            .expect("mark V1 schema");
+        database
+            .execute_batch(
+                "INSERT INTO thymus_rubrics
+                    (id, tenant, principal_id, name, criteria, created_at, updated_at)
+                 VALUES
+                    (1, 't1', 'p1', 'shared-name', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO thymus_evaluations
+                    (rubric_id, tenant, principal_id, agent, evaluator, subject, scores, overall_score, created_at)
+                 VALUES
+                    (1, 't1', 'p1', 'a1', 'e1', 'fixture', '{}', 1.0, '2026-01-01T00:00:00Z');",
+            )
+            .expect("seed V1 rows");
+
+        apply_migrations(&mut database).expect("upgrade to current schema");
+
+        let version: i64 = database
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, 2);
+        let evaluations: i64 = database
+            .query_row("SELECT COUNT(*) FROM thymus_evaluations", [], |row| {
+                row.get(0)
+            })
+            .expect("count evaluations");
+        assert_eq!(
+            evaluations, 1,
+            "the rebuild must preserve dependent evaluations"
+        );
+        database
+            .execute_batch(
+                "INSERT INTO thymus_rubrics
+                    (tenant, principal_id, name, criteria, created_at, updated_at)
+                 VALUES
+                    ('t2', 'p1', 'shared-name', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .expect("same name in another tenant must be accepted");
+        database
+            .execute_batch(
+                "INSERT INTO thymus_rubrics
+                    (tenant, principal_id, name, criteria, created_at, updated_at)
+                 VALUES
+                    ('t1', 'p1', 'shared-name', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .expect_err("the name is still unique inside one tenant");
     }
 
     /// A two-criterion rubric: quality (weight 2, scale 0-10) + speed (weight 1, scale 0-5).
@@ -1207,6 +1335,41 @@ mod tests {
             .delete_rubric(tenant, principal, r.id)
             .await
             .expect("delete"));
+    }
+
+    /// One principal may reuse a rubric name in a different tenant only.
+    #[tokio::test]
+    async fn rubric_name_is_unique_per_tenant_not_globally() {
+        let (store, _sink, _bus) = store_with_sink();
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let principal = PrincipalId::new();
+        let definition = |tenant| NewRubric {
+            tenant,
+            principal_id: principal,
+            name: "shared-name".to_string(),
+            description: None,
+            criteria: vec![Criterion {
+                name: "quality".to_string(),
+                weight: 1.0,
+                scale_min: 0.0,
+                scale_max: 1.0,
+            }],
+        };
+
+        store
+            .create_rubric(definition(tenant_a))
+            .await
+            .expect("first tenant takes the name");
+        store
+            .create_rubric(definition(tenant_b))
+            .await
+            .expect("second tenant reuses the name");
+        let duplicate = store
+            .create_rubric(definition(tenant_a))
+            .await
+            .expect_err("same-tenant duplicate must fail");
+        assert!(matches!(duplicate, ThymusError::InvalidInput(_)));
     }
 
     /// Verifies weighted evaluation scores and propagation to the quality sink.

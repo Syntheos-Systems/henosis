@@ -33,7 +33,7 @@ fn agent_email(username: &str) -> String {
 /// by timing repeated requests. Human credentials are JWTs and can never equal
 /// the dedicated bridge secret, which keeps bridge-only routes isolated from
 /// the user JWT signing key.
-fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
+pub(crate) fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
     let Some(token) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -117,6 +117,13 @@ pub async fn notify_message(
         Ok(Some(m)) => m,
         _ => return StatusCode::NOT_FOUND,
     };
+
+    // The message and the broadcast target are two independent caller-supplied
+    // fields. Without binding them, this route would relay any message -- including
+    // a private DM -- to the subscribers of any other channel.
+    if msg.channel_id != req.channel_id {
+        return StatusCode::NOT_FOUND;
+    }
 
     // Fetch attachments
     let attachments = db::get_attachments_for_message(&pool, req.message_id)

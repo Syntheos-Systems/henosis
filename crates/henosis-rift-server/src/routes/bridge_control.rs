@@ -1,15 +1,18 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
+use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::models::permissions::perms;
+use crate::routes::bridge::bridge_authorized;
 
 /// Response for bridge status.
 #[derive(Serialize)]
@@ -66,11 +69,24 @@ pub async fn resume_bridge(
     Ok(Json(BridgeStatus { paused: false }))
 }
 
-/// Get one server's bridge status for its daemon poller.
+/// Get one server's bridge status.
+///
+/// Two callers legitimately read this: the bridge daemon's pause poller, which
+/// presents the shared bridge secret, and a human operator inspecting the same
+/// control they can toggle. Anyone else is refused -- left open, this route
+/// disclosed per-server bridge state to anonymous callers and answered as a
+/// server-existence oracle for arbitrary identifiers.
 pub async fn bridge_status(
     State(pool): State<PgPool>,
+    State(config): State<Config>,
+    headers: HeaderMap,
+    auth: Option<AuthUser>,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<BridgeStatus>, AppError> {
+    if !bridge_authorized(&headers, &config) {
+        let auth = auth.ok_or(AppError::Unauthorized)?;
+        require_bridge_controller(&pool, server_id, auth.user_id).await?;
+    }
     let paused = db::is_bridge_paused(&pool, server_id).await?;
     Ok(Json(BridgeStatus { paused }))
 }

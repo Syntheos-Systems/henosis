@@ -150,7 +150,7 @@ pub struct EvaluationFilter {
     pub agent: Option<PrincipalId>,
     /// Only evaluations against this rubric.
     pub rubric_id: Option<i64>,
-    /// Maximum rows to return (`None` = no limit).
+    /// Maximum rows to return (`None` or an oversized value uses the store ceiling).
     pub limit: Option<usize>,
     /// Rows to skip (for pagination).
     pub offset: Option<usize>,

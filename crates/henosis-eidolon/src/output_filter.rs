@@ -15,6 +15,38 @@ fn normalize_key(key: &str) -> String {
 /// What a redacted field's value is replaced with.
 pub const REDACTED: &str = "[redacted]";
 
+/// High-confidence credential shapes, matched against string *content*.
+///
+/// Key-name matching alone cannot see a credential that arrives inside a value:
+/// raw tool stdout under `output`, a provider error echoing an `Authorization`
+/// header, or a bare string result. These patterns are deliberately anchored on
+/// issuer-specific prefixes and minimum lengths rather than an entropy heuristic,
+/// because a false positive here silently corrupts legitimate output.
+const SECRET_CONTENT_PATTERNS: &[&str] = &[
+    // Anthropic, OpenAI and compatible providers.
+    r"sk-ant-[A-Za-z0-9_\-]{16,}",
+    r"sk-[A-Za-z0-9_\-]{20,}",
+    // GitHub personal, OAuth, user, server and refresh tokens, plus fine-grained PATs.
+    r"gh[pousr]_[A-Za-z0-9]{16,}",
+    r"github_pat_[A-Za-z0-9_]{20,}",
+    // GitLab personal access tokens.
+    r"glpat-[A-Za-z0-9_\-]{16,}",
+    // Slack bot, user, app, refresh and legacy tokens.
+    r"xox[baprs]-[A-Za-z0-9\-]{10,}",
+    // AWS access key identifiers.
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+    // Google OAuth access tokens and API keys.
+    r"ya29\.[A-Za-z0-9_\-]{20,}",
+    r"\bAIza[A-Za-z0-9_\-]{35}\b",
+    // npm and DigitalOcean.
+    r"\bnpm_[A-Za-z0-9]{36}\b",
+    r"\bdop_v1_[a-f0-9]{64}\b",
+    // JSON Web Tokens, whatever field they arrive in.
+    r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
+    // PEM private key blocks, including their body.
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+];
+
 /// The policy authority for the dispatcher's output-filter slot.
 ///
 /// Walks the executor result and replaces, in place, the value of every object field whose
@@ -25,6 +57,10 @@ pub const REDACTED: &str = "[redacted]";
 pub struct EidolonOutputFilter {
     /// The patterns matched against normalized field names. Pre-normalized at construction.
     sensitive_fields: Vec<String>,
+    /// Credential shapes matched against string content, compiled once.
+    secret_content: regex::RegexSet,
+    /// The same shapes individually, for replacing just the matched span.
+    secret_content_each: Vec<regex::Regex>,
 }
 
 /// Implements Eidolon's sensitive-output filtering helpers.
@@ -43,8 +79,23 @@ impl EidolonOutputFilter {
             }
             normalized.push(n);
         }
+        // These patterns are compile-time constants; a failure here is a bug in
+        // this file, not a policy error, so it is surfaced as one.
+        let secret_content = regex::RegexSet::new(SECRET_CONTENT_PATTERNS).map_err(|e| {
+            EidolonError::InvalidPolicy(format!("built-in secret pattern failed to compile: {e}"))
+        })?;
+        let mut secret_content_each = Vec::with_capacity(SECRET_CONTENT_PATTERNS.len());
+        for pattern in SECRET_CONTENT_PATTERNS {
+            secret_content_each.push(regex::Regex::new(pattern).map_err(|e| {
+                EidolonError::InvalidPolicy(format!(
+                    "built-in secret pattern failed to compile: {e}"
+                ))
+            })?);
+        }
         Ok(Self {
             sensitive_fields: normalized,
+            secret_content,
+            secret_content_each,
         })
     }
 
@@ -54,6 +105,25 @@ impl EidolonOutputFilter {
         self.sensitive_fields
             .iter()
             .any(|p| key.contains(p.as_str()))
+    }
+
+    /// Replace credential-shaped spans inside a string, returning `None` if clean.
+    ///
+    /// Only the matched span is replaced, not the whole value: an agent's build log
+    /// that happens to contain one token stays readable, which is what makes this
+    /// safe to apply to every string in the result.
+    fn redact_content(&self, text: &str) -> Option<String> {
+        let matched = self.secret_content.matches(text);
+        if !matched.matched_any() {
+            return None;
+        }
+        let mut scrubbed = text.to_string();
+        for index in matched.iter() {
+            scrubbed = self.secret_content_each[index]
+                .replace_all(&scrubbed, REDACTED)
+                .into_owned();
+        }
+        Some(scrubbed)
     }
 }
 
@@ -73,15 +143,12 @@ impl OutputFilter for EidolonOutputFilter {
         result: &mut serde_json::Value,
         _ctx: &RequestContext,
     ) -> FilterDecision {
-        if self.sensitive_fields.is_empty() {
-            return FilterDecision::Pass;
-        }
         let mut stack: Vec<&mut serde_json::Value> = vec![result];
         while let Some(value) = stack.pop() {
             match value {
                 serde_json::Value::Object(map) => {
                     for (k, v) in map.iter_mut() {
-                        if self.is_sensitive(k) {
+                        if !self.sensitive_fields.is_empty() && self.is_sensitive(k) {
                             *v = serde_json::Value::String(REDACTED.to_string());
                         } else {
                             stack.push(v);
@@ -89,6 +156,16 @@ impl OutputFilter for EidolonOutputFilter {
                     }
                 }
                 serde_json::Value::Array(items) => stack.extend(items.iter_mut()),
+                // Content scanning applies to every string the result carries,
+                // including a bare string result and any value sitting under an
+                // innocuous key such as `output` or `stdout`. Key-name matching
+                // cannot see those, and raw tool output is exactly where a leaked
+                // credential shows up.
+                serde_json::Value::String(text) => {
+                    if let Some(scrubbed) = self.redact_content(text) {
+                        *text = scrubbed;
+                    }
+                }
                 _ => {}
             }
         }
@@ -209,7 +286,79 @@ mod tests {
         assert_eq!(result, before);
     }
 
-    /// An explicitly empty sensitive-field list disables output scrubbing.
+    /// A credential in raw tool output is redacted even though its key is innocuous.
+    ///
+    /// This is the gap key-name matching cannot close: an agent that runs `env` or
+    /// `cat .env` returns its stdout under a generic field.
+    #[tokio::test]
+    async fn secret_in_plain_output_is_redacted() {
+        let f = filter();
+        let mut result = serde_json::json!({
+            "stdout": "ANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA\nDONE"
+        });
+        let decision = f.filter(&mut result, &ctx()).await;
+        assert_eq!(decision, FilterDecision::Pass);
+        let scrubbed = result["stdout"].as_str().expect("string output");
+        assert!(!scrubbed.contains("sk-ant-api03"), "got {scrubbed}");
+        assert!(scrubbed.contains(REDACTED));
+        assert!(scrubbed.contains("DONE"), "surrounding output is preserved");
+    }
+
+    /// Project-scoped OpenAI keys containing separators are redacted in full.
+    #[tokio::test]
+    async fn project_scoped_openai_key_is_redacted() {
+        let f = filter();
+        let mut result = serde_json::json!({
+            "stdout": "OPENAI_API_KEY=sk-proj-AAAAAAAAAAAAAAAAAAAAAAAA_BBBBBBBB"
+        });
+        f.filter(&mut result, &ctx()).await;
+        let scrubbed = result["stdout"].as_str().expect("string output");
+        assert_eq!(scrubbed, "OPENAI_API_KEY=[redacted]");
+    }
+
+    /// A bare string result is scanned too, not passed through untouched.
+    #[tokio::test]
+    async fn secret_in_bare_string_result_is_redacted() {
+        let f = filter();
+        let mut result = serde_json::json!("token is ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        f.filter(&mut result, &ctx()).await;
+        let scrubbed = result.as_str().expect("string result");
+        assert!(!scrubbed.contains("ghp_A"), "got {scrubbed}");
+        assert!(scrubbed.contains(REDACTED));
+    }
+
+    /// Credentials nested in arrays and deep objects are reached.
+    #[tokio::test]
+    async fn secret_in_nested_structures_is_redacted() {
+        let f = filter();
+        let mut result = serde_json::json!({
+            "steps": [{ "log": "aws key AKIAIOSFODNN7EXAMPLE used" }]
+        });
+        f.filter(&mut result, &ctx()).await;
+        let scrubbed = result["steps"][0]["log"].as_str().expect("string");
+        assert!(!scrubbed.contains("AKIAIOSFODNN7EXAMPLE"), "got {scrubbed}");
+    }
+
+    /// Ordinary prose and code are left exactly as they were.
+    ///
+    /// A false positive here silently corrupts legitimate agent output, so the
+    /// patterns are anchored on issuer prefixes rather than an entropy guess.
+    #[tokio::test]
+    async fn ordinary_output_is_not_touched() {
+        let f = filter();
+        let original = serde_json::json!({
+            "stdout": "running 42 tests\nsk-not-a-key\nlet checksum = compute(sha256);\nok",
+            "path": "/usr/local/bin/henosis",
+        });
+        let mut result = original.clone();
+        f.filter(&mut result, &ctx()).await;
+        assert_eq!(result, original);
+    }
+
+    /// An explicitly empty sensitive-field list disables field-name scrubbing.
+    ///
+    /// Content scanning is independent and still runs; this value is not
+    /// credential-shaped, so it survives.
     #[tokio::test]
     async fn empty_sensitive_list_disables_scrub() {
         let policy = EidolonPolicy {

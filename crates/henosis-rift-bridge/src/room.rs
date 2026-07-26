@@ -36,7 +36,7 @@ use crate::execution::sandbox::SandboxManager;
 use crate::execution::supervisor::ExecutionSupervisor;
 use crate::execution::{RiftRoomNotifier, RoomNotifier};
 use crate::executor::{AgentExecutor, DiscussionContext};
-use crate::executors::{build_synapse_executor, ClaudeCodeExecutor};
+use crate::executors::{build_synapse_executor, ClaudeCodeExecutor, CommandExecutor};
 use crate::growth::GrowthStore;
 use crate::kleos::KleosClient;
 use crate::loop_prevention::{LoopBudget, LoopGuard};
@@ -170,6 +170,27 @@ impl Room {
         let mut executors: HashMap<AgentId, Arc<dyn AgentExecutor>> = HashMap::new();
         for (agent, config) in roster.all_by_slot().into_iter().zip(agent_configs.iter()) {
             let executor: Arc<dyn AgentExecutor> = match &config.executor {
+                ExecutorConfig::Command {
+                    binary,
+                    discuss_args,
+                    execute_args,
+                    cwd,
+                    max_runtime_secs,
+                    progress_format,
+                    env,
+                    inherit_env,
+                    env_clear,
+                } => Arc::new(CommandExecutor::new(
+                    binary.clone(),
+                    discuss_args.clone(),
+                    execute_args.clone(),
+                    cwd.clone(),
+                    *max_runtime_secs,
+                    *progress_format,
+                    env.clone(),
+                    inherit_env.clone(),
+                    *env_clear,
+                )),
                 ExecutorConfig::ClaudeCode {
                     binary,
                     model,

@@ -11,8 +11,8 @@ use anyhow::{bail, Context, Result};
 use synapse_core::executors::SynapseExecutor;
 use synapse_core::hooks::HookConfig;
 use synapse_core::types::AgentConfig as SynapseAgentConfig;
-use synapse_provider::{create_provider, ProviderConfig, ToolExecutor};
-use synapse_tools::{default_tools, ToolRegistryExecutor};
+use synapse_provider::{create_provider, ProviderConfig};
+use synapse_tools::default_tools;
 
 /// Build a `SynapseExecutor` from bridge-level configuration values.
 ///
@@ -51,20 +51,9 @@ pub fn build_synapse_executor(
             let token = token.context("foundry-openai provider requires 'token'")?;
             ProviderConfig::FoundryOpenAI { host, token }
         }
-        "claude-max" | "claude-cli" => {
-            // Claude Max owns its MCP loop inside a persistent provider. That
-            // loop cannot inherit this executor's per-task Pistis gate or
-            // worktree safely, so keep it text-only until providers are scoped
-            // to one authorized task.
-            let tool_executor: Arc<dyn ToolExecutor> = Arc::new(ToolRegistryExecutor::disabled());
-            ProviderConfig::ClaudeMax {
-                model: Some(model_str.clone()),
-                cli_path: None,
-                cred_namespace: None,
-                cred_key: None,
-                tools: tool_executor,
-            }
-        }
+        "claude-max" | "claude-cli" => bail!(
+            "{provider_type} is disabled in the multi-agent Rift bridge because the Claude CLI requires an OAuth token in its environment; use a network provider or isolate each agent under a distinct UID or protected PID namespace"
+        ),
         "anthropic" => {
             let key = api_key
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())

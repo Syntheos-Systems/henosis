@@ -21,6 +21,12 @@ use crate::events::ActionLogged;
 use crate::model::{ActionEntry, ActionFilter, BrocaStats, LogAction};
 use crate::narrate::{narrate_from_template, Narrator};
 
+/// Maximum rows one list or query call may return.
+///
+/// Enforced by the store rather than trusted from the caller, so an omitted or
+/// oversized limit cannot turn a listing into an unbounded scan.
+const MAX_LIST_LIMIT: usize = 500;
+
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/V1__broca_actions.sql"))];
 
@@ -289,12 +295,13 @@ impl BrocaStore {
             args.push(ts_nanos(since).into());
         }
         sql.push_str(" ORDER BY id DESC");
-        // limit/offset are `usize`, safe to inline. OFFSET needs a LIMIT in SQLite (-1 = unbounded).
-        match (filter.limit, filter.offset) {
-            (Some(l), Some(o)) => sql.push_str(&format!(" LIMIT {l} OFFSET {o}")),
-            (Some(l), None) => sql.push_str(&format!(" LIMIT {l}")),
-            (None, Some(o)) => sql.push_str(&format!(" LIMIT -1 OFFSET {o}")),
-            (None, None) => {}
+        // A caller-supplied limit is advisory. An omitted or oversized value would
+        // otherwise scan and serialize every row this tenant has accumulated while
+        // holding the process-wide connection mutex, stalling every other tenant.
+        let limit = filter.limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        match filter.offset {
+            Some(offset) => sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}")),
+            None => sql.push_str(&format!(" LIMIT {limit}")),
         }
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql).map_err(berr)?;

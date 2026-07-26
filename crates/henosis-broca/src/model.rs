@@ -58,7 +58,7 @@ pub struct ActionFilter {
     pub action: Option<String>,
     /// Only actions recorded at or after this instant.
     pub since: Option<Timestamp>,
-    /// Maximum rows to return (`None` = no limit).
+    /// Maximum rows to return (`None` or an oversized value uses the store ceiling).
     pub limit: Option<usize>,
     /// Rows to skip (for pagination).
     pub offset: Option<usize>,

@@ -620,6 +620,9 @@ fn chiasm_error(e: ChiasmError) -> (StatusCode, String) {
         ChiasmError::NotFound(_) => StatusCode::NOT_FOUND,
         ChiasmError::ClaimConflict { .. } => StatusCode::CONFLICT,
         ChiasmError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
+        ChiasmError::SelfDependency(_) | ChiasmError::DependencyCycle { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         // Backend, backfill, and any future variants are server-side failures.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1765,6 +1768,34 @@ mod tests {
     use syntheos_dispatch::{Executor, ExecutorError};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
+
+    /// Dependency-graph validation failures are client errors while storage failures stay server errors.
+    #[test]
+    fn chiasm_dependency_errors_preserve_the_http_error_boundary() {
+        let task_id = TaskId::new();
+        let dependency_id = TaskId::new();
+
+        assert_eq!(
+            chiasm_error(ChiasmError::SelfDependency(task_id)).0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::DependencyCycle {
+                task_id,
+                depends_on: dependency_id,
+            })
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::Backend("database unavailable".to_string())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::Backfill("legacy data is invalid".to_string())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     /// Build an isolated in-memory credential store for compatibility-chain tests.
     fn test_credential_store(bus: Arc<AxonBus>) -> Arc<CredentialStore> {

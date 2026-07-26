@@ -38,7 +38,7 @@ use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
 use syntheos_server::authority::{AuditBoundary, AuditExecutionGuard, AuthorityState};
 use syntheos_server::billing::BillingState;
-use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, InitMode, RunResult};
+use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, RunResult};
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{
     eidolon_gate, public_gate_chain, runtime_router, spawn_action_reactor, AppState,
@@ -393,7 +393,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if auto_init_requested(optional_env("HENOSIS_AUTO_INIT")?.as_deref())? {
-        CliRunner::local(cli_paths.clone()).run(Command::Init(InitMode::Quick))?;
+        CliRunner::local(cli_paths.clone())
+            .run(syntheos_server::cli::quick_init_command_from_env())?;
     }
     syntheos_server::cli::load_local_environment_if_present(&cli_paths)?;
     tokio::runtime::Builder::new_multi_thread()
@@ -2023,7 +2024,9 @@ mod auto_init_tests {
         assert!(control_command(&Command::Token(
             syntheos_server::cli::TokenCommand::List
         )));
-        assert!(!control_command(&Command::Init(InitMode::Quick)));
+        assert!(!control_command(&Command::Init(
+            syntheos_server::cli::InitMode::Quick
+        )));
         assert!(!control_command(&Command::Serve));
     }
 

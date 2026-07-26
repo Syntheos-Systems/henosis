@@ -15,6 +15,7 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub rift: RiftConfig,
     /// Bridge daemon behavior settings.
+    #[serde(default)]
     pub bridge: BridgeDaemonConfig,
     /// Agent roster -- one entry per agent user to provision.
     pub agents: Vec<AgentConfig>,
@@ -350,6 +351,37 @@ pub struct AgentConfig {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ExecutorConfig {
+    /// Run any external agent CLI as the harness.
+    ///
+    /// The escape hatch that keeps Henosis from being tied to one agent: the
+    /// operator names a binary and the argument templates for a discussion turn
+    /// and an execution session, and `{prompt}` is substituted as a single
+    /// argument. Anything that takes a prompt and answers on stdout works.
+    Command {
+        /// Path to the harness binary, or a bare name resolved against PATH.
+        binary: PathBuf,
+        /// Argument template for a discussion turn; `{prompt}` is substituted.
+        #[serde(default)]
+        discuss_args: Vec<String>,
+        /// Argument template for an execution session; `{prompt}` is substituted.
+        #[serde(default)]
+        execute_args: Vec<String>,
+        /// Working directory for discussion turns. Execution uses the sandbox.
+        cwd: Option<PathBuf>,
+        /// Wall-clock ceiling per session, enforced by killing the process.
+        max_runtime_secs: Option<u64>,
+        /// Set to "jsonl" when the harness emits newline-delimited JSON progress.
+        progress_format: Option<crate::executors::ProgressFormat>,
+        /// Extra environment entries handed to the harness.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Ambient environment names explicitly inherited by the harness.
+        #[serde(default)]
+        inherit_env: Vec<String>,
+        /// Start the harness from an empty environment instead of inheriting.
+        #[serde(default = "default_env_clear")]
+        env_clear: bool,
+    },
     /// Shell out to `claude -p`. Lightweight, no tool access.
     ClaudeCode {
         /// Absolute path to claude binary.
@@ -361,7 +393,7 @@ pub enum ExecutorConfig {
     },
     /// Full Synapse agent loop with provider + tool access.
     Synapse {
-        /// Provider backend: "foundry-anthropic", "foundry-openai", "claude-max", "anthropic".
+        /// Provider backend: "foundry-anthropic", "foundry-openai", or "anthropic".
         provider: String,
         /// Model identifier (e.g., "claude-sonnet-4-6").
         model: Option<String>,
@@ -438,6 +470,47 @@ impl BridgeConfig {
         if let Some(control) = &self.control {
             control.validate(&[&self.rift.jwt_secret, &self.rift.bridge_secret])?;
         }
+        for agent in &self.agents {
+            if let ExecutorConfig::Command {
+                binary,
+                discuss_args,
+                execute_args,
+                max_runtime_secs,
+                env,
+                inherit_env,
+                ..
+            } = &agent.executor
+            {
+                if binary.as_os_str().is_empty() {
+                    return Err(BridgeError::Config(format!(
+                        "command executor for {} requires a binary",
+                        agent.username
+                    )));
+                }
+                validate_command_template(&agent.username, "discuss_args", discuss_args)?;
+                validate_command_template(&agent.username, "execute_args", execute_args)?;
+                if discuss_args == execute_args {
+                    return Err(BridgeError::Config(format!(
+                        "command executor for {} must use distinct discussion and execution modes",
+                        agent.username
+                    )));
+                }
+                if *max_runtime_secs == Some(0) {
+                    return Err(BridgeError::Config(format!(
+                        "command executor for {} requires max_runtime_secs greater than zero",
+                        agent.username
+                    )));
+                }
+                for name in inherit_env.iter().chain(env.keys()) {
+                    if !valid_command_env_name(name) {
+                        return Err(BridgeError::Config(format!(
+                            "command executor for {} has invalid environment name {name:?}",
+                            agent.username
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -455,6 +528,37 @@ impl BridgeConfig {
         }
         Ok(())
     }
+}
+
+/// Keep generic harnesses isolated from ambient process credentials unless explicitly overridden.
+fn default_env_clear() -> bool {
+    true
+}
+
+/// Accept environment names that cannot make process construction panic.
+fn valid_command_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|character| matches!(character, '=' | '\0'))
+}
+
+/// Validate one external-harness argument template at the configuration boundary.
+fn validate_command_template(
+    username: &str,
+    field: &str,
+    template: &[String],
+) -> Result<(), BridgeError> {
+    let placeholders = template
+        .iter()
+        .filter(|arg| arg.as_str() == "{prompt}")
+        .count();
+    if template.is_empty() || placeholders != 1 {
+        return Err(BridgeError::Config(format!(
+            "command executor {field} for {username} must contain exactly one whole-element {{prompt}} placeholder"
+        )));
+    }
+    Ok(())
 }
 
 /// A repository an approved task may execute against.
@@ -836,5 +940,122 @@ mod tests {
         assert_eq!(config.rift.server_id, server_id);
         assert_eq!(config.rift.channel_id, channel_id);
         assert_eq!(config.agents.len(), 1);
+    }
+
+    /// A generated roster can omit bridge tuning and still defaults to an empty child environment.
+    #[test]
+    fn managed_command_roster_uses_safe_defaults() {
+        let parsed: BridgeConfig = toml::from_str(
+            r#"
+                [[agents]]
+                name = "Adapter"
+                username = "adapter"
+                base_chance = 1.0
+                system_prompt = "Discuss safely."
+
+                executor = { type = "Command", binary = "/opt/bin/adapter", discuss_args = ["--henosis-discuss", "{prompt}"], execute_args = ["--henosis-execute", "{prompt}"] }
+            "#,
+        )
+        .expect("generated roster parses");
+
+        assert_eq!(parsed.bridge.turn_budget, 5);
+        match &parsed.agents[0].executor {
+            super::ExecutorConfig::Command {
+                env_clear,
+                inherit_env,
+                ..
+            } => {
+                assert!(*env_clear);
+                assert!(inherit_env.is_empty());
+            }
+            _ => panic!("expected command executor"),
+        }
+    }
+
+    /// A command harness cannot reuse its execution mode for ordinary discussion turns.
+    #[test]
+    fn managed_command_roster_rejects_identical_modes() {
+        let path = std::env::temp_dir().join(format!(
+            "henosis-managed-command-config-{}.toml",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [[agents]]
+                name = "Unsafe"
+                username = "unsafe"
+                base_chance = 1.0
+                system_prompt = "Unsafe fixture."
+                executor = { type = "Command", binary = "codex", discuss_args = ["exec", "{prompt}"], execute_args = ["exec", "{prompt}"] }
+            "#,
+        )
+        .expect("write temporary managed config");
+        let result = BridgeConfig::load_for_managed_room(
+            &path,
+            "http://127.0.0.1:3200".to_string(),
+            "ws://127.0.0.1:3200/ws".to_string(),
+            "j".repeat(32),
+            "b".repeat(32),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        std::fs::remove_file(&path).expect("remove temporary managed config");
+
+        assert!(
+            matches!(result, Err(super::BridgeError::Config(message)) if message.contains("distinct discussion and execution modes"))
+        );
+    }
+
+    /// Command timeouts and inherited environment names fail at config load, not process spawn.
+    #[test]
+    fn managed_command_roster_rejects_invalid_process_settings() {
+        let executor_type_key = "type";
+        let invalid = [
+            ("max_runtime_secs = 0", "max_runtime_secs greater than zero"),
+            ("inherit_env = [\"BAD=NAME\"]", "invalid environment name"),
+        ];
+
+        for (setting, expected) in invalid {
+            let path = std::env::temp_dir().join(format!(
+                "henosis-invalid-command-config-{}.toml",
+                Uuid::new_v4()
+            ));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+                        [[agents]]
+                        name = "Invalid"
+                        username = "invalid"
+                        base_chance = 1.0
+                        system_prompt = "Invalid fixture."
+
+                        [agents.executor]
+                        {executor_type_key} = "Command"
+                        binary = "adapter"
+                        discuss_args = ["--henosis-discuss", "{{prompt}}"]
+                        execute_args = ["--henosis-execute", "{{prompt}}"]
+                        {setting}
+                    "#
+                ),
+            )
+            .expect("write invalid managed config");
+            let result = BridgeConfig::load_for_managed_room(
+                &path,
+                "http://127.0.0.1:3200".to_string(),
+                "ws://127.0.0.1:3200/ws".to_string(),
+                "j".repeat(32),
+                "b".repeat(32),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            );
+            std::fs::remove_file(&path).expect("remove invalid managed config");
+
+            assert!(
+                matches!(result, Err(super::BridgeError::Config(message)) if message.contains(expected)),
+                "setting {setting:?} must report {expected:?}"
+            );
+        }
     }
 }

@@ -30,6 +30,7 @@ pub enum PresenceStatus {
     Error,
 }
 
+/// Converts typed presence states to and from their stable storage tokens.
 impl PresenceStatus {
     /// The canonical storage/wire token for this status.
     pub fn as_str(&self) -> &'static str {
@@ -118,7 +119,7 @@ pub struct PresenceFilter {
     pub agent_type: Option<String>,
     /// Only agents in this status.
     pub status: Option<PresenceStatus>,
-    /// Maximum rows to return (`None` = no limit).
+    /// Maximum rows to return (`None` or an oversized value uses the store ceiling).
     pub limit: Option<usize>,
 }
 

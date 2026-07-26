@@ -202,15 +202,29 @@ impl RiftRestClient {
     }
 
     /// Check whether the bridge for one server is paused.
+    ///
+    /// Presents the bridge secret: the status route is control-plane state, not
+    /// public. Failures propagate rather than reporting "not paused", so the
+    /// poller keeps the last known state instead of silently resuming a room the
+    /// operator paused.
     pub async fn is_paused(&self, server_id: Uuid) -> Result<bool, BridgeError> {
         let url = bridge_status_url(&self.base_url, server_id);
-        let resp = self.client.get(&url).send().await?;
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(self.auth.bridge_secret())
+            .send()
+            .await?;
 
         if resp.status().is_success() {
             let status: BridgeStatus = resp.json().await?;
             Ok(status.paused)
         } else {
-            Ok(false)
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(BridgeError::RiftApi(format!(
+                "bridge status check failed ({status}): {body}"
+            )))
         }
     }
 }
