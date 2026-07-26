@@ -3,6 +3,8 @@
 FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS build
 WORKDIR /src
 COPY . .
+RUN apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818

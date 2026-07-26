@@ -4,21 +4,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::RwLock;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::checkpoint::{Checkpoint, PausedState};
 use crate::clients::{AnthropicResult, ClientError, Clients};
-use crate::hermes_client::{ToolDef, builtin_tools};
+use crate::hermes_client::{builtin_tools, ToolDef};
 use crate::streaming::{StreamEventEnvelope, StreamHub};
 
 /// Lifecycle state of a task. Transitions are monotone: Accepted ->
@@ -247,13 +247,15 @@ async fn execute_task(
     setup_task(&state, &id, agent, &project, &title, &body).await;
     run_task(
         state,
-        id,
-        project,
-        title,
-        body.tenant_id,
-        body.principal_id,
-        body.system,
-        body.input,
+        TaskExecution {
+            id,
+            project,
+            title,
+            tenant_id: body.tenant_id,
+            principal_id: body.principal_id,
+            system: body.system,
+            input: body.input,
+        },
     )
     .await;
 }
@@ -368,13 +370,15 @@ pub async fn create_task(
     tokio::spawn(async move {
         run_task(
             state_spawn,
-            id_spawn,
-            project_spawn,
-            title_spawn,
-            body.tenant_id,
-            body.principal_id,
-            body.system,
-            body.input,
+            TaskExecution {
+                id: id_spawn,
+                project: project_spawn,
+                title: title_spawn,
+                tenant_id: body.tenant_id,
+                principal_id: body.principal_id,
+                system: body.system,
+                input: body.input,
+            },
         )
         .await;
     });
@@ -437,18 +441,36 @@ pub async fn resume_task(
     ))
 }
 
+/// Owns the prepared fields consumed by one fresh task execution.
+struct TaskExecution {
+    /// Stable task identifier shared across persistence and event records.
+    id: String,
+    /// Chiasm project that receives coordination updates.
+    project: String,
+    /// Human-readable task title used for coordination records.
+    title: String,
+    /// Optional tenant boundary forwarded to provider and tool calls.
+    tenant_id: Option<String>,
+    /// Optional principal boundary forwarded to provider and tool calls.
+    principal_id: Option<String>,
+    /// Optional system prompt supplied to the model.
+    system: Option<String>,
+    /// Original user input supplied to the model.
+    input: String,
+}
+
 /// Spawn a fresh executor loop for a newly-created task. Creates the Chiasm
 /// task, flips status to Running, then calls into the LLM loop.
-async fn run_task(
-    state: AppState,
-    id: String,
-    project: String,
-    title: String,
-    tenant_id: Option<String>,
-    principal_id: Option<String>,
-    system: Option<String>,
-    input: String,
-) {
+async fn run_task(state: AppState, task: TaskExecution) {
+    let TaskExecution {
+        id,
+        project,
+        title,
+        tenant_id,
+        principal_id,
+        system,
+        input,
+    } = task;
     let clients = state.clients.clone();
     let store = state.store.clone();
 
@@ -536,13 +558,15 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
         info!(task_id = %id, "resuming Accepted task -- starting fresh");
         run_task(
             state,
-            id,
-            rec.project,
-            rec.title,
-            tenant_id,
-            principal_id,
-            rec.system,
-            rec.input,
+            TaskExecution {
+                id,
+                project: rec.project,
+                title: rec.title,
+                tenant_id,
+                principal_id,
+                system: rec.system,
+                input: rec.input,
+            },
         )
         .await;
         return;
@@ -554,13 +578,15 @@ pub async fn resume_task_from_kleos(state: AppState, rec: TaskRecord) {
             warn!(task_id = %id, "no checkpoint -- restarting from input");
             run_task(
                 state,
-                id,
-                rec.project,
-                rec.title,
-                tenant_id,
-                principal_id,
-                rec.system,
-                rec.input,
+                TaskExecution {
+                    id,
+                    project: rec.project,
+                    title: rec.title,
+                    tenant_id,
+                    principal_id,
+                    system: rec.system,
+                    input: rec.input,
+                },
             )
             .await;
             return;
