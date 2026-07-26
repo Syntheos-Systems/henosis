@@ -1,6 +1,6 @@
 # Build and run Henosis as an unprivileged, immutable container process.
 
-FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS build
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge

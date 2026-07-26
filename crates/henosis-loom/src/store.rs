@@ -1947,18 +1947,14 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            store
-                .delete_workflow(wf.tenant, principal, wf.id)
-                .await
-                .expect("delete")
-        );
-        assert!(
-            !store
-                .delete_workflow(wf.tenant, principal, wf.id)
-                .await
-                .expect("delete")
-        );
+        assert!(store
+            .delete_workflow(wf.tenant, principal, wf.id)
+            .await
+            .expect("delete"));
+        assert!(!store
+            .delete_workflow(wf.tenant, principal, wf.id)
+            .await
+            .expect("delete"));
     }
 
     #[tokio::test]
@@ -2005,20 +2001,16 @@ mod tests {
             .expect("tenant A step");
         let step_a_started = step_a.started_at.expect("tenant A attempt start");
 
-        assert!(
-            store
-                .get_workflow(tenant_b, principal, workflow_a.id)
-                .await
-                .expect("cross-tenant workflow lookup")
-                .is_none()
-        );
-        assert!(
-            store
-                .get_workflow_by_name(tenant_b, principal, &workflow_a.name)
-                .await
-                .expect("cross-tenant workflow name lookup")
-                .is_none()
-        );
+        assert!(store
+            .get_workflow(tenant_b, principal, workflow_a.id)
+            .await
+            .expect("cross-tenant workflow lookup")
+            .is_none());
+        assert!(store
+            .get_workflow_by_name(tenant_b, principal, &workflow_a.name)
+            .await
+            .expect("cross-tenant workflow name lookup")
+            .is_none());
         assert_eq!(
             store
                 .list_workflows(tenant_b, principal)
@@ -2043,12 +2035,10 @@ mod tests {
                 .await,
             Err(LoomError::WorkflowNotFound(id)) if id == workflow_a.id
         ));
-        assert!(
-            !store
-                .delete_workflow(tenant_b, principal, workflow_a.id)
-                .await
-                .expect("cross-tenant workflow delete")
-        );
+        assert!(!store
+            .delete_workflow(tenant_b, principal, workflow_a.id)
+            .await
+            .expect("cross-tenant workflow delete"));
         assert!(matches!(
             store
                 .create_run(tenant_b, principal, workflow_a.id, None)
@@ -2056,13 +2046,11 @@ mod tests {
             Err(LoomError::WorkflowNotFound(id)) if id == workflow_a.id
         ));
 
-        assert!(
-            store
-                .get_run(tenant_b, principal, run_a.id)
-                .await
-                .expect("cross-tenant run lookup")
-                .is_none()
-        );
+        assert!(store
+            .get_run(tenant_b, principal, run_a.id)
+            .await
+            .expect("cross-tenant run lookup")
+            .is_none());
         assert_eq!(
             store
                 .list_runs(tenant_b, principal, RunFilter::default())
@@ -2077,20 +2065,16 @@ mod tests {
             store.cancel_run(tenant_b, principal, run_a.id).await,
             Err(LoomError::RunNotFound(id)) if id == run_a.id
         ));
-        assert!(
-            store
-                .get_steps(tenant_b, principal, run_a.id)
-                .await
-                .expect("cross-tenant steps")
-                .is_empty()
-        );
-        assert!(
-            store
-                .get_step(tenant_b, principal, step_a.id)
-                .await
-                .expect("cross-tenant step lookup")
-                .is_none()
-        );
+        assert!(store
+            .get_steps(tenant_b, principal, run_a.id)
+            .await
+            .expect("cross-tenant steps")
+            .is_empty());
+        assert!(store
+            .get_step(tenant_b, principal, step_a.id)
+            .await
+            .expect("cross-tenant step lookup")
+            .is_none());
         assert!(matches!(
             store
                 .complete_step(
@@ -2121,13 +2105,11 @@ mod tests {
             store.advance_run(tenant_b, principal, run_a.id).await,
             Err(LoomError::RunNotFound(id)) if id == run_a.id
         ));
-        assert!(
-            store
-                .logs(tenant_b, principal, run_a.id, 100)
-                .await
-                .expect("cross-tenant logs")
-                .is_empty()
-        );
+        assert!(store
+            .logs(tenant_b, principal, run_a.id, 100)
+            .await
+            .expect("cross-tenant logs")
+            .is_empty());
 
         let stats_b = store
             .stats(tenant_b, principal)
@@ -2948,12 +2930,10 @@ mod tests {
             .expect("run");
         let _ = drain_kinds(&mut rx);
 
-        assert!(
-            store
-                .cancel_run(run.tenant, principal, run.id)
-                .await
-                .expect("cancel")
-        );
+        assert!(store
+            .cancel_run(run.tenant, principal, run.id)
+            .await
+            .expect("cancel"));
         assert_eq!(drain_kinds(&mut rx), ["workflow.run.cancelled"]);
         let run = store
             .get_run(run.tenant, principal, run.id)
@@ -2967,12 +2947,10 @@ mod tests {
             .expect("steps");
         assert!(steps.iter().all(|s| s.status == StepStatus::Skipped));
         // Cancelling again is a no-op.
-        assert!(
-            !store
-                .cancel_run(run.tenant, principal, run.id)
-                .await
-                .expect("cancel")
-        );
+        assert!(!store
+            .cancel_run(run.tenant, principal, run.id)
+            .await
+            .expect("cancel"));
     }
 
     #[tokio::test]
@@ -3016,12 +2994,10 @@ mod tests {
             .expect("a running step");
 
         // Concurrent cancel: the running step becomes 'skipped'.
-        assert!(
-            store
-                .cancel_run(run.tenant, principal, run.id)
-                .await
-                .expect("cancel")
-        );
+        assert!(store
+            .cancel_run(run.tenant, principal, run.id)
+            .await
+            .expect("cancel"));
 
         // Completing with the now-stale 'running' snapshot must be refused.
         let result = store
@@ -3165,11 +3141,9 @@ mod tests {
             .get_steps(run.tenant, principal, run.id)
             .await
             .expect("steps");
-        assert!(
-            persisted_steps
-                .iter()
-                .all(|step| step.status == StepStatus::Running)
-        );
+        assert!(persisted_steps
+            .iter()
+            .all(|step| step.status == StepStatus::Running));
         assert_eq!(
             store
                 .logs(run.tenant, principal, run.id, 100)
@@ -3219,12 +3193,11 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(
-            run.error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("timed out")
-        );
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("timed out"));
         // Nothing left to sweep.
         assert!(store.sweep_timeouts().await.expect("sweep").is_empty());
     }
@@ -3281,12 +3254,10 @@ mod tests {
                 + time::Duration::nanoseconds(1),
         );
 
-        assert!(
-            store
-                .cancel_run(stale_run.tenant, principal, stale_run.id)
-                .await
-                .expect("cancel stale run")
-        );
+        assert!(store
+            .cancel_run(stale_run.tenant, principal, stale_run.id)
+            .await
+            .expect("cancel stale run"));
         let timed_out = store
             .sweep_timeout_candidates(
                 vec![(stale_step, stale_run), (live_step.clone(), live_run)],
@@ -3335,13 +3306,11 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(cancelled.len(), 1);
-        assert!(
-            store
-                .list_runs(wf.tenant, PrincipalId::new(), RunFilter::default())
-                .await
-                .expect("list")
-                .is_empty()
-        );
+        assert!(store
+            .list_runs(wf.tenant, PrincipalId::new(), RunFilter::default())
+            .await
+            .expect("list")
+            .is_empty());
 
         let stats = store.stats(wf.tenant, principal).await.expect("stats");
         assert_eq!(stats.workflows, 1);

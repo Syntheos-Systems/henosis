@@ -20,12 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -y libpcsclite-dev libpq-dev libssl-dev pkg-config ripgrep
-      - run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - run: rustup toolchain install 1.94.0 --profile minimal --component clippy,rustfmt
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo +1.88.0 fmt --all --check
-      - run: cargo +1.88.0 clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
-      - run: cargo +1.88.0 test --locked --workspace --exclude henosis-cognition
-      - run: cargo +1.88.0 test --locked -p synapse-tools --features henosis-pistis henosis_tests
+      - run: cargo +1.94.0 fmt --all --check
+      - run: cargo +1.94.0 clippy --locked --workspace --all-targets --exclude henosis-cognition -- -D warnings
+      - run: cargo +1.94.0 test --locked --workspace --exclude henosis-cognition
+      - run: cargo +1.94.0 test --locked -p synapse-tools --features henosis-pistis henosis_tests
       - run: ./scripts/stub-scan.sh
 
   cognition:
@@ -92,19 +92,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - shell: pwsh
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup target add --toolchain 1.88.0 x86_64-pc-windows-msvc
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 x86_64-pc-windows-msvc
       - shell: pwsh
-        run: cargo +1.88.0 test --locked -p synapse-tools confined_fs::tests --target x86_64-pc-windows-msvc
+        run: cargo +1.94.0 test --locked -p synapse-tools confined_fs::tests --target x86_64-pc-windows-msvc
       - shell: pwsh
-        run: cargo +1.88.0 test --locked -p henosis-eidolon supervisor::tests --target x86_64-pc-windows-msvc
+        run: cargo +1.94.0 test --locked -p henosis-eidolon supervisor::tests --target x86_64-pc-windows-msvc
       - shell: pwsh
-        run: cargo +1.88.0 test --locked -p henosis-sqlite --target x86_64-pc-windows-msvc
+        run: cargo +1.94.0 test --locked -p henosis-sqlite --target x86_64-pc-windows-msvc
       - shell: pwsh
-        run: cargo +1.88.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
+        run: cargo +1.94.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
       - shell: pwsh
         run: |
-          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target x86_64-pc-windows-msvc
+          cargo +1.94.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target x86_64-pc-windows-msvc
       - shell: powershell
         run: ./tests/install.ps1
       - shell: pwsh
@@ -147,23 +147,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: runner.os != 'Windows'
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup target add --toolchain 1.88.0 ${{ matrix.target }}
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 ${{ matrix.target }}
           if [ "${{ runner.os }}" = Linux ]; then sudo apt-get update -q && sudo apt-get install -y musl-tools; fi
           if [ "${{ runner.os }}" = macOS ]; then brew install gnu-tar; fi
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup target add --toolchain 1.88.0 ${{ matrix.target }}
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup target add --toolchain 1.94.0 ${{ matrix.target }}
       - if: runner.os != 'Windows'
-        run: cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
+        run: cargo +1.94.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
       - if: runner.os != 'Windows'
         run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" ./scripts/package-release.sh "target/${{ matrix.target }}/release/henosis" "target/${{ matrix.target }}/release/crucible" "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" dist
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo +1.88.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
+          cargo +1.94.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
           & .\scripts\package-release.ps1 -HenosisBinaryPath "target\${{ matrix.target }}\release\henosis.exe" -CrucibleBinaryPath "target\${{ matrix.target }}\release\crucible.exe" -Version $env:GITHUB_REF_NAME.Substring(1) -Target '${{ matrix.target }}' -OutputDirectory dist -SourceDateEpoch ([long](git log -1 --format=%ct))
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
