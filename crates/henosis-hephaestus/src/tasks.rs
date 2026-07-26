@@ -4,21 +4,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::checkpoint::{Checkpoint, PausedState};
 use crate::clients::{AnthropicResult, ClientError, Clients};
-use crate::hermes_client::{builtin_tools, ToolDef};
+use crate::hermes_client::{ToolDef, builtin_tools};
 use crate::streaming::{StreamEventEnvelope, StreamHub};
 
 /// Lifecycle state of a task. Transitions are monotone: Accepted ->
