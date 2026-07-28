@@ -45,6 +45,10 @@ printf '%s\n' \
     'case "$*" in' \
     '    *check-runs*)' \
     '        printf "Rust quality\tcompleted\tsuccess\n"' \
+    '        case "${FAKE_DESKTOP_STATUS:-success}" in' \
+    '            success) printf "Desktop quality\tcompleted\tsuccess\n" ;;' \
+    '            failure) printf "Desktop quality\tcompleted\tfailure\n" ;;' \
+    '        esac' \
     '        case "${FAKE_COGNITION_STATUS:-missing}" in' \
     '            success) printf "Cognition quality\tcompleted\tsuccess\n" ;;' \
     '            failure) printf "Cognition quality\tcompleted\tfailure\n" ;;' \
@@ -157,6 +161,18 @@ if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/n
 fi
 
 : > "$promotion_log"
+if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_DESKTOP_STATUS=missing PROMOTION_CHECK_ATTEMPTS=2 PROMOTION_CHECK_INTERVAL_SECONDS=1 \
+    "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-desktop-missing.log" 2>&1
+then
+    fail 'promotion accepted a candidate without Desktop quality'
+fi
+grep -F 'required checks did not pass' "$TEST_DIRECTORY/promotion-desktop-missing.log" >/dev/null || fail 'missing Desktop quality stopped promotion for the wrong reason'
+grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/null || fail 'promotion did not remove the candidate with missing Desktop quality'
+if grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null; then
+    fail 'promotion pushed main without Desktop quality'
+fi
+
+: > "$promotion_log"
 if PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success FAKE_MAIN_LOOKUP_STATUS=failure \
     "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-main-lookup.log" 2>&1
 then
@@ -205,6 +221,6 @@ grep -F "push origin --delete candidate/$candidate_sha" "$promotion_log" >/dev/n
 : > "$promotion_log"
 PATH="$fake_bin:$PATH" PROMOTION_LOG="$promotion_log" FAKE_CANDIDATE_SHA="$candidate_sha" FAKE_MAIN_SHA="$main_sha" FAKE_COGNITION_STATUS=success \
     "$REPOSITORY_DIR/scripts/promote-main.sh" "$candidate_sha" >"$TEST_DIRECTORY/promotion-success.log" 2>&1 ||
-    fail 'promotion rejected six successful required checks'
-grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null || fail 'promotion did not push main after six successful checks'
+    fail 'promotion rejected seven successful required checks'
+grep -F "push origin $candidate_sha:refs/heads/main" "$promotion_log" >/dev/null || fail 'promotion did not push main after seven successful checks'
 printf '%s\n' 'release package contract passed'

@@ -24,7 +24,7 @@ require_line() { grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"; }
 [ "$(grep -Fc 'git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main' "$WORKFLOW")" -eq 2 ] ||
     fail 'release ancestry must be verified before build and publication'
 require_line "$WORKFLOW" 'environment: release'
-[ "$(grep -Fc "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" "$WORKFLOW")" -eq 3 ] ||
+[ "$(grep -Fc "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" "$WORKFLOW")" -eq 4 ] ||
     fail 'release jobs must run only for v-tag push events'
 if grep -F 'workflow_dispatch:' "$WORKFLOW" >/dev/null; then
     fail 'release workflow must not expose a manual dispatch path'
@@ -37,6 +37,9 @@ require_line "$WORKFLOW" 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a8
 require_line "$WORKFLOW" 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1'
 require_line "$WORKFLOW" 'actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0'
 require_line "$WORKFLOW" 'anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0'
+require_line "$WORKFLOW" './scripts/validate-release-assets.sh release "${GITHUB_REF_NAME#v}"'
+require_line "$WORKFLOW" 'find . -maxdepth 1 -type f ! -name SHA256SUMS'
+require_line "$WORKFLOW" 'test "$(wc -l < SHA256SUMS)" -eq 10'
 require_line "$WORKFLOW" 'docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0'
 require_line "$WORKFLOW" 'docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0'
 require_line "$WORKFLOW" 'docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0'

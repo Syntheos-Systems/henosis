@@ -1,0 +1,29 @@
+[package]
+name = "henosis"
+version = "0.1.0-alpha.6"
+description = "Henosis graphical operating environment for persistent agents"
+edition = "2024"
+rust-version = "1.88"
+
+# Keep desktop platform dependencies out of the headless Henosis server workspace.
+[workspace]
+
+[lib]
+name = "henosis_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "henosis"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.5", features = [] }
+thiserror = "2.0.19"
+url = "2.5.8"

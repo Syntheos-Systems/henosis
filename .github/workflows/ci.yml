@@ -28,6 +28,28 @@ jobs:
       - run: cargo +1.88.0 test --locked -p synapse-tools --features henosis-pistis henosis_tests
       - run: ./scripts/stub-scan.sh
 
+  desktop-quality:
+    name: Desktop quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -y libappindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev patchelf xdg-utils
+      - run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - run: npm install --global pnpm@11.3.0
+      - run: pnpm --dir apps/desktop install --frozen-lockfile
+      - run: pnpm --dir apps/desktop test
+      - run: pnpm --dir apps/desktop test:release
+      - run: pnpm --dir apps/desktop build
+      - run: cargo +1.88.0 fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check
+      - run: cargo +1.88.0 clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo +1.88.0 test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
   cognition:
     name: Cognition quality
     runs-on: ubuntu-24.04
@@ -81,6 +103,7 @@ jobs:
       - run: ./tests/install.sh
       - run: ./tests/release-package.sh
       - run: ./tests/release-trust.sh
+      - run: ./tests/desktop-release.sh
       - run: ./tests/container-contract.sh
       - run: ./tests/vendor-drift.sh
       - run: ./scripts/vendor-drift.sh --metadata-only
@@ -126,7 +149,13 @@ jobs:
           git fetch --no-tags origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
           package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/syntheos-server/Cargo.toml)"
+          desktop_package_version="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",*$/\1/p' apps/desktop/package.json)"
+          desktop_cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/desktop/src-tauri/Cargo.toml)"
+          desktop_config_version="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",*$/\1/p' apps/desktop/src-tauri/tauri.conf.json)"
           test -n "$package_version"
+          test "$desktop_package_version" = "$package_version"
+          test "$desktop_cargo_version" = "$package_version"
+          test "$desktop_config_version" = "$package_version"
           test "$GITHUB_REF_NAME" = "v$package_version"
 
   release-build:
@@ -171,9 +200,47 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  desktop-release-build:
+    name: Desktop ${{ matrix.asset_target }}
+    needs: [quality, desktop-quality, cognition, dependencies, secrets, release-package-contract, release-package-windows, release-version]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, asset_target: linux-x86_64, bundles: 'deb,appimage', suffixes: '.deb,.AppImage' }
+          - { runner: macos-15-intel, asset_target: macos-x86_64, bundles: 'dmg', suffixes: '.dmg' }
+          - { runner: macos-15, asset_target: macos-aarch64, bundles: 'dmg', suffixes: '.dmg' }
+          - { runner: windows-2025, asset_target: windows-x86_64, bundles: 'nsis', suffixes: '.exe' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y libappindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev patchelf xdg-utils
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - run: npm install --global pnpm@11.3.0
+      - run: pnpm --dir apps/desktop install --frozen-lockfile
+      - if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+      - run: pnpm --dir apps/desktop tauri build --ci --bundles "${{ matrix.bundles }}"
+      - run: node apps/desktop/scripts/collect-release-assets.mjs apps/desktop/src-tauri/target/release/bundle apps/desktop/release-assets "${GITHUB_REF_NAME#v}" "${{ matrix.asset_target }}" "${{ matrix.suffixes }}"
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: henosis-desktop-${{ matrix.asset_target }}
+          path: apps/desktop/release-assets/*
+          if-no-files-found: error
+
   release-publish:
     name: Publish attested release
-    needs: [release-build, release-version]
+    needs: [release-build, desktop-release-build, release-version]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment: release
@@ -205,11 +272,13 @@ jobs:
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { pattern: henosis-*, path: release, merge-multiple: true }
-      - name: Create native checksums
+      - name: Validate release artifacts
+        run: ./scripts/validate-release-assets.sh release "${GITHUB_REF_NAME#v}"
+      - name: Create release checksums
         run: |
           cd release
-          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 5
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 10
       - name: Generate source SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:

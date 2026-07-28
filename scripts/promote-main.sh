@@ -66,6 +66,7 @@ wait_for_checks() {
         complete=1
         for required in \
             'Rust quality' \
+            'Desktop quality' \
             'Cognition quality' \
             'Dependency audit' \
             'Secret scan' \

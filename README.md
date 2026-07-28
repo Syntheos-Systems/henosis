@@ -18,14 +18,17 @@
 
 ---
 
-Henosis gives persistent AI agents a durable runtime for real work. It carries identity, policy,
-approval, execution, audit, task continuity, and memory across sessions, while server-owned gates
-decide which actions may run.
+Henosis gives people and persistent AI agents a graphical operating environment for real work.
+The desktop application opens to the Rift room directory with the most recently active room
+pinned. Athena is an internal workbench, while server-owned gates decide which actions may run.
+The headless runtime carries identity, policy, approval, execution, audit, task continuity, and
+memory across sessions.
 
-The public alpha installs as one executable with local initialization, diagnostics, serving,
-tokens, approvals, and dispatch. Model providers remain swappable behind a stable interface.
-Production credential brokerage through `phylaxd` and managed room trust from the proprietary
-Pistis service are deployment boundaries and do not ship in this repository.
+The public alpha ships the desktop application alongside one headless executable with local
+initialization, diagnostics, serving, tokens, approvals, and dispatch. Model providers remain
+swappable behind a stable interface. Production credential brokerage through `phylaxd` and
+managed room trust from the proprietary Pistis service are deployment boundaries and do not ship
+in this repository.
 
 > [!IMPORTANT]
 > Henosis is source-available under the [Elastic License 2.0](LICENSE) and remains in public alpha.
@@ -43,6 +46,26 @@ audit boundaries. The alpha includes:
 - one `henosis` executable for initialization, diagnostics, control, and serving.
 
 ## Install the public alpha
+
+### Desktop application
+
+The [Henosis releases page](https://github.com/Syntheos-Systems/henosis/releases) provides the
+graphical application in these formats:
+
+- Linux x86-64: Debian package or AppImage
+- macOS Intel and Apple Silicon: DMG
+- Windows x86-64: NSIS installer
+
+The desktop application is the primary human interface. This release makes first-run Rift
+connection and room selection GUI-operable and opens directly into the room directory. Remaining
+operational surfaces will be added inside this application, not exposed as terminal-only user
+flows.
+
+The current direct-download artifacts are installable but are not yet Apple-notarized or
+Windows Authenticode-signed. Their checksums and GitHub provenance attestations are published with
+the same protected release as the headless runtime.
+
+### Headless runtime
 
 Native release archives contain one launch executable: `henosis`. The installers select the host
 platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account,
@@ -205,8 +228,8 @@ before starting the service. The production compose file publishes no host port.
 
 ## Release verification
 
-Every release publishes platform archives, `SHA256SUMS`, SPDX SBOMs, and Sigstore attestation
-bundles. Verify an archive before use:
+Every release publishes desktop installers, headless platform archives, `SHA256SUMS`, SPDX SBOMs,
+and Sigstore attestation bundles. Verify an archive before use:
 
 ```sh
 grep -F '  henosis-0.1.0-alpha.6-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
@@ -230,7 +253,10 @@ must be enabled and an active `v*` tag ruleset must restrict tag creation, updat
 GhostFrame. The workflow compares the exact remote tag object immediately before and after
 publication.
 
-The release workflow builds Linux x86-64 and arm64, macOS Intel and Apple Silicon, and Windows x86-64 archives. It also publishes a Linux amd64/arm64 container image when GitHub package publishing is available.
+The release workflow builds desktop installers for Linux x86-64, macOS Intel and Apple Silicon,
+and Windows x86-64. It also builds headless archives for Linux x86-64 and arm64, macOS Intel and
+Apple Silicon, and Windows x86-64, plus a Linux amd64/arm64 container image when GitHub package
+publishing is available.
 
 ## Security and support
 
