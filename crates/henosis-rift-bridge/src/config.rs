@@ -359,6 +359,15 @@ pub enum ExecutorConfig {
         /// Max tokens for response.
         max_tokens: Option<u32>,
     },
+    /// Invoke the Codex CLI with explicit sandboxing and JSONL output.
+    Codex {
+        /// Absolute path to the Codex binary.
+        binary: PathBuf,
+        /// Model identifier passed to `codex exec`.
+        model: String,
+        /// Optional model reasoning-effort override.
+        reasoning_effort: Option<String>,
+    },
     /// Full Synapse agent loop with provider + tool access.
     Synapse {
         /// Provider backend: "foundry-anthropic", "foundry-openai", "claude-max", "anthropic".

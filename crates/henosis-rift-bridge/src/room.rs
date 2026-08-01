@@ -36,7 +36,7 @@ use crate::execution::sandbox::SandboxManager;
 use crate::execution::supervisor::ExecutionSupervisor;
 use crate::execution::{RiftRoomNotifier, RoomNotifier};
 use crate::executor::{AgentExecutor, DiscussionContext};
-use crate::executors::{build_synapse_executor, ClaudeCodeExecutor};
+use crate::executors::{build_synapse_executor, ClaudeCodeExecutor, CodexExecutor};
 use crate::growth::GrowthStore;
 use crate::kleos::KleosClient;
 use crate::loop_prevention::{LoopBudget, LoopGuard};
@@ -178,6 +178,15 @@ impl Room {
                     binary.clone(),
                     model.clone(),
                     *max_tokens,
+                )),
+                ExecutorConfig::Codex {
+                    binary,
+                    model,
+                    reasoning_effort,
+                } => Arc::new(CodexExecutor::new(
+                    binary.clone(),
+                    model.clone(),
+                    reasoning_effort.clone(),
                 )),
                 ExecutorConfig::Synapse {
                     provider,
