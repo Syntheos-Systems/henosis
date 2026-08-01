@@ -33,7 +33,7 @@ pub(crate) fn agent_email(username: &str) -> String {
 /// by timing repeated requests. Human credentials are JWTs and can never equal
 /// the dedicated bridge secret, which keeps bridge-only routes isolated from
 /// the user JWT signing key.
-fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
+pub(crate) fn bridge_authorized(headers: &HeaderMap, config: &Config) -> bool {
     let Some(token) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())

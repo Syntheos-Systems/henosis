@@ -74,7 +74,7 @@ pub struct ListMessageResponse {
     pub created_at: String,
 }
 
-/// Bridge status response from the pause endpoint.
+/// Bridge status response from the daemon-only pause endpoint.
 #[derive(Debug, Deserialize)]
 pub struct BridgeStatus {
     /// Whether the bridge is paused.
@@ -204,7 +204,12 @@ impl RiftRestClient {
     /// Check whether the bridge for one server is paused.
     pub async fn is_paused(&self, server_id: Uuid) -> Result<bool, BridgeError> {
         let url = bridge_status_url(&self.base_url, server_id);
-        let resp = self.client.get(&url).send().await?;
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(self.auth.bridge_secret())
+            .send()
+            .await?;
 
         if resp.status().is_success() {
             let status: BridgeStatus = resp.json().await?;
@@ -217,7 +222,7 @@ impl RiftRestClient {
 
 /// Build the server-scoped bridge status endpoint.
 fn bridge_status_url(base_url: &str, server_id: Uuid) -> String {
-    format!("{base_url}/api/servers/{server_id}/bridge/status")
+    format!("{base_url}/api/bridge/servers/{server_id}/status")
 }
 
 /// Build the JSON body for a message post.
@@ -355,7 +360,7 @@ mod tests {
         let server_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         assert_eq!(
             bridge_status_url("https://rift.example", server_id),
-            "https://rift.example/api/servers/11111111-1111-1111-1111-111111111111/bridge/status"
+            "https://rift.example/api/bridge/servers/11111111-1111-1111-1111-111111111111/status"
         );
     }
 

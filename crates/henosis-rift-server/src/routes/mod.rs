@@ -1,3 +1,5 @@
+/// Revisioned room roster, capability, and reconciliation routes.
+pub mod agent_control;
 /// Human-owned persistent agent identity routes.
 pub mod agent_identities;
 pub mod auth;

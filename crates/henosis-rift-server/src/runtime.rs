@@ -198,6 +198,7 @@ pub fn router_with_control_registry(
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -332,6 +333,23 @@ pub fn router_with_control_registry(
         .route(
             "/api/servers/{server_id}/bridge/status",
             get(routes::bridge_control::bridge_status),
+        )
+        .route(
+            "/api/bridge/servers/{server_id}/status",
+            get(routes::bridge_control::daemon_bridge_status),
+        )
+        .route(
+            "/api/servers/{server_id}/agent-roster",
+            get(routes::agent_control::get_agent_roster)
+                .put(routes::agent_control::put_agent_roster),
+        )
+        .route(
+            "/api/servers/{server_id}/agent-capabilities",
+            get(routes::agent_control::get_agent_capabilities),
+        )
+        .route(
+            "/api/servers/{server_id}/bridge/reconcile",
+            post(routes::agent_control::reconcile_agent_roster),
         )
         // DMs
         .route(
