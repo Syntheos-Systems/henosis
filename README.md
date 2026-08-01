@@ -1,75 +1,29 @@
-<div align="center">
-
-<img src="docs/assets/banner.svg" width="100%" alt="Henosis persistent agent runtime banner" />
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Henosis persistent agent runtime banner" width="100%" />
+</p>
 
 # Henosis
 
-**Persistent infrastructure for AI agents that need to carry real work across sessions without carrying unchecked authority.**
+Governed infrastructure for persistent AI agents.
 
 [![CI](https://github.com/Syntheos-Systems/henosis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Syntheos-Systems/henosis/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Syntheos-Systems/henosis?include_prereleases&sort=semver&color=f05a42)](https://github.com/Syntheos-Systems/henosis/releases)
 [![License: Elastic 2.0](https://img.shields.io/badge/license-Elastic--2.0-7b5740)](LICENSE)
 [![Language: Rust](https://img.shields.io/github/languages/top/Syntheos-Systems/henosis?logo=rust&color=b7410e)](Cargo.toml)
-[![GHCR: public](https://img.shields.io/badge/GHCR-public-657f77?logo=github)](https://github.com/orgs/Syntheos-Systems/packages/container/package/henosis)
 
-[Website](https://henosis.syntheos.dev/) · [Install](#install-the-public-alpha) · [Proof](https://henosis.syntheos.dev/proof) · [Releases](https://github.com/Syntheos-Systems/henosis/releases) · [Security](SECURITY.md) · [Limitations](scripts/known-incomplete.md) · [Contributing](CONTRIBUTING.md)
+[Releases](https://github.com/Syntheos-Systems/henosis/releases) · [Desktop source](apps/desktop/) · [Security](SECURITY.md) · [Limitations](scripts/known-incomplete.md) · [Contributing](CONTRIBUTING.md)
 
-</div>
+Henosis gives agents a durable place to work across sessions while operators retain control of identity, policy, approvals, credentials, execution, and audit. Rift rooms provide the human coordination surface. A headless Rust control plane owns the trust boundary.
 
----
+> **Public alpha:** v0.1.0-alpha.6 contains headless archives. Desktop source and release packaging live in this source tree, but that tagged release has no desktop installers. Local mode binds to loopback and supports one operator. Review the [limitations ledger](scripts/known-incomplete.md) before any network exposure.
 
-Henosis gives people and persistent AI agents a graphical operating environment for real work.
-The desktop application opens to the Rift room directory with the most recently active room
-pinned. Athena is an internal workbench, while server-owned gates decide which actions may run.
-The headless runtime carries identity, policy, approval, execution, audit, task continuity, and
-memory across sessions.
+Henosis authenticates each request, checks current membership and policy, binds any approval to the exact action, limits execution, filters the result, and commits the audit record before returning control.
 
-The public alpha ships the desktop application alongside one headless executable with local
-initialization, diagnostics, serving, tokens, approvals, and dispatch. Model providers remain
-swappable behind a stable interface. Production credential brokerage through `phylaxd` and
-managed room trust from the proprietary Pistis service are deployment boundaries and do not ship
-in this repository.
-
-> [!IMPORTANT]
-> Henosis is source-available under the [Elastic License 2.0](LICENSE) and remains in public alpha.
-> Local mode is loopback-only. Review the [limitations ledger](scripts/known-incomplete.md) before
-> any network exposure.
-
-Every public action crosses server-owned identity, policy, approval, credential, execution, and
-audit boundaries. The alpha includes:
-
-- machine and human operator authentication with live tenant membership checks;
-- request-bound, one-use approvals stored durably in SQLite;
-- synchronous hash-chained audit records with an independently signed witness option;
-- a typed Wasmtime Component Model host with fuel, memory, time, output, and network limits;
-- a credential boundary that exposes named broker operations without returning raw secrets; and
-- one `henosis` executable for initialization, diagnostics, control, and serving.
-
-## Install the public alpha
-
-### Desktop application
-
-The [Henosis releases page](https://github.com/Syntheos-Systems/henosis/releases) provides the
-graphical application in these formats:
-
-- Linux x86-64: Debian package or AppImage
-- macOS Intel and Apple Silicon: DMG
-- Windows x86-64: NSIS installer
-
-The desktop application is the primary human interface. This release makes first-run Rift
-connection and room selection GUI-operable and opens directly into the room directory. Remaining
-operational surfaces will be added inside this application, not exposed as terminal-only user
-flows.
-
-The current direct-download artifacts are installable but are not yet Apple-notarized or
-Windows Authenticode-signed. Their checksums and GitHub provenance attestations are published with
-the same protected release as the headless runtime.
+## Start here
 
 ### Headless runtime
 
-Native release archives contain one launch executable: `henosis`. The installers select the host
-platform, require a SHA-256 match from `SHA256SUMS`, install only into the current user account,
-run `henosis init --quick`, and restore the prior executable if initialization fails.
+The installers select the host platform, verify `SHA256SUMS`, install into the current user account, run `henosis init --quick`, and restore the prior version if initialization fails.
 
 On Linux or macOS, copy and run this command:
 
@@ -93,17 +47,7 @@ try {
 }
 ```
 
-Both commands pin the reviewed installer script to its full Git commit while selecting the release
-version separately, so a moved tag cannot replace code before verification. Before downloading a
-binary, the installer requires GitHub to report that release as published and immutable. Set
-`HENOSIS_VERSION`, `HENOSIS_RELEASE_BASE`, `HENOSIS_RELEASE_API`, or `HENOSIS_INSTALL_DIR` to
-override installer defaults.
-
-That is the complete install and initialization path for local mode. It does not require a source
-checkout, Rust toolchain, container runtime, database server, account, password, or API key.
-
-The installer creates private local configuration without asking for or generating a user
-password. Start the loopback service and keep that terminal open:
+Both commands pin the installer to a reviewed commit and select the release version as a separate input. Start the loopback service:
 
 ```sh
 $HOME/.local/bin/henosis serve
@@ -115,10 +59,7 @@ On Windows:
 & "$HOME\.local\bin\henosis.exe" serve
 ```
 
-Henosis is ready when `http://127.0.0.1:8088/health` returns `ok`. Stop it with `Ctrl+C`.
-Open a second terminal for the remaining commands. The first boot creates a private local owner
-token under `HENOSIS_HOME`. Live CLI commands read that token automatically and never print it
-except when a newly requested token must be shown once.
+Henosis is ready when `http://127.0.0.1:8088/health` returns `ok`. The first boot writes a private owner token under `HENOSIS_HOME`; live CLI commands read it from disk.
 
 Create a scoped machine token for an agent or integration and capture its one-time credential:
 
@@ -132,13 +73,7 @@ On Windows:
 $env:HENOSIS_AGENT_TOKEN = & "$HOME\.local\bin\henosis.exe" token create first-agent --token-only
 ```
 
-The loopback compatibility authority recognizes only `henosis.probe` in the stable local room
-`!henosis-local:loopback`. Supply that room through `context.room`.
-
-Every public dispatch requires a unique retry identity in `X-Henosis-Idempotency-Key`. Keys are
-scoped to the authenticated tenant and principal. Repeating the same key and exact request returns
-the stored filtered result without running the tool again. Reusing the key with different content
-returns a conflict.
+The local compatibility authority recognizes `henosis.probe` in `!henosis-local:loopback`. Each dispatch needs an `X-Henosis-Idempotency-Key` scoped to the tenant and principal.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8088/api/v1/dispatch \
@@ -148,128 +83,97 @@ curl --fail-with-body http://127.0.0.1:8088/api/v1/dispatch \
   --data '{"tool":"henosis","action":"probe","args":{},"context":{"room":"!henosis-local:loopback"}}'
 ```
 
-On Windows:
+Repeating the same key and request returns the stored filtered result. Reusing the key with different content returns a conflict. An action that needs approval returns `202 Accepted`; approve its ID with `henosis approvals approve <approval-id>`, then repeat the request with the original key and `X-Henosis-Approval-Id`.
 
-```powershell
-$headers = @{
-  Authorization = "Bearer $env:HENOSIS_AGENT_TOKEN"
-  "X-Henosis-Idempotency-Key" = "first-agent-probe-1"
-}
-$body = @{
-  tool = "henosis"
-  action = "probe"
-  args = @{}
-  context = @{ room = "!henosis-local:loopback" }
-} | ConvertTo-Json -Depth 3
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8088/api/v1/dispatch" `
-  -Headers $headers -ContentType "application/json" -Body $body
+## Desktop
+
+The Tauri application opens to the Rift room directory and pins the room with the newest activity. It keeps Rift tokens in the native process and stores sanitized connection and room-cache data. Build and development instructions live in [apps/desktop](apps/desktop/README.md).
+
+## Trust model
+
+| Boundary | Henosis behavior |
+| --- | --- |
+| Identity | Human and machine credentials are tenant-bound, scoped, revocable, and checked against live membership. |
+| Approval | Durable, one-use approvals bind to the request, principal, tenant, policy revision, and expiry. Production requires a different administrator from the requester. |
+| Execution | The Wasmtime Component Model host enforces fuel, memory, time, output, and network limits. Third-party extension loading remains disconnected in the alpha. |
+| Filesystem | Built-in file tools accept task-root-relative paths and reject traversal and symlink escapes. `bash` is a separate capability with the operating-system access of the Henosis process. |
+| Credentials | Tools request named broker operations without receiving raw secrets. Production uses the external `phylaxd` broker. |
+| Audit | Henosis writes synchronous hash-chained records and supports an independent witness. Production requires off-host intent and outcome receipts. |
+
+```text
+operator or agent
+        |
+        v
+identity -> policy -> approval -> bounded execution -> filtered result
+                                      |
+                                      v
+                               audit and witness
 ```
 
-Operations that require approval return `202 Accepted` with an approval ID. Approve that ID with `henosis approvals approve <approval-id>`, then repeat the exact dispatch with both the original idempotency key and `X-Henosis-Approval-Id`.
+Model providers sit behind a shared interface. Capability authorization stays on the server, so switching models does not move the trust boundary into a prompt or client application.
 
-Operator WebSocket clients authenticate without URL credentials by offering the subprotocols `henosis.v1, henosis.auth.<access-token>`. The server negotiates only `henosis.v1`, checks live organization membership during the connection, and disconnects at the token's signed expiry.
+## Deployment boundary
 
-## Local development
+| Mode | Contract |
+| --- | --- |
+| Local | Loopback-only, one operator, SQLite state, embedded compatibility policy, and restart-scoped quota counters. The signed compatibility room authorizes `henosis.probe` only. |
+| Production | Managed PostgreSQL, TLS and authenticated ingress, protected storage, backups, source-aware login limits, an independent audit witness, and private `phylaxd` access. |
 
-Local mode binds to loopback by default at `127.0.0.1:8088`. It is intended for one operator and uses the embedded local policy backend. Its quota and rate-limit counters reset when the process restarts. Do not expose local mode directly to a network.
+The full Pistis service is private and does not ship in this repository. Production capability requests fail closed until the deployment supplies trusted room state from Pistis. See [SECURITY.md](SECURITY.md) and [`containers/production.env.example`](containers/production.env.example) for the full contract.
+
+Run local mode with Compose:
 
 ```sh
 docker compose -f containers/compose.local.yml up --build
 curl http://127.0.0.1:8088/health
 ```
 
-The Compose service runs the same idempotent `henosis init --quick` path as the native installer. Persistent state stays in the named `henosis-state` volume.
+Compose uses `henosis init --quick` and stores state in the `henosis-state` volume.
 
-## Production prerequisites
+## Build from source
 
-Production requires a managed PostgreSQL authority, protected persistent storage, TLS termination,
-authenticated ingress with source-aware login rate limiting, backups, an independent audit
-witness, and the proprietary `phylaxd` credential broker. Operators manage credentials through
-`cred`; `phylaxd` brokers them, and Henosis contacts its separately deployed service over a
-private, authenticated endpoint.
-
-The full Pistis service is a private, proprietary integration and is not distributed in this
-repository. Henosis contains a narrow fail-closed compatibility decision core for loopback local
-mode. Capability-bearing production requests remain denied until a deployment supplies trusted
-room-state from Pistis.
-
-### Integration boundaries
-
-Henosis keeps model selection and capability authorization behind interfaces. Production deployments keep credential brokerage outside those interfaces.
-
-| Boundary | Choices | Deployment contract |
-| --- | --- | --- |
-| Model provider | Anthropic, Ollama, an OpenAI-compatible proxy, OpenCode Zen, OpenAI Codex, Azure OpenAI, Foundry, or Claude Max CLI | Select a provider through `ProviderConfig`. The OpenAI-compatible path supports additional services without a Henosis code change. |
-| Capability authority | Embedded loopback compatibility policy or the feature-gated Henosis room-state adapter | Select an authority through `PistisAuthority`. Restricted tools fail closed when trusted state is absent or invalid. |
-| Proprietary services | `phylaxd` and the full Pistis service | Production credentials require `phylaxd`. Deployments using managed room trust supply trusted room-state integration from the full Pistis service. Neither service ships in this repository. |
-
-The `read`, `write`, `edit`, `ls`, `grep`, and `glob` tools accept only paths relative to the
-task root. They reject absolute paths, parent traversal, and symlink escapes. `bash` is a separate,
-explicit capability and is not a filesystem sandbox; it runs with the operating-system access
-granted to the Henosis process.
-
-Use `containers/compose.production.yml` only after:
-
-1. Copying `containers/production.env.example` to the ignored `containers/.env.production` file and replacing every placeholder.
-2. Copying `containers/agents.production.example.toml` to the ignored
-   `containers/secrets/agents.toml` file and customizing the agent roster. The starter roster uses
-   Synapse with `ANTHROPIC_API_KEY` from the private environment file; change both when selecting a
-   different provider. Henosis supplies the managed Rift connection and room secrets at startup.
-3. Placing a base64-encoded 32-byte audit origin signing key and the witness public key in the ignored `containers/secrets` directory with restrictive permissions.
-4. Copying `HENOSIS_IMAGE_REPOSITORY` and `HENOSIS_IMAGE_DIGEST` from the release
-   `container-image.env` asset.
-5. Choosing the first operator email and password in the bootstrap variables. Remove both bootstrap variables after the first successful start.
-
-Start production Compose with the same private environment file for interpolation and service
-configuration:
+The headless workspace requires Rust 1.88 or newer:
 
 ```sh
-docker compose --env-file containers/.env.production -f containers/compose.production.yml up -d
+cargo build --locked --workspace
+cargo test --locked --workspace
 ```
 
-The image reference always contains `@sha256:`. Docker rejects a missing or malformed digest
-before starting the service. The production compose file publishes no host port.
+The desktop application uses pnpm 11 and an isolated Tauri Cargo workspace:
 
-## Release verification
+```sh
+cd apps/desktop
+pnpm install --frozen-lockfile
+pnpm test
+pnpm build
+```
 
-Every release publishes desktop installers, headless platform archives, `SHA256SUMS`, SPDX SBOMs,
-and Sigstore attestation bundles. Verify an archive before use:
+## Verify a release
+
+Each release includes checksums, SPDX SBOMs, and GitHub OIDC provenance. Verify the Linux x86-64 archive after downloading it with `SHA256SUMS`:
 
 ```sh
 grep -F '  henosis-0.1.0-alpha.6-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
   | sha256sum --check
-```
 
-GitHub also stores OIDC-backed provenance for each archive. The GitHub CLI verifies the artifact,
-repository identity, and release workflow:
-
-```sh
 gh attestation verify henosis-0.1.0-alpha.6-x86_64-unknown-linux-musl.tar.gz \
   --repo Syntheos-Systems/henosis \
   --signer-workflow Syntheos-Systems/henosis/.github/workflows/ci.yml
 ```
 
-The release workflow accepts only an annotated tag signed by the GhostFrame key recorded in the
-protected `release` environment's `RELEASE_ALLOWED_SIGNERS` variable. The
-`security/release-allowed-signers` file is the public audit copy, not the workflow's trust source.
-The tagged commit must exist on `origin/main`. Before publication, repository release immutability
-must be enabled and an active `v*` tag ruleset must restrict tag creation, updates, and deletion to
-GhostFrame. The workflow compares the exact remote tag object immediately before and after
-publication.
+## Repository map
 
-The release workflow builds desktop installers for Linux x86-64, macOS Intel and Apple Silicon,
-and Windows x86-64. It also builds headless archives for Linux x86-64 and arm64, macOS Intel and
-Apple Silicon, and Windows x86-64, plus a Linux amd64/arm64 container image when GitHub package
-publishing is available.
+| Path | Contents |
+| --- | --- |
+| [`crates/`](crates/) | Rust services for the runtime, identity, approval, audit, Rift, memory, model providers, and tools. |
+| [`apps/desktop/`](apps/desktop/) | The React and Tauri desktop application. |
+| [`containers/`](containers/) | Local and production Compose contracts. |
+| [`scripts/`](scripts/) | Release validation, dependency checks, and the public limitations ledger. |
 
 ## Security and support
 
-Report vulnerabilities privately to [security@syntheos.dev](mailto:security@syntheos.dev). Send non-sensitive support requests to [support@syntheos.dev](mailto:support@syntheos.dev). See [SECURITY.md](SECURITY.md) for scope and handling guidance.
+Send vulnerability reports to [security@syntheos.dev](mailto:security@syntheos.dev). Send non-sensitive support requests to [support@syntheos.dev](mailto:support@syntheos.dev). Do not put credentials, private endpoints, or exploit details in a public issue.
 
-## Current limitations
+## License
 
-The public limitations ledger is [scripts/known-incomplete.md](scripts/known-incomplete.md). Alpha deployments must review it before any network exposure.
-
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
+Henosis source is available under the [Elastic License 2.0](LICENSE). The license does not permit offering Henosis to third parties as a hosted or managed service. Contact [support@syntheos.dev](mailto:support@syntheos.dev) for commercial terms.
