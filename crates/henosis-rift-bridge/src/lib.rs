@@ -14,6 +14,8 @@ pub mod config;
 pub mod context;
 /// HTTP control server (approval endpoint).
 pub mod control;
+/// Governed scheduling adapter for managed-room cron jobs.
+pub(crate) mod cron;
 /// Cross-agent echo suppression (token-overlap and embedding tiers).
 pub mod echo;
 /// Optional text-embedding capability (semantic echo/loop detection).

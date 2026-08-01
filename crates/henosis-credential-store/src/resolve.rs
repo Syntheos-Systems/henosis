@@ -236,6 +236,38 @@ pub(crate) fn replace_all_bytes(haystack: &[u8], needle: &[u8], replacement: &[u
     out
 }
 
+/// Drain one child pipe, retaining at most `cap` bytes.
+///
+/// The child keeps running and its pipe keeps draining past the cap, so a
+/// verbose command still exits normally instead of blocking on a full pipe; the
+/// excess is discarded as it arrives rather than accumulated. Buffering the
+/// whole stream first would let any allowlisted command that can be made
+/// verbose (`dd`, a large `curl` response) drive this shared, single-process
+/// store's memory with only the wall-clock timeout as a bound.
+#[cfg(unix)]
+async fn read_capped<R>(reader: Option<R>, cap: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut retained = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        if retained.len() < cap {
+            let take = read.min(cap - retained.len());
+            retained.extend_from_slice(&chunk[..take]);
+        }
+    }
+}
+
 /// Scrub a secret from child output: the raw bytes plus their base64 and hex (both cases)
 /// encodings. A hostile command can always re-encode the secret in a form this cannot catch,
 /// which is why exec is allowlist-gated; the scrub closes the accidental-leak paths (an echoed
@@ -252,6 +284,12 @@ pub(crate) fn scrub_secret(output: &[u8], secret: &[u8]) -> Vec<u8> {
         out = replace_all_bytes(&out, needle, b"[redacted]");
     }
     out
+}
+
+/// Return the pipe retention limit needed to scrub an encoding that crosses the output cap.
+fn scrub_retention_cap(secret: &[u8]) -> usize {
+    let longest_encoding = secret.len().saturating_mul(2).max(B64.encode(secret).len());
+    EXEC_OUTPUT_CAP.saturating_add(longest_encoding.saturating_sub(1))
 }
 
 /// POSIX-shaped environment variable names only.
@@ -318,7 +356,7 @@ impl CredentialStore {
                 std::ffi::OsStr::from_bytes(&secret).to_owned()
             };
 
-            let child = tokio::process::Command::new(argv0)
+            let mut child = tokio::process::Command::new(argv0)
                 .args(&argv[1..])
                 .env_clear()
                 .env(env_var, &secret_os)
@@ -332,13 +370,28 @@ impl CredentialStore {
                     CredentialStoreError::InvalidInput("command could not be started".into())
                 })?;
 
-            let output = match tokio::time::timeout(
+            // Retain enough overlap for the longest supported representation so a
+            // raw, base64, or hex secret crossing the cut is complete when scrubbed.
+            let retain = scrub_retention_cap(&secret);
+            let child_stdout = child.stdout.take();
+            let child_stderr = child.stderr.take();
+
+            let collect = async {
+                let (out, err) = tokio::join!(
+                    read_capped(child_stdout, retain),
+                    read_capped(child_stderr, retain),
+                );
+                let status = child.wait().await?;
+                Ok::<_, std::io::Error>((out?, err?, status))
+            };
+
+            let (raw_stdout, raw_stderr, status) = match tokio::time::timeout(
                 std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
-                child.wait_with_output(),
+                collect,
             )
             .await
             {
-                Ok(Ok(output)) => output,
+                Ok(Ok(captured)) => captured,
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "exec wait failed");
                     return Err(CredentialStoreError::Backend(
@@ -356,14 +409,15 @@ impl CredentialStore {
                 }
             };
 
-            let mut stdout = scrub_secret(&output.stdout, &secret);
-            let mut stderr = scrub_secret(&output.stderr, &secret);
+            let mut stdout = scrub_secret(&raw_stdout, &secret);
+            let mut stderr = scrub_secret(&raw_stderr, &secret);
             stdout.truncate(EXEC_OUTPUT_CAP);
             stderr.truncate(EXEC_OUTPUT_CAP);
+            let output_status = status;
 
             Ok(crate::model::ExecOutcome {
                 timed_out: false,
-                exit_code: output.status.code(),
+                exit_code: output_status.code(),
                 stdout,
                 stderr,
             })
@@ -714,6 +768,66 @@ mod tests {
                 !b"[redacted]".windows(n).any(|w| w == &s[..n])
             },
         )
+    }
+
+    /// A child that outruns the cap is drained without being fully buffered.
+    ///
+    /// Guards the memory bound directly: the reader must retain exactly `cap`
+    /// bytes no matter how much the child emits, and must still reach EOF so the
+    /// process can exit instead of blocking on a full pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_capped_retains_only_the_cap() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "yes abcdefghij | head -c 2000000"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn verbose child");
+
+        let stdout = child.stdout.take();
+        let retained = read_capped(stdout, 4096).await.expect("drain child");
+        let status = child.wait().await.expect("child exits");
+
+        assert_eq!(retained.len(), 4096, "must retain exactly the cap");
+        assert!(status.success(), "child must not block on a full pipe");
+    }
+
+    /// A child quieter than the cap is returned whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_capped_returns_short_output_intact() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf hello"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn child");
+
+        let stdout = child.stdout.take();
+        let retained = read_capped(stdout, 4096).await.expect("drain child");
+        let _ = child.wait().await;
+
+        assert_eq!(retained, b"hello");
+    }
+
+    /// A hex secret crossing the public output cap is scrubbed before truncation.
+    #[test]
+    fn encoded_secret_crossing_output_cap_does_not_leak_a_prefix() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let encoded = hex::encode(secret);
+        let prefix_len = EXEC_OUTPUT_CAP - 16;
+        let mut retained = vec![b'x'; prefix_len];
+        retained.extend_from_slice(encoded.as_bytes());
+        assert!(retained.len() <= scrub_retention_cap(secret));
+
+        let mut scrubbed = scrub_secret(&retained, secret);
+        scrubbed.truncate(EXEC_OUTPUT_CAP);
+
+        assert!(scrubbed.ends_with(b"[redacted]"));
+        assert!(!scrubbed
+            .windows(16)
+            .any(|window| window == &encoded.as_bytes()[..16]));
     }
 
     /// True when `needle` occurs nowhere in `haystack`.

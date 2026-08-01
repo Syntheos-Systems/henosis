@@ -391,6 +391,12 @@ fn executor_for_seat(
             )
         })?;
     match &template.executor {
+        // Command executors are deployment-defined argv templates; the managed
+        // catalog never advertises them, so a seat cannot select one.
+        ExecutorConfig::Command { .. } => Err(materialize_error(
+            "harness_unavailable",
+            "command executors are deployment-defined and not seat-selectable",
+        )),
         ExecutorConfig::ClaudeCode {
             binary, max_tokens, ..
         } => Ok(ExecutorConfig::ClaudeCode {
@@ -440,7 +446,7 @@ fn executor_template_is_absolute(executor: &ExecutorConfig) -> bool {
         ExecutorConfig::ClaudeCode { binary, .. } | ExecutorConfig::Codex { binary, .. } => {
             binary.is_absolute()
         }
-        ExecutorConfig::Synapse { .. } => false,
+        ExecutorConfig::Synapse { .. } | ExecutorConfig::Command { .. } => false,
     }
 }
 
@@ -450,7 +456,7 @@ fn executor_template_available(executor: &ExecutorConfig) -> bool {
         ExecutorConfig::ClaudeCode { binary, .. } | ExecutorConfig::Codex { binary, .. } => {
             crate::catalog::command_available(binary)
         }
-        ExecutorConfig::Synapse { .. } => true,
+        ExecutorConfig::Synapse { .. } | ExecutorConfig::Command { .. } => true,
     }
 }
 
@@ -460,6 +466,7 @@ pub(crate) fn harness_id(executor: &ExecutorConfig) -> &'static str {
         ExecutorConfig::ClaudeCode { .. } => "claude-code",
         ExecutorConfig::Codex { .. } => "codex",
         ExecutorConfig::Synapse { .. } => "synapse",
+        ExecutorConfig::Command { .. } => "command",
     }
 }
 

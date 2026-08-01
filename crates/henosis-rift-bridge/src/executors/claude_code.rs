@@ -76,12 +76,25 @@ impl ClaudeCodeExecutor {
     }
 
     /// Build stable Claude arguments for direct or broker-mediated invocation.
-    fn arguments(&self, working_dir: Option<&std::path::Path>, prompt: &str) -> Vec<String> {
+    ///
+    /// Discussion turns disable the CLI's built-in tools; only approved
+    /// execution runs with tool access. Untrusted prompt text always follows
+    /// the explicit option terminator.
+    fn arguments(
+        &self,
+        working_dir: Option<&std::path::Path>,
+        prompt: &str,
+        tools_enabled: bool,
+    ) -> Vec<String> {
         let mut arguments = vec![
             "-p".to_string(),
             "--output-format".to_string(),
             "text".to_string(),
         ];
+        if !tools_enabled {
+            arguments.push("--tools".to_string());
+            arguments.push(String::new());
+        }
         if let Some(model) = &self.model {
             arguments.push("--model".to_string());
             arguments.push(model.clone());
@@ -95,11 +108,19 @@ impl ClaudeCodeExecutor {
         arguments
     }
 
-    /// Build a Command with common flags applied.
-    fn base_cmd(&self) -> Command {
+    /// Build a command with common flags and an explicit tool-access mode.
+    fn base_cmd(&self, tools_enabled: bool) -> Command {
         let mut cmd = Command::new(&self.binary);
+        // Dropping the output future on timeout must terminate the CLI. Without
+        // this the process survives its deadline, keeps mutating the sandbox
+        // worktree after the bridge considers the session over, and races the
+        // retry attempt that reuses that same worktree.
+        cmd.kill_on_drop(true);
         cmd.arg("-p");
         cmd.arg("--output-format").arg("text");
+        if !tools_enabled {
+            cmd.arg("--tools").arg("");
+        }
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -112,10 +133,11 @@ impl ClaudeCodeExecutor {
         prompt: &str,
         working_dir: Option<&std::path::Path>,
         cargo_target_dir: Option<&std::path::Path>,
+        tools_enabled: bool,
     ) -> Result<ClaudeOutput> {
         match &self.execution_mode {
             ResolvedExecutionMode::HostSession => {
-                let mut command = self.base_cmd();
+                let mut command = self.base_cmd(tools_enabled);
                 command.arg("--").arg(prompt);
                 if let Some(working_dir) = working_dir {
                     command.current_dir(working_dir);
@@ -124,7 +146,6 @@ impl ClaudeCodeExecutor {
                 if let Some(cargo_target_dir) = cargo_target_dir {
                     command.env("CARGO_TARGET_DIR", cargo_target_dir);
                 }
-                command.kill_on_drop(true);
                 let output = command.output().await?;
                 Ok(ClaudeOutput {
                     success: output.status.success(),
@@ -143,7 +164,7 @@ impl ClaudeCodeExecutor {
                     })
                     .unwrap_or_else(|| prompt.to_string());
                 let mut argv = vec![self.binary.display().to_string()];
-                argv.extend(self.arguments(working_dir, &broker_prompt));
+                argv.extend(self.arguments(working_dir, &broker_prompt, tools_enabled));
                 let output: MediatedCommandOutput = binding
                     .runner
                     .run(&binding.category, &binding.slot, &binding.env_var, &argv)
@@ -164,26 +185,6 @@ impl ClaudeCodeExecutor {
                 })
             }
         }
-    }
-}
-
-#[cfg(test)]
-/// Command-assembly tests for treating untrusted prompt text as positional data.
-mod tests {
-    use super::*;
-
-    /// Prompt text beginning with a dash follows the explicit option terminator.
-    #[test]
-    fn mediated_arguments_terminate_options_before_prompt() {
-        let executor = ClaudeCodeExecutor::new(PathBuf::from("/opt/claude"), None, Some(64));
-
-        let arguments = executor.arguments(None, "--dangerously-skip-permissions");
-
-        assert!(!arguments.iter().any(|argument| argument == "--max-tokens"));
-        assert_eq!(
-            &arguments[arguments.len() - 2..],
-            ["--", "--dangerously-skip-permissions"]
-        );
     }
 }
 
@@ -210,7 +211,7 @@ impl AgentExecutor for ClaudeCodeExecutor {
     async fn discuss(&self, context: DiscussionContext) -> Result<Option<AgentResponse>> {
         let prompt = to_cli_prompt(&context);
 
-        let output = self.run(&prompt, None, None).await?;
+        let output = self.run(&prompt, None, None, false).await?;
 
         if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -245,13 +246,31 @@ impl AgentExecutor for ClaudeCodeExecutor {
         // actually advanced it (committed work), not just echo the worktree's base commit.
         let head_before = git_head(&task.sandbox.working_dir).await;
 
-        let output = self
-            .run(
-                &task.description,
-                Some(&task.sandbox.working_dir),
-                task.sandbox.cargo_target_dir.as_deref(),
-            )
-            .await?;
+        // Enforce the sandbox's wall-clock ceiling here rather than trusting the
+        // CLI to honour it. On expiry the run future is dropped: a host-session
+        // child dies through `kill_on_drop`, and a broker-mediated child stays
+        // bounded by the broker's own execution deadline.
+        let deadline = std::time::Duration::from_secs(task.sandbox.max_runtime_secs);
+        let run = self.run(
+            &task.description,
+            Some(&task.sandbox.working_dir),
+            task.sandbox.cargo_target_dir.as_deref(),
+            true,
+        );
+        let output = match tokio::time::timeout(deadline, run).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = progress_tx.send(ProgressUpdate::Done).await;
+                let advanced = git_head(&task.sandbox.working_dir).await != head_before;
+                return Ok(ExecutionResult::Failed {
+                    reason: format!(
+                        "claude exceeded its {}s execution limit and was terminated",
+                        task.sandbox.max_runtime_secs
+                    ),
+                    partial_work: advanced,
+                });
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let _ = progress_tx.send(ProgressUpdate::Done).await;
@@ -290,5 +309,54 @@ impl AgentExecutor for ClaudeCodeExecutor {
                 self.binary.display()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+/// Command-assembly tests for tool-access modes and untrusted prompt text.
+mod tests {
+    use super::*;
+
+    /// Prompt text beginning with a dash follows the explicit option terminator.
+    #[test]
+    fn mediated_arguments_terminate_options_before_prompt() {
+        let executor = ClaudeCodeExecutor::new(PathBuf::from("/opt/claude"), None, Some(64));
+
+        let arguments = executor.arguments(None, "--dangerously-skip-permissions", false);
+
+        assert!(!arguments.iter().any(|argument| argument == "--max-tokens"));
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            ["--", "--dangerously-skip-permissions"]
+        );
+    }
+
+    /// Discussion disables built-in tools while approved execution leaves them available.
+    #[test]
+    fn tool_access_is_disabled_only_for_discussion() {
+        let executor = ClaudeCodeExecutor::new(PathBuf::from("claude"), None, None);
+        let discussion: Vec<String> = executor
+            .base_cmd(false)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let execution: Vec<String> = executor
+            .base_cmd(true)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(discussion.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(!execution.iter().any(|arg| arg == "--tools"));
+
+        // Mediated argv applies the same tool-access modes.
+        let mediated_discussion = executor.arguments(None, "prompt", false);
+        let mediated_execution = executor.arguments(None, "prompt", true);
+        assert!(mediated_discussion
+            .windows(2)
+            .any(|pair| pair == ["--tools", ""]));
+        assert!(!mediated_execution.iter().any(|arg| arg == "--tools"));
     }
 }

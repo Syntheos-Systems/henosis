@@ -3809,6 +3809,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "synapse-core",
+ "synapse-cron",
  "synapse-provider",
  "synapse-tools",
  "syntheos-axon",
@@ -3821,6 +3822,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "which",
 ]
 
 [[package]]
@@ -8491,6 +8493,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "synapse-cron",
  "syntheos-axon",
  "syntheos-contracts",
  "syntheos-dispatch",

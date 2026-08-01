@@ -12,5 +12,6 @@
 | `henosis update` and `henosis uninstall` are reserved CLI commands and are not implemented in the alpha. | Open |
 | The optional cognition facade is not part of the default build and remains incomplete. | Open |
 | Production requires a separately deployed proprietary `phylaxd` broker. | Open |
+| The direct `claude-max` provider hands its OAuth token to the `claude` CLI through that CLI's own environment variable, so the token is readable from `/proc/<pid>/environ` by any process sharing the UID while the subprocess runs. The multi-agent Rift bridge rejects this provider unless process isolation is implemented; direct single-agent users remain responsible for UID or PID-namespace isolation. | Open |
 
 Machine and operator authentication, live membership checks, durable request-bound approvals, synchronous hash-chained audit, independent witness receipts, and the bounded Wasmtime host are implemented in the alpha.

@@ -27,6 +27,12 @@ use crate::model::{
     TaskFilter, TaskPatch, TaskStatus, TaskUpdate,
 };
 
+/// Maximum rows one list or query call may return.
+///
+/// Enforced by the store rather than trusted from the caller, so an omitted or
+/// oversized limit cannot turn a listing into an unbounded scan.
+const MAX_LIST_LIMIT: usize = 500;
+
 /// Ordered schema migrations, applied by `PRAGMA user_version`. Append-only (see the DB convention).
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/V1__chiasm_tasks.sql")),
@@ -379,12 +385,13 @@ impl ChiasmStore {
             args.push(project.clone().into());
         }
         sql.push_str(" ORDER BY updated_at DESC");
-        // limit/offset are `usize`, safe to inline. OFFSET needs a LIMIT in SQLite (-1 = unbounded).
-        match (filter.limit, filter.offset) {
-            (Some(l), Some(o)) => sql.push_str(&format!(" LIMIT {l} OFFSET {o}")),
-            (Some(l), None) => sql.push_str(&format!(" LIMIT {l}")),
-            (None, Some(o)) => sql.push_str(&format!(" LIMIT -1 OFFSET {o}")),
-            (None, None) => {}
+        // A caller-supplied limit is advisory. An omitted or oversized value would
+        // otherwise scan and serialize every row this tenant has accumulated while
+        // holding the process-wide connection mutex, stalling every other tenant.
+        let limit = filter.limit.unwrap_or(MAX_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        match filter.offset {
+            Some(offset) => sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}")),
+            None => sql.push_str(&format!(" LIMIT {limit}")),
         }
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql).map_err(berr)?;
@@ -2015,6 +2022,55 @@ mod tests {
             .await
             .expect_err("must be NotFound");
         assert!(matches!(err, ChiasmError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    /// An omitted or oversized caller limit is capped by the store itself.
+    ///
+    /// Without this cap a caller could omit `limit` and force the store to
+    /// materialize every row it holds while owning the process-wide connection
+    /// mutex, stalling every other tenant's writes.
+    async fn list_caps_an_omitted_or_oversized_limit() {
+        let (store, _bus) = store();
+        let (tenant, principal) = (TenantId::new(), PrincipalId::new());
+        for index in 0..(MAX_LIST_LIMIT + 5) {
+            store
+                .create(new_task(tenant, principal, &format!("task-{index}")))
+                .await
+                .expect("create");
+        }
+
+        let omitted = store
+            .list(tenant, principal, TaskFilter::default())
+            .await
+            .expect("list without a limit");
+        assert_eq!(omitted.len(), MAX_LIST_LIMIT);
+
+        let oversized = store
+            .list(
+                tenant,
+                principal,
+                TaskFilter {
+                    limit: Some(usize::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with an oversized limit");
+        assert_eq!(oversized.len(), MAX_LIST_LIMIT);
+
+        let under_cap = store
+            .list(
+                tenant,
+                principal,
+                TaskFilter {
+                    limit: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list under the cap");
+        assert_eq!(under_cap.len(), 3);
     }
 
     #[tokio::test]

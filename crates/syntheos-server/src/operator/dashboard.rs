@@ -220,8 +220,8 @@ pub async fn compose_dashboard(
         }
     };
 
-    // -- Loom: workflow/run aggregate, scoped by principal. --
-    let (loom_health, workflows) = match loom.stats(principal).await {
+    // -- Loom: workflow/run aggregate, scoped by tenant and principal. --
+    let (loom_health, workflows) = match loom.stats(org, principal).await {
         Ok(stats) => (
             ServiceHealth {
                 name: "loom".into(),

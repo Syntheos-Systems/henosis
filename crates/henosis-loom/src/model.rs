@@ -390,7 +390,7 @@ pub struct RunFilter {
     pub workflow_id: Option<WorkflowId>,
     /// Only runs in this status.
     pub status: Option<RunStatus>,
-    /// Maximum rows to return (`None` = no limit).
+    /// Maximum rows to return (`None` or an oversized value uses the store ceiling).
     pub limit: Option<usize>,
     /// Rows to skip (for pagination).
     pub offset: Option<usize>,

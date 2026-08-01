@@ -22,6 +22,7 @@ use henosis_rift_server::config::{
 use henosis_rift_server::runtime::{
     initialize_with_control_registry, InitializedRuntime, RuntimeError,
 };
+use synapse_cron::CronScheduler;
 use tokio::sync::watch;
 
 use crate::room_reconciler::{
@@ -29,13 +30,16 @@ use crate::room_reconciler::{
 };
 
 /// Environment value enabling the complete managed room.
-const REQUIRED_MODE: &str = "required";
+pub(crate) const REQUIRED_MODE: &str = "required";
 
 /// Environment value reserved for explicit developer-only room suppression.
-const DISABLED_MODE: &str = "disabled";
+pub(crate) const DISABLED_MODE: &str = "disabled";
 
 /// Default browser clients allowed to connect to the local Rift API.
 const DEFAULT_CORS_ORIGINS: &str = "http://localhost:5173,http://127.0.0.1:5173,tauri://localhost";
+
+/// Default persistent directory for managed scheduled jobs and their results.
+const DEFAULT_CRON_DIR: &str = "data/synapse-cron";
 
 /// Complete room configuration after environment validation.
 pub struct RoomRuntimeConfig {
@@ -45,6 +49,8 @@ pub struct RoomRuntimeConfig {
     bridge_config_path: PathBuf,
     /// Persistent room display settings.
     room: ManagedRoomConfig,
+    /// Persistent Synapse cron state owned by this managed runtime.
+    cron_dir: PathBuf,
 }
 
 /// Whether this Henosis process owns the full room stack.
@@ -52,7 +58,7 @@ pub enum RoomRuntimeSelection {
     /// Explicit developer-only mode without Rift or Synapse room services.
     Disabled,
     /// Required production room configuration.
-    Required(RoomRuntimeConfig),
+    Required(Box<RoomRuntimeConfig>),
 }
 
 /// Prepared server and the desired-state supervisor owning the bridge.
@@ -86,6 +92,15 @@ pub enum RoomRuntimeError {
     /// Synapse bridge configuration could not be loaded.
     #[error("Synapse room configuration failed: {0}")]
     BridgeConfig(#[from] henosis_rift_bridge::error::BridgeError),
+    /// Persistent scheduled-job state could not be opened.
+    #[error("Synapse cron state at {} failed: {source}", path.display())]
+    Cron {
+        /// Scheduler directory that failed to open.
+        path: PathBuf,
+        /// Underlying filesystem or serialization failure.
+        #[source]
+        source: anyhow::Error,
+    },
     /// Rift listener setup failed.
     #[error("Rift listener failed: {0}")]
     Listener(#[from] std::io::Error),
@@ -107,9 +122,9 @@ pub fn room_runtime_from_environment() -> Result<RoomRuntimeSelection, RoomRunti
     let mode = env::var("HENOSIS_ROOM_MODE").unwrap_or_else(|_| REQUIRED_MODE.to_string());
     match parse_room_mode(&mode)? {
         RoomMode::Disabled => Ok(RoomRuntimeSelection::Disabled),
-        RoomMode::Required => Ok(RoomRuntimeSelection::Required(
+        RoomMode::Required => Ok(RoomRuntimeSelection::Required(Box::new(
             RoomRuntimeConfig::from_environment()?,
-        )),
+        ))),
     }
 }
 
@@ -135,6 +150,12 @@ pub async fn prepare_room_runtime(
         room.server_id,
         room.channel_id,
     )?;
+    // Validate the durable scheduler store now so a misconfigured directory
+    // fails preparation; each bridge generation re-opens it from disk.
+    CronScheduler::open(&config.cron_dir).map_err(|source| RoomRuntimeError::Cron {
+        path: config.cron_dir.clone(),
+        source,
+    })?;
     let memory: Arc<dyn BridgeMemory> = Arc::new(CognitionMemoryBackend::new(cognition));
     let kleos: Arc<dyn KleosClient> = Arc::new(InProcessKleosClient::new(
         chiasm,
@@ -149,7 +170,10 @@ pub async fn prepare_room_runtime(
     let (handle, reconciler) = build_room_reconciler(
         rift.pool().clone(),
         bridge,
-        RuntimeDependencies { kleos: Some(kleos) },
+        RuntimeDependencies {
+            kleos: Some(kleos),
+            cron_dir: Some(config.cron_dir.clone()),
+        },
         bindings,
     );
     agent_control.install(Arc::new(handle)).map_err(|_| {
@@ -214,7 +238,7 @@ impl PreparedRoomRuntime {
 
 /// Internal room mode after strict parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoomMode {
+pub(crate) enum RoomMode {
     /// The complete room is required.
     Required,
     /// A developer explicitly suppressed room startup.
@@ -222,7 +246,7 @@ enum RoomMode {
 }
 
 /// Parse an exact room mode without silently accepting typos.
-fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError> {
+pub(crate) fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError> {
     match value {
         REQUIRED_MODE => Ok(RoomMode::Required),
         DISABLED_MODE => Ok(RoomMode::Disabled),
@@ -266,7 +290,17 @@ impl RoomRuntimeConfig {
                 channel_name: env::var("HENOSIS_RIFT_CHANNEL_NAME")
                     .unwrap_or_else(|_| "general".to_string()),
             },
+            cron_dir: PathBuf::from(env_or_default("HENOSIS_CRON_DIR", DEFAULT_CRON_DIR)?),
         })
+    }
+}
+
+/// Read one optional Unicode environment setting with a deterministic default.
+fn env_or_default(name: &'static str, default: &str) -> Result<String, RoomRuntimeError> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(source) => Err(RoomRuntimeError::Environment { name, source }),
     }
 }
 
@@ -318,7 +352,7 @@ where
 /// Pure configuration and endpoint tests.
 #[cfg(test)]
 mod tests {
-    use super::{internal_urls, parse_room_mode, RoomMode};
+    use super::{internal_urls, parse_room_mode, RoomMode, DEFAULT_CRON_DIR};
 
     /// Production room startup is the default contract value.
     #[test]
@@ -331,6 +365,12 @@ mod tests {
     fn invalid_mode_fails_closed() {
         assert!(parse_room_mode("off").is_err());
         assert!(parse_room_mode("disabled ").is_err());
+    }
+
+    /// Managed cron state defaults beneath the runtime's existing data directory.
+    #[test]
+    fn cron_state_uses_runtime_local_default() {
+        assert_eq!(DEFAULT_CRON_DIR, "data/synapse-cron");
     }
 
     /// Wildcard listeners produce loopback internal bridge endpoints.

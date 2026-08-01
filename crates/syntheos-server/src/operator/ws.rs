@@ -2,9 +2,9 @@
 //!
 //! ## Channel wiring
 //!
-//! The hub subscribes to three channels at connection time (all channels the
-//! kernel currently publishes on). Events on other channels are not forwarded;
-//! as new emitters land, add their channels to `SUBSCRIBED_CHANNELS` here.
+//! The hub subscribes to five operator-facing channels at connection time.
+//! Events on other channels are not forwarded; as new operator surfaces land,
+//! add their channels to `SUBSCRIBED_CHANNELS` here with an explicit RBAC rule.
 //!
 //! | Channel      | Producer            | Event kinds emitted                               |
 //! |-------------|---------------------|--------------------------------------------------|
@@ -16,6 +16,12 @@
 //! |             |                     | `workflow.run_failed`, `workflow.run_cancelled`,   |
 //! |             |                     | `workflow.step_started`, `workflow.step_completed`,|
 //! |             |                     | `workflow.step_failed`                            |
+//! | `action`    | `syntheos-dispatch` | action lifecycle, including durable approval waits |
+//! | `human`     | `henosis-rift`      | compatibility human-approval requests              |
+//!
+//! `action` and `human` carry approval metadata and require a live Owner/Admin
+//! role for every forwarded envelope. The socket remains notification-only;
+//! approval decisions use the authenticated durable HTTP authority routes.
 //!
 //! ## Org isolation
 //!
@@ -36,10 +42,11 @@ use axum::extract::ws::Message;
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use henosis_plutus::{can, Permission, PolicyBackend};
+use henosis_plutus::{can, Permission, PolicyBackend, Role};
+use henosis_rift::HUMAN_CHANNEL;
 use serde_json::json;
 use syntheos_axon::AxonBus;
-use syntheos_contracts::{AxonEnvelope, PrincipalId, TenantId};
+use syntheos_contracts::{AxonEnvelope, PrincipalId, TenantId, ACTION_CHANNEL};
 use tokio::sync::broadcast::error::RecvError;
 use zeroize::Zeroizing;
 
@@ -49,14 +56,20 @@ use super::OperatorState;
 
 /// Channels the hub subscribes to at connection time.
 ///
-/// These are the channels the kernel currently publishes on. The list is
-/// explicit (not a wildcard) so uncovered event types land only as their
-/// emitters are added -- no fabricated events reach clients.
+/// The explicit operator-facing channel allowlist.
+///
+/// This is not a wildcard: new kernel channels remain private until their
+/// payload and RBAC contract are reviewed here.
 const SUBSCRIBED_CHANNELS: &[&str] = &[
-    "narration", // henosis-broca: ActionLogged events
+    "narration",    // henosis-broca: ActionLogged events
     "agent", // henosis-soma: AgentRegistered/Deregistered/Heartbeat/StatusChanged/QualityUpdated
     "workflow", // henosis-loom: RunCreated/Completed/Failed/Cancelled, StepStarted/Completed/Failed
+    ACTION_CHANNEL, // syntheos-dispatch: action lifecycle and durable approval-required events
+    HUMAN_CHANNEL, // henosis-rift: compatibility HumanApprovalRequested events
 ];
+
+/// Channels whose metadata is restricted to current owners and administrators.
+const ADMIN_CHANNELS: &[&str] = &[ACTION_CHANNEL, HUMAN_CHANNEL];
 
 /// Periodic heartbeat interval. The server sends a heartbeat frame every
 /// `HEARTBEAT_INTERVAL_SECS` seconds so clients can detect stale connections.
@@ -103,6 +116,25 @@ pub fn envelope_to_event(env: &AxonEnvelope, org: TenantId) -> Option<serde_json
             "data": env.payload,
         }
     }))
+}
+
+/// Check tenant ownership and live administrative authority for one envelope.
+async fn can_observe_envelope(
+    policy: &dyn PolicyBackend,
+    org: TenantId,
+    principal: PrincipalId,
+    env: &AxonEnvelope,
+) -> bool {
+    if env.tenant != org {
+        return false;
+    }
+    if !ADMIN_CHANNELS.contains(&env.channel.as_str()) {
+        return true;
+    }
+    matches!(
+        resolve_live_role(policy, org, principal).await,
+        Ok(Role::Owner | Role::Admin)
+    )
 }
 
 /// Extract one bearer credential from the strict WebSocket subprotocol offer.
@@ -210,8 +242,8 @@ enum SessionEvent {
 ///
 /// **Select! loop** (four arms):
 /// 1. `socket.recv()` -- client frames. Responds to pings; breaks on close/error.
-/// 2. `rx.recv()` -- merged bus envelopes. Calls [`envelope_to_event`] for org
-///    filtering; forwards `Some` results as JSON text frames; skips `None`.
+/// 2. `rx.recv()` -- merged bus envelopes. Calls [`can_observe_envelope`] for
+///    tenant and channel authority, then [`envelope_to_event`] for serialization.
 /// 3. `hb.tick()` -- heartbeat. Sends `{"type":"server.heartbeat","payload":{"ts":<u64>}}`.
 /// 4. signed expiry -- closes the connection when its access token expires.
 ///
@@ -300,6 +332,9 @@ async fn handle_socket(
             // -- AxonBus events --
             SessionEvent::Envelope(None) => break, // all forwarder tasks exited (bus dropped)
             SessionEvent::Envelope(Some(env)) => {
+                if !can_observe_envelope(&*policy, org, principal, &env).await {
+                    continue;
+                }
                 if let Some(event_json) = envelope_to_event(&env, org) {
                     let text = serde_json::to_string(&event_json).unwrap_or_default();
                     if socket.send(Message::Text(text.into())).await.is_err() {
@@ -356,16 +391,22 @@ mod tests {
     use henosis_broca::BrocaStore;
     use henosis_chiasm::ChiasmStore;
     use henosis_loom::LoomStore;
-    use henosis_plutus::MockPolicyBackend;
+    use henosis_plutus::{LocalPolicyBackend, MockPolicyBackend, QuotaTier, Role};
+    use henosis_rift::HUMAN_CHANNEL;
     use henosis_soma::SomaStore;
     use henosis_thymus::ThymusStore;
     use syntheos_axon::AxonBus;
-    use syntheos_contracts::{AxonEnvelope, EventId, PrincipalId, TenantId, Timestamp};
+    use syntheos_contracts::{
+        AxonEnvelope, EventId, PrincipalId, TenantId, Timestamp, ACTION_CHANNEL,
+    };
     use syntheos_identity::InMemoryDirectory;
 
     use super::super::auth::{sign, OperatorClaims};
     use super::super::OperatorState;
-    use super::{envelope_to_event, websocket_credential, ws_handler, WS_AUTH_PREFIX, WS_PROTOCOL};
+    use super::{
+        can_observe_envelope, envelope_to_event, websocket_credential, ws_handler, WS_AUTH_PREFIX,
+        WS_PROTOCOL,
+    };
 
     /// Build an in-memory `OperatorState` for WS tests.
     ///
@@ -383,7 +424,7 @@ mod tests {
         let accounts =
             Arc::new(syntheos_identity::SqliteDirectory::open_in_memory().expect("accounts"));
         let plutus: Arc<dyn henosis_plutus::PolicyBackend> =
-            Arc::new(MockPolicyBackend::allow_all());
+            Arc::new(MockPolicyBackend::with_role(Role::Owner));
         let jwt_secret: Arc<Vec<u8>> = Arc::new(b"ws-test-secret-32bytes-padded!!!".to_vec());
 
         let org = TenantId::new();
@@ -508,6 +549,44 @@ mod tests {
         );
     }
 
+    /// Sensitive approval channels require live administrative authority while ordinary
+    /// operator channels remain visible to tenant viewers.
+    #[tokio::test]
+    async fn approval_channels_require_live_administrator() {
+        let org = TenantId::new();
+        let principal = PrincipalId::new();
+        let viewer = LocalPolicyBackend::new(org, principal, Role::Viewer, QuotaTier::Free);
+        let member = LocalPolicyBackend::new(org, principal, Role::Member, QuotaTier::Free);
+        let admin = LocalPolicyBackend::new(org, principal, Role::Admin, QuotaTier::Free);
+        let owner = LocalPolicyBackend::new(org, principal, Role::Owner, QuotaTier::Free);
+        let failing = MockPolicyBackend::always_error();
+        let mut envelope = AxonEnvelope {
+            id: EventId::new(),
+            channel: HUMAN_CHANNEL.to_string(),
+            kind: "human.approval.requested".to_string(),
+            tenant: org,
+            principal,
+            occurred_at: Timestamp::now(),
+            payload: serde_json::json!({ "approval_id": "approval-1" }),
+        };
+
+        assert!(!can_observe_envelope(&viewer, org, principal, &envelope).await);
+        assert!(!can_observe_envelope(&member, org, principal, &envelope).await);
+        assert!(can_observe_envelope(&admin, org, principal, &envelope).await);
+        assert!(can_observe_envelope(&owner, org, principal, &envelope).await);
+        assert!(!can_observe_envelope(&failing, org, principal, &envelope).await);
+        envelope.channel = ACTION_CHANNEL.to_string();
+        assert!(!can_observe_envelope(&viewer, org, principal, &envelope).await);
+        assert!(!can_observe_envelope(&member, org, principal, &envelope).await);
+        assert!(can_observe_envelope(&admin, org, principal, &envelope).await);
+        assert!(can_observe_envelope(&owner, org, principal, &envelope).await);
+        assert!(!can_observe_envelope(&failing, org, principal, &envelope).await);
+        envelope.channel = "workflow".to_string();
+        assert!(can_observe_envelope(&viewer, org, principal, &envelope).await);
+        envelope.tenant = TenantId::new();
+        assert!(!can_observe_envelope(&admin, org, principal, &envelope).await);
+    }
+
     // ----------------------------------------------------------------
     // Integration test: auth rejection + bus event forwarding over real TCP
     // ----------------------------------------------------------------
@@ -521,9 +600,9 @@ mod tests {
     /// - A `connect_async` with a malformed credential protocol fails (server returns non-101).
     /// - A `connect_async` with a valid credential protocol succeeds (101 Switching Protocols).
     ///
-    /// **Org-filter assertions** (after a valid-token connection):
-    /// - An envelope whose `tenant == org` arrives as a JSON text frame.
-    /// - An envelope whose `tenant != org` does NOT arrive within a short timeout.
+    /// **Event assertions** (after a valid-token connection):
+    /// - Same-tenant compatibility and durable approval envelopes arrive as JSON text frames.
+    /// - A cross-tenant approval envelope does NOT arrive within a short timeout.
     #[tokio::test]
     async fn ws_rejects_bad_token_and_forwards_org_events() {
         use futures::StreamExt;
@@ -574,12 +653,12 @@ mod tests {
         let principal = PrincipalId::new();
         let matching_env = AxonEnvelope {
             id: EventId::new(),
-            channel: "narration".to_string(),
-            kind: "narration.action_logged".to_string(),
+            channel: HUMAN_CHANNEL.to_string(),
+            kind: "human.approval.requested".to_string(),
             tenant: org,
             principal,
             occurred_at: Timestamp::now(),
-            payload: serde_json::json!({ "action": "ws_test" }),
+            payload: serde_json::json!({ "approval_id": "approval-1" }),
         };
         bus.publish(&matching_env);
 
@@ -593,20 +672,43 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&text).expect("frame must be valid JSON");
         assert_eq!(
-            json["type"], "narration.action_logged",
+            json["type"], "human.approval.requested",
             "type must match env.kind"
         );
         assert_eq!(
-            json["payload"]["channel"], "narration",
+            json["payload"]["channel"], HUMAN_CHANNEL,
             "payload.channel must be forwarded"
         );
+
+        // -- Publish a production durable approval event and verify it arrives. --
+        let action_env = AxonEnvelope {
+            id: EventId::new(),
+            channel: ACTION_CHANNEL.to_string(),
+            kind: "action.approval_required".to_string(),
+            tenant: org,
+            principal,
+            occurred_at: Timestamp::now(),
+            payload: serde_json::json!({ "approval_id": "approval-2" }),
+        };
+        bus.publish(&action_env);
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws_stream.next())
+            .await
+            .expect("timed out waiting for the durable approval event")
+            .expect("stream ended unexpectedly")
+            .expect("WS protocol error");
+        let text = frame.into_text().expect("expected text frame");
+        let json: serde_json::Value =
+            serde_json::from_str(&text).expect("frame must be valid JSON");
+        assert_eq!(json["type"], "action.approval_required");
+        assert_eq!(json["payload"]["channel"], ACTION_CHANNEL);
 
         // -- Publish a cross-tenant envelope; it must NOT arrive (org-isolation). --
         let other_org = TenantId::new();
         let cross_env = AxonEnvelope {
             id: EventId::new(),
-            channel: "narration".to_string(),
-            kind: "narration.action_logged".to_string(),
+            channel: HUMAN_CHANNEL.to_string(),
+            kind: "human.approval.requested".to_string(),
             tenant: other_org, // wrong tenant -- dropped by the org filter
             principal,
             occurred_at: Timestamp::now(),

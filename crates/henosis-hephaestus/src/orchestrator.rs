@@ -25,7 +25,7 @@ use tracing::warn;
 use crate::anthropic_auth::CLAUDE_CODE_IDENTITY;
 use crate::checkpoint::Checkpoint;
 use crate::config::Config;
-use crate::gate::{GateClient, GateVerdict};
+use crate::gate::{GateAuthority, GateScope, GateVerdict};
 use crate::hermes_client::{HermesClient, ToolDef, ToolResult};
 use crate::provider::{ChatMessage, ChatRequest, ContentBlock, Provider, Role, StopReason};
 use crate::services::Services;
@@ -92,9 +92,10 @@ pub async fn run(
     provider: Arc<dyn Provider>,
     services: &Services,
     hermes: &HermesClient,
-    gate: &GateClient,
+    gate: &dyn GateAuthority,
     cfg: &Config,
     tenant_id: Option<&str>,
+    principal_id: Option<&str>,
     task_id: Option<&str>,
     extra_system: Option<&str>,
     tools: &[ToolDef],
@@ -113,6 +114,7 @@ pub async fn run(
         gate,
         cfg,
         tenant_id,
+        principal_id,
         task_id,
         extra_system,
         tools,
@@ -133,9 +135,10 @@ pub async fn resume(
     provider: Arc<dyn Provider>,
     services: &Services,
     hermes: &HermesClient,
-    gate: &GateClient,
+    gate: &dyn GateAuthority,
     cfg: &Config,
     tenant_id: Option<&str>,
+    principal_id: Option<&str>,
     task_id: Option<&str>,
     extra_system: Option<&str>,
     tools: &[ToolDef],
@@ -151,6 +154,7 @@ pub async fn resume(
         gate,
         cfg,
         tenant_id,
+        principal_id,
         task_id,
         extra_system,
         tools,
@@ -169,9 +173,10 @@ async fn loop_inner(
     provider: Arc<dyn Provider>,
     services: &Services,
     hermes: &HermesClient,
-    gate: &GateClient,
+    gate: &dyn GateAuthority,
     cfg: &Config,
     tenant_id: Option<&str>,
+    principal_id: Option<&str>,
     task_id: Option<&str>,
     extra_system: Option<&str>,
     tools: &[ToolDef],
@@ -180,6 +185,10 @@ async fn loop_inner(
     start_step: u32,
     stream: Option<&StreamSink>,
 ) -> Result<OrchestratorResult, OrchestratorError> {
+    let gate_scope = GateScope {
+        tenant_id,
+        principal_id,
+    };
     let tools_json: Option<Vec<Value>> = if tools.is_empty() {
         None
     } else {
@@ -222,7 +231,10 @@ async fn loop_inner(
         // Gate check before LLM call. No provider request may run unless the
         // gate explicitly permits it.
         let gate_ctx = json!({ "turn": step, "action": "llm.call" });
-        require_gate_allow("llm.call", gate.check("llm.call", &gate_ctx).await)?;
+        require_gate_allow(
+            "llm.call",
+            gate.check(gate_scope, "llm.call", &gate_ctx).await,
+        )?;
 
         // Build the generic ChatRequest. System prompt is provider-agnostic:
         // we include the Hephaestus claude-code identity block alongside any
@@ -329,7 +341,7 @@ async fn loop_inner(
                     });
                     require_gate_allow(
                         "tool.results",
-                        gate.check("tool.results", &gate_ctx).await,
+                        gate.check(gate_scope, "tool.results", &gate_ctx).await,
                     )?;
                     if let Some(s) = stream {
                         for result in &result_blocks {
@@ -397,7 +409,10 @@ async fn loop_inner(
         // Post-tool gate check. Tool results are not streamed or appended to
         // the next provider request unless the gate explicitly permits them.
         let gate_ctx = json!({ "action": "tool.results", "tool_count": result_blocks.len() });
-        require_gate_allow("tool.results", gate.check("tool.results", &gate_ctx).await)?;
+        require_gate_allow(
+            "tool.results",
+            gate.check(gate_scope, "tool.results", &gate_ctx).await,
+        )?;
 
         // Mirror approved tool results to any attached stream subscriber.
         if let Some(s) = stream {

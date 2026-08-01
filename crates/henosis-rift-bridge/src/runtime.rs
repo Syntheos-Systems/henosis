@@ -3,6 +3,7 @@
 //! Connects to the Rift server via WebSocket, listens for messages,
 //! and dispatches agent responses through the room state machine.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,6 +14,7 @@ use tokio::task::JoinSet;
 use crate::auth::AgentAuthManager;
 use crate::capability::{PistisOracle, StaticAllowlistOracle};
 use crate::config::{BridgeConfig, EmbeddingConfig};
+use crate::cron::{poll_due_jobs, record_job_result, scheduled_job_stimulus};
 #[cfg(feature = "cognition")]
 use crate::embedding::CognitionEmbedder;
 use crate::embedding::{Embedder, OpenAiEmbedder};
@@ -58,6 +60,9 @@ use crate::room::Room;
 pub struct RuntimeDependencies {
     /// Existing kernel client sharing Henosis's Chiasm, Broca, and cognition state.
     pub kleos: Option<Arc<dyn crate::kleos::KleosClient>>,
+    /// Directory holding durable scheduler state, opened per bridge generation
+    /// so a replaced bridge always rehydrates the jobs persisted on disk.
+    pub cron_dir: Option<std::path::PathBuf>,
 }
 
 /// One provisioned Rift identity reported when a managed bridge becomes usable.
@@ -130,6 +135,16 @@ where
     tracing::info!("loaded config with {} agents", config.agents.len());
     let mut tasks = JoinSet::new();
     tokio::pin!(stop);
+    let RuntimeDependencies {
+        kleos: injected_kleos,
+        cron_dir,
+    } = dependencies;
+    // Each bridge generation rehydrates scheduler state from disk so jobs
+    // added by a previous generation survive a managed bridge replacement.
+    let mut cron_scheduler = match &cron_dir {
+        Some(dir) => Some(synapse_cron::CronScheduler::open(dir)?),
+        None => None,
+    };
 
     // Build embeddings before either consumer so cognition and Rift receive
     // clones of the same provider Arc in the in-process configuration.
@@ -141,7 +156,7 @@ where
         config.rift.bridge_secret.clone(),
     );
     let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
-    let kleos = match dependencies.kleos {
+    let kleos = match injected_kleos {
         Some(kleos) => {
             tracing::info!("kleos backend: injected Henosis kernel stores");
             kleos
@@ -384,6 +399,9 @@ where
 
     // Cascades borrow their own pause receiver so slot waits can watch it.
     let mut cascade_pause_rx = pause_rx.clone();
+    let mut cron_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    cron_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pending_cron_jobs = VecDeque::new();
 
     tracing::info!("bridge is running");
 
@@ -395,6 +413,21 @@ where
         tokio::select! {
             _ = &mut stop => {
                 tracing::info!("bridge stop requested");
+                if let Some(scheduler) = cron_scheduler.as_ref() {
+                    while let Some((job, started_at)) = pending_cron_jobs.pop_front() {
+                        let outcome =
+                            Err("bridge stopped before the governed room cascade".to_string());
+                        if let Err(error) = record_job_result(
+                            scheduler,
+                            &job,
+                            started_at,
+                            chrono::Utc::now().timestamp(),
+                            &outcome,
+                        ) {
+                            tracing::error!(job_id = %job.id, "cron shutdown result persistence failed: {error}");
+                        }
+                    }
+                }
                 break;
             }
             Some(event) = event_rx.recv() => {
@@ -447,6 +480,51 @@ where
                 }
                 // Same end-of-cascade stamp as the message arm.
                 let _ = activity_tx.send(std::time::Instant::now());
+            }
+            _ = std::future::ready(()), if !pending_cron_jobs.is_empty() && !*pause_rx.borrow() => {
+                let (job, started_at) = pending_cron_jobs
+                    .pop_front()
+                    .expect("cron dispatch branch requires a pending job");
+                tracing::info!(job_id = %job.id, "injecting scheduled task into governed room");
+                let _ = activity_tx.send(std::time::Instant::now());
+                let stimulus = scheduled_job_stimulus(&job);
+                let outcome = room
+                    .handle_stimulus(stimulus, &mut event_rx, &mut cascade_pause_rx)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = activity_tx.send(std::time::Instant::now());
+                let scheduler = cron_scheduler
+                    .as_ref()
+                    .expect("pending cron job requires a scheduler");
+                if let Err(error) = record_job_result(
+                    scheduler,
+                    &job,
+                    started_at,
+                    chrono::Utc::now().timestamp(),
+                    &outcome,
+                ) {
+                    tracing::error!(job_id = %job.id, "cron result persistence failed: {error}");
+                }
+                match outcome {
+                    Ok(()) => tracing::info!(job_id = %job.id, "scheduled room cascade completed"),
+                    Err(error) => tracing::error!(job_id = %job.id, "scheduled room cascade failed: {error}"),
+                }
+            }
+            _ = cron_tick.tick(), if cron_scheduler.is_some() && pending_cron_jobs.is_empty() => {
+                let paused = *pause_rx.borrow();
+                let scheduler = cron_scheduler
+                    .as_mut()
+                    .expect("cron select branch requires a scheduler");
+                let due = match poll_due_jobs(scheduler, paused) {
+                    Ok(due) => due,
+                    Err(error) => {
+                        tracing::error!("cron scheduler tick failed: {error}");
+                        continue;
+                    }
+                };
+                for job in due {
+                    pending_cron_jobs.push_back((job, chrono::Utc::now().timestamp()));
+                }
             }
         }
     }

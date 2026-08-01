@@ -4,10 +4,13 @@
 set -eu
 
 PROGRAM=henosis-installer
-RELEASE_BASE=${HENOSIS_RELEASE_BASE:-https://github.com/Syntheos-Systems/henosis/releases/download}
+DEFAULT_RELEASE_BASE=https://github.com/Syntheos-Systems/henosis/releases/download
+RELEASE_BASE=${HENOSIS_RELEASE_BASE:-$DEFAULT_RELEASE_BASE}
 RELEASE_API=${HENOSIS_RELEASE_API:-https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags}
 VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.6}
 INSTALL_DIR=${HENOSIS_INSTALL_DIR:-"${HOME}/.local/bin"}
+ATTESTATION_REPO=${HENOSIS_ATTESTATION_REPO:-Syntheos-Systems/henosis}
+ATTESTATION_SIGNER_WORKFLOW=Syntheos-Systems/henosis/.github/workflows/ci.yml
 HEADLESS=0
 
 # Print an installer message to standard error.
@@ -39,6 +42,18 @@ Environment:
   HENOSIS_RELEASE_BASE  Release download base URL
   HENOSIS_RELEASE_API   Release metadata API base URL
   HENOSIS_INSTALL_DIR   Destination directory, default ~/.local/bin
+  HENOSIS_REQUIRE_ATTESTATION
+                        Set to 1 to require sigstore build-provenance verification
+                        via the GitHub CLI and refuse to install without it.
+                        Default is opportunistic: verified when gh is present.
+  HENOSIS_HARNESS       Agent harness for the generated roster, default synapse.
+                        Presets: synapse, claude-code, aider. Any other binary
+                        must implement distinct --henosis-discuss and
+                        --henosis-execute adapter modes.
+
+Examples:
+  curl -fsSL <url>/install.sh | HENOSIS_HARNESS=aider sh
+  henosis init --quick --harness /opt/bin/my-agent
 EOF
 }
 
@@ -104,6 +119,51 @@ verify_archive() {
     [ "${#expected}" -eq 64 ] || die "checksum manifest contains an invalid checksum for $name"
     actual=$(sha256 "$archive")
     [ "$actual" = "$expected" ] || die "checksum verification failed for $name"
+}
+
+# Verify the archive's build provenance against its sigstore attestation.
+#
+# The checksum manifest is served from the same release as the archive, so a
+# matching checksum only proves the file is the one that was uploaded there --
+# not that Henosis's release workflow built it. The release job publishes
+# sigstore provenance for exactly this purpose; `gh attestation verify` checks
+# that chain against the signing identity, which same-origin checksums cannot.
+#
+# Verification runs when the GitHub CLI is available. Set
+# HENOSIS_REQUIRE_ATTESTATION=1 to refuse to install without it.
+verify_attestation() {
+    archive=$1
+    name=$2
+    # HENOSIS_SKIP_ATTESTATION exists for the contract test, which serves a
+    # synthetic release through stubbed download tooling; that fixture has no
+    # attestation and must not reach the network to discover it.
+    #
+    # A non-default release base is a mirror or a fork, which likewise does not
+    # carry this repo's attestations.
+    if [ "${HENOSIS_SKIP_ATTESTATION:-0}" = 1 ] || [ "$RELEASE_BASE" != "$DEFAULT_RELEASE_BASE" ]; then
+        if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+            die 'HENOSIS_REQUIRE_ATTESTATION=1 requires the default release base and no skip override'
+        fi
+        info "skipping provenance verification for $name (non-canonical release source)"
+        return 0
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+            die 'HENOSIS_REQUIRE_ATTESTATION=1 but the GitHub CLI (gh) is not installed'
+        fi
+        info "skipping provenance verification for $name (gh not installed; set HENOSIS_REQUIRE_ATTESTATION=1 to require it)"
+        return 0
+    fi
+    info "verifying build provenance for $name"
+    if gh attestation verify "$archive" --repo "$ATTESTATION_REPO" \
+        --signer-workflow "$ATTESTATION_SIGNER_WORKFLOW" >/dev/null 2>&1; then
+        info "provenance verified for $name"
+        return 0
+    fi
+    if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+        die "provenance verification failed for $name"
+    fi
+    info "WARNING: provenance verification failed for $name; continuing on checksum alone"
 }
 
 # Extract the relevant top-level fields from a JSON release document.
@@ -517,6 +577,7 @@ main() {
         download "$url_base/SHA256SUMS" "$manifest" || die 'could not download checksum manifest'
         download "$url_base/$archive_name" "$archive" || die "could not download $archive_name"
         verify_archive "$manifest" "$archive" "$archive_name"
+        verify_attestation "$archive" "$archive_name"
         tar -xzf "$archive" -C "$WORK_DIR" || die 'could not extract verified archive'
         candidate="$WORK_DIR/henosis-${VERSION#v}-${target}/henosis"
         crucible_candidate="$WORK_DIR/henosis-${VERSION#v}-${target}/crucible"

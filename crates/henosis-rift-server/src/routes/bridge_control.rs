@@ -1,9 +1,9 @@
 //! Human and daemon bridge-state routes with separate authentication boundaries.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::HeaderMap,
+    Json,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -100,6 +100,11 @@ pub async fn resume_bridge(
 }
 
 /// Return public bridge status to an authenticated human room member.
+///
+/// Membership is required because an open route disclosed per-server bridge
+/// state to anonymous callers and answered as a server-existence oracle for
+/// arbitrary identifiers. The bridge daemon's pause poller does not use this
+/// route; it reads through the bridge-secret boundary below.
 pub async fn bridge_status(
     auth: AuthUser,
     State(pool): State<PgPool>,

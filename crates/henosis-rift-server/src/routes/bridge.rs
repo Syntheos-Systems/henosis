@@ -118,6 +118,13 @@ pub async fn notify_message(
         _ => return StatusCode::NOT_FOUND,
     };
 
+    // The message and the broadcast target are two independent caller-supplied
+    // fields. Without binding them, this route would relay any message -- including
+    // a private DM -- to the subscribers of any other channel.
+    if msg.channel_id != req.channel_id {
+        return StatusCode::NOT_FOUND;
+    }
+
     // Fetch attachments
     let attachments = db::get_attachments_for_message(&pool, req.message_id)
         .await

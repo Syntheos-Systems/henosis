@@ -7,6 +7,12 @@ REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/henosis-install-test.XXXXXX")
 ORIGINAL_PATH=$PATH
 
+# These fixtures are synthetic releases served through stubbed download tooling,
+# so they carry no sigstore attestation. Without this the installer would reach
+# out to GitHub on every case and this suite would depend on the network.
+HENOSIS_SKIP_ATTESTATION=1
+export HENOSIS_SKIP_ATTESTATION
+
 # Remove only the temporary test tree created by this script.
 cleanup() { rm -rf "$TEST_ROOT"; }
 
@@ -84,6 +90,26 @@ EOF
     chmod 755 "$tools/curl"
 }
 
+# Create a GitHub CLI double that validates the provenance trust arguments.
+make_gh() {
+    tools=$1
+    cat > "$tools/gh" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 7 ]
+[ "$1" = attestation ]
+[ "$2" = verify ]
+[ -f "$3" ]
+[ "$4" = --repo ]
+[ "$5" = Syntheos-Systems/henosis ]
+[ "$6" = --signer-workflow ]
+[ "$7" = Syntheos-Systems/henosis/.github/workflows/ci.yml ]
+printf '%s\n' verified > "${HENOSIS_GH_LOG:?}"
+exit "${HENOSIS_FIXTURE_GH_EXIT:-0}"
+EOF
+    chmod 755 "$tools/gh"
+}
+
 # Verify a healthy installation selects the archive, verifies it, and initializes it.
 test_verified_install() {
     version=v0.1.0-alpha.6; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/release"; case_root="$TEST_ROOT/success"
@@ -96,6 +122,40 @@ test_verified_install() {
     [ -x "$case_root/bin/henosis" ] || fail 'henosis was not installed'
     [ -x "$case_root/bin/crucible" ] || fail 'Crucible was not installed'
     [ "$(cat "$case_root/init.log")" = 'init --quick' ] || fail 'installer did not run henosis init --quick'
+}
+
+# Verify required provenance pins both the repository and release workflow identities.
+test_required_attestation_success() {
+    version=v0.1.0-alpha.6; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/attested-release"; case_root="$TEST_ROOT/attested"
+    make_release "$version" "$target" 'exit 0' "$release"
+    make_curl "$case_root/tools"; make_gh "$case_root/tools"; mkdir -p "$case_root/remote/$version"
+    cp "$release/$version"/* "$case_root/remote/$version/"
+    HENOSIS_SKIP_ATTESTATION=0 HENOSIS_REQUIRE_ATTESTATION=1 \
+        HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" \
+        HENOSIS_GH_LOG="$case_root/gh.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
+        "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" \
+            --headless > "$case_root/result.json"
+    [ "$(cat "$case_root/gh.log")" = verified ] || fail 'attestation verifier was not invoked'
+    [ -x "$case_root/bin/henosis" ] || fail 'attested release was not installed'
+}
+
+# Verify a failed required provenance check aborts before extraction or installation.
+test_required_attestation_failure() {
+    version=v0.1.0-alpha.6; target=x86_64-unknown-linux-musl; release="$TEST_ROOT/unattested-release"; case_root="$TEST_ROOT/unattested"
+    make_release "$version" "$target" 'exit 0' "$release"
+    make_curl "$case_root/tools"; make_gh "$case_root/tools"; mkdir -p "$case_root/remote/$version"
+    cp "$release/$version"/* "$case_root/remote/$version/"
+    if HENOSIS_SKIP_ATTESTATION=0 HENOSIS_REQUIRE_ATTESTATION=1 HENOSIS_FIXTURE_GH_EXIT=1 \
+        HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" \
+        HENOSIS_GH_LOG="$case_root/gh.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
+        "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" \
+            --headless > "$case_root/result.json" 2>&1; then
+        fail 'failed required attestation succeeded'
+    fi
+    [ "$(cat "$case_root/gh.log")" = verified ] || fail 'failing attestation verifier was not invoked'
+    [ ! -e "$case_root/bin/henosis" ] || fail 'failed attestation installed a binary'
+    grep -F 'provenance verification failed' "$case_root/result.json" >/dev/null ||
+        fail 'failed attestation did not report the trust failure'
 }
 
 # Verify a failed initializer restores the precise previous executable.
@@ -195,6 +255,8 @@ test_archive_marker_mismatch() {
 
 trap cleanup EXIT HUP INT TERM
 test_verified_install
+test_required_attestation_success
+test_required_attestation_failure
 test_rollback
 test_checksum_failure
 test_mutable_release_failure

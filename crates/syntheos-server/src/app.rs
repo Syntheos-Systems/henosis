@@ -620,6 +620,9 @@ fn chiasm_error(e: ChiasmError) -> (StatusCode, String) {
         ChiasmError::NotFound(_) => StatusCode::NOT_FOUND,
         ChiasmError::ClaimConflict { .. } => StatusCode::CONFLICT,
         ChiasmError::InvalidStatus(_) => StatusCode::BAD_REQUEST,
+        ChiasmError::SelfDependency(_) | ChiasmError::DependencyCycle { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         // Backend, backfill, and any future variants are server-side failures.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1170,21 +1173,23 @@ async fn loom_create_workflow(
         .map_err(loom_error)
 }
 
-/// Query string asserting the owner principal for Loom reads.
+/// Query string asserting the tenant and owner principal for Loom reads.
 #[derive(Debug, Deserialize)]
 pub struct LoomOwnerQuery {
+    /// The tenant boundary for the request.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
 }
 
-/// List the asserted principal's workflows.
+/// List the asserted principal's workflows within a tenant.
 async fn loom_list_workflows(
     State(state): State<AppState>,
     Query(q): Query<LoomOwnerQuery>,
 ) -> Result<Json<Vec<Workflow>>, (StatusCode, String)> {
     state
         .loom
-        .list_workflows(q.principal_id)
+        .list_workflows(q.tenant, q.principal_id)
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1198,7 +1203,7 @@ async fn loom_get_workflow(
 ) -> Result<Json<Workflow>, (StatusCode, String)> {
     state
         .loom
-        .get_workflow(q.principal_id, id)
+        .get_workflow(q.tenant, q.principal_id, id)
         .await
         .map_err(loom_error)?
         .map(Json)
@@ -1208,6 +1213,8 @@ async fn loom_get_workflow(
 /// Body for [`loom_create_run`].
 #[derive(Debug, Deserialize)]
 pub struct LoomCreateRun {
+    /// Tenant containing the workflow and resulting run.
+    pub tenant: TenantId,
     /// Owner principal (the runner; must own the workflow).
     pub principal_id: PrincipalId,
     /// The workflow to run.
@@ -1223,7 +1230,7 @@ async fn loom_create_run(
 ) -> Result<Json<Run>, (StatusCode, String)> {
     state
         .loom
-        .create_run(req.principal_id, req.workflow_id, req.input)
+        .create_run(req.tenant, req.principal_id, req.workflow_id, req.input)
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1232,6 +1239,8 @@ async fn loom_create_run(
 /// Query string for [`loom_list_runs`]: the asserted owner plus optional AND-filters.
 #[derive(Debug, Deserialize)]
 pub struct LoomRunsQuery {
+    /// Tenant containing the requested runs.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Only runs of this workflow.
@@ -1252,6 +1261,7 @@ async fn loom_list_runs(
     state
         .loom
         .list_runs(
+            q.tenant,
             q.principal_id,
             RunFilter {
                 workflow_id: q.workflow_id,
@@ -1273,7 +1283,7 @@ async fn loom_get_run(
 ) -> Result<Json<Run>, (StatusCode, String)> {
     state
         .loom
-        .get_run(q.principal_id, id)
+        .get_run(q.tenant, q.principal_id, id)
         .await
         .map_err(loom_error)?
         .map(Json)
@@ -1288,7 +1298,7 @@ async fn loom_cancel_run(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .loom
-        .cancel_run(q.principal_id, id)
+        .cancel_run(q.tenant, q.principal_id, id)
         .await
         .map(|cancelled| Json(serde_json::json!({ "cancelled": cancelled })))
         .map_err(loom_error)
@@ -1302,7 +1312,7 @@ async fn loom_get_steps(
 ) -> Result<Json<Vec<Step>>, (StatusCode, String)> {
     state
         .loom
-        .get_steps(q.principal_id, id)
+        .get_steps(q.tenant, q.principal_id, id)
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1311,6 +1321,8 @@ async fn loom_get_steps(
 /// Query string for [`loom_get_logs`]: owner plus an optional cap.
 #[derive(Debug, Deserialize)]
 pub struct LoomLogsQuery {
+    /// Tenant containing the requested run.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Maximum lines to return (defaults to 200).
@@ -1325,7 +1337,7 @@ async fn loom_get_logs(
 ) -> Result<Json<Vec<LogEntry>>, (StatusCode, String)> {
     state
         .loom
-        .logs(q.principal_id, id, q.limit.unwrap_or(200))
+        .logs(q.tenant, q.principal_id, id, q.limit.unwrap_or(200))
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1334,6 +1346,8 @@ async fn loom_get_logs(
 /// Body for [`loom_complete_step`]: the external-completion path.
 #[derive(Debug, Deserialize)]
 pub struct LoomCompleteStep {
+    /// Tenant containing the step's run.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Retry counter of the exact attempt that produced this result.
@@ -1353,6 +1367,7 @@ async fn loom_complete_step(
     state
         .loom
         .complete_step(
+            req.tenant,
             req.principal_id,
             id,
             req.expected_retry_count,
@@ -1367,6 +1382,8 @@ async fn loom_complete_step(
 /// Body for [`loom_fail_step`].
 #[derive(Debug, Deserialize)]
 pub struct LoomFailStep {
+    /// Tenant containing the step's run.
+    pub tenant: TenantId,
     /// The asserted owner principal.
     pub principal_id: PrincipalId,
     /// Retry counter of the exact attempt that failed.
@@ -1386,6 +1403,7 @@ async fn loom_fail_step(
     state
         .loom
         .fail_step(
+            req.tenant,
             req.principal_id,
             id,
             req.expected_retry_count,
@@ -1397,14 +1415,14 @@ async fn loom_fail_step(
         .map_err(loom_error)
 }
 
-/// Aggregate workflow/run counts for the asserted principal.
+/// Aggregate workflow/run counts for the asserted tenant and principal.
 async fn loom_stats(
     State(state): State<AppState>,
     Query(q): Query<LoomOwnerQuery>,
 ) -> Result<Json<LoomStats>, (StatusCode, String)> {
     state
         .loom
-        .stats(q.principal_id)
+        .stats(q.tenant, q.principal_id)
         .await
         .map(Json)
         .map_err(loom_error)
@@ -1750,6 +1768,34 @@ mod tests {
     use syntheos_dispatch::{Executor, ExecutorError};
     use syntheos_identity::InMemoryDirectory;
     use tower::ServiceExt;
+
+    /// Dependency-graph validation failures are client errors while storage failures stay server errors.
+    #[test]
+    fn chiasm_dependency_errors_preserve_the_http_error_boundary() {
+        let task_id = TaskId::new();
+        let dependency_id = TaskId::new();
+
+        assert_eq!(
+            chiasm_error(ChiasmError::SelfDependency(task_id)).0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::DependencyCycle {
+                task_id,
+                depends_on: dependency_id,
+            })
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::Backend("database unavailable".to_string())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            chiasm_error(ChiasmError::Backfill("legacy data is invalid".to_string())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     /// Build an isolated in-memory credential store for compatibility-chain tests.
     fn test_credential_store(bus: Arc<AxonBus>) -> Arc<CredentialStore> {
@@ -3088,6 +3134,7 @@ mod tests {
 
         // A run advances and completes inline via the transform executor.
         let body = serde_json::json!({
+            "tenant": tenant,
             "principal_id": owner,
             "workflow_id": workflow_id,
             "input": {"who": "henosis"},
@@ -3115,7 +3162,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/loom/runs/{run_id}/logs?principal_id={owner}"))
+                    .uri(format!(
+                        "/loom/runs/{run_id}/logs?tenant={tenant}&principal_id={owner}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3127,6 +3176,322 @@ mod tests {
             logs.as_array().expect("array").len() >= 3,
             "created/started/completed lines"
         );
+    }
+
+    #[tokio::test]
+    /// Loom HTTP routes reject same-principal access across tenant boundaries.
+    async fn loom_http_routes_enforce_tenant_boundaries() {
+        use syntheos_contracts::{PrincipalId, TenantId};
+        let app = router(test_state());
+        let tenant_a = TenantId::new().to_string();
+        let tenant_b = TenantId::new().to_string();
+        let owner = PrincipalId::new().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_a,
+                            "principal_id": owner,
+                            "name": "tenant-a-workflow",
+                            "steps": [{"name": "approve-a", "type": "action"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let workflow_a: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let workflow_a_id = workflow_a["id"].as_str().expect("tenant A workflow id");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_b,
+                            "principal_id": owner,
+                            "name": "tenant-b-workflow",
+                            "steps": [{"name": "approve-b", "type": "action"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let workflow_b: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let workflow_b_id = workflow_b["id"].as_str().expect("tenant B workflow id");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_a,
+                            "principal_id": owner,
+                            "workflow_id": workflow_a_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let run_a: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let run_a_id = run_a["id"].as_str().expect("tenant A run id");
+        assert_eq!(run_a["status"], "running");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_b,
+                            "principal_id": owner,
+                            "workflow_id": workflow_b_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let run_b: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let run_b_id = run_b["id"].as_str().expect("tenant B run id");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/workflows?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let workflows_b: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(workflows_b.as_array().expect("workflow array").len(), 1);
+        assert_eq!(workflows_b[0]["id"], workflow_b_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/workflows/{workflow_a_id}?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loom/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_b,
+                            "principal_id": owner,
+                            "workflow_id": workflow_a_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/loom/runs?tenant={tenant_b}&principal_id={owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let runs_b: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(runs_b.as_array().expect("run array").len(), 1);
+        assert_eq!(runs_b[0]["id"], run_b_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}/steps?tenant={tenant_a}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let steps_a: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let step_a = &steps_a[0];
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}/steps?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cross_steps: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(cross_steps.as_array().expect("step array").is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}/logs?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cross_logs: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(cross_logs.as_array().expect("log array").is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/loom/steps/{}/complete",
+                        step_a["id"].as_i64().expect("tenant A step id")
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tenant": tenant_b,
+                            "principal_id": owner,
+                            "expected_retry_count": step_a["retry_count"],
+                            "expected_started_at": step_a["started_at"],
+                            "output": {"forbidden": true},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}/cancel?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/stats?tenant={tenant_b}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats_b: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(stats_b["workflows"], 1);
+        assert_eq!(stats_b["runs"], 1);
+        assert_eq!(stats_b["active_runs"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loom/runs/{run_a_id}?tenant={tenant_a}&principal_id={owner}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let run_a_after: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(run_a_after["status"], "running");
     }
 
     #[tokio::test]

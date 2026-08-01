@@ -32,9 +32,9 @@ fn test_rejects_missing_token_for_foundry() {
     assert!(result.is_err(), "foundry provider requires token");
 }
 
-/// Verifies text-only Claude Max configuration can be constructed without explicit credentials.
+/// Verifies shared-UID Claude Max configuration fails closed before credential retrieval.
 #[test]
-fn test_claude_max_needs_no_credentials() {
+fn test_claude_max_is_rejected_in_multi_agent_bridge() {
     let result = build_synapse_executor(
         "claude-max",
         Some("claude-sonnet-4-6".into()),
@@ -45,10 +45,12 @@ fn test_claude_max_needs_no_credentials() {
         None,
         None,
     );
-    assert!(
-        result.is_ok(),
-        "text-only claude-max should work with no explicit credentials"
-    );
+    let error = result
+        .err()
+        .expect("shared-UID claude-max must fail closed");
+    assert!(error
+        .to_string()
+        .contains("distinct UID or protected PID namespace"));
 }
 
 /// Verifies the generic OpenAI-compatible proxy arm builds with a base URL

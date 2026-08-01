@@ -211,10 +211,14 @@ granted to the Henosis process.
 Use `containers/compose.production.yml` only after:
 
 1. Copying `containers/production.env.example` to the ignored `containers/.env.production` file and replacing every placeholder.
-2. Placing a base64-encoded 32-byte audit origin signing key and the witness public key in the ignored `containers/secrets` directory with restrictive permissions.
-3. Copying `HENOSIS_IMAGE_REPOSITORY` and `HENOSIS_IMAGE_DIGEST` from the release
+2. Copying `containers/agents.production.example.toml` to the ignored
+   `containers/secrets/agents.toml` file and customizing the agent roster. The starter roster uses
+   Synapse with `ANTHROPIC_API_KEY` from the private environment file; change both when selecting a
+   different provider. Henosis supplies the managed Rift connection and room secrets at startup.
+3. Placing a base64-encoded 32-byte audit origin signing key and the witness public key in the ignored `containers/secrets` directory with restrictive permissions.
+4. Copying `HENOSIS_IMAGE_REPOSITORY` and `HENOSIS_IMAGE_DIGEST` from the release
    `container-image.env` asset.
-4. Choosing the first operator email and password in the bootstrap variables. Remove both bootstrap variables after the first successful start.
+5. Choosing the first operator email and password in the bootstrap variables. Remove both bootstrap variables after the first successful start.
 
 Start production Compose with the same private environment file for interpolation and service
 configuration:

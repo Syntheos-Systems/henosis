@@ -1,0 +1,19 @@
+# Production agent roster for Henosis's managed room.
+#
+# Henosis injects the Rift connection, room identifiers, and shared secrets at
+# startup. Keep them out of this file. The starter executor reads
+# ANTHROPIC_API_KEY from the container environment; replace the executor block
+# when using a different provider.
+
+[[agents]]
+name = "Assistant"
+username = "assistant"
+base_chance = 1.0
+system_prompt = "You are a careful engineering agent."
+
+[agents.executor]
+type = "Synapse"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+max_tokens = 4096
+max_turns = 4

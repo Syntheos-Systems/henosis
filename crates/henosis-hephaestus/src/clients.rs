@@ -25,7 +25,7 @@ use crate::anthropic_auth::{AuthError, ProviderChain};
 use crate::checkpoint::Checkpoint;
 use crate::config::Config;
 use crate::crucible::CrucibleClient;
-use crate::gate::GateClient;
+use crate::gate::{GateAuthority, GateClient};
 use crate::hermes_client::{HermesClient, ToolDef};
 use crate::orchestrator::{self, OrchestratorError, OrchestratorResult};
 use crate::services::Services;
@@ -104,8 +104,8 @@ pub struct Clients {
     auth: ProviderChain,
     /// Hermes tool gateway client.
     hermes: HermesClient,
-    /// Eidolon gate client.
-    gate: GateClient,
+    /// Eidolon gate authority, either standalone HTTP or injected in-process.
+    gate: Arc<dyn GateAuthority>,
     /// In-process Crucible quality-gate service.
     crucible: CrucibleClient,
     /// Coordination service bundle (Kleos, Chiasm, Axon, cred).
@@ -125,6 +125,22 @@ impl Clients {
             .timeout(cfg.llm_timeout)
             .build()
             .expect("reqwest client build");
+        let gate = Arc::new(GateClient::new(&cfg.eidolon_url, http.clone()));
+        Self::with_http_and_gate(cfg, http, gate)
+    }
+
+    /// Construct with an in-process gate authority while retaining all other runtime clients.
+    pub fn with_gate(cfg: Config, gate: Arc<dyn GateAuthority>) -> Self {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(cfg.llm_timeout)
+            .build()
+            .expect("reqwest client build");
+        Self::with_http_and_gate(cfg, http, gate)
+    }
+
+    /// Build the aggregate over one shared HTTP pool and the selected gate authority.
+    fn with_http_and_gate(cfg: Config, http: Client, gate: Arc<dyn GateAuthority>) -> Self {
         let auth = ProviderChain::from_config(&cfg);
 
         // Build the in-process Hermes invoker. phylaxd URL and token are read
@@ -150,7 +166,6 @@ impl Clients {
         };
         let hermes = HermesClient::new(registry, circuits, ctx);
 
-        let gate = GateClient::new(&cfg.eidolon_url, http.clone());
         let crucible = CrucibleClient::open(cfg.crucible_enabled, &cfg.crucible_db)
             .expect("Crucible database initialization failed");
         let services = Services::new(http, cfg.clone());
@@ -244,6 +259,7 @@ impl Clients {
     pub async fn anthropic_complete(
         &self,
         tenant_id: Option<&str>,
+        principal_id: Option<&str>,
         task_id: Option<&str>,
         prompt: &str,
         extra_system: Option<&str>,
@@ -265,9 +281,10 @@ impl Clients {
             provider,
             &self.services,
             &self.hermes,
-            &self.gate,
+            self.gate.as_ref(),
             &self.cfg,
             tenant_id,
+            principal_id,
             task_id,
             extra_system,
             tools,
@@ -284,6 +301,7 @@ impl Clients {
     pub async fn anthropic_resume(
         &self,
         tenant_id: Option<&str>,
+        principal_id: Option<&str>,
         task_id: Option<&str>,
         extra_system: Option<&str>,
         messages: Vec<serde_json::Value>,
@@ -306,9 +324,10 @@ impl Clients {
             provider,
             &self.services,
             &self.hermes,
-            &self.gate,
+            self.gate.as_ref(),
             &self.cfg,
             tenant_id,
+            principal_id,
             task_id,
             extra_system,
             tools,

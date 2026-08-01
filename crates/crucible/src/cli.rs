@@ -9,8 +9,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::bridge::HttpSkillsBridge;
-use crate::json_io::{Output, read_input, write_output};
-use crate::{Database, SkillsBridge, Tool, run_tool};
+use crate::json_io::{read_input, write_output, Output};
+use crate::{run_tool, Database, SkillsBridge, Tool};
 
 /// Top-level CLI: every invocation specifies a subcommand plus input/output JSON paths.
 #[derive(Parser)]

@@ -53,11 +53,13 @@ sha2.workspace = true
 
 # Synapse agent loop engine (local development path dependency)
 synapse-core = { path = "../synapse-core" }
+synapse-cron = { path = "../synapse-cron" }
 synapse-provider = { path = "../synapse-provider" }
 synapse-tools = { path = "../synapse-tools" }
 
 # anyhow (synapse-core's error type at the AgentExecutor boundary)
 anyhow = "1"
+which.workspace = true
 
 # Pinned FrameShift persona selection engine in the excluded vendor workspace.
 frameshift-orchestrator = { path = "../../vendor/frameshift/frameshift-orchestrator" }

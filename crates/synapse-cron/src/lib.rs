@@ -1,8 +1,8 @@
 //! synapse-cron: Time-based agent task scheduling.
 //!
-//! Manages cron jobs that spawn Synapse agent sessions on a schedule.
-//! Jobs are stored in ~/.synapse/cron/jobs.json and executed by a
-//! background tick loop.
+//! Manages persistent cron jobs consumed by a host runtime. The managed
+//! Henosis host routes due jobs through its governed Rift/Synapse room;
+//! standalone callers may provide a different execution policy.
 
 mod scheduler;
 

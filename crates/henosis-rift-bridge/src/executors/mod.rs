@@ -8,15 +8,38 @@ use crate::executor::AgentExecutor;
 
 pub mod claude_code;
 pub mod codex;
+pub mod command;
 pub mod synapse;
 
 pub use claude_code::ClaudeCodeExecutor;
 pub use codex::CodexExecutor;
+pub use command::{CommandExecutor, ProgressFormat};
 pub use synapse::build_synapse_executor;
 
 /// Construct one executor from a materialized agent configuration.
 pub fn build_executor(config: &AgentConfig) -> Result<Arc<dyn AgentExecutor>, BridgeError> {
     match &config.executor {
+        ExecutorConfig::Command {
+            binary,
+            discuss_args,
+            execute_args,
+            cwd,
+            max_runtime_secs,
+            progress_format,
+            env,
+            inherit_env,
+            env_clear,
+        } => Ok(Arc::new(CommandExecutor::new(
+            binary.clone(),
+            discuss_args.clone(),
+            execute_args.clone(),
+            cwd.clone(),
+            *max_runtime_secs,
+            *progress_format,
+            env.clone(),
+            inherit_env.clone(),
+            *env_clear,
+        ))),
         ExecutorConfig::ClaudeCode {
             binary,
             model,

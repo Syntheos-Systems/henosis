@@ -20,11 +20,22 @@ use syntheos_contracts::{PrincipalId, TenantId};
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::room_runtime::{parse_room_mode, RoomMode, DISABLED_MODE, REQUIRED_MODE};
+
 /// Relative configuration file created by `henosis init --quick`.
 const CONFIG_FILE: &str = "config.env";
 
 /// Relative persistent data directory created by `henosis init --quick`.
 const DATA_DIRECTORY: &str = "data";
+
+/// Relative agent roster file created by `henosis init --quick`.
+const AGENTS_FILE: &str = "agents.toml";
+
+/// Environment variable selecting the agent harness during initialization.
+///
+/// Exists because `install.sh` runs under `curl | sh`, where stdin is the script
+/// itself and an interactive prompt cannot read a reply.
+const HARNESS_ENV: &str = "HENOSIS_HARNESS";
 
 /// Local owner-token path key written by `henosis init --quick`.
 const LOCAL_TOKEN_KEY: &str = "HENOSIS_LOCAL_TOKEN_FILE";
@@ -61,6 +72,10 @@ const LOCAL_DATABASES: &[(&str, &str)] = &[
 const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
     "SYNTHEOS_PLUTUS_DB",
     "SYNTHEOS_OPERATOR_JWT_SECRET",
+    "HENOSIS_RIFT_JWT_SECRET",
+    "HENOSIS_RIFT_BRIDGE_SECRET",
+    "HENOSIS_RIFT_DATABASE_URL",
+    "HENOSIS_RIFT_BRIDGE_CONFIG",
     "PHYLAXD_URL",
     "HERMES_PHYLAXD_TOKEN",
     "HENOSIS_WITNESS_URL",
@@ -71,7 +86,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (unavailable in alpha)\n  henosis uninstall (unavailable in alpha)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (unavailable in alpha)\n  henosis uninstall (unavailable in alpha)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -81,6 +96,8 @@ pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
 pub enum Command {
     /// Initialize a local operator home directory.
     Init(InitMode),
+    /// Initialize a local operator home with an explicitly selected external harness.
+    InitWithHarness(Harness),
     /// Inspect local configuration and data directory readiness.
     Doctor(DoctorOutputFormat),
     /// Print the stable command reference without mutating local state.
@@ -789,7 +806,10 @@ impl<'a> CliRunner<'a> {
     pub fn run(&self, command: Command) -> Result<RunResult, CliError> {
         match command {
             Command::Init(InitMode::Quick) => {
-                initialize_quick(&self.paths).map(RunResult::Initialized)
+                initialize_quick(&self.paths, &Harness::Synapse).map(RunResult::Initialized)
+            }
+            Command::InitWithHarness(harness) => {
+                initialize_quick(&self.paths, &harness).map(RunResult::Initialized)
             }
             Command::Init(InitMode::Production) => {
                 initialize_production(&self.paths).map(RunResult::Initialized)
@@ -942,6 +962,12 @@ pub enum CliError {
         /// Missing local paths or non-secret required configuration key names.
         missing: Vec<String>,
     },
+    /// Quick initialization preserved an existing configuration that cannot boot local mode.
+    #[error("quick initialization found incomplete local configuration: {next_step}")]
+    QuickConfigurationIncomplete {
+        /// Non-secret repair instruction produced by the same doctor contract.
+        next_step: String,
+    },
     /// JSON encoding of a local diagnostic report failed.
     #[error("cannot encode the doctor report as JSON: {0}")]
     Serialization(#[source] serde_json::Error),
@@ -1008,14 +1034,159 @@ pub enum CliError {
     },
 }
 
+/// Agent harness the generated roster will run.
+///
+/// Henosis is not tied to one agent implementation. The built-in Synapse loop is
+/// the default because it needs no external binary, but any CLI that accepts a
+/// prompt and answers on stdout can take its place.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Harness {
+    /// The in-process Synapse agent loop with provider and tool access.
+    #[default]
+    Synapse,
+    /// An external agent CLI, named by preset or by path.
+    External(String),
+}
+
+/// Resolves harness names into generated roster configuration.
+impl Harness {
+    /// Parse a `--harness` value or `HENOSIS_HARNESS` setting.
+    ///
+    /// An unrecognized value is treated as a binary name or path rather than an
+    /// error, so a harness Henosis has never heard of still works on day one.
+    fn parse(value: &str) -> Self {
+        match value.trim() {
+            "" | "synapse" => Self::Synapse,
+            other => Self::External(other.to_string()),
+        }
+    }
+
+    /// The value recorded in the generated configuration file.
+    fn config_value(&self) -> &str {
+        match self {
+            Self::Synapse => "synapse",
+            Self::External(name) => name,
+        }
+    }
+
+    /// Render the `[agents.executor]` block for this harness.
+    ///
+    /// Presets cover modes whose discussion path is known not to edit. Any
+    /// other binary uses the explicit Henosis adapter contract, keeping its
+    /// discussion and approved execution entry points distinct.
+    fn executor_toml(&self) -> String {
+        let executor_type_key = "type";
+        let (binary, discuss, execute, inherit_env) = match self {
+            Self::Synapse => {
+                return format!(
+                    "[agents.executor]\n\
+                     {executor_type_key} = \"Synapse\"\n\
+                     provider = \"anthropic\"\n\
+                     # api_key = \"...\"   # or set ANTHROPIC_API_KEY in the environment\n\
+                     model = \"claude-sonnet-4-6\"\n"
+                );
+            }
+            Self::External(name) => match name.as_str() {
+                "claude-code" | "claude" => {
+                    return format!(
+                        "[agents.executor]\n\
+                         {executor_type_key} = \"ClaudeCode\"\n\
+                         binary = \"claude\"\n\
+                         model = \"sonnet\"\n"
+                    );
+                }
+                "aider" => (
+                    "aider",
+                    vec![
+                        "--chat-mode",
+                        "ask",
+                        "--message",
+                        "{prompt}",
+                        "--no-auto-commits",
+                    ],
+                    vec!["--message", "{prompt}", "--yes"],
+                    vec!["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"],
+                ),
+                other => (
+                    other,
+                    vec!["--henosis-discuss", "{prompt}"],
+                    vec!["--henosis-execute", "{prompt}"],
+                    vec!["HOME", "USERPROFILE", "XDG_CONFIG_HOME"],
+                ),
+            },
+        };
+        let render = |args: &[&str]| {
+            args.iter()
+                .map(|arg| format!("\"{arg}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // JSON and TOML basic strings share the escaping emitted here, and
+        // serde_json is already part of the CLI's public response surface.
+        let binary = serde_json::to_string(binary).expect("string serialization cannot fail");
+        let inherit_env = render(&inherit_env);
+        format!(
+            "[agents.executor]\n\
+             {executor_type_key} = \"Command\"\n\
+             binary = {binary}\n\
+             discuss_args = [{}]\n\
+             execute_args = [{}]\n\
+             max_runtime_secs = 600\n\
+             env_clear = true\n\
+             inherit_env = [{inherit_env}]\n\
+             # Add provider credential variable names to inherit_env only when\n\
+             # the harness cannot load credentials from its own protected config.\n\
+             # progress_format = \"jsonl\"   # if this harness streams JSON lines\n",
+            render(&discuss),
+            render(&execute),
+        )
+    }
+}
+
+/// Resolve the harness selection from the environment.
+///
+/// Used by both `henosis init --quick` and the automatic boot-time
+/// initialization path, so a `HENOSIS_HARNESS` set for a `curl | sh` install
+/// applies however initialization is reached.
+pub fn harness_from_env() -> Harness {
+    std::env::var(HARNESS_ENV)
+        .ok()
+        .as_deref()
+        .map(Harness::parse)
+        .unwrap_or_default()
+}
+
+/// Build the source-compatible quick-init command selected by the environment.
+pub fn quick_init_command_from_env() -> Command {
+    quick_init_command(harness_from_env())
+}
+
+/// Keep the established unit-style quick command for the built-in harness.
+fn quick_init_command(harness: Harness) -> Command {
+    match harness {
+        Harness::Synapse => Command::Init(InitMode::Quick),
+        external => Command::InitWithHarness(external),
+    }
+}
+
 /// Parses the `init` subcommand and requires exactly one safe non-interactive flag.
+///
+/// `--harness` may accompany `--quick`. When it is absent the `HENOSIS_HARNESS`
+/// environment variable is consulted so `curl | sh` installs can select a
+/// harness without an interactive prompt.
 fn parse_init(arguments: &[String]) -> Result<Command, CliError> {
+    let default_harness = harness_from_env();
     match arguments {
         [] => Err(CliError::InitModeRequired),
-        [flag] if flag == "--quick" => Ok(Command::Init(InitMode::Quick)),
+        [flag] if flag == "--quick" => Ok(quick_init_command(default_harness)),
         [flag] if flag == "--production" => Ok(Command::Init(InitMode::Production)),
+        [flag, harness_flag, value] if flag == "--quick" && harness_flag == "--harness" => {
+            Ok(quick_init_command(Harness::parse(value)))
+        }
         _ => Err(CliError::Usage {
-            message: "usage: henosis init --quick | --production".to_string(),
+            message:
+                "usage: henosis init --quick [--harness <name|path>] | henosis init --production"
+                    .to_string(),
         }),
     }
 }
@@ -1121,16 +1292,39 @@ fn control_operation_name(request: &ControlRequest) -> &'static str {
 }
 
 /// Creates the local operator home, protected data directory, and bootable private configuration.
-fn initialize_quick(paths: &CliPaths) -> Result<InitResult, CliError> {
+fn initialize_quick(paths: &CliPaths, harness: &Harness) -> Result<InitResult, CliError> {
+    validate_harness_config_value(harness)?;
     ensure_private_directory(&paths.home)?;
     ensure_private_database_directory(&paths.data)?;
-    create_private_config(paths)?;
+    create_private_config(paths, harness)?;
+    create_agent_roster(paths, harness)?;
+    let report = doctor(paths)?;
+    if !report.local_ready {
+        return Err(CliError::QuickConfigurationIncomplete {
+            next_step: report.next_step,
+        });
+    }
     Ok(InitResult {
         mode: InitMode::Quick,
         config: paths.config.clone(),
         data: paths.data.clone(),
-        next_step: "local configuration is ready; run `henosis serve`".to_string(),
+        next_step: "local configuration is ready; run `henosis serve`; room agents remain disabled until managed-room authorities are configured".to_string(),
     })
+}
+
+/// Rejects harness names that cannot be represented as one environment-file value.
+fn validate_harness_config_value(harness: &Harness) -> Result<(), CliError> {
+    let value = harness.config_value();
+    if value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err(CliError::Usage {
+            message: "harness name or path must be a non-empty single-line value".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Refuses production initialization unless existing local state names both required authorities.
@@ -1174,10 +1368,15 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
             "SYNTHEOS_LOCAL_POLICY (remove this local-only setting for production)".to_string(),
         );
     }
+    let room_mode = effective_room_mode(&values);
+    if room_mode != Some(RoomMode::Required) {
+        missing_production_keys
+            .push("HENOSIS_ROOM_MODE (must be required for production)".to_string());
+    }
     let local_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
-        && local_configuration_ready(&values);
+        && local_configuration_ready(&values, room_mode);
     let production_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
@@ -1189,12 +1388,12 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
         "run `henosis init --quick` to create only missing local paths".to_string()
     } else if !local_ready {
         format!(
-            "repair the required local identity, JWT, and database values in {}",
+            "repair the required local identity, JWT, room mode, and database values in {}",
             paths.config.display()
         )
     } else if !production_ready {
         format!(
-            "set the required PostgreSQL, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, then run `henosis init --production`",
+            "set the required PostgreSQL, managed-room, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, select HENOSIS_ROOM_MODE=required, then run `henosis init --production`",
             paths.config.display()
         )
     } else {
@@ -1236,12 +1435,12 @@ fn ensure_private_directory(path: &Path) -> Result<(), CliError> {
 }
 
 /// Creates configuration exactly once while preserving every byte of an existing regular file.
-fn create_private_config(paths: &CliPaths) -> Result<(), CliError> {
+fn create_private_config(paths: &CliPaths, harness: &Harness) -> Result<(), CliError> {
     if inspect_path(&paths.config)? == LocalPathState::File {
         let file = open_regular_config(&paths.config)?;
         return set_unix_file_mode(&file, &paths.config, 0o600);
     }
-    let configuration = render_quick_config(paths)?;
+    let configuration = render_quick_config(paths, harness)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1276,8 +1475,81 @@ fn create_private_config(paths: &CliPaths) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Writes the starter agent roster naming the selected harness.
+///
+/// Never overwrites an existing roster: the operator's edits to their own agent
+/// definitions outrank a regenerated template, and `init --quick` is documented
+/// as idempotent.
+fn create_agent_roster(paths: &CliPaths, harness: &Harness) -> Result<(), CliError> {
+    let roster_path = paths.home.join(AGENTS_FILE);
+    if inspect_path(&roster_path)? != LocalPathState::Missing {
+        return Ok(());
+    }
+    let roster = render_agent_roster(harness);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&roster_path) {
+        Ok(mut file) => {
+            file.write_all(roster.as_bytes())
+                .map_err(|source| CliError::Filesystem {
+                    path: roster_path.clone(),
+                    source,
+                })?;
+            file.sync_all().map_err(|source| CliError::Filesystem {
+                path: roster_path.clone(),
+                source,
+            })?;
+            set_unix_file_mode(&file, &roster_path, 0o600)?;
+            Ok(())
+        }
+        // A roster that appeared between the check and the create is still the
+        // operator's, so leave it alone rather than racing it.
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(CliError::Filesystem {
+            path: roster_path,
+            source,
+        }),
+    }
+}
+
+/// Renders the starter roster body for one harness.
+fn render_agent_roster(harness: &Harness) -> String {
+    format!(
+        "# Henosis agent roster.\n\
+         #\n\
+         # Henosis is not tied to one agent implementation. `type` selects the\n\
+         # harness: \"Synapse\" (built in), \"ClaudeCode\", or \"Command\" for any\n\
+         # external agent CLI. A Command harness receives the prompt as a single\n\
+         # argument wherever {{prompt}} appears, and answers on stdout.\n\
+         #\n\
+         # Re-run `henosis init --quick --harness <name|path>` in a fresh home to\n\
+         # regenerate this file for a different harness. Known presets: synapse,\n\
+         # claude-code, aider. Other binaries implement --henosis-discuss and\n\
+         # --henosis-execute as separate adapter modes.\n\
+         \n\
+         [[agents]]\n\
+         name = \"Assistant\"\n\
+         username = \"assistant\"\n\
+         base_chance = 1.0\n\
+         system_prompt = \"You are a helpful engineering agent.\"\n\
+         \n\
+         {}",
+        harness.executor_toml()
+    )
+}
+
 /// Renders generated identities, local JWT material, and absolute persistent database paths.
-fn render_quick_config(paths: &CliPaths) -> Result<String, CliError> {
+fn render_quick_config(paths: &CliPaths, harness: &Harness) -> Result<String, CliError> {
+    validate_harness_config_value(harness)?;
+    let home = fs::canonicalize(&paths.home).map_err(|source| CliError::Filesystem {
+        path: paths.home.clone(),
+        source,
+    })?;
     let data = fs::canonicalize(&paths.data).map_err(|source| CliError::Filesystem {
         path: paths.data.clone(),
         source,
@@ -1285,14 +1557,19 @@ fn render_quick_config(paths: &CliPaths) -> Result<String, CliError> {
     let tenant = TenantId::new();
     let principal = PrincipalId::new();
     let jwt_secret = hex::encode(rand::random::<[u8; 32]>());
+    let roster_path = config_path_value("HENOSIS_RIFT_BRIDGE_CONFIG", &home.join(AGENTS_FILE))?;
     let mut configuration = format!(
         "# Henosis private local operator configuration.\n\
          # This file contains local authority material. Do not share it.\n\
          SYNTHEOS_ADDR=127.0.0.1:8088\n\
          SYNTHEOS_LOCAL_POLICY=1\n\
+         HENOSIS_ROOM_MODE={DISABLED_MODE}\n\
          SYNTHEOS_PLUTUS_OPERATOR_TENANT={tenant}\n\
          SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL={principal}\n\
-         SYNTHEOS_OPERATOR_JWT_SECRET={jwt_secret}\n"
+         SYNTHEOS_OPERATOR_JWT_SECRET={jwt_secret}\n\
+         HENOSIS_HARNESS={harness}\n\
+         HENOSIS_RIFT_BRIDGE_CONFIG={roster_path}\n",
+        harness = harness.config_value()
     );
     for &(key, filename) in LOCAL_DATABASES {
         let path = config_path_value(key, &data.join(filename))?;
@@ -1555,8 +1832,24 @@ fn config_value_present(values: &BTreeMap<String, String>, key: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Resolves room mode with the same process-environment precedence used by server startup.
+fn effective_room_mode(values: &BTreeMap<String, String>) -> Option<RoomMode> {
+    let mode = match env::var("HENOSIS_ROOM_MODE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => values
+            .get("HENOSIS_ROOM_MODE")
+            .cloned()
+            .unwrap_or_else(|| REQUIRED_MODE.to_string()),
+        Err(env::VarError::NotUnicode(_)) => return None,
+    };
+    parse_room_mode(&mode).ok()
+}
+
 /// Validates every generated local value needed for the private runtime to boot.
-fn local_configuration_ready(values: &BTreeMap<String, String>) -> bool {
+fn local_configuration_ready(
+    values: &BTreeMap<String, String>,
+    room_mode: Option<RoomMode>,
+) -> bool {
     if values
         .get("SYNTHEOS_LOCAL_POLICY")
         .is_none_or(|value| value != "1")
@@ -1579,7 +1872,8 @@ fn local_configuration_ready(values: &BTreeMap<String, String>) -> bool {
     let local_token_ready = values
         .get(LOCAL_TOKEN_KEY)
         .is_some_and(|value| Path::new(value).is_absolute());
-    jwt_ready
+    room_mode == Some(RoomMode::Disabled)
+        && jwt_ready
         && local_token_ready
         && LOCAL_DATABASES.iter().all(|(key, _)| {
             values
@@ -1997,12 +2291,144 @@ mod tests {
         assert!(Command::parse(&["status".into(), ";".into(), "whoami".into()]).is_err());
     }
 
+    /// An explicit harness flag selects an external harness.
+    #[test]
+    fn harness_flag_selects_external_harness() {
+        assert_eq!(
+            Command::parse(&[
+                "init".into(),
+                "--quick".into(),
+                "--harness".into(),
+                "aider".into()
+            ])
+            .expect("parse harness init"),
+            Command::InitWithHarness(Harness::External("aider".to_string()))
+        );
+    }
+
+    /// An unknown harness name is accepted as a binary rather than rejected.
+    #[test]
+    fn unknown_harness_is_treated_as_a_binary() {
+        assert_eq!(
+            Harness::parse("/opt/bin/my-agent"),
+            Harness::External("/opt/bin/my-agent".to_string())
+        );
+    }
+
+    /// The built-in harness stays the default.
+    #[test]
+    fn synapse_is_the_default_harness() {
+        assert_eq!(Harness::parse("synapse"), Harness::Synapse);
+        assert_eq!(Harness::parse(""), Harness::Synapse);
+        assert_eq!(Harness::default(), Harness::Synapse);
+    }
+
+    /// Presets render a Command executor with a whole-element prompt placeholder.
+    #[test]
+    fn external_preset_renders_command_executor() {
+        let toml = Harness::External("aider".to_string()).executor_toml();
+        assert!(toml.contains("type = \"Command\""));
+        assert!(toml.contains("binary = \"aider\""));
+        assert!(toml.contains("\"{prompt}\""));
+        assert!(toml.contains("inherit_env = [\"HOME\""));
+        assert!(!toml.contains("ANTHROPIC_API_KEY"));
+    }
+
+    /// The Claude Code preset uses the dedicated executor, not the generic one.
+    #[test]
+    fn claude_code_preset_uses_its_own_executor() {
+        let toml = Harness::External("claude-code".to_string()).executor_toml();
+        assert!(toml.contains("type = \"ClaudeCode\""));
+    }
+
+    /// Quick initialization writes a roster naming the selected harness.
+    #[test]
+    fn quick_init_writes_roster_for_selected_harness() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths, &Harness::External("codex".to_string()))
+            .expect("initialize with harness");
+
+        let roster = fs::read_to_string(home.join(AGENTS_FILE)).expect("read roster");
+        assert!(roster.contains("type = \"Command\""));
+        assert!(roster.contains("binary = \"codex\""));
+        assert!(roster.contains("--henosis-discuss"));
+        assert!(roster.contains("--henosis-execute"));
+
+        let values = read_config_values(&paths.config).expect("read generated configuration");
+        assert_eq!(values["HENOSIS_HARNESS"], "codex");
+        let roster_path = fs::canonicalize(home.join(AGENTS_FILE)).expect("canonical roster");
+        assert_eq!(
+            PathBuf::from(&values["HENOSIS_RIFT_BRIDGE_CONFIG"]),
+            roster_path
+        );
+        let managed = henosis_rift_bridge::config::BridgeConfig::load_for_managed_room(
+            &roster_path,
+            "http://127.0.0.1:3200".to_string(),
+            "ws://127.0.0.1:3200/ws".to_string(),
+            "j".repeat(32),
+            "b".repeat(32),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        )
+        .expect("generated roster is consumable by managed runtime");
+        assert_eq!(managed.agents.len(), 1);
+    }
+
+    /// A harness value cannot inject another line into the private configuration.
+    #[test]
+    fn quick_init_rejects_multiline_harness_before_writing_state() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        let error = initialize_quick(
+            &paths,
+            &Harness::External("adapter\nHENOSIS_ROOM_MODE=required".to_string()),
+        )
+        .expect_err("multiline harness must be rejected");
+
+        assert!(matches!(error, CliError::Usage { .. }));
+        assert_eq!(
+            inspect_path(&paths.config).expect("inspect config"),
+            LocalPathState::Missing
+        );
+        assert_eq!(
+            inspect_path(&paths.home).expect("inspect home"),
+            LocalPathState::Missing
+        );
+    }
+
+    /// The established quick-init mode remains Copy and source-compatible.
+    #[test]
+    fn quick_init_mode_remains_copy() {
+        let first = InitMode::Quick;
+        let second = first;
+        assert_eq!(first, second);
+    }
+
+    /// An existing roster is never overwritten by a repeat initialization.
+    #[test]
+    fn quick_init_preserves_an_existing_roster() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths, &Harness::Synapse).expect("first initialization");
+
+        let roster_path = home.join(AGENTS_FILE);
+        fs::write(&roster_path, "# operator edited\n").expect("edit roster");
+        initialize_quick(&paths, &Harness::External("aider".to_string()))
+            .expect("second initialization");
+
+        assert_eq!(
+            fs::read_to_string(&roster_path).expect("read roster"),
+            "# operator edited\n"
+        );
+    }
+
     /// Generates bootable identities, a strong JWT secret, and absolute local database paths.
     #[test]
     fn quick_init_generates_bootable_private_configuration() {
         let home = temporary_home();
         let paths = CliPaths::from_home(&home);
-        initialize_quick(&paths).expect("quick initialization");
+        initialize_quick(&paths, &Harness::Synapse).expect("quick initialization");
         let values = read_config_values(&paths.config).expect("read generated configuration");
 
         let tenant = values["SYNTHEOS_PLUTUS_OPERATOR_TENANT"]
@@ -2018,6 +2444,7 @@ mod tests {
             .expect("generated JWT secret is hex");
         assert!(jwt.len() >= 32);
         assert!(!values.contains_key("SYNTHEOS_OPERATOR_PASSWORD"));
+        assert_eq!(values["HENOSIS_ROOM_MODE"], DISABLED_MODE);
 
         let canonical_data = fs::canonicalize(&paths.data).expect("canonical data path");
         assert_eq!(
@@ -2044,7 +2471,7 @@ mod tests {
         remove_temporary_home(&home);
     }
 
-    /// Creates the same local bootstrap state twice without overwriting any configuration byte.
+    /// Preserves every byte of a complete existing local configuration across repeated initialization.
     #[test]
     fn quick_init_is_idempotent() {
         let home = temporary_home();
@@ -2053,8 +2480,9 @@ mod tests {
         let first = runner
             .run(Command::Init(InitMode::Quick))
             .expect("first initialization");
-        let preserved = b"OPERATOR_NOTE=preserve-me\nBINARYISH=\0tail\n";
-        fs::write(&paths.config, preserved).expect("modify configuration");
+        let mut preserved = fs::read(&paths.config).expect("read generated configuration");
+        preserved.extend_from_slice(b"OPERATOR_NOTE=preserve-me\n");
+        fs::write(&paths.config, &preserved).expect("extend configuration");
         #[cfg(unix)]
         set_unix_mode(&paths.config, 0o644).expect("make permissions repairable");
         let before = fs::read(&paths.config).expect("read first configuration");
@@ -2079,6 +2507,34 @@ mod tests {
                 0o600
             );
         }
+        remove_temporary_home(&home);
+    }
+
+    /// Preserves a legacy local file but refuses to call it ready when room mode is absent.
+    #[test]
+    fn quick_init_rejects_incomplete_existing_configuration_without_overwrite() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths, &Harness::Synapse).expect("initial quick configuration");
+        let legacy = fs::read_to_string(&paths.config)
+            .expect("read generated configuration")
+            .lines()
+            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&paths.config, &legacy).expect("write legacy configuration");
+
+        let error = initialize_quick(&paths, &Harness::Synapse)
+            .expect_err("legacy configuration must not claim ready");
+
+        assert!(matches!(
+            error,
+            CliError::QuickConfigurationIncomplete { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(&paths.config).expect("read preserved legacy configuration"),
+            legacy
+        );
         remove_temporary_home(&home);
     }
 
@@ -2265,6 +2721,10 @@ mod tests {
         assert!(missing.iter().any(|key| key == "SYNTHEOS_PLUTUS_DB"));
         assert!(missing.iter().any(|key| key == "PHYLAXD_URL"));
         assert!(missing.iter().any(|key| key == "HENOSIS_WITNESS_URL"));
+        assert!(missing.iter().any(|key| key == "HENOSIS_RIFT_JWT_SECRET"));
+        assert!(missing
+            .iter()
+            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
         assert!(missing
             .iter()
             .any(|key| key.starts_with("SYNTHEOS_LOCAL_POLICY")));
@@ -2279,13 +2739,16 @@ mod tests {
     fn production_init_accepts_complete_authority_configuration() {
         let home = temporary_home();
         let paths = CliPaths::from_home(&home);
-        initialize_quick(&paths).expect("quick initialization");
+        initialize_quick(&paths, &Harness::Synapse).expect("quick initialization");
         let generated = fs::read_to_string(&paths.config).expect("read generated configuration");
         let mut production = generated
             .lines()
-            .filter(|line| *line != "SYNTHEOS_LOCAL_POLICY=1")
+            .filter(|line| {
+                *line != "SYNTHEOS_LOCAL_POLICY=1" && *line != "HENOSIS_ROOM_MODE=disabled"
+            })
             .map(|line| format!("{line}\n"))
             .collect::<String>();
+        production.push_str("HENOSIS_ROOM_MODE=required\n");
         for key in PRODUCTION_REQUIRED_KEYS {
             if !production
                 .lines()
@@ -2299,6 +2762,40 @@ mod tests {
         let result = initialize_production(&paths).expect("production initialization");
 
         assert_eq!(result.mode, InitMode::Production);
+        remove_temporary_home(&home);
+    }
+
+    /// Refuses to call local configuration ready when its room mode is absent or invalid.
+    #[test]
+    fn doctor_requires_explicit_disabled_room_mode_for_local_readiness() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths, &Harness::Synapse).expect("quick initialization");
+        let generated = fs::read_to_string(&paths.config).expect("read generated configuration");
+
+        let without_room_mode = generated
+            .lines()
+            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&paths.config, without_room_mode).expect("remove room mode");
+        assert!(
+            !doctor(&paths)
+                .expect("doctor without room mode")
+                .local_ready
+        );
+
+        fs::write(
+            &paths.config,
+            generated.replace("HENOSIS_ROOM_MODE=disabled", "HENOSIS_ROOM_MODE=invalid"),
+        )
+        .expect("write invalid room mode");
+        let report = doctor(&paths).expect("doctor with invalid room mode");
+        assert!(!report.local_ready);
+        assert!(report
+            .missing_production_keys
+            .iter()
+            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
         remove_temporary_home(&home);
     }
 

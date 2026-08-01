@@ -61,7 +61,7 @@ token = "your-foundry-token"
 model = "claude-sonnet-4-6"
 max_tokens = 4096
 
-# Agent using Synapse with Claude Max provider (text-only in shared bridge sessions)
+# Agent using Synapse with the Anthropic network provider
 [[agents]]
 name = "Builder"
 username = "agent-builder"
@@ -70,11 +70,23 @@ system_prompt = "You are a builder. You write code, run tests, and ship features
 
 [agents.executor]
 type = "Synapse"
-provider = "claude-max"
+provider = "anthropic"
+api_key = "replace-with-an-anthropic-api-key"
 model = "claude-sonnet-4-6"
 max_tokens = 4096
 max_turns = 4
-cwd = "/path/to/agent/workspace"
+
+# Generic external harnesses use type = "Command" with distinct discussion and
+# execution argument templates. They start with an empty environment by default;
+# inherit only the names the harness actually needs.
+# [agents.executor]
+# type = "Command"
+# binary = "/opt/bin/my-agent"
+# discuss_args = ["--henosis-discuss", "{prompt}"]
+# execute_args = ["--henosis-execute", "{prompt}"]
+# max_runtime_secs = 600
+# env_clear = true
+# inherit_env = ["HOME", "XDG_CONFIG_HOME"]
 
 # --- Execution mode -------------------------------------------------------
 

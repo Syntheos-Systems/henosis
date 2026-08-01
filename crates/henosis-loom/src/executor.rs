@@ -7,7 +7,7 @@
 //! graph can run end-to-end.
 
 use async_trait::async_trait;
-use syntheos_contracts::RunId;
+use syntheos_contracts::{PrincipalId, RunId, TenantId};
 
 use crate::model::StepType;
 
@@ -16,6 +16,10 @@ use crate::model::StepType;
 pub struct StepContext<'a> {
     /// The run the step belongs to.
     pub run_id: RunId,
+    /// The tenant that owns the run, resolved by Loom rather than step input.
+    pub tenant: TenantId,
+    /// The principal that owns the run, resolved by Loom rather than step input.
+    pub principal: PrincipalId,
     /// The step's run-internal id.
     pub step_id: i64,
     /// The step name.
@@ -157,7 +161,12 @@ pub trait HephaestusDispatch: Send + Sync {
     /// `StepContext::config` (config keys win). The dispatch implementation extracts
     /// the `"input"` string key as the agent task prompt; other keys map to
     /// `CreateTaskBody` fields (`agent`, `project`, `system`, etc.).
-    async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn run(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
 }
 
 /// Inline executor for [`StepType::Hephaestus`] steps.
@@ -209,7 +218,17 @@ impl<D: HephaestusDispatch + 'static> StepExecutor for HephaestusStepExecutor<D>
                 payload.insert(k.clone(), v.clone());
             }
         }
-        self.dispatch.run(serde_json::Value::Object(payload)).await
+        // Scope is supplied out of band from the owning run. Remove payload aliases so a
+        // workflow definition cannot create two conflicting notions of task authority.
+        payload.remove("tenant_id");
+        payload.remove("principal_id");
+        self.dispatch
+            .run(
+                ctx.tenant,
+                ctx.principal,
+                serde_json::Value::Object(payload),
+            )
+            .await
     }
 }
 
@@ -359,7 +378,12 @@ mod tests {
     /// Implements a fixture Hephaestus dispatch for executor tests.
     impl HephaestusDispatch for FakeDispatch {
         /// Echo the input JSON, adding `"dispatched": true` to confirm this ran.
-        async fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn run(
+            &self,
+            tenant: TenantId,
+            principal: PrincipalId,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             let mut out = match input {
                 serde_json::Value::Object(m) => m,
                 other => {
@@ -368,6 +392,8 @@ mod tests {
                     m
                 }
             };
+            out.insert("tenant_id".to_string(), serde_json::json!(tenant));
+            out.insert("principal_id".to_string(), serde_json::json!(principal));
             out.insert("dispatched".to_string(), serde_json::Value::Bool(true));
             Ok(serde_json::Value::Object(out))
         }
@@ -378,9 +404,18 @@ mod tests {
     async fn hephaestus_step_executor_runs_and_records_output() {
         let exec = HephaestusStepExecutor::new(FakeDispatch);
         let input = serde_json::json!({"task": "summarise"});
-        let config = serde_json::json!({"input": "please summarise", "agent": "test-agent"});
+        let config = serde_json::json!({
+            "input": "please summarise",
+            "agent": "test-agent",
+            "tenant_id": TenantId::new(),
+            "principal_id": PrincipalId::new()
+        });
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
         let ctx = StepContext {
             run_id: RunId::new(),
+            tenant,
+            principal,
             step_id: 1,
             name: "call-hephaestus",
             step_type: StepType::Hephaestus,
@@ -397,6 +432,8 @@ mod tests {
         assert_eq!(result["input"], "please summarise");
         assert_eq!(result["agent"], "test-agent");
         assert_eq!(result["task"], "summarise");
+        assert_eq!(result["tenant_id"], serde_json::json!(tenant));
+        assert_eq!(result["principal_id"], serde_json::json!(principal));
         assert_eq!(result["dispatched"], true);
     }
 
@@ -416,6 +453,8 @@ mod tests {
         let transform_config = serde_json::from_str(r#"{"mapping": {"out.v": "src.v"}}"#).unwrap();
         let transform_ctx = StepContext {
             run_id: RunId::new(),
+            tenant: TenantId::new(),
+            principal: PrincipalId::new(),
             step_id: 1,
             name: "t",
             step_type: StepType::Transform,
@@ -430,6 +469,8 @@ mod tests {
         let heph_config = serde_json::json!({});
         let heph_ctx = StepContext {
             run_id: RunId::new(),
+            tenant: TenantId::new(),
+            principal: PrincipalId::new(),
             step_id: 2,
             name: "h",
             step_type: StepType::Hephaestus,
@@ -449,6 +490,8 @@ mod tests {
         let input = serde_json::json!({"src": {"v": 42}, "name": "x"});
         let ctx = |config: &'static str| StepContext {
             run_id: RunId::new(),
+            tenant: TenantId::new(),
+            principal: PrincipalId::new(),
             step_id: 1,
             name: "t",
             step_type: StepType::Transform,

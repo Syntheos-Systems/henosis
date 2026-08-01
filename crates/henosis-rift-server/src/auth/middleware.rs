@@ -1,4 +1,7 @@
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{
+    extract::{FromRequestParts, OptionalFromRequestParts},
+    http::request::Parts,
+};
 use uuid::Uuid;
 
 use super::jwt;
@@ -43,5 +46,31 @@ where
             user_id: claims.sub,
             username: claims.username,
         })
+    }
+}
+
+/// Extracts Rift user identity when present, without rejecting when it is absent.
+///
+/// Used by routes that accept more than one kind of caller, such as the bridge
+/// status route, which admits either the bridge daemon's shared secret or a
+/// human controller. A missing, malformed, or expired token yields `None`; the
+/// route is then responsible for refusing the request through its other path.
+impl<S> OptionalFromRequestParts<S> for AuthUser
+where
+    S: Send + Sync,
+{
+    /// Optional extraction never rejects on its own.
+    type Rejection = AppError;
+
+    /// Returns the authenticated user, or `None` when no valid bearer token is present.
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(
+            <AuthUser as FromRequestParts<S>>::from_request_parts(parts, state)
+                .await
+                .ok(),
+        )
     }
 }
