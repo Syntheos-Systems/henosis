@@ -444,8 +444,6 @@ pub async fn logout(session: &RiftSession) {
 #[cfg(test)]
 /// Pure native client tests that do not require a running Rift service.
 mod tests {
-    //! Pure native client tests that do not require a running Rift service.
-
     use super::*;
 
     /// Accept and normalize supported service-root URLs.
@@ -485,7 +483,7 @@ mod tests {
             active_work: None,
             pending_approvals: 0,
         };
-        let mut rooms = vec![room("z", "Zulu"), room("b", "alpha"), room("a", "Alpha")];
+        let mut rooms = [room("z", "Zulu"), room("b", "alpha"), room("a", "Alpha")];
 
         rooms.sort_by(compare_rooms);
 
