@@ -283,7 +283,10 @@ impl UpdateRoomAgentRoster {
         for seat in &self.seats {
             seat.validate()?;
             if !seat_ids.insert(seat.seat_id) {
-                return Err(validation_error("duplicate_seat", "seat IDs must be unique"));
+                return Err(validation_error(
+                    "duplicate_seat",
+                    "seat IDs must be unique",
+                ));
             }
             if !agent_ids.insert(seat.agent_user_id) {
                 return Err(validation_error(
@@ -481,10 +484,7 @@ fn validate_identifier(
 }
 
 /// Construct one stable validation failure.
-fn validation_error(
-    code: &'static str,
-    message: impl Into<String>,
-) -> AgentControlValidationError {
+fn validation_error(code: &'static str, message: impl Into<String>) -> AgentControlValidationError {
     AgentControlValidationError {
         code,
         message: message.into(),
@@ -514,10 +514,22 @@ mod tests {
     /// Apply states use stable snake-case values on the wire.
     #[test]
     fn apply_states_serialize_stably() {
-        assert_eq!(serde_json::to_string(&ApplyState::Idle).unwrap(), "\"idle\"");
-        assert_eq!(serde_json::to_string(&ApplyState::Pending).unwrap(), "\"pending\"");
-        assert_eq!(serde_json::to_string(&ApplyState::Active).unwrap(), "\"active\"");
-        assert_eq!(serde_json::to_string(&ApplyState::Failed).unwrap(), "\"failed\"");
+        assert_eq!(
+            serde_json::to_string(&ApplyState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApplyState::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApplyState::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApplyState::Failed).unwrap(),
+            "\"failed\""
+        );
     }
 
     /// Whole-roster validation rejects excessive size and duplicate identities.
@@ -525,7 +537,9 @@ mod tests {
     fn roster_bounds_and_uniqueness_are_enforced() {
         let too_many = UpdateRoomAgentRoster {
             expected_revision: None,
-            seats: (0..=MAX_AGENT_SEATS).map(|index| seat(index as i32)).collect(),
+            seats: (0..=MAX_AGENT_SEATS)
+                .map(|index| seat(index as i32))
+                .collect(),
         };
         assert_eq!(too_many.validate().unwrap_err().code, "too_many_seats");
 
@@ -589,7 +603,10 @@ mod tests {
             required: true,
             control: CapabilitySettingControl::Select { options: vec![] },
         };
-        assert_eq!(empty.validate_descriptor().unwrap_err().code, "empty_setting_options");
+        assert_eq!(
+            empty.validate_descriptor().unwrap_err().code,
+            "empty_setting_options"
+        );
 
         let invalid_range = CapabilitySetting {
             id: "turns".to_string(),

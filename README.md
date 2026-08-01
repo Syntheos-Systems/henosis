@@ -119,7 +119,7 @@ Model providers sit behind a shared interface. Capability authorization stays on
 | Local | Loopback-only, one operator, SQLite state, embedded compatibility policy, and restart-scoped quota counters. The signed compatibility room authorizes `henosis.probe` only. |
 | Production | Managed PostgreSQL, TLS and authenticated ingress, protected storage, backups, source-aware login limits, an independent audit witness, and private `phylaxd` access. |
 
-The full Pistis service is private and does not ship in this repository. Production capability requests fail closed until the deployment supplies trusted room state from Pistis. See [SECURITY.md](SECURITY.md) and [`containers/production.env.example`](containers/production.env.example) for the full contract.
+The full Pistis service is private and does not ship in this repository. Production capability requests fail closed until the deployment supplies trusted room state from Pistis. See [SECURITY.md](SECURITY.md), [`containers/production.env.example`](containers/production.env.example), and the [`containers/agents.production.example.toml`](containers/agents.production.example.toml) starter roster for the full contract.
 
 Run local mode with Compose:
 

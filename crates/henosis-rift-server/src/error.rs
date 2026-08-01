@@ -97,11 +97,7 @@ impl IntoResponse for AppError {
     /// Converts an application error into its status and JSON error body.
     fn into_response(self) -> Response {
         let (status, code, message) = match &self {
-            AppError::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                self.to_string(),
-            ),
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", self.to_string()),
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", self.to_string()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
@@ -149,7 +145,11 @@ mod tests {
     #[test]
     fn managed_error_codes_are_stable() {
         let cases = [
-            (AppError::revision_conflict(Some(3)), StatusCode::CONFLICT, "revision_conflict"),
+            (
+                AppError::revision_conflict(Some(3)),
+                StatusCode::CONFLICT,
+                "revision_conflict",
+            ),
             (
                 AppError::capability_unavailable("model unavailable"),
                 StatusCode::UNPROCESSABLE_ENTITY,

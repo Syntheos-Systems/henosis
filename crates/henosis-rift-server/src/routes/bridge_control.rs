@@ -1,9 +1,9 @@
 //! Human and daemon bridge-state routes with separate authentication boundaries.
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::HeaderMap,
-    Json,
 };
 use sqlx::PgPool;
 use uuid::Uuid;

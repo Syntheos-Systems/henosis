@@ -313,7 +313,12 @@ mod tests {
         changed.seat.settings = json!({"reasoning_effort": "high"});
         changed.seat.credential_binding_id = Some(Uuid::new_v4());
         assert!(
-            authorize_roster_change(Some(actor(owner, false)), &[], &[existing.clone()]).is_ok()
+            authorize_roster_change(
+                Some(actor(owner, false)),
+                &[],
+                std::slice::from_ref(&existing)
+            )
+            .is_ok()
         );
         assert!(
             authorize_roster_change(Some(actor(owner, false)), &[existing], &[changed]).is_ok()
@@ -330,8 +335,12 @@ mod tests {
         disabled.seat.enabled = false;
         disabled.seat.position = 2;
         assert!(
-            authorize_roster_change(Some(actor(manager, true)), &[existing.clone()], &[disabled])
-                .is_ok()
+            authorize_roster_change(
+                Some(actor(manager, true)),
+                std::slice::from_ref(&existing),
+                &[disabled]
+            )
+            .is_ok()
         );
         assert!(authorize_roster_change(Some(actor(manager, true)), &[existing], &[]).is_ok());
     }

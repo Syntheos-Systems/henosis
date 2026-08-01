@@ -187,30 +187,6 @@ impl CodexExecutor {
     }
 }
 
-#[cfg(test)]
-/// Command-assembly tests for treating brokered prompt text as positional data.
-mod tests {
-    use super::*;
-
-    /// A flag-shaped prompt follows the explicit Codex option terminator.
-    #[test]
-    fn mediated_arguments_terminate_options_before_prompt() {
-        let executor =
-            CodexExecutor::new(PathBuf::from("/opt/codex"), "gpt-5.6-sol".to_string(), None);
-
-        let arguments = executor.arguments(
-            CodexSandbox::WorkspaceWrite,
-            Some(Path::new("/workspace")),
-            Some("--dangerously-bypass-approvals-and-sandbox"),
-        );
-
-        assert_eq!(
-            &arguments[arguments.len() - 2..],
-            ["--", "--dangerously-bypass-approvals-and-sandbox"]
-        );
-    }
-}
-
 /// Return the final completed agent-message text from a Codex JSONL stream.
 fn final_agent_message(stdout: &[u8]) -> Result<Option<String>> {
     let output = std::str::from_utf8(stdout).context("Codex JSONL output was not UTF-8")?;
@@ -351,5 +327,29 @@ impl AgentExecutor for CodexExecutor {
                 self.binary.display()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+/// Command-assembly tests for treating brokered prompt text as positional data.
+mod tests {
+    use super::*;
+
+    /// A flag-shaped prompt follows the explicit Codex option terminator.
+    #[test]
+    fn mediated_arguments_terminate_options_before_prompt() {
+        let executor =
+            CodexExecutor::new(PathBuf::from("/opt/codex"), "gpt-5.6-sol".to_string(), None);
+
+        let arguments = executor.arguments(
+            CodexSandbox::WorkspaceWrite,
+            Some(Path::new("/workspace")),
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+        );
+
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            ["--", "--dangerously-bypass-approvals-and-sandbox"]
+        );
     }
 }

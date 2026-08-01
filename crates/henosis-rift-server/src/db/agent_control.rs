@@ -77,19 +77,35 @@ pub async fn list_owned_agents(
     .await
 }
 
+/// Raw apply-status row selected from `bridge_server_state`.
+type BridgeStateRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Raw seat row selected from `room_agent_seats` joined with agent ownership.
+type SeatRow = (
+    Uuid,
+    Uuid,
+    String,
+    String,
+    serde_json::Value,
+    Option<Uuid>,
+    bool,
+    i32,
+    Option<Uuid>,
+);
+
 /// Read the latest desired room roster together with durable bridge apply status.
 pub async fn read_room_agent_roster(
     pool: &PgPool,
     server_id: Uuid,
 ) -> Result<RoomAgentRoster, sqlx::Error> {
-    let state: Option<(
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let state: Option<BridgeStateRow> = sqlx::query_as(
         r#"SELECT desired_revision, active_revision, last_good_revision,
                   apply_state, apply_error_code, apply_error_message
            FROM bridge_server_state
@@ -143,17 +159,7 @@ pub async fn read_room_agent_revision(
     server_id: Uuid,
     revision: i64,
 ) -> Result<Vec<AgentSeatView>, sqlx::Error> {
-    let rows: Vec<(
-        Uuid,
-        Uuid,
-        String,
-        String,
-        serde_json::Value,
-        Option<Uuid>,
-        bool,
-        i32,
-        Option<Uuid>,
-    )> = sqlx::query_as(
+    let rows: Vec<SeatRow> = sqlx::query_as(
         r#"SELECT seat.seat_id, seat.agent_user_id, seat.harness_id,
                   seat.model_id, seat.settings, seat.credential_binding_id,
                   seat.enabled, seat.position, ownership.owner_user_id
