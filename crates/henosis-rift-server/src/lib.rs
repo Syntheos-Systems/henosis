@@ -1,3 +1,5 @@
+/// Managed execution capability and reconciliation boundary.
+pub mod agent_control;
 pub mod auth;
 /// Transactional creation of the managed Henosis room.
 pub mod bootstrap;

@@ -15,7 +15,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::{config, routes, ws};
+use crate::{agent_control::ManagedAgentControlRegistry, config, routes, ws};
 
 use config::Config;
 use routes::upload::PendingUploads;
@@ -54,6 +54,7 @@ struct AppState {
     config: Config,
     gateway: Gateway,
     pending_uploads: PendingUploads,
+    agent_control: ManagedAgentControlRegistry,
 }
 
 /// Initialized Rift resources that Henosis may inspect before binding the listener.
@@ -116,6 +117,14 @@ impl axum::extract::FromRef<AppState> for PendingUploads {
     }
 }
 
+/// Extracts managed execution control from the Rift application state.
+impl axum::extract::FromRef<AppState> for ManagedAgentControlRegistry {
+    /// Clones the one-time controller registry for an Axum request extractor.
+    fn from_ref(state: &AppState) -> Self {
+        state.agent_control.clone()
+    }
+}
+
 /// Initialize Rift persistence and construct its complete HTTP router.
 pub async fn build_router(config: Config) -> Result<Router, RuntimeError> {
     Ok(initialize(config).await?.into_router())
@@ -123,6 +132,14 @@ pub async fn build_router(config: Config) -> Result<Router, RuntimeError> {
 
 /// Initialize Rift persistence and retain the pool for unified room bootstrap.
 pub async fn initialize(config: Config) -> Result<InitializedRuntime, RuntimeError> {
+    initialize_with_control_registry(config, ManagedAgentControlRegistry::default()).await
+}
+
+/// Initialize Rift with a registry that Henosis may populate before serving.
+pub async fn initialize_with_control_registry(
+    config: Config,
+    agent_control: ManagedAgentControlRegistry,
+) -> Result<InitializedRuntime, RuntimeError> {
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&config.database_url)
@@ -140,7 +157,7 @@ pub async fn initialize(config: Config) -> Result<InitializedRuntime, RuntimeErr
     tokio::fs::create_dir_all(&config.upload_dir).await?;
 
     let listen_addr = config.listen_addr.clone();
-    let app = router(config, pool.clone());
+    let app = router_with_control_registry(config, pool.clone(), agent_control);
     Ok(InitializedRuntime {
         app,
         pool,
@@ -150,6 +167,15 @@ pub async fn initialize(config: Config) -> Result<InitializedRuntime, RuntimeErr
 
 /// Construct Rift's complete router over an initialized PostgreSQL pool.
 pub fn router(config: Config, pool: sqlx::PgPool) -> Router {
+    router_with_control_registry(config, pool, ManagedAgentControlRegistry::default())
+}
+
+/// Construct Rift's router with a shared managed execution controller registry.
+pub fn router_with_control_registry(
+    config: Config,
+    pool: sqlx::PgPool,
+    agent_control: ManagedAgentControlRegistry,
+) -> Router {
     let gateway = Gateway::new();
     let pending_uploads: PendingUploads = std::sync::Arc::new(dashmap::DashMap::new());
 
@@ -164,6 +190,7 @@ pub fn router(config: Config, pool: sqlx::PgPool) -> Router {
         config: config.clone(),
         gateway,
         pending_uploads,
+        agent_control,
     };
 
     let cors = CorsLayer::new()
