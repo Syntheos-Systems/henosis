@@ -12,7 +12,7 @@ describe("ConnectionSetup", () => {
       target: { value: "https://rift.example.test/" },
     });
     fireEvent.change(screen.getByLabelText("Username"), {
-      target: { value: "zan" },
+      target: { value: "operator" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
@@ -21,7 +21,7 @@ describe("ConnectionSetup", () => {
 
     expect(onConnect).toHaveBeenCalledWith({
       endpoint: "https://rift.example.test/",
-      username: "zan",
+      username: "operator",
       password: "correct horse battery staple",
     });
   });

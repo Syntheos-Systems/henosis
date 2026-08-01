@@ -15,9 +15,9 @@ function fixtureDirectory(): RoomDirectorySnapshot {
   return {
     connection: {
       endpoint: "http://127.0.0.1:4010",
-      username: "zan",
-      userId: "user-zan",
-      displayName: "Zan",
+      username: "operator",
+      userId: "user-operator",
+      displayName: "Operator",
     },
     rooms: createFixtureRooms(new Date("2026-07-26T18:00:00.000Z")),
     source: "fixture",
@@ -116,7 +116,7 @@ describe("App", () => {
 
     expect(await screen.findByLabelText("Rift endpoint")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Username"), {
-      target: { value: "zan" },
+      target: { value: "operator" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "secret-value" },

@@ -26,8 +26,8 @@ export function createFixtureRooms(now: Date = new Date()): RoomSummary[] {
           presence: "online",
         },
         {
-          id: "human-zan",
-          displayName: "Zan",
+          id: "human-operator",
+          displayName: "Operator",
           isAgent: false,
           presence: "online",
         },
@@ -60,8 +60,8 @@ export function createFixtureRooms(now: Date = new Date()): RoomSummary[] {
           presence: "online",
         },
         {
-          id: "human-zan",
-          displayName: "Zan",
+          id: "human-operator",
+          displayName: "Operator",
           isAgent: false,
           presence: "online",
         },
@@ -104,13 +104,13 @@ export function createFixtureRooms(now: Date = new Date()): RoomSummary[] {
       serverId: "server-operations",
       serverName: "Operations",
       topic: "Quiet infrastructure observation",
-      preview: "Room bridge paused by Zan.",
+      preview: "Room bridge paused by Operator.",
       latestAuthor: "Henosis",
       lastActivityAt: minutesBefore(now, 2_420),
       participants: [
         {
-          id: "human-zan",
-          displayName: "Zan",
+          id: "human-operator",
+          displayName: "Operator",
           isAgent: false,
           presence: "offline",
         },

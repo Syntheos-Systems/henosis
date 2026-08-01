@@ -42,9 +42,9 @@ export class FixtureHenosisClient implements HenosisClient {
   private snapshot(
     connection: SanitizedConnection = {
       endpoint: "http://127.0.0.1:4010",
-      username: "zan",
+      username: "operator",
       userId: "fixture-user",
-      displayName: "Zan",
+      displayName: "Operator",
     },
   ): RoomDirectorySnapshot {
     return {
