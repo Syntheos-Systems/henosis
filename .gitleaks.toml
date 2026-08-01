@@ -26,6 +26,18 @@ regexTarget = "line"
 paths = ['''vendor/kleos/kleos-lib/src/artifacts_crypto\.rs$''']
 regexes = ['''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''']
 
+# This visibly fake placeholder exercises managed-room configuration in unit tests.
+[[allowlists]]
+description = "Managed-room placeholder JWT fixture in unit tests"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''crates/henosis-rift-bridge/src/materialize\.rs$''',
+  '''crates/syntheos-server/src/room_reconciler\.rs$''',
+]
+regexes = ['''jwt-secret-that-is-at-least-32-bytes''']
+
 # This exact static Ed25519 vector exercises validated PKCS8 parsing in two tests.
 [[allowlists]]
 description = "Deterministic Ed25519 PKCS8 parser test vector"
