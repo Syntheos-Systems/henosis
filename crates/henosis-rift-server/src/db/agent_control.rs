@@ -121,64 +121,7 @@ pub async fn read_room_agent_roster(
     };
 
     let seats = match desired_revision {
-        Some(revision) => {
-            let rows: Vec<(
-                Uuid,
-                Uuid,
-                String,
-                String,
-                serde_json::Value,
-                Option<Uuid>,
-                bool,
-                i32,
-                Option<Uuid>,
-            )> = sqlx::query_as(
-                r#"SELECT seat.seat_id, seat.agent_user_id, seat.harness_id,
-                          seat.model_id, seat.settings, seat.credential_binding_id,
-                          seat.enabled, seat.position, ownership.owner_user_id
-                   FROM room_agent_seats seat
-                   LEFT JOIN agent_ownership ownership
-                     ON ownership.agent_user_id = seat.agent_user_id
-                   WHERE seat.server_id = $1 AND seat.revision = $2
-                   ORDER BY seat.position, seat.seat_id"#,
-            )
-            .bind(server_id)
-            .bind(revision)
-            .fetch_all(pool)
-            .await?;
-            rows.into_iter()
-                .map(
-                    |(
-                        seat_id,
-                        agent_user_id,
-                        harness_id,
-                        model_id,
-                        settings,
-                        credential_binding_id,
-                        enabled,
-                        position,
-                        owner_user_id,
-                    )| AgentSeatView {
-                        credential_readiness: if credential_binding_id.is_some() {
-                            CredentialReadiness::Ready
-                        } else {
-                            CredentialReadiness::HostSession
-                        },
-                        seat: AgentSeatInput {
-                            seat_id,
-                            agent_user_id,
-                            harness_id,
-                            model_id,
-                            settings,
-                            credential_binding_id,
-                            enabled,
-                            position,
-                        },
-                        owner_user_id,
-                    },
-                )
-                .collect()
-        }
+        Some(revision) => read_room_agent_revision(pool, server_id, revision).await?,
         None => Vec::new(),
     };
 
@@ -192,6 +135,71 @@ pub async fn read_room_agent_roster(
         apply_error_message,
         seats,
     })
+}
+
+/// Read one immutable room roster revision in stable execution order.
+pub async fn read_room_agent_revision(
+    pool: &PgPool,
+    server_id: Uuid,
+    revision: i64,
+) -> Result<Vec<AgentSeatView>, sqlx::Error> {
+    let rows: Vec<(
+        Uuid,
+        Uuid,
+        String,
+        String,
+        serde_json::Value,
+        Option<Uuid>,
+        bool,
+        i32,
+        Option<Uuid>,
+    )> = sqlx::query_as(
+        r#"SELECT seat.seat_id, seat.agent_user_id, seat.harness_id,
+                  seat.model_id, seat.settings, seat.credential_binding_id,
+                  seat.enabled, seat.position, ownership.owner_user_id
+           FROM room_agent_seats seat
+           LEFT JOIN agent_ownership ownership
+             ON ownership.agent_user_id = seat.agent_user_id
+           WHERE seat.server_id = $1 AND seat.revision = $2
+           ORDER BY seat.position, seat.seat_id"#,
+    )
+    .bind(server_id)
+    .bind(revision)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                seat_id,
+                agent_user_id,
+                harness_id,
+                model_id,
+                settings,
+                credential_binding_id,
+                enabled,
+                position,
+                owner_user_id,
+            )| AgentSeatView {
+                credential_readiness: if credential_binding_id.is_some() {
+                    CredentialReadiness::Ready
+                } else {
+                    CredentialReadiness::HostSession
+                },
+                seat: AgentSeatInput {
+                    seat_id,
+                    agent_user_id,
+                    harness_id,
+                    model_id,
+                    settings,
+                    credential_binding_id,
+                    enabled,
+                    position,
+                },
+                owner_user_id,
+            },
+        )
+        .collect())
 }
 
 /// Append one immutable room roster and mark it as the pending desired revision.

@@ -331,11 +331,11 @@ pub fn materialize_revision(
             "base bridge configuration could not be loaded",
         )
     })?;
-    materialize_from_base(base, seats, execution_modes)
+    materialize_loaded_revision(base, seats, execution_modes)
 }
 
 /// Replace the roster of an already loaded base config while retaining every other subsystem.
-fn materialize_from_base(
+pub fn materialize_loaded_revision(
     mut base: BridgeConfig,
     seats: Vec<ManagedSeat>,
     execution_modes: Vec<ResolvedExecutionMode>,
@@ -552,7 +552,7 @@ pub(crate) mod test_support {
         seats: Vec<ManagedSeat>,
         modes: Vec<ResolvedExecutionMode>,
     ) -> Result<BridgeConfig, MaterializeError> {
-        materialize_from_base(base, seats, modes)
+        materialize_loaded_revision(base, seats, modes)
     }
 }
 

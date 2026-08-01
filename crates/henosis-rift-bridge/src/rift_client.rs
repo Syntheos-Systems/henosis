@@ -303,8 +303,6 @@ async fn connect_and_listen(
             )));
         }
     }
-    let _ = event_tx.send(RiftWsEvent::Ready).await;
-
     // Subscribe to server channels.
     let subscribe = serde_json::json!({
         "type": "Subscribe",
@@ -313,6 +311,10 @@ async fn connect_and_listen(
     ws.send(WsMessage::Text(subscribe.to_string().into()))
         .await
         .map_err(|e| BridgeError::WebSocket(format!("subscribe failed: {e}")))?;
+
+    // A managed supervisor may replace the old bridge as soon as it observes
+    // this event, so readiness must follow the successful subscription send.
+    let _ = event_tx.send(RiftWsEvent::Ready).await;
 
     tracing::info!("WebSocket connected and subscribed");
 

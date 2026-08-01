@@ -49,6 +49,9 @@ pub mod billing;
 /// The default kernel server is unchanged when [`operator::OperatorState`] is not constructed.
 pub mod operator;
 
+/// Desired-state reconciliation between Rift room rosters and the live bridge.
+pub mod room_reconciler;
+
 /// Managed Rift room and Synapse bridge lifecycle owned by Henosis.
 pub mod room_runtime;
 

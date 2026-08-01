@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::auth::AgentAuthManager;
@@ -54,10 +54,26 @@ use crate::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use crate::room::Room;
 
 /// Dependencies a unified Henosis process may inject into the room bridge.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeDependencies {
     /// Existing kernel client sharing Henosis's Chiasm, Broca, and cognition state.
     pub kleos: Option<Arc<dyn crate::kleos::KleosClient>>,
+}
+
+/// One provisioned Rift identity reported when a managed bridge becomes usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyAgent {
+    /// Unique Rift username in stable roster order.
+    pub username: String,
+    /// Persistent Rift user identifier returned by roster provisioning.
+    pub user_id: uuid::Uuid,
+}
+
+/// Proof that a managed bridge provisioned its roster and subscribed to Rift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeReady {
+    /// Ordered username-to-user-ID mapping for the running roster.
+    pub roster: Vec<ReadyAgent>,
 }
 
 /// Run the complete Rift bridge until its process is terminated.
@@ -78,6 +94,35 @@ pub async fn run_with_dependencies<F>(
     config: BridgeConfig,
     dependencies: RuntimeDependencies,
     stop: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    run_runtime(config, dependencies, stop, None).await
+}
+
+/// Run a supervisor-owned bridge with explicit cancellation and readiness channels.
+pub async fn run_managed(
+    config: BridgeConfig,
+    dependencies: RuntimeDependencies,
+    cancellation: watch::Receiver<bool>,
+    ready: oneshot::Sender<BridgeReady>,
+) -> anyhow::Result<()> {
+    run_runtime(
+        config,
+        dependencies,
+        wait_for_cancellation(cancellation),
+        Some(ready),
+    )
+    .await
+}
+
+/// Run the shared bridge lifecycle and emit readiness only after Rift subscription.
+async fn run_runtime<F>(
+    config: BridgeConfig,
+    dependencies: RuntimeDependencies,
+    stop: F,
+    mut ready: Option<oneshot::Sender<BridgeReady>>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -190,6 +235,15 @@ where
         .next()
         .ok_or_else(|| anyhow::anyhow!("no agents configured"))?;
     let ws_token = ws_auth.issue_token(first_agent.rift_user_id, &first_agent.username)?;
+    let ready_roster = room
+        .roster_ref()
+        .all_by_slot()
+        .into_iter()
+        .map(|agent| ReadyAgent {
+            username: agent.username.clone(),
+            user_id: agent.rift_user_id,
+        })
+        .collect::<Vec<_>>();
 
     // WebSocket event channel.
     let (event_tx, mut event_rx) = mpsc::channel::<RiftWsEvent>(256);
@@ -347,6 +401,13 @@ where
                 match event {
                     RiftWsEvent::Ready => {
                         tracing::info!("WebSocket ready");
+                        if let Some(sender) = ready.take() {
+                            sender
+                                .send(BridgeReady {
+                                    roster: ready_roster.clone(),
+                                })
+                                .map_err(|_| anyhow::anyhow!("bridge readiness receiver closed"))?;
+                        }
                     }
                     RiftWsEvent::MessageCreate(msg) => {
                         let _ = activity_tx.send(std::time::Instant::now());
@@ -393,6 +454,18 @@ where
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Wait until a supervisor cancellation token becomes true or disconnects.
+async fn wait_for_cancellation(mut cancellation: watch::Receiver<bool>) {
+    if *cancellation.borrow() {
+        return;
+    }
+    while cancellation.changed().await.is_ok() {
+        if *cancellation.borrow() {
+            return;
+        }
+    }
 }
 
 /// Choose the provider without constructing model state, keeping precedence

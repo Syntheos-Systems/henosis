@@ -13,13 +13,20 @@ use henosis_rift_bridge::identity::{bridge_tenant, principal_for_agent};
 use henosis_rift_bridge::kleos::{
     BridgeMemory, CognitionMemoryBackend, InProcessKleosClient, KleosClient,
 };
-use henosis_rift_bridge::runtime::{run_with_dependencies, RuntimeDependencies};
+use henosis_rift_bridge::runtime::RuntimeDependencies;
+use henosis_rift_server::agent_control::ManagedAgentControlRegistry;
 use henosis_rift_server::bootstrap::{bootstrap_managed_room, BootstrapError, ManagedRoomConfig};
 use henosis_rift_server::config::{
     parse_cors_origins, parse_upload_limit, validate_secrets, Config as RiftConfig,
 };
-use henosis_rift_server::runtime::{initialize, InitializedRuntime, RuntimeError};
+use henosis_rift_server::runtime::{
+    initialize_with_control_registry, InitializedRuntime, RuntimeError,
+};
 use tokio::sync::watch;
+
+use crate::room_reconciler::{
+    build_room_reconciler, credential_binding_resolver_from_environment, RoomReconciler,
+};
 
 /// Environment value enabling the complete managed room.
 const REQUIRED_MODE: &str = "required";
@@ -48,14 +55,12 @@ pub enum RoomRuntimeSelection {
     Required(RoomRuntimeConfig),
 }
 
-/// Prepared server, bridge configuration, and shared kernel dependencies.
+/// Prepared server and the desired-state supervisor owning the bridge.
 pub struct PreparedRoomRuntime {
     /// Initialized Rift router and persistence.
     rift: InitializedRuntime,
-    /// Bridge settings targeting the bootstrapped room.
-    bridge: BridgeConfig,
-    /// Shared kernel handles injected into the bridge.
-    dependencies: RuntimeDependencies,
+    /// Reconciler supervising the bridge against durable desired state.
+    reconciler: RoomReconciler,
 }
 
 /// Failures emitted while configuring or supervising the room stack.
@@ -118,7 +123,8 @@ pub async fn prepare_room_runtime(
     let jwt_secret = config.rift.jwt_secret.clone();
     let bridge_secret = config.rift.bridge_secret.clone();
     let (api_url, ws_url) = internal_urls(&config.rift.listen_addr)?;
-    let rift = initialize(config.rift).await?;
+    let agent_control = ManagedAgentControlRegistry::default();
+    let rift = initialize_with_control_registry(config.rift, agent_control.clone()).await?;
     let room = bootstrap_managed_room(rift.pool(), config.room).await?;
     let bridge = BridgeConfig::load_for_managed_room(
         &config.bridge_config_path,
@@ -137,55 +143,68 @@ pub async fn prepare_room_runtime(
         bridge_tenant(),
         principal_for_agent("rift-bridge"),
     ));
-    Ok(PreparedRoomRuntime {
-        rift,
+    let bindings = credential_binding_resolver_from_environment().map_err(|error| {
+        RoomRuntimeError::InvalidConfig(format!("credential binding configuration failed: {error}"))
+    })?;
+    let (handle, reconciler) = build_room_reconciler(
+        rift.pool().clone(),
         bridge,
-        dependencies: RuntimeDependencies { kleos: Some(kleos) },
-    })
+        RuntimeDependencies { kleos: Some(kleos) },
+        bindings,
+    );
+    agent_control.install(Arc::new(handle)).map_err(|_| {
+        RoomRuntimeError::InvalidConfig(
+            "managed agent controller was already installed".to_string(),
+        )
+    })?;
+    Ok(PreparedRoomRuntime { rift, reconciler })
 }
 
-/// Supervise Rift and the Synapse bridge until the parent requests a stop.
+/// Supervise Rift and the bridge reconciler until the parent requests a stop.
 impl PreparedRoomRuntime {
-    /// Bind Rift before the bridge provisions agents, then supervise both tasks.
+    /// Bind Rift before the reconciler provisions agents, then supervise both.
+    ///
+    /// Rift exit stays fatal for the whole room runtime. Bridge failures are
+    /// absorbed inside the reconciler and never abort Rift; only the
+    /// reconciler itself exiting is fatal here.
     pub async fn run(self, mut stop: watch::Receiver<bool>) -> Result<(), RoomRuntimeError> {
         let (listen_addr, app) = self.rift.into_parts();
         let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
         let (component_stop_tx, component_stop_rx) = watch::channel(false);
         let mut server_task = tokio::spawn(async move { axum::serve(listener, app).await });
-        let mut bridge_task = tokio::spawn(run_with_dependencies(
-            self.bridge,
-            self.dependencies,
-            wait_for_stop(component_stop_rx),
-        ));
+        let mut reconciler_task = tokio::spawn(self.reconciler.run(component_stop_rx));
 
         tokio::select! {
             _ = wait_for_stop_ref(&mut stop) => {
+                // Stop the reconciler first so the bridge is fully down before
+                // the Rift server it talks to goes away.
                 let _ = component_stop_tx.send(true);
-                let bridge_result = bridge_task.await;
+                let reconciler_result = reconciler_task.await;
                 server_task.abort();
                 let _ = server_task.await;
-                match bridge_result {
+                match reconciler_result {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(RoomRuntimeError::BridgeStop(error)),
+                    Ok(Err(detail)) => Err(RoomRuntimeError::BridgeStop(anyhow::anyhow!(detail))),
                     Err(error) => Err(RoomRuntimeError::ComponentStopped {
-                        component: "Synapse bridge",
+                        component: "room reconciler",
                         detail: error.to_string(),
                     }),
                 }
             }
             result = &mut server_task => {
+                // Rift exit is fatal; stop the bridge before reporting it.
                 let _ = component_stop_tx.send(true);
-                let _ = bridge_task.await;
+                let _ = reconciler_task.await;
                 Err(RoomRuntimeError::ComponentStopped {
                     component: "Rift server",
                     detail: task_result_detail(result),
                 })
             }
-            result = &mut bridge_task => {
+            result = &mut reconciler_task => {
                 server_task.abort();
                 let _ = server_task.await;
                 Err(RoomRuntimeError::ComponentStopped {
-                    component: "Synapse bridge",
+                    component: "room reconciler",
                     detail: task_result_detail(result),
                 })
             }
@@ -270,18 +289,6 @@ fn internal_urls(listen_addr: &str) -> Result<(String, String), RoomRuntimeError
     };
     let internal = SocketAddr::new(internal_ip, parsed.port());
     Ok((format!("http://{internal}"), format!("ws://{internal}/ws")))
-}
-
-/// Wait until a component-local stop receiver becomes true or disconnects.
-async fn wait_for_stop(mut receiver: watch::Receiver<bool>) {
-    if *receiver.borrow() {
-        return;
-    }
-    while receiver.changed().await.is_ok() {
-        if *receiver.borrow() {
-            return;
-        }
-    }
 }
 
 /// Wait on a borrowed parent stop receiver.

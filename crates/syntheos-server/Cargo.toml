@@ -40,6 +40,8 @@ henosis-rift = { path = "../henosis-rift" }
 # Persistent Rift room server and its Synapse agent bridge.
 henosis-rift-server = { path = "../henosis-rift-server" }
 henosis-rift-bridge = { path = "../henosis-rift-bridge", features = ["cognition"] }
+# The room reconciler receives Rift's PgPool at initialization (agent-control seam).
+sqlx = { workspace = true }
 # The external tool gateway, invoked in-process after the canonical gate chain allows an action.
 henosis-hermes = { path = "../henosis-hermes" }
 # Plutus policy authority.
@@ -90,6 +92,8 @@ tracing-subscriber.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+# Paused-time (start_paused) room reconciler lifecycle tests.
+tokio = { workspace = true, features = ["test-util"] }
 # ServiceExt::oneshot drives the router in handler tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
 # WS client for the ws.rs integration test (ws_forwards_org_matching_events).
