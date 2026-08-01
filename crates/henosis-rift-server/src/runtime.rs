@@ -204,6 +204,15 @@ pub fn router(config: Config, pool: sqlx::PgPool) -> Router {
             post(routes::users::change_password),
         )
         .route(
+            "/api/users/@me/agents",
+            get(routes::agent_identities::list_owned_agents)
+                .post(routes::agent_identities::create_owned_agent),
+        )
+        .route(
+            "/api/agents/{agent_id}/claim",
+            post(routes::agent_identities::claim_agent),
+        )
+        .route(
             "/api/users/@me/dms",
             get(routes::users::list_dms).post(routes::users::create_dm),
         )

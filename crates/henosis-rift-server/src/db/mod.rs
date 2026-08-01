@@ -328,6 +328,39 @@ pub async fn create_agent_user(
     .await
 }
 
+/// Atomically create an agent identity and assign its first human owner.
+pub async fn create_owned_agent_user(
+    pool: &PgPool,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    display_name: Option<&str>,
+    owner_user_id: Uuid,
+) -> Result<User, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let user = sqlx::query_as::<_, User>(
+        r#"INSERT INTO users (username, email, password_hash, display_name, is_agent)
+           SELECT $1, $2, $3, $4, TRUE
+           FROM users owner
+           WHERE owner.id = $5 AND owner.is_agent = FALSE
+           RETURNING users.*"#,
+    )
+    .bind(username)
+    .bind(email)
+    .bind(password_hash)
+    .bind(display_name)
+    .bind(owner_user_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query("INSERT INTO agent_ownership (agent_user_id, owner_user_id) VALUES ($1, $2)")
+        .bind(user.id)
+        .bind(owner_user_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(user)
+}
+
 /// Flag an existing user as an agent.
 ///
 /// Converges agent accounts provisioned before `is_agent` was set correctly:
@@ -472,6 +505,67 @@ pub async fn is_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<
             .fetch_optional(pool)
             .await?;
     Ok(row.map(|r| r.0 > 0).unwrap_or(false))
+}
+
+/// Atomically claim an agent only when the human manages a shared server.
+pub async fn claim_agent_as_shared_manager(
+    pool: &PgPool,
+    owner_user_id: Uuid,
+    agent_user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    use crate::models::permissions::perms;
+
+    let claimed = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO agent_ownership (agent_user_id, owner_user_id)
+           SELECT agent.id, owner.id
+           FROM users agent
+           CROSS JOIN users owner
+           WHERE agent.id = $2
+             AND agent.is_agent = TRUE
+             AND owner.id = $1
+             AND owner.is_agent = FALSE
+             AND EXISTS (
+                 SELECT 1
+                 FROM members owner_member
+                 INNER JOIN members agent_member
+                   ON agent_member.server_id = owner_member.server_id
+                 INNER JOIN servers server
+                   ON server.id = owner_member.server_id
+                 WHERE owner_member.user_id = owner.id
+                   AND agent_member.user_id = agent.id
+                   AND (
+                       server.owner_id = owner.id
+                       OR EXISTS (
+                           SELECT 1
+                           FROM roles role
+                           WHERE role.server_id = server.id
+                             AND (
+                                 role.is_default = TRUE
+                                 OR EXISTS (
+                                     SELECT 1
+                                     FROM member_roles member_role
+                                     WHERE member_role.server_id = server.id
+                                       AND member_role.user_id = owner.id
+                                       AND member_role.role_id = role.id
+                                 )
+                             )
+                             AND (
+                                 (role.permissions & $3) <> 0
+                                 OR (role.permissions & $4) <> 0
+                             )
+                       )
+                   )
+             )
+           ON CONFLICT (agent_user_id) DO NOTHING
+           RETURNING agent_user_id"#,
+    )
+    .bind(owner_user_id)
+    .bind(agent_user_id)
+    .bind(perms::MANAGE_SERVER)
+    .bind(perms::ADMINISTRATOR)
+    .fetch_optional(pool)
+    .await?;
+    Ok(claimed.is_some())
 }
 
 // ───── Channels ─────

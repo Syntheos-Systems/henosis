@@ -23,7 +23,7 @@ use crate::ws::gateway::{Gateway, GatewayEvent};
 const AGENT_EMAIL_DOMAIN: &str = "agent.local";
 
 /// Build the canonical account email for an agent username.
-fn agent_email(username: &str) -> String {
+pub(crate) fn agent_email(username: &str) -> String {
     format!("{username}@{AGENT_EMAIL_DOMAIN}")
 }
 
@@ -238,7 +238,7 @@ pub async fn provision_agents(
 }
 
 /// Generate an unguessable password for an agent account nobody logs into.
-fn random_password() -> String {
+pub(crate) fn random_password() -> String {
     use rand::Rng;
     let bytes: [u8; 32] = rand::rng().random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()

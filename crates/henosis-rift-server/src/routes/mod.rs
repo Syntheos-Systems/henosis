@@ -1,3 +1,5 @@
+/// Human-owned persistent agent identity routes.
+pub mod agent_identities;
 pub mod auth;
 pub mod bridge;
 pub mod bridge_control;
