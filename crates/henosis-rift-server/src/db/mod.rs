@@ -2,6 +2,9 @@
 //! servers, members, channels, messages, attachments, roles, invites,
 //! DMs, and bridge state.
 
+/// Persistent ownership and revisioned room agent configuration operations.
+pub mod agent_control;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
