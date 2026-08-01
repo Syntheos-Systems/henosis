@@ -6,6 +6,8 @@ pub mod approval_dispatch;
 pub mod auth;
 /// Capability oracles gating execution proposals.
 pub mod capability;
+/// Host execution capability discovery.
+pub mod catalog;
 /// Bridge, roster, and execution configuration.
 pub mod config;
 /// Discussion context assembly for executors.
@@ -34,6 +36,8 @@ pub mod identity;
 pub mod kleos;
 /// Turn budgets, consensus signals, thread ceiling.
 pub mod loop_prevention;
+/// Managed revision validation and bridge configuration materialization.
+pub mod materialize;
 /// Frameshift persona allocation across the roster.
 pub mod persona_alloc;
 /// Message-to-persona relevance scoring.

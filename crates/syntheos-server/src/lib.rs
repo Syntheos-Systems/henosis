@@ -29,6 +29,9 @@ pub mod authority;
 /// Safe command parsing, local initialization, and configuration loading for the `henosis` binary.
 pub mod cli;
 
+/// Opaque managed-agent credential bindings and Phylax command mediation.
+pub mod credential_bindings;
+
 /// Projects dispatcher lifecycle events into Broca and task-scoped Chiasm activity.
 pub mod action_reactor;
 

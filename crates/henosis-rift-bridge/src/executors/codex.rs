@@ -15,6 +15,7 @@ use crate::executor::{
     AgentExecutor, AgentResponse, Capability, DiscussionContext, ExecutionResult, ExecutionSandbox,
     HealthStatus, ProgressUpdate, TaskContext,
 };
+use crate::materialize::{MediatedCommandOutput, ResolvedExecutionMode};
 
 /// Codex sandbox selected for one CLI invocation.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +45,20 @@ pub struct CodexExecutor {
     model: String,
     /// Optional Codex reasoning-effort override.
     reasoning_effort: Option<String>,
+    /// Host-session or broker-mediated credential execution selected at materialization.
+    execution_mode: ResolvedExecutionMode,
+}
+
+/// Normalized output shared by direct and broker-mediated Codex invocations.
+struct CodexOutput {
+    /// Whether the child completed successfully.
+    success: bool,
+    /// Stable status detail used only in safe executor errors.
+    status: String,
+    /// Captured or broker-scrubbed standard output.
+    stdout: Vec<u8>,
+    /// Captured or broker-scrubbed standard error.
+    stderr: Vec<u8>,
 }
 
 /// Implements construction and guarded command assembly for the Codex CLI.
@@ -54,30 +69,51 @@ impl CodexExecutor {
             binary,
             model,
             reasoning_effort,
+            execution_mode: ResolvedExecutionMode::HostSession,
         }
+    }
+
+    /// Select a validated runtime credential path for this executor.
+    pub fn with_execution_mode(mut self, execution_mode: ResolvedExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Build stable arguments shared by direct and broker-mediated invocation.
+    fn arguments(
+        &self,
+        sandbox: CodexSandbox,
+        working_dir: Option<&Path>,
+        prompt_argument: Option<&str>,
+    ) -> Vec<String> {
+        let mut arguments = vec![
+            "exec".to_string(),
+            "--ephemeral".to_string(),
+            "--json".to_string(),
+            "--model".to_string(),
+            self.model.clone(),
+        ];
+        if let Some(working_dir) = working_dir {
+            arguments.push("--cd".to_string());
+            arguments.push(working_dir.display().to_string());
+        }
+        arguments.push("--sandbox".to_string());
+        arguments.push(sandbox.as_str().to_string());
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            let quoted = serde_json::to_string(reasoning_effort)
+                .expect("serializing a Rust string to JSON cannot fail");
+            arguments.push("-c".to_string());
+            arguments.push(format!("model_reasoning_effort={quoted}"));
+        }
+        arguments.push("--".to_string());
+        arguments.push(prompt_argument.unwrap_or("-").to_string());
+        arguments
     }
 
     /// Build an ephemeral JSONL command with an explicit sandbox and optional working directory.
     fn command(&self, sandbox: CodexSandbox, working_dir: Option<&Path>) -> Command {
         let mut command = Command::new(&self.binary);
-        command
-            .arg("exec")
-            .arg("--ephemeral")
-            .arg("--json")
-            .arg("--model")
-            .arg(&self.model);
-        if let Some(working_dir) = working_dir {
-            command.arg("--cd").arg(working_dir);
-        }
-        command.arg("--sandbox").arg(sandbox.as_str());
-        if let Some(reasoning_effort) = &self.reasoning_effort {
-            let quoted = serde_json::to_string(reasoning_effort)
-                .expect("serializing a Rust string to JSON cannot fail");
-            command
-                .arg("-c")
-                .arg(format!("model_reasoning_effort={quoted}"));
-        }
-        command.arg("-");
+        command.args(self.arguments(sandbox, working_dir, None));
         command
     }
 
@@ -88,34 +124,90 @@ impl CodexExecutor {
         sandbox: CodexSandbox,
         working_dir: Option<&Path>,
         cargo_target_dir: Option<&Path>,
-    ) -> Result<Output> {
-        let mut command = self.command(sandbox, working_dir);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        command.env_remove("CARGO_TARGET_DIR");
-        if let Some(cargo_target_dir) = cargo_target_dir {
-            command.env("CARGO_TARGET_DIR", cargo_target_dir);
-        }
+    ) -> Result<CodexOutput> {
+        match &self.execution_mode {
+            ResolvedExecutionMode::HostSession => {
+                let mut command = self.command(sandbox, working_dir);
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                command.env_remove("CARGO_TARGET_DIR");
+                if let Some(cargo_target_dir) = cargo_target_dir {
+                    command.env("CARGO_TARGET_DIR", cargo_target_dir);
+                }
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to start Codex CLI at {}", self.binary.display()))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("Codex CLI did not expose piped stdin")?;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write the Codex prompt")?;
-        drop(stdin);
-        child
-            .wait_with_output()
-            .await
-            .context("failed while waiting for the Codex CLI")
+                let mut child = command.spawn().with_context(|| {
+                    format!("failed to start Codex CLI at {}", self.binary.display())
+                })?;
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .context("Codex CLI did not expose piped stdin")?;
+                stdin
+                    .write_all(prompt.as_bytes())
+                    .await
+                    .context("failed to write the Codex prompt")?;
+                drop(stdin);
+                let output: Output = child
+                    .wait_with_output()
+                    .await
+                    .context("failed while waiting for the Codex CLI")?;
+                Ok(CodexOutput {
+                    success: output.status.success(),
+                    status: output.status.to_string(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+            ResolvedExecutionMode::Phylax(binding) => {
+                let mut argv = vec![self.binary.display().to_string()];
+                argv.extend(self.arguments(sandbox, working_dir, Some(prompt)));
+                let output: MediatedCommandOutput = binding
+                    .runner
+                    .run(&binding.category, &binding.slot, &binding.env_var, &argv)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                Ok(CodexOutput {
+                    success: !output.timed_out && output.exit_code == Some(0),
+                    status: if output.timed_out {
+                        "broker timeout".to_string()
+                    } else {
+                        output
+                            .exit_code
+                            .map(|code| format!("exit status {code}"))
+                            .unwrap_or_else(|| "terminated without an exit status".to_string())
+                    },
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Command-assembly tests for treating brokered prompt text as positional data.
+mod tests {
+    use super::*;
+
+    /// A flag-shaped prompt follows the explicit Codex option terminator.
+    #[test]
+    fn mediated_arguments_terminate_options_before_prompt() {
+        let executor =
+            CodexExecutor::new(PathBuf::from("/opt/codex"), "gpt-5.6-sol".to_string(), None);
+
+        let arguments = executor.arguments(
+            CodexSandbox::WorkspaceWrite,
+            Some(Path::new("/workspace")),
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+        );
+
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            ["--", "--dangerously-bypass-approvals-and-sandbox"]
+        );
     }
 }
 
@@ -190,7 +282,7 @@ impl AgentExecutor for CodexExecutor {
         let output = self
             .run(&to_cli_prompt(&context), CodexSandbox::ReadOnly, None, None)
             .await?;
-        if !output.status.success() {
+        if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!("codex exited with {}: {stderr}", output.status);
         }
@@ -225,7 +317,7 @@ impl AgentExecutor for CodexExecutor {
             .await?;
         let _ = progress_tx.send(ProgressUpdate::Done).await;
 
-        if !output.status.success() {
+        if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Ok(ExecutionResult::Failed {
                 reason: format!("codex exited with {}: {stderr}", output.status),
@@ -251,7 +343,7 @@ impl AgentExecutor for CodexExecutor {
 
     /// Report whether the configured Codex binary exists on this host.
     async fn health_check(&self) -> Result<HealthStatus> {
-        if self.binary.exists() {
+        if crate::catalog::command_available(&self.binary) {
             Ok(HealthStatus::Ready)
         } else {
             Ok(HealthStatus::Unavailable(format!(

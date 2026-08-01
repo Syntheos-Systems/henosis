@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::error::BridgeError;
+use crate::materialize::ResolvedExecutionMode;
 
 /// Top-level bridge configuration loaded from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BridgeConfig {
     /// Connection settings for the Rift server.
     #[serde(default)]
@@ -185,7 +186,7 @@ fn default_stimulus_max_per_hour() -> u32 {
 }
 
 /// Room-level Frameshift persona allocation settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PersonaSettings {
     /// Frameshift persona library (catalog) root directory.
     pub library_path: PathBuf,
@@ -219,7 +220,7 @@ pub struct KleosBackendConfig {
 }
 
 /// Connection to the Rift server.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct RiftConfig {
     /// Rift server base URL (e.g., http://localhost:3200).
     #[serde(default)]
@@ -244,7 +245,7 @@ pub struct RiftConfig {
 }
 
 /// Bridge daemon settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BridgeDaemonConfig {
     /// Minimum seconds between two posts by the SAME agent (hard pacing
     /// floor, enforced during round planning).
@@ -332,7 +333,7 @@ impl Default for BridgeDaemonConfig {
 }
 
 /// Configuration for a single agent in the roster.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     /// Display name for the agent in Rift.
     pub name: String,
@@ -344,10 +345,13 @@ pub struct AgentConfig {
     pub base_chance: f64,
     /// System prompt preamble for this agent.
     pub system_prompt: String,
+    /// Runtime-only credential mediation selected by managed materialization.
+    #[serde(skip)]
+    pub execution_mode: ResolvedExecutionMode,
 }
 
 /// Executor backend configuration (tagged union in TOML).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ExecutorConfig {
     /// Shell out to `claude -p`. Lightweight, no tool access.
@@ -356,7 +360,7 @@ pub enum ExecutorConfig {
         binary: PathBuf,
         /// Model to use (e.g., "sonnet").
         model: Option<String>,
-        /// Max tokens for response.
+        /// Legacy value retained for TOML compatibility; current Claude CLI ignores it.
         max_tokens: Option<u32>,
     },
     /// Invoke the Codex CLI with explicit sandboxing and JSONL output.
@@ -478,7 +482,7 @@ pub struct WorkspaceConfig {
 }
 
 /// Execution-mode runtime settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExecutionSettings {
     /// Root directory under which per-task git worktrees are created.
     pub worktrees_root: PathBuf,

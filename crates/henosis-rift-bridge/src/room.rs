@@ -21,8 +21,7 @@ use uuid::Uuid;
 use crate::approval_dispatch::ApprovalDispatcher;
 use crate::capability::CapabilityOracle;
 use crate::config::{
-    AgentConfig, BridgeDaemonConfig, EmbeddingConfig, ExecutorConfig, PersonaSettings,
-    WorkspaceConfig,
+    AgentConfig, BridgeDaemonConfig, EmbeddingConfig, PersonaSettings, WorkspaceConfig,
 };
 use crate::context::build_discussion_context;
 use crate::echo::EchoDetector;
@@ -36,7 +35,7 @@ use crate::execution::sandbox::SandboxManager;
 use crate::execution::supervisor::ExecutionSupervisor;
 use crate::execution::{RiftRoomNotifier, RoomNotifier};
 use crate::executor::{AgentExecutor, DiscussionContext};
-use crate::executors::{build_synapse_executor, ClaudeCodeExecutor, CodexExecutor};
+use crate::executors::build_executor;
 use crate::growth::GrowthStore;
 use crate::kleos::KleosClient;
 use crate::loop_prevention::{LoopBudget, LoopGuard};
@@ -169,54 +168,7 @@ impl Room {
         // list handed agents each other's executors.
         let mut executors: HashMap<AgentId, Arc<dyn AgentExecutor>> = HashMap::new();
         for (agent, config) in roster.all_by_slot().into_iter().zip(agent_configs.iter()) {
-            let executor: Arc<dyn AgentExecutor> = match &config.executor {
-                ExecutorConfig::ClaudeCode {
-                    binary,
-                    model,
-                    max_tokens,
-                } => Arc::new(ClaudeCodeExecutor::new(
-                    binary.clone(),
-                    model.clone(),
-                    *max_tokens,
-                )),
-                ExecutorConfig::Codex {
-                    binary,
-                    model,
-                    reasoning_effort,
-                } => Arc::new(CodexExecutor::new(
-                    binary.clone(),
-                    model.clone(),
-                    reasoning_effort.clone(),
-                )),
-                ExecutorConfig::Synapse {
-                    provider,
-                    model,
-                    host,
-                    token,
-                    api_key,
-                    max_tokens,
-                    max_turns,
-                    cwd,
-                } => {
-                    let synapse = build_synapse_executor(
-                        provider,
-                        model.clone(),
-                        host.clone(),
-                        token.clone(),
-                        api_key.clone(),
-                        *max_tokens,
-                        *max_turns,
-                        cwd.clone(),
-                    )
-                    .map_err(|e| {
-                        BridgeError::Config(format!(
-                            "failed to build SynapseExecutor for {}: {e}",
-                            config.name,
-                        ))
-                    })?;
-                    Arc::new(synapse)
-                }
-            };
+            let executor = build_executor(config)?;
             executors.insert(agent.id, executor);
         }
 

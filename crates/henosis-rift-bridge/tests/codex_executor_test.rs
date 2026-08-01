@@ -142,6 +142,7 @@ async fn discussion_uses_guarded_argument_vector_and_stdin() {
             "read-only",
             "-c",
             "model_reasoning_effort=\"medium\"",
+            "--",
             "-",
         ]
     );
@@ -182,6 +183,7 @@ async fn execution_uses_guarded_argument_vector_and_scoped_environment() {
             fake.root.display().to_string(),
             "--sandbox".to_string(),
             "workspace-write".to_string(),
+            "--".to_string(),
             "-".to_string(),
         ]
     );

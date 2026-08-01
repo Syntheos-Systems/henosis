@@ -13,6 +13,7 @@ use crate::executor::{
     AgentExecutor, AgentResponse, Capability, DiscussionContext, ExecutionResult, ExecutionSandbox,
     HealthStatus, ProgressUpdate, TaskContext,
 };
+use crate::materialize::{MediatedCommandOutput, ResolvedExecutionMode};
 
 /// Return the worktree's current HEAD commit hash, or `None` if `dir` is not a git
 /// repository or the command fails. Used to detect whether an execution committed work.
@@ -41,19 +42,57 @@ pub struct ClaudeCodeExecutor {
     binary: PathBuf,
     /// Model override (e.g., "sonnet").
     model: Option<String>,
-    /// Maximum tokens for the response.
-    max_tokens: Option<u32>,
+    /// Host-session or broker-mediated credential execution selected at materialization.
+    execution_mode: ResolvedExecutionMode,
+}
+
+/// Normalized output shared by direct and broker-mediated Claude invocations.
+struct ClaudeOutput {
+    /// Whether the child completed successfully.
+    success: bool,
+    /// Stable status detail used only in safe executor errors.
+    status: String,
+    /// Captured or broker-scrubbed standard output.
+    stdout: Vec<u8>,
+    /// Captured or broker-scrubbed standard error.
+    stderr: Vec<u8>,
 }
 
 /// Implements construction and command assembly for the Claude CLI executor.
 impl ClaudeCodeExecutor {
     /// Create a new Claude Code executor.
-    pub fn new(binary: PathBuf, model: Option<String>, max_tokens: Option<u32>) -> Self {
+    pub fn new(binary: PathBuf, model: Option<String>, _legacy_max_tokens: Option<u32>) -> Self {
         Self {
             binary,
             model,
-            max_tokens,
+            execution_mode: ResolvedExecutionMode::HostSession,
         }
+    }
+
+    /// Select a validated runtime credential path for this executor.
+    pub fn with_execution_mode(mut self, execution_mode: ResolvedExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Build stable Claude arguments for direct or broker-mediated invocation.
+    fn arguments(&self, working_dir: Option<&std::path::Path>, prompt: &str) -> Vec<String> {
+        let mut arguments = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "text".to_string(),
+        ];
+        if let Some(model) = &self.model {
+            arguments.push("--model".to_string());
+            arguments.push(model.clone());
+        }
+        if let Some(working_dir) = working_dir {
+            arguments.push("--add-dir".to_string());
+            arguments.push(working_dir.display().to_string());
+        }
+        arguments.push("--".to_string());
+        arguments.push(prompt.to_string());
+        arguments
     }
 
     /// Build a Command with common flags applied.
@@ -64,10 +103,87 @@ impl ClaudeCodeExecutor {
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
-        if let Some(max) = self.max_tokens {
-            cmd.arg("--max-tokens").arg(max.to_string());
-        }
         cmd
+    }
+
+    /// Run Claude through either the host session or the authenticated Phylax broker.
+    async fn run(
+        &self,
+        prompt: &str,
+        working_dir: Option<&std::path::Path>,
+        cargo_target_dir: Option<&std::path::Path>,
+    ) -> Result<ClaudeOutput> {
+        match &self.execution_mode {
+            ResolvedExecutionMode::HostSession => {
+                let mut command = self.base_cmd();
+                command.arg("--").arg(prompt);
+                if let Some(working_dir) = working_dir {
+                    command.current_dir(working_dir);
+                }
+                command.env_remove("CARGO_TARGET_DIR");
+                if let Some(cargo_target_dir) = cargo_target_dir {
+                    command.env("CARGO_TARGET_DIR", cargo_target_dir);
+                }
+                command.kill_on_drop(true);
+                let output = command.output().await?;
+                Ok(ClaudeOutput {
+                    success: output.status.success(),
+                    status: output.status.to_string(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+            ResolvedExecutionMode::Phylax(binding) => {
+                let broker_prompt = working_dir
+                    .map(|directory| {
+                        format!(
+                            "Work only inside the approved workspace at {}. Use absolute paths rooted in that workspace for every file operation.\n\nTask:\n{prompt}",
+                            directory.display()
+                        )
+                    })
+                    .unwrap_or_else(|| prompt.to_string());
+                let mut argv = vec![self.binary.display().to_string()];
+                argv.extend(self.arguments(working_dir, &broker_prompt));
+                let output: MediatedCommandOutput = binding
+                    .runner
+                    .run(&binding.category, &binding.slot, &binding.env_var, &argv)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                Ok(ClaudeOutput {
+                    success: !output.timed_out && output.exit_code == Some(0),
+                    status: if output.timed_out {
+                        "broker timeout".to_string()
+                    } else {
+                        output
+                            .exit_code
+                            .map(|code| format!("exit status {code}"))
+                            .unwrap_or_else(|| "terminated without an exit status".to_string())
+                    },
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Command-assembly tests for treating untrusted prompt text as positional data.
+mod tests {
+    use super::*;
+
+    /// Prompt text beginning with a dash follows the explicit option terminator.
+    #[test]
+    fn mediated_arguments_terminate_options_before_prompt() {
+        let executor = ClaudeCodeExecutor::new(PathBuf::from("/opt/claude"), None, Some(64));
+
+        let arguments = executor.arguments(None, "--dangerously-skip-permissions");
+
+        assert!(!arguments.iter().any(|argument| argument == "--max-tokens"));
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            ["--", "--dangerously-skip-permissions"]
+        );
     }
 }
 
@@ -94,12 +210,9 @@ impl AgentExecutor for ClaudeCodeExecutor {
     async fn discuss(&self, context: DiscussionContext) -> Result<Option<AgentResponse>> {
         let prompt = to_cli_prompt(&context);
 
-        let mut cmd = self.base_cmd();
-        cmd.arg(&prompt);
+        let output = self.run(&prompt, None, None).await?;
 
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
+        if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("claude exited with {}: {stderr}", output.status);
         }
@@ -132,21 +245,18 @@ impl AgentExecutor for ClaudeCodeExecutor {
         // actually advanced it (committed work), not just echo the worktree's base commit.
         let head_before = git_head(&task.sandbox.working_dir).await;
 
-        let mut cmd = self.base_cmd();
-        cmd.arg(&task.description);
-        cmd.current_dir(&task.sandbox.working_dir);
-        // Honor the workspace's configured CARGO_TARGET_DIR so the agent's cargo builds write
-        // off the source tree. Unset when the workspace did not configure one.
-        if let Some(target_dir) = &task.sandbox.cargo_target_dir {
-            cmd.env("CARGO_TARGET_DIR", target_dir);
-        }
-
-        let output = cmd.output().await?;
+        let output = self
+            .run(
+                &task.description,
+                Some(&task.sandbox.working_dir),
+                task.sandbox.cargo_target_dir.as_deref(),
+            )
+            .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let _ = progress_tx.send(ProgressUpdate::Done).await;
 
-        if output.status.success() {
+        if output.success {
             // Report the resulting commit only if HEAD moved -- i.e. the agent committed.
             let commit_hash = match git_head(&task.sandbox.working_dir).await {
                 Some(after) if Some(&after) != head_before.as_ref() => Some(after),
@@ -172,7 +282,7 @@ impl AgentExecutor for ClaudeCodeExecutor {
 
     /// Health check: verify the claude binary exists and is executable.
     async fn health_check(&self) -> Result<HealthStatus> {
-        if self.binary.exists() {
+        if crate::catalog::command_available(&self.binary) {
             Ok(HealthStatus::Ready)
         } else {
             Ok(HealthStatus::Unavailable(format!(
