@@ -51,9 +51,40 @@ struct RuntimeAgentIdentity {
     owner_user_id: Uuid,
 }
 
+/// Opaque lifetime token proving and monitoring exclusive supervision of one room.
+#[async_trait]
+trait RoomLeadershipLease: Send {
+    /// Subscribe to the first observed loss of the lock-holding database session.
+    fn subscribe_loss(&self) -> watch::Receiver<Option<String>>;
+
+    /// Stop the monitor and close the lock-holding session before returning.
+    async fn release(&mut self);
+}
+
+/// PostgreSQL advisory-lock monitor retained for one supervisor lifetime.
+struct PostgresRoomLeadershipLease {
+    /// Latest sanitized database-session failure, initially absent.
+    loss: watch::Receiver<Option<String>>,
+    /// Task owning and probing the dedicated lock-holding connection.
+    monitor: Option<JoinHandle<()>>,
+}
+
+/// Ensures an abandoned lease still closes its dedicated PostgreSQL session.
+impl Drop for PostgresRoomLeadershipLease {
+    /// Abort the monitor so dropping its future also drops the owned connection.
+    fn drop(&mut self) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.abort();
+        }
+    }
+}
+
 /// Persistence boundary used by the reconciler and deterministic lifecycle tests.
 #[async_trait]
 trait RoomRevisionStore: Send + Sync {
+    /// Acquire exclusive process leadership before spawning any bridge generation.
+    async fn acquire_leadership(&self) -> Result<Box<dyn RoomLeadershipLease>, String>;
+
     /// Atomically install the ready TOML roster when no desired revision exists.
     async fn import_initial_roster(
         &self,
@@ -74,7 +105,11 @@ trait RoomRevisionStore: Send + Sync {
     ) -> Result<Option<RuntimeAgentIdentity>, String>;
 
     /// Persist one observable runtime transition.
-    async fn set_status(&self, status: ApplyStatusUpdate) -> Result<(), String>;
+    async fn set_status(
+        &self,
+        expected_desired_revision: Option<i64>,
+        status: ApplyStatusUpdate,
+    ) -> Result<(), String>;
 }
 
 /// PostgreSQL implementation over the Rift-owned desired-state tables.
@@ -88,6 +123,44 @@ struct PostgresRoomRevisionStore {
 /// Reads Rift state without exposing database failures through public control routes.
 #[async_trait]
 impl RoomRevisionStore for PostgresRoomRevisionStore {
+    /// Hold and monitor a session advisory lock for the full supervisor lifetime.
+    async fn acquire_leadership(&self) -> Result<Box<dyn RoomLeadershipLease>, String> {
+        let pooled = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| sanitized_store_failure("room leadership connection", &error))?;
+        let mut connection = pooled.detach();
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(room_reconciler_lock_key(self.server_id))
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|error| sanitized_store_failure("room leadership lock", &error))?;
+        if !acquired {
+            return Err("another Henosis process already supervises this room".to_string());
+        }
+        let (loss_tx, loss) = watch::channel(None);
+        let monitor = tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(ROOM_LEADERSHIP_HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) = sqlx::query_scalar::<_, i32>("SELECT 1")
+                    .fetch_one(&mut connection)
+                    .await
+                {
+                    let detail = sanitized_store_failure("room leadership heartbeat", &error);
+                    let _ = loss_tx.send(Some(detail));
+                    return;
+                }
+            }
+        });
+        Ok(Box::new(PostgresRoomLeadershipLease {
+            loss,
+            monitor: Some(monitor),
+        }))
+    }
+
     /// Import through Rift's row-locked initial-revision transaction.
     async fn import_initial_roster(
         &self,
@@ -142,11 +215,50 @@ impl RoomRevisionStore for PostgresRoomRevisionStore {
     }
 
     /// Write active, last-good, and failure state through Rift's repository.
-    async fn set_status(&self, status: ApplyStatusUpdate) -> Result<(), String> {
-        db::agent_control::set_room_apply_status(&self.pool, self.server_id, status)
-            .await
-            .map_err(|error| error.to_string())
+    async fn set_status(
+        &self,
+        expected_desired_revision: Option<i64>,
+        status: ApplyStatusUpdate,
+    ) -> Result<(), String> {
+        db::agent_control::set_room_apply_status(
+            &self.pool,
+            self.server_id,
+            expected_desired_revision,
+            status,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
+}
+
+/// Exposes lock-session failure and deterministic release to the supervisor.
+#[async_trait]
+impl RoomLeadershipLease for PostgresRoomLeadershipLease {
+    /// Clone the watch receiver without exposing the dedicated database connection.
+    fn subscribe_loss(&self) -> watch::Receiver<Option<String>> {
+        self.loss.clone()
+    }
+
+    /// Abort and join the monitor so the database session is closed before return.
+    async fn release(&mut self) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.abort();
+            let _ = monitor.await;
+        }
+    }
+}
+
+/// Domain separator for per-room PostgreSQL advisory lock keys.
+const ROOM_RECONCILER_LOCK_DOMAIN: u64 = 0x4845_4e4f_5349_5352;
+
+/// Maximum interval before a dead leadership session is observed.
+const ROOM_LEADERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Fold one room UUID into a stable namespaced 64-bit PostgreSQL lock key.
+fn room_reconciler_lock_key(server_id: Uuid) -> i64 {
+    let raw = server_id.as_u128();
+    let folded = (raw as u64) ^ ((raw >> 64) as u64) ^ ROOM_RECONCILER_LOCK_DOMAIN;
+    i64::from_be_bytes(folded.to_be_bytes())
 }
 
 /// Process lifecycle boundary replaced by fakes in reconciler tests.
@@ -211,6 +323,8 @@ enum ReadyWait {
     Closed,
     /// The startup deadline elapsed first.
     TimedOut,
+    /// The database session proving exclusive room leadership failed.
+    LeadershipLost(String),
 }
 
 /// Outcome of starting one bridge; every non-Ready case has collected the task.
@@ -221,6 +335,8 @@ enum StartupOutcome {
     Cancelled,
     /// The bridge exited, closed readiness, or timed out; it was stopped.
     Failed(String),
+    /// Exclusive room leadership was lost and the candidate was stopped.
+    LeadershipLost(String),
 }
 
 /// Drives one spawned bridge to its readiness boundary exactly once.
@@ -229,12 +345,17 @@ impl SpawnedBridge {
     async fn wait_ready(
         mut self,
         stop: &mut watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
         timeout: Duration,
     ) -> StartupOutcome {
         let wait = {
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
             tokio::select! {
+                biased;
+                detail = wait_for_leadership_loss(leadership_loss) => {
+                    ReadyWait::LeadershipLost(detail)
+                }
                 _ = wait_for_stop(stop) => ReadyWait::Stopped,
                 result = &mut self.ready => match result {
                     Ok(ready) => ReadyWait::Ready(ready),
@@ -256,6 +377,17 @@ impl SpawnedBridge {
                     tracing::warn!(%detail, "bridge stop after startup cancellation reported an error");
                 }
                 StartupOutcome::Cancelled
+            }
+            ReadyWait::LeadershipLost(detail) => {
+                if let Err(stop_detail) =
+                    stop_bridge_task(self.cancellation, self.task, timeout).await
+                {
+                    tracing::warn!(
+                        %stop_detail,
+                        "bridge stop after leadership loss reported an error"
+                    );
+                }
+                StartupOutcome::LeadershipLost(detail)
             }
             // The runtime drops its readiness sender only on exit, so the task
             // result is available promptly and is polled exactly once here.
@@ -445,6 +577,8 @@ enum LoopControl {
     Continue,
     /// Parent stop was observed during this pass.
     Stop,
+    /// The database session proving room leadership failed.
+    LeadershipLost,
 }
 
 /// Reason the supervisor woke from its event wait.
@@ -784,16 +918,50 @@ impl RoomReconciler {
     /// it. Rift is never aborted from here: an initial startup failure returns
     /// an error for the parent to treat as fatal, while later bridge failures
     /// are absorbed by fallback and restart.
-    pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> Result<(), String> {
+    pub async fn run(self, stop: watch::Receiver<bool>) -> Result<(), String> {
+        let mut leadership_lease = self
+            .core
+            .store
+            .acquire_leadership()
+            .await
+            .map_err(|detail| format!("room reconciler leadership unavailable: {detail}"))?;
+        let mut leadership_loss = leadership_lease.subscribe_loss();
+        let result = self.run_with_leadership(stop, &mut leadership_loss).await;
+        leadership_lease.release().await;
+        result
+    }
+
+    /// Run bridge supervision while reacting to lock-session health failures.
+    async fn run_with_leadership(
+        mut self,
+        mut stop: watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
+    ) -> Result<(), String> {
         let base = self.core.base.clone();
-        let (running, ready) = match self.start_bridge(base.clone(), &mut stop).await {
+        let (running, ready) = match self
+            .start_bridge(base.clone(), &mut stop, leadership_loss)
+            .await
+        {
             StartupOutcome::Ready(running, ready) => (running, ready),
             StartupOutcome::Cancelled => return Ok(()),
             StartupOutcome::Failed(detail) => {
                 return Err(format!("initial bridge startup failed: {detail}"));
             }
+            StartupOutcome::LeadershipLost(detail) => {
+                return Err(format!("room reconciler leadership lost: {detail}"));
+            }
         };
-        let initial_revision = match self.import_ready_roster(&ready).await {
+        let import_result = self.import_ready_roster(&ready).await;
+        if let Some(detail) = current_leadership_loss(leadership_loss) {
+            if let Err(stop_detail) = running.stop(self.lifecycle_timeout).await {
+                tracing::warn!(
+                    %stop_detail,
+                    "initial bridge stop after leadership loss reported an error"
+                );
+            }
+            return Err(format!("room reconciler leadership lost: {detail}"));
+        }
+        let initial_revision = match import_result {
             Ok(revision) => revision,
             Err(detail) => {
                 if let Err(stop_detail) = running.stop(self.lifecycle_timeout).await {
@@ -825,20 +993,34 @@ impl RoomReconciler {
             durable_last_good: initial_revision,
             hints_open: true,
         };
-        loop {
-            if self.converge(&mut state, &mut stop).await == LoopControl::Stop {
-                break;
+        let leadership_failure = loop {
+            match self.converge(&mut state, &mut stop, leadership_loss).await {
+                LoopControl::Continue => {}
+                LoopControl::Stop => break None,
+                LoopControl::LeadershipLost => {
+                    break Some(leadership_loss_detail(leadership_loss));
+                }
             }
-            if self.wait_for_event(&mut state, &mut stop).await == LoopControl::Stop {
-                break;
+            match self
+                .wait_for_event(&mut state, &mut stop, leadership_loss)
+                .await
+            {
+                LoopControl::Continue => {}
+                LoopControl::Stop => break None,
+                LoopControl::LeadershipLost => {
+                    break Some(leadership_loss_detail(leadership_loss));
+                }
             }
-        }
+        };
         if let Some(bridge) = state.active.take() {
             if let Err(detail) = bridge.running.stop(self.lifecycle_timeout).await {
                 tracing::warn!(%detail, "managed bridge stop reported an error during shutdown");
             }
         }
-        Ok(())
+        match leadership_failure {
+            Some(detail) => Err(format!("room reconciler leadership lost: {detail}")),
+            None => Ok(()),
+        }
     }
 
     /// Import a ready TOML roster only when managed control is explicitly enabled.
@@ -882,6 +1064,7 @@ impl RoomReconciler {
         &mut self,
         state: &mut Supervision,
         stop: &mut watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
     ) -> LoopControl {
         let poll_interval = self.poll_interval;
         let event = {
@@ -903,6 +1086,10 @@ impl RoomReconciler {
                 }
             };
             tokio::select! {
+                biased;
+                _ = wait_for_leadership_loss(leadership_loss) => {
+                    return LoopControl::LeadershipLost;
+                }
                 _ = wait_for_stop(stop) => return LoopControl::Stop,
                 changed = hint => match changed {
                     Ok(()) => WakeEvent::Hint,
@@ -942,7 +1129,11 @@ impl RoomReconciler {
         &mut self,
         state: &mut Supervision,
         stop: &mut watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
     ) -> LoopControl {
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
         // Collect a bridge that crashed while this pass was not watching it.
         if state
             .active
@@ -956,7 +1147,10 @@ impl RoomReconciler {
         }
         // Restore supervision before consulting desired state.
         if state.active.is_none() {
-            match self.start_bridge(state.last_good.1.clone(), stop).await {
+            match self
+                .start_bridge(state.last_good.1.clone(), stop, leadership_loss)
+                .await
+            {
                 StartupOutcome::Ready(running, _ready) => {
                     state.active = Some(ActiveBridge {
                         revision: state.last_good.0,
@@ -964,16 +1158,20 @@ impl RoomReconciler {
                     });
                 }
                 StartupOutcome::Cancelled => return LoopControl::Stop,
+                StartupOutcome::LeadershipLost(_) => return LoopControl::LeadershipLost,
                 StartupOutcome::Failed(detail) => {
                     tracing::error!(%detail, "restart of the last known good bridge failed");
                     if self.initial_roster_author.is_some() {
-                        self.persist_status(ApplyStatusUpdate {
-                            active_revision: None,
-                            last_good_revision: state.last_good.0.or(state.durable_last_good),
-                            apply_state: ApplyState::Failed,
-                            error_code: Some("bridge_unavailable".to_string()),
-                            error_message: Some(bounded_detail(&detail)),
-                        })
+                        self.persist_status(
+                            state.failed_revision.or(state.last_good.0),
+                            ApplyStatusUpdate {
+                                active_revision: None,
+                                last_good_revision: state.last_good.0.or(state.durable_last_good),
+                                apply_state: ApplyState::Failed,
+                                error_code: Some("bridge_unavailable".to_string()),
+                                error_message: Some(bounded_detail(&detail)),
+                            },
+                        )
                         .await;
                     }
                     // The next poll tick retries the restart.
@@ -987,7 +1185,11 @@ impl RoomReconciler {
             // it neither reads nor writes managed roster state.
             return LoopControl::Continue;
         }
-        let roster = match self.core.store.current_roster().await {
+        let roster_result = self.core.store.current_roster().await;
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
+        let roster = match roster_result {
             Ok(roster) => roster,
             Err(detail) => {
                 tracing::warn!(%detail, "durable roster read failed; keeping the current bridge");
@@ -1005,13 +1207,16 @@ impl RoomReconciler {
             // Heal durable status that lags the running bridge, for example
             // after a status write that failed right after a successful swap.
             if roster.active_revision != Some(desired) || roster.apply_state != ApplyState::Active {
-                self.persist_status(ApplyStatusUpdate {
-                    active_revision: Some(desired),
-                    last_good_revision: Some(desired),
-                    apply_state: ApplyState::Active,
-                    error_code: None,
-                    error_message: None,
-                })
+                self.persist_status(
+                    Some(desired),
+                    ApplyStatusUpdate {
+                        active_revision: Some(desired),
+                        last_good_revision: Some(desired),
+                        apply_state: ApplyState::Active,
+                        error_code: None,
+                        error_message: None,
+                    },
+                )
                 .await;
             }
             return LoopControl::Continue;
@@ -1021,7 +1226,8 @@ impl RoomReconciler {
             // desired revision falls through and applies normally.
             return LoopControl::Continue;
         }
-        self.apply_revision(desired, state, stop).await
+        self.apply_revision(desired, state, stop, leadership_loss)
+            .await
     }
 
     /// Validate, preflight, and swap to one desired revision with fallback.
@@ -1030,8 +1236,13 @@ impl RoomReconciler {
         revision: i64,
         state: &mut Supervision,
         stop: &mut watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
     ) -> LoopControl {
-        let seats = match self.core.store.revision_seats(revision).await {
+        let seats_result = self.core.store.revision_seats(revision).await;
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
+        let seats = match seats_result {
             Ok(views) => views.into_iter().map(|view| view.seat).collect::<Vec<_>>(),
             Err(detail) => {
                 tracing::warn!(%detail, revision, "desired revision read failed; retrying on the next pass");
@@ -1039,7 +1250,11 @@ impl RoomReconciler {
             }
         };
         let running_revision = state.active.as_ref().and_then(|bridge| bridge.revision);
-        let candidate = match self.materialize_candidate(&seats).await {
+        let candidate_result = self.materialize_candidate(&seats).await;
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
+        let candidate = match candidate_result {
             Ok(config) => config,
             // A store outage during seat resolution is transient: retry on
             // the next pass instead of latching the revision as failed.
@@ -1057,7 +1272,11 @@ impl RoomReconciler {
                 return LoopControl::Continue;
             }
         };
-        if let Err(error) = self.runner.preflight(&candidate).await {
+        let preflight_result = self.runner.preflight(&candidate).await;
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
+        if let Err(error) = preflight_result {
             self.record_apply_failure(revision, state, running_revision, error)
                 .await;
             return LoopControl::Continue;
@@ -1069,7 +1288,13 @@ impl RoomReconciler {
                 tracing::warn!(%detail, "previous bridge stop reported an error during replacement");
             }
         }
-        match self.start_bridge(candidate.clone(), stop).await {
+        if current_leadership_loss(leadership_loss).is_some() {
+            return LoopControl::LeadershipLost;
+        }
+        match self
+            .start_bridge(candidate.clone(), stop, leadership_loss)
+            .await
+        {
             StartupOutcome::Ready(running, _ready) => {
                 state.active = Some(ActiveBridge {
                     revision: Some(revision),
@@ -1078,20 +1303,27 @@ impl RoomReconciler {
                 state.last_good = (Some(revision), candidate);
                 state.durable_last_good = Some(revision);
                 state.failed_revision = None;
-                self.persist_status(ApplyStatusUpdate {
-                    active_revision: Some(revision),
-                    last_good_revision: Some(revision),
-                    apply_state: ApplyState::Active,
-                    error_code: None,
-                    error_message: None,
-                })
+                self.persist_status(
+                    Some(revision),
+                    ApplyStatusUpdate {
+                        active_revision: Some(revision),
+                        last_good_revision: Some(revision),
+                        apply_state: ApplyState::Active,
+                        error_code: None,
+                        error_message: None,
+                    },
+                )
                 .await;
                 LoopControl::Continue
             }
             StartupOutcome::Cancelled => LoopControl::Stop,
+            StartupOutcome::LeadershipLost(_) => LoopControl::LeadershipLost,
             StartupOutcome::Failed(detail) => {
                 tracing::error!(%detail, revision, "candidate bridge failed to start; restarting last known good");
-                match self.start_bridge(state.last_good.1.clone(), stop).await {
+                match self
+                    .start_bridge(state.last_good.1.clone(), stop, leadership_loss)
+                    .await
+                {
                     StartupOutcome::Ready(running, _ready) => {
                         state.active = Some(ActiveBridge {
                             revision: state.last_good.0,
@@ -1099,6 +1331,9 @@ impl RoomReconciler {
                         });
                     }
                     StartupOutcome::Cancelled => return LoopControl::Stop,
+                    StartupOutcome::LeadershipLost(_) => {
+                        return LoopControl::LeadershipLost;
+                    }
                     StartupOutcome::Failed(fallback_detail) => {
                         tracing::error!(
                             %fallback_detail,
@@ -1140,9 +1375,12 @@ impl RoomReconciler {
         &self,
         config: BridgeConfig,
         stop: &mut watch::Receiver<bool>,
+        leadership_loss: &mut watch::Receiver<Option<String>>,
     ) -> StartupOutcome {
         let spawned = self.runner.spawn(config, self.dependencies.clone());
-        spawned.wait_ready(stop, self.lifecycle_timeout).await
+        spawned
+            .wait_ready(stop, leadership_loss, self.lifecycle_timeout)
+            .await
     }
 
     /// Latch one failed revision and persist its sanitized failure status.
@@ -1163,19 +1401,31 @@ impl RoomReconciler {
             "desired revision failed to apply"
         );
         state.failed_revision = Some(revision);
-        self.persist_status(ApplyStatusUpdate {
-            active_revision,
-            last_good_revision: state.last_good.0.or(state.durable_last_good),
-            apply_state: ApplyState::Failed,
-            error_code: Some(error.code.to_string()),
-            error_message: Some(bounded_detail(&error.message)),
-        })
+        self.persist_status(
+            Some(revision),
+            ApplyStatusUpdate {
+                active_revision,
+                last_good_revision: state.last_good.0.or(state.durable_last_good),
+                apply_state: ApplyState::Failed,
+                error_code: Some(error.code.to_string()),
+                error_message: Some(bounded_detail(&error.message)),
+            },
+        )
         .await;
     }
 
     /// Persist one observable transition, tolerating a transient store failure.
-    async fn persist_status(&self, status: ApplyStatusUpdate) {
-        if let Err(detail) = self.core.store.set_status(status).await {
+    async fn persist_status(
+        &self,
+        expected_desired_revision: Option<i64>,
+        status: ApplyStatusUpdate,
+    ) {
+        if let Err(detail) = self
+            .core
+            .store
+            .set_status(expected_desired_revision, status)
+            .await
+        {
             tracing::warn!(%detail, "bridge status persistence failed; the poll loop will heal it");
         }
     }
@@ -1224,6 +1474,34 @@ async fn wait_for_stop(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Wait until the dedicated leadership monitor reports a database-session failure.
+async fn wait_for_leadership_loss(receiver: &mut watch::Receiver<Option<String>>) -> String {
+    loop {
+        if let Some(detail) = receiver.borrow().clone() {
+            return detail;
+        }
+        if receiver.changed().await.is_err() {
+            return "room leadership monitor ended unexpectedly".to_string();
+        }
+    }
+}
+
+/// Read the current leadership failure without blocking when the session is healthy.
+fn current_leadership_loss(receiver: &watch::Receiver<Option<String>>) -> Option<String> {
+    receiver.borrow().clone().or_else(|| {
+        receiver
+            .has_changed()
+            .is_err()
+            .then(|| "room leadership monitor ended unexpectedly".to_string())
+    })
+}
+
+/// Return the observed leadership failure or a stable fallback for a closed monitor.
+fn leadership_loss_detail(receiver: &watch::Receiver<Option<String>>) -> String {
+    current_leadership_loss(receiver)
+        .unwrap_or_else(|| "room leadership monitor ended unexpectedly".to_string())
+}
+
 /// Render a nested bridge task result without discarding either error layer.
 fn task_result_detail(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> String {
     match result {
@@ -1260,12 +1538,16 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
 
     use henosis_rift_bridge::config::{BridgeDaemonConfig, ExecutorConfig, RiftConfig};
     use henosis_rift_bridge::materialize::ResolvedExecutionMode;
     use henosis_rift_server::models::agent_control::CredentialReadiness;
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
     use tokio::sync::Notify;
 
     use super::*;
@@ -1308,6 +1590,22 @@ mod tests {
     /// Stable server identity shared by every test roster.
     fn server_id() -> Uuid {
         Uuid::from_u128(1)
+    }
+
+    /// PostgreSQL leadership keys are deterministic and distinct across sample rooms.
+    #[test]
+    fn room_leadership_lock_key_is_stable_and_room_scoped() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+
+        assert_eq!(
+            room_reconciler_lock_key(first),
+            room_reconciler_lock_key(first)
+        );
+        assert_ne!(
+            room_reconciler_lock_key(first),
+            room_reconciler_lock_key(second)
+        );
     }
 
     /// Produce the deterministic provisioned user ID emitted by the fake runner.
@@ -1403,6 +1701,47 @@ mod tests {
     struct FakeStore {
         /// Lock-protected durable fixture state.
         state: Mutex<FakeStoreState>,
+        /// Process-wide flag modeling one room's database advisory lock.
+        leadership_held: Arc<AtomicBool>,
+        /// Failure sender for the currently held fake leadership lease.
+        leadership_loss: Mutex<Option<watch::Sender<Option<String>>>>,
+    }
+
+    /// Fake lifetime token releasing room leadership when the supervisor exits.
+    struct FakeLeadershipLease {
+        /// Shared lock state reset when this lease is dropped.
+        held: Arc<AtomicBool>,
+        /// Receiver carrying a scripted leadership-session failure.
+        loss: watch::Receiver<Option<String>>,
+        /// Whether explicit release already cleared the shared flag.
+        released: bool,
+    }
+
+    /// Exposes scripted failure and deterministic release for fake leadership.
+    #[async_trait]
+    impl RoomLeadershipLease for FakeLeadershipLease {
+        /// Clone the scripted loss receiver for one supervisor.
+        fn subscribe_loss(&self) -> watch::Receiver<Option<String>> {
+            self.loss.clone()
+        }
+
+        /// Release the in-memory leadership flag before returning.
+        async fn release(&mut self) {
+            if !self.released {
+                self.held.store(false, Ordering::Release);
+                self.released = true;
+            }
+        }
+    }
+
+    /// Releases fake room leadership at the same lifetime boundary as PostgreSQL.
+    impl Drop for FakeLeadershipLease {
+        /// Make the room available to a later reconciler.
+        fn drop(&mut self) {
+            if !self.released {
+                self.held.store(false, Ordering::Release);
+            }
+        }
     }
 
     /// Builds and inspects fake durable state.
@@ -1431,7 +1770,20 @@ mod tests {
                     revision_results: VecDeque::new(),
                     revision_reads: Vec::new(),
                 }),
+                leadership_held: Arc::new(AtomicBool::new(false)),
+                leadership_loss: Mutex::new(None),
             })
+        }
+
+        /// Simulate failure of the database session holding room leadership.
+        fn lose_leadership(&self) {
+            self.leadership_loss
+                .lock()
+                .expect("fake leadership sender lock")
+                .as_ref()
+                .expect("fake leadership must be held")
+                .send(Some("scripted room leadership failure".to_string()))
+                .expect("fake leadership receiver must be alive");
         }
 
         /// Install one desired revision holding a single enabled Claude seat.
@@ -1580,6 +1932,23 @@ mod tests {
     /// Serves durable state from the shared fixture.
     #[async_trait]
     impl RoomRevisionStore for FakeStore {
+        /// Acquire the single in-memory leadership slot for this fake room.
+        async fn acquire_leadership(&self) -> Result<Box<dyn RoomLeadershipLease>, String> {
+            self.leadership_held
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| "another Henosis process already supervises this room".to_string())?;
+            let (loss_tx, loss) = watch::channel(None);
+            *self
+                .leadership_loss
+                .lock()
+                .expect("fake leadership sender lock") = Some(loss_tx);
+            Ok(Box::new(FakeLeadershipLease {
+                held: self.leadership_held.clone(),
+                loss,
+                released: false,
+            }))
+        }
+
         /// Import revision one exactly once while recording every call.
         async fn import_initial_roster(
             &self,
@@ -1652,10 +2021,17 @@ mod tests {
                 .cloned())
         }
 
-        /// Record one status write, honoring scripted failures before mutation.
-        async fn set_status(&self, status: ApplyStatusUpdate) -> Result<(), String> {
+        /// Record one status write and reject it when its desired revision is stale.
+        async fn set_status(
+            &self,
+            expected_desired_revision: Option<i64>,
+            status: ApplyStatusUpdate,
+        ) -> Result<(), String> {
             let mut state = self.state.lock().expect("fake store lock");
             state.status_updates.push(status.clone());
+            if state.roster.desired_revision != expected_desired_revision {
+                return Err("desired revision changed before status persistence".to_string());
+            }
             if let Some(result) = state.status_results.pop_front() {
                 result?;
             }
@@ -1952,6 +2328,141 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, RunnerEvent::Stopped(_))));
+    }
+
+    /// A second process cannot spawn a bridge until the current supervisor exits.
+    #[tokio::test(start_paused = true)]
+    async fn room_leadership_allows_only_one_reconciler_at_a_time() {
+        let store = FakeStore::new();
+        let first = start_disabled_harness(store.clone(), Vec::new(), Vec::new());
+        wait_until(|| first.runner.spawned().len() == 1).await;
+
+        let second = start_disabled_harness(store, Vec::new(), Vec::new());
+        let Harness {
+            runner: second_runner,
+            task: second_task,
+            ..
+        } = second;
+        let second_error = second_task
+            .await
+            .expect("second reconciler task join")
+            .expect_err("second reconciler must not acquire room leadership");
+        assert!(second_error.contains("already supervises this room"));
+        assert!(second_runner.spawned().is_empty());
+
+        let (store, _) = stop_and_join(first).await;
+        let third = start_disabled_harness(store, Vec::new(), Vec::new());
+        wait_until(|| third.runner.spawned().len() == 1).await;
+        stop_and_join(third).await;
+    }
+
+    /// Losing the lock session stops the running bridge before supervision returns.
+    #[tokio::test(start_paused = true)]
+    async fn room_leadership_loss_stops_the_supervised_bridge() {
+        let harness = start_disabled_harness(FakeStore::new(), Vec::new(), Vec::new());
+        wait_until(|| harness.runner.spawned().len() == 1).await;
+        let Harness {
+            store,
+            runner,
+            task,
+            stop: _stop,
+            handle: _handle,
+            control_registry: _control_registry,
+            _fixtures,
+        } = harness;
+
+        store.lose_leadership();
+        let error = task
+            .await
+            .expect("reconciler task join after leadership loss")
+            .expect_err("leadership loss must stop supervision");
+        assert!(error.contains("scripted room leadership failure"));
+        assert!(matches!(
+            runner.events().last(),
+            Some(RunnerEvent::Stopped(_))
+        ));
+    }
+
+    /// Live PostgreSQL leadership contends and releases on its dedicated session.
+    #[tokio::test]
+    async fn live_postgres_room_leadership_contends_and_releases() {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!("skipping live leadership test: HENOSIS_RIFT_TEST_DATABASE_URL is unset");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        let store = PostgresRoomRevisionStore {
+            pool: pool.clone(),
+            server_id: Uuid::new_v4(),
+        };
+
+        let mut first = store
+            .acquire_leadership()
+            .await
+            .expect("first PostgreSQL session must acquire leadership");
+        let contention = match store.acquire_leadership().await {
+            Ok(mut unexpected) => {
+                unexpected.release().await;
+                panic!("second PostgreSQL session unexpectedly acquired leadership");
+            }
+            Err(detail) => detail,
+        };
+        assert!(contention.contains("already supervises this room"));
+
+        first.release().await;
+        let mut replacement = store
+            .acquire_leadership()
+            .await
+            .expect("replacement session must acquire released leadership");
+        replacement.release().await;
+        pool.close().await;
+    }
+
+    /// Stale runtime results cannot overwrite the status of a newer desired revision.
+    #[tokio::test]
+    async fn status_persistence_is_bound_to_the_desired_revision() {
+        let store = FakeStore::new();
+        store.install_revision(2);
+
+        let stale_result = store
+            .set_status(
+                Some(1),
+                ApplyStatusUpdate {
+                    active_revision: Some(1),
+                    last_good_revision: Some(1),
+                    apply_state: ApplyState::Active,
+                    error_code: None,
+                    error_message: None,
+                },
+            )
+            .await;
+        assert!(stale_result.is_err());
+        let unchanged = store.latest_roster();
+        assert_eq!(unchanged.desired_revision, Some(2));
+        assert_eq!(unchanged.active_revision, None);
+        assert_eq!(unchanged.apply_state, ApplyState::Pending);
+
+        store
+            .set_status(
+                Some(2),
+                ApplyStatusUpdate {
+                    active_revision: Some(2),
+                    last_good_revision: Some(2),
+                    apply_state: ApplyState::Active,
+                    error_code: None,
+                    error_message: None,
+                },
+            )
+            .await
+            .expect("current desired revision may persist status");
+        let applied = store.latest_roster();
+        assert_eq!(applied.active_revision, Some(2));
+        assert_eq!(applied.last_good_revision, Some(2));
+        assert_eq!(applied.apply_state, ApplyState::Active);
     }
 
     /// Disabled control ignores durable desired state and keeps the TOML bridge unchanged.

@@ -16,6 +16,9 @@ use crate::models::role::Role;
 use crate::models::server::{Invite, Member, Server};
 use crate::models::user::User;
 
+/// Email suffix proving an agent identity was created by the Rift bridge path.
+pub(crate) const CLAIMABLE_AGENT_EMAIL_SUFFIX: &str = "@agent.local";
+
 // ───── Users ─────
 
 /// Insert a human user account and return the created row.
@@ -522,6 +525,9 @@ pub async fn claim_agent_as_shared_manager(
            CROSS JOIN users owner
            WHERE agent.id = $2
              AND agent.is_agent = TRUE
+             AND agent.email = agent.username || $5
+             AND agent.executor_type IS DISTINCT FROM 'System'
+             AND agent.agent_roster_id IS DISTINCT FROM 'henosis-room-owner'
              AND owner.id = $1
              AND owner.is_agent = FALSE
              AND EXISTS (
@@ -563,6 +569,7 @@ pub async fn claim_agent_as_shared_manager(
     .bind(agent_user_id)
     .bind(perms::MANAGE_SERVER)
     .bind(perms::ADMINISTRATOR)
+    .bind(CLAIMABLE_AGENT_EMAIL_SUFFIX)
     .fetch_optional(pool)
     .await?;
     Ok(claimed.is_some())

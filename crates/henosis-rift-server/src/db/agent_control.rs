@@ -47,6 +47,9 @@ pub async fn claim_agent(
            CROSS JOIN users owner
            WHERE agent.id = $1
              AND agent.is_agent = TRUE
+             AND agent.email = agent.username || $3
+             AND agent.executor_type IS DISTINCT FROM 'System'
+             AND agent.agent_roster_id IS DISTINCT FROM 'henosis-room-owner'
              AND owner.id = $2
              AND owner.is_agent = FALSE
            ON CONFLICT (agent_user_id) DO NOTHING
@@ -54,6 +57,7 @@ pub async fn claim_agent(
     )
     .bind(agent_user_id)
     .bind(owner_user_id)
+    .bind(super::CLAIMABLE_AGENT_EMAIL_SUFFIX)
     .fetch_optional(pool)
     .await?;
     Ok(claimed.is_some())
@@ -291,24 +295,27 @@ pub async fn write_room_agent_roster(
     Ok(revision)
 }
 
-/// Persist bridge reconciliation status for one room.
+/// Persist bridge reconciliation status only while the reported revision remains desired.
 pub async fn set_room_apply_status(
     pool: &PgPool,
     server_id: Uuid,
+    expected_desired_revision: Option<i64>,
     status: ApplyStatusUpdate,
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
         r#"UPDATE bridge_server_state
-           SET active_revision = $2,
-               last_good_revision = $3,
-               apply_state = $4,
-               apply_error_code = $5,
-               apply_error_message = $6,
+           SET active_revision = $3,
+               last_good_revision = $4,
+               apply_state = $5,
+               apply_error_code = $6,
+               apply_error_message = $7,
                apply_updated_at = NOW(),
                updated_at = NOW()
-           WHERE server_id = $1"#,
+           WHERE server_id = $1
+             AND desired_revision IS NOT DISTINCT FROM $2"#,
     )
     .bind(server_id)
+    .bind(expected_desired_revision)
     .bind(status.active_revision)
     .bind(status.last_good_revision)
     .bind(apply_state_name(status.apply_state))
@@ -412,19 +419,21 @@ mod tests {
         )
         .await
         .expect("owner must be created");
+        let first_agent_username = format!("agent-a-{}", &suffix[..10]);
         let first_agent = crate::db::create_agent_user(
             &pool,
-            &format!("agent-a-{}", &suffix[..10]),
-            &format!("agent-a-{suffix}@example.invalid"),
+            &first_agent_username,
+            &format!("{first_agent_username}@agent.local"),
             "unusable-test-hash",
             Some("Agent A"),
         )
         .await
         .expect("first agent must be created");
+        let second_agent_username = format!("agent-b-{}", &suffix[..10]);
         let second_agent = crate::db::create_agent_user(
             &pool,
-            &format!("agent-b-{}", &suffix[..10]),
-            &format!("agent-b-{suffix}@example.invalid"),
+            &second_agent_username,
+            &format!("{second_agent_username}@agent.local"),
             "unusable-test-hash",
             Some("Agent B"),
         )
@@ -433,10 +442,42 @@ mod tests {
         let server = crate::db::create_server(&pool, "Roster revision test", None, owner.id)
             .await
             .expect("server must be created");
+        let reserved_agent: crate::models::user::User = sqlx::query_as(
+            r#"INSERT INTO users
+               (username, email, password_hash, display_name, is_agent, executor_type, agent_roster_id)
+               VALUES ($1, $2, 'unusable-test-hash', 'Reserved Agent', TRUE, 'System',
+                       'henosis-room-owner')
+               RETURNING *"#,
+        )
+        .bind(format!("reserved-{}", &suffix[..12]))
+        .bind(format!("reserved-{suffix}@example.invalid"))
+        .fetch_one(&pool)
+        .await
+        .expect("reserved agent must be created");
+        crate::db::add_member(&pool, server.id, owner.id)
+            .await
+            .expect("owner membership must be created");
+        crate::db::add_member(&pool, server.id, reserved_agent.id)
+            .await
+            .expect("reserved membership must be created");
 
         assert!(claim_agent(&pool, first_agent.id, owner.id).await.unwrap());
         assert!(claim_agent(&pool, second_agent.id, owner.id).await.unwrap());
         assert!(!claim_agent(&pool, first_agent.id, owner.id).await.unwrap());
+        assert!(
+            !claim_agent(&pool, reserved_agent.id, owner.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::db::claim_agent_as_shared_manager(&pool, owner.id, reserved_agent.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            owner_for_agent(&pool, reserved_agent.id).await.unwrap(),
+            None
+        );
         assert_eq!(
             owner_for_agent(&pool, first_agent.id).await.unwrap(),
             Some(owner.id)
@@ -488,12 +529,54 @@ mod tests {
         assert_eq!(roster.seats.len(), 2);
         assert_eq!(roster.apply_state, ApplyState::Pending);
 
+        let stale_status = set_room_apply_status(
+            &pool,
+            server.id,
+            Some(1),
+            ApplyStatusUpdate {
+                active_revision: Some(1),
+                last_good_revision: Some(1),
+                apply_state: ApplyState::Active,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .expect_err("stale status must not overwrite revision two");
+        assert!(matches!(stale_status, sqlx::Error::RowNotFound));
+        let unchanged = read_room_agent_roster(&pool, server.id)
+            .await
+            .expect("stale status must leave the roster readable");
+        assert_eq!(unchanged.active_revision, None);
+        assert_eq!(unchanged.apply_state, ApplyState::Pending);
+
+        set_room_apply_status(
+            &pool,
+            server.id,
+            Some(2),
+            ApplyStatusUpdate {
+                active_revision: Some(2),
+                last_good_revision: Some(2),
+                apply_state: ApplyState::Active,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .expect("current desired revision may update status");
+        let applied = read_room_agent_roster(&pool, server.id)
+            .await
+            .expect("applied roster must remain readable");
+        assert_eq!(applied.active_revision, Some(2));
+        assert_eq!(applied.last_good_revision, Some(2));
+        assert_eq!(applied.apply_state, ApplyState::Active);
+
         sqlx::query("DELETE FROM servers WHERE id = $1")
             .bind(server.id)
             .execute(&pool)
             .await
             .expect("test server cleanup must succeed");
-        for user_id in [first_agent.id, second_agent.id, owner.id] {
+        for user_id in [first_agent.id, second_agent.id, reserved_agent.id, owner.id] {
             sqlx::query("DELETE FROM users WHERE id = $1")
                 .bind(user_id)
                 .execute(&pool)
