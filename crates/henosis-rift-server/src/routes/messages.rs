@@ -1,6 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -29,8 +30,13 @@ pub async fn list_messages(
         .ok_or(AppError::NotFound("Channel not found".into()))?;
 
     require_member(&pool, channel.server_id, auth.user_id).await?;
+    let cursor = select_list_message_cursor(&query)?;
 
     let messages = db::get_messages(&pool, channel_id, &query).await?;
+    require_existing_message_cursor(cursor, |cursor| {
+        db::message_cursor_exists_in_channel(&pool, channel_id, cursor)
+    })
+    .await?;
 
     // Batch-load attachments for all messages
     let msg_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
@@ -286,6 +292,44 @@ fn resolve_message_type(requested: Option<&str>, author_is_agent: bool) -> Resul
     }
 }
 
+/// Select one pagination direction and reject ambiguous list queries.
+fn select_list_message_cursor(query: &MessageQuery) -> Result<Option<Uuid>, AppError> {
+    match (query.before, query.after) {
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "before and after cursors cannot be combined".to_string(),
+        )),
+        (Some(cursor), None) | (None, Some(cursor)) => Ok(Some(cursor)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Confirm the page boundary still belongs to this channel after the page read.
+async fn require_existing_message_cursor<F, Fut>(
+    cursor: Option<Uuid>,
+    cursor_exists: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce(Uuid) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+{
+    let Some(cursor) = cursor else {
+        return Ok(());
+    };
+    if !cursor_exists(cursor).await? {
+        return Err(invalid_message_cursor());
+    }
+    Ok(())
+}
+
+/// Construct the stable non-disclosing response for an invalid room cursor.
+fn invalid_message_cursor() -> AppError {
+    AppError::Coded {
+        status: StatusCode::NOT_FOUND,
+        code: "invalid_message_cursor",
+        message: "Message cursor does not exist in this channel".to_string(),
+    }
+}
+
 /// Reject callers that are not members of the server owning the channel.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
     if !db::is_member(pool, server_id, user_id).await? {
@@ -312,9 +356,248 @@ async fn require_permission(
 /// Covers message parent binding and message-type authorization rules.
 #[cfg(test)]
 mod tests {
-    use super::{require_message_channel, resolve_message_type};
+    use axum::extract::{Path, Query, State};
+    use axum::response::IntoResponse;
+    use sqlx::postgres::PgPoolOptions;
+
+    use super::{
+        list_messages, require_existing_message_cursor, require_message_channel,
+        resolve_message_type, select_list_message_cursor,
+    };
+    use crate::auth::middleware::AuthUser;
+    use crate::db;
     use crate::error::AppError;
+    use crate::models::message::MessageQuery;
     use uuid::Uuid;
+
+    /// Construct one list query around the requested before and after cursors.
+    fn message_query(before: Option<Uuid>, after: Option<Uuid>) -> MessageQuery {
+        MessageQuery {
+            before,
+            after,
+            limit: Some(50),
+        }
+    }
+
+    /// Connect to the opt-in PostgreSQL test database without exposing its URL.
+    async fn live_test_pool() -> Option<sqlx::PgPool> {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!("skipping live message cursor test: HENOSIS_RIFT_TEST_DATABASE_URL is unset");
+            return None;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+        Some(pool)
+    }
+
+    /// Assert the concrete HTTP envelope for one invalid cursor error.
+    async fn assert_invalid_message_cursor_error(error: AppError) {
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("coded error body must be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("coded error body must be JSON");
+        assert_eq!(body["code"], "invalid_message_cursor");
+    }
+
+    /// Assert that one unavailable cursor maps to Rift's stable coded 404.
+    async fn assert_invalid_message_cursor(query: MessageQuery) {
+        let cursor = select_list_message_cursor(&query).expect("one cursor must be selectable");
+        let error = require_existing_message_cursor(cursor, |_| async { Ok(false) })
+            .await
+            .expect_err("unavailable cursor must fail");
+        assert_invalid_message_cursor_error(error).await;
+    }
+
+    /// An unknown after cursor returns the stable non-disclosing 404 contract.
+    #[tokio::test]
+    async fn list_messages_rejects_unknown_after_cursor() {
+        assert_invalid_message_cursor(message_query(None, Some(Uuid::new_v4()))).await;
+    }
+
+    /// An unknown before cursor returns the stable non-disclosing 404 contract.
+    #[tokio::test]
+    async fn list_messages_rejects_unknown_before_cursor() {
+        assert_invalid_message_cursor(message_query(Some(Uuid::new_v4()), None)).await;
+    }
+
+    /// A cursor rejected by the channel-scoped store uses the same opaque error.
+    #[tokio::test]
+    async fn list_messages_rejects_cursor_from_another_channel() {
+        assert_invalid_message_cursor(message_query(Some(Uuid::new_v4()), None)).await;
+    }
+
+    /// A channel-owned cursor passes validation even when its page will be empty.
+    #[tokio::test]
+    async fn list_messages_accepts_valid_boundary_cursor() {
+        let query = message_query(None, Some(Uuid::new_v4()));
+        let cursor = select_list_message_cursor(&query).expect("one cursor must be selectable");
+        require_existing_message_cursor(cursor, |_| async { Ok(true) })
+            .await
+            .expect("channel-owned cursor must pass");
+    }
+
+    /// Combining pagination directions remains a client error.
+    #[tokio::test]
+    async fn list_messages_rejects_combined_cursors() {
+        let error =
+            select_list_message_cursor(&message_query(Some(Uuid::new_v4()), Some(Uuid::new_v4())))
+                .expect_err("combined cursors must fail");
+        assert!(matches!(error, AppError::BadRequest(_)));
+    }
+
+    /// Live PostgreSQL proves cursor scope, stable ordering, and empty boundaries.
+    #[tokio::test]
+    async fn list_messages_enforce_live_channel_cursor_contracts() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let username = format!("cursor_{suffix}");
+        let user = db::create_user(
+            &pool,
+            &username,
+            &format!("cursor-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("test user must be created");
+        let server = db::create_server(&pool, &format!("cursor-{suffix}"), None, user.id)
+            .await
+            .expect("test server must be created");
+        db::add_member(&pool, server.id, user.id)
+            .await
+            .expect("test member must be created");
+        let channel = db::create_channel(&pool, server.id, "target", None, "text")
+            .await
+            .expect("target channel must be created");
+        let other_channel = db::create_channel(&pool, server.id, "other", None, "text")
+            .await
+            .expect("other channel must be created");
+        let first = db::create_message(&pool, channel.id, user.id, "first", "user")
+            .await
+            .expect("first message must be created");
+        let second = db::create_message(&pool, channel.id, user.id, "second", "user")
+            .await
+            .expect("second message must be created");
+        let other = db::create_message(&pool, other_channel.id, user.id, "other", "user")
+            .await
+            .expect("other-channel message must be created");
+        let equal_time_ids = vec![first.id, second.id];
+        sqlx::query(
+            "UPDATE messages SET created_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' \
+             WHERE id = ANY($1)",
+        )
+        .bind(&equal_time_ids)
+        .execute(&pool)
+        .await
+        .expect("test messages must share one timestamp");
+
+        let auth = AuthUser {
+            user_id: user.id,
+            username,
+        };
+        for query in [
+            message_query(Some(Uuid::new_v4()), None),
+            message_query(None, Some(Uuid::new_v4())),
+            message_query(Some(other.id), None),
+        ] {
+            let error = match list_messages(
+                State(pool.clone()),
+                auth.clone(),
+                Path(channel.id),
+                Query(query),
+            )
+            .await
+            {
+                Ok(_) => panic!("invalid cursor must not produce a page"),
+                Err(error) => error,
+            };
+            assert_invalid_message_cursor_error(error).await;
+        }
+
+        let (lower_id, higher_id) = if first.id < second.id {
+            (first.id, second.id)
+        } else {
+            (second.id, first.id)
+        };
+        let before = db::get_messages(&pool, channel.id, &message_query(Some(higher_id), None))
+            .await
+            .expect("before page must load");
+        assert_eq!(
+            before.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![lower_id]
+        );
+        let after = db::get_messages(&pool, channel.id, &message_query(None, Some(lower_id)))
+            .await
+            .expect("after page must load");
+        assert_eq!(
+            after.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![higher_id]
+        );
+
+        let newest = db::create_message(&pool, channel.id, user.id, "newest", "user")
+            .await
+            .expect("newest message must be created");
+        let after_equal_time =
+            db::get_messages(&pool, channel.id, &message_query(None, Some(higher_id)))
+                .await
+                .expect("forward page must load");
+        assert_eq!(
+            after_equal_time
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![newest.id]
+        );
+
+        let (concurrent_one, concurrent_two) = tokio::join!(
+            db::create_message(&pool, channel.id, user.id, "concurrent-one", "user"),
+            db::create_message(&pool, channel.id, user.id, "concurrent-two", "user"),
+        );
+        let concurrent_one = concurrent_one.expect("first concurrent message must be created");
+        let concurrent_two = concurrent_two.expect("second concurrent message must be created");
+        assert_ne!(concurrent_one.created_at, concurrent_two.created_at);
+        let concurrent_page =
+            db::get_messages(&pool, channel.id, &message_query(None, Some(newest.id)))
+                .await
+                .expect("concurrent forward page must load");
+        assert_eq!(
+            concurrent_page
+                .iter()
+                .map(|message| message.id)
+                .collect::<std::collections::HashSet<_>>(),
+            [concurrent_one.id, concurrent_two.id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
+
+        let newest_concurrent_id = if concurrent_one.created_at > concurrent_two.created_at {
+            concurrent_one.id
+        } else {
+            concurrent_two.id
+        };
+        let boundary = list_messages(
+            State(pool),
+            auth,
+            Path(channel.id),
+            Query(message_query(None, Some(newest_concurrent_id))),
+        )
+        .await
+        .expect("valid newest cursor must return an empty page");
+        assert!(boundary.0.is_empty());
+    }
 
     /// A message is accepted only under its authoritative channel identifier.
     #[test]

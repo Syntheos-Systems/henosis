@@ -257,6 +257,10 @@ pub fn router_with_control_registry(
                 .delete(routes::servers::delete_server),
         )
         .route(
+            "/api/servers/{server_id}/permissions/@me",
+            get(routes::servers::current_user_permissions),
+        )
+        .route(
             "/api/servers/{server_id}/members",
             get(routes::servers::list_members),
         )
@@ -398,4 +402,50 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
         .on_upgrade(move |socket| async move {
             gateway.handle_connection(socket, jwt_secret, pool).await;
         })
+}
+
+/// Exercises security properties of routes that must remain authenticated.
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::{Config, router};
+
+    /// Construct a secret-safe configuration for routes that reject before I/O.
+    fn test_config() -> Config {
+        Config {
+            database_url: "postgresql://rift.invalid/henosis_test".to_string(),
+            jwt_secret: "test-jwt-secret-not-for-production".to_string(),
+            bridge_secret: "test-bridge-secret-not-for-production".to_string(),
+            listen_addr: "127.0.0.1:0".to_string(),
+            cors_origins: vec![
+                "http://localhost:5173"
+                    .parse()
+                    .expect("test origin must parse"),
+            ],
+            upload_dir: "uploads".to_string(),
+            max_upload_bytes: 1024,
+        }
+    }
+
+    /// The current-user permission contract is mounted behind bearer authentication.
+    #[tokio::test]
+    async fn current_user_permissions_route_requires_authentication() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://rift.invalid/henosis_test")
+            .expect("test database URL must parse");
+        let response = router(test_config(), pool)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/servers/{}/permissions/@me", Uuid::new_v4()))
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must answer");
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
 }

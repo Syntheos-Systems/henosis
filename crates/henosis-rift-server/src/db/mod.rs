@@ -661,9 +661,15 @@ pub async fn delete_channel(pool: &PgPool, channel_id: Uuid) -> Result<(), sqlx:
 
 // ───── Messages ─────
 
-/// Insert a message with an explicit type and return it joined with author
-/// info. The type is resolved and authorized at the route layer; the column
-/// default ('user') only covers legacy writers that predate explicit stamping.
+/// Domain separator for per-channel message creation advisory locks.
+const MESSAGE_CREATE_LOCK_DOMAIN: u64 = 0x4845_4e4f_5349_534d;
+
+/// Insert a channel-ordered message with an explicit authorized type.
+///
+/// A transaction-scoped advisory lock serializes creation per channel, and the
+/// following insert reads a fresh snapshot after acquiring that lock. Its
+/// stored timestamp advances beyond that channel's current maximum even if the
+/// host clock stalls, which keeps cursors monotonic across Rift processes.
 pub async fn create_message(
     pool: &PgPool,
     channel_id: Uuid,
@@ -671,10 +677,36 @@ pub async fn create_message(
     content: &str,
     message_type: &str,
 ) -> Result<MessageWithAuthor, sqlx::Error> {
-    sqlx::query_as::<_, MessageWithAuthor>(
-        r#"WITH new_msg AS (
-               INSERT INTO messages (channel_id, author_id, content, message_type)
-               VALUES ($1, $2, $3, $4)
+    let raw_channel_id = channel_id.as_u128();
+    let folded_channel_id =
+        (raw_channel_id as u64) ^ ((raw_channel_id >> 64) as u64) ^ MESSAGE_CREATE_LOCK_DOMAIN;
+    let lock_key = i64::from_be_bytes(folded_channel_id.to_be_bytes());
+    let mut transaction = pool.begin().await?;
+    // Per-statement snapshots are required so a waiter observes the preceding
+    // lock holder's committed message before choosing its own timestamp.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *transaction)
+        .await?;
+    let message = sqlx::query_as::<_, MessageWithAuthor>(
+        r#"WITH next_time AS (
+               SELECT GREATEST(
+                          clock_timestamp(),
+                          COALESCE(
+                              MAX(created_at) + INTERVAL '1 microsecond',
+                              '-infinity'::timestamptz
+                          )
+                      ) AS created_at
+               FROM messages
+               WHERE channel_id = $1
+           ),
+           new_msg AS (
+               INSERT INTO messages (channel_id, author_id, content, message_type, created_at)
+               SELECT $1, $2, $3, $4, created_at
+               FROM next_time
                RETURNING *
            )
            SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
@@ -689,11 +721,26 @@ pub async fn create_message(
     .bind(author_id)
     .bind(content)
     .bind(message_type)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(message)
 }
 
-/// Page a channel's messages joined with author info: before/after cursor or latest-first.
+/// Report whether a message cursor belongs to the requested channel.
+pub async fn message_cursor_exists_in_channel(
+    pool: &PgPool,
+    channel_id: Uuid,
+    message_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = $1 AND id = $2)")
+        .bind(channel_id)
+        .bind(message_id)
+        .fetch_one(pool)
+        .await
+}
+
+/// Page a channel's messages with deterministic before/after cursor ordering.
 pub async fn get_messages(
     pool: &PgPool,
     channel_id: Uuid,
@@ -703,16 +750,22 @@ pub async fn get_messages(
 
     if let Some(before) = query.before {
         sqlx::query_as::<_, MessageWithAuthor>(
-            r#"SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
+            r#"WITH boundary AS (
+                   SELECT created_at, id
+                   FROM messages
+                   WHERE channel_id = $1 AND id = $2
+               )
+               SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
                       m.message_type,
                       u.username AS author_username,
                       u.display_name AS author_display_name,
                       u.avatar_url AS author_avatar_url
                FROM messages m
                INNER JOIN users u ON m.author_id = u.id
+               CROSS JOIN boundary b
                WHERE m.channel_id = $1
-                 AND m.created_at < (SELECT created_at FROM messages WHERE id = $2)
-               ORDER BY m.created_at DESC
+                 AND (m.created_at, m.id) < (b.created_at, b.id)
+               ORDER BY m.created_at DESC, m.id DESC
                LIMIT $3"#,
         )
         .bind(channel_id)
@@ -722,16 +775,22 @@ pub async fn get_messages(
         .await
     } else if let Some(after) = query.after {
         sqlx::query_as::<_, MessageWithAuthor>(
-            r#"SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
+            r#"WITH boundary AS (
+                   SELECT created_at, id
+                   FROM messages
+                   WHERE channel_id = $1 AND id = $2
+               )
+               SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
                       m.message_type,
                       u.username AS author_username,
                       u.display_name AS author_display_name,
                       u.avatar_url AS author_avatar_url
                FROM messages m
                INNER JOIN users u ON m.author_id = u.id
+               CROSS JOIN boundary b
                WHERE m.channel_id = $1
-                 AND m.created_at > (SELECT created_at FROM messages WHERE id = $2)
-               ORDER BY m.created_at ASC
+                 AND (m.created_at, m.id) > (b.created_at, b.id)
+               ORDER BY m.created_at ASC, m.id ASC
                LIMIT $3"#,
         )
         .bind(channel_id)
@@ -750,7 +809,7 @@ pub async fn get_messages(
                FROM messages m
                INNER JOIN users u ON m.author_id = u.id
                WHERE m.channel_id = $1
-               ORDER BY m.created_at DESC
+               ORDER BY m.created_at DESC, m.id DESC
                LIMIT $2"#,
         )
         .bind(channel_id)

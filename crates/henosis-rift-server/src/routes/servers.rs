@@ -34,6 +34,34 @@ pub struct MemberInfo {
     pub joined_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Effective room capabilities exposed to the authenticated human client.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomPermissions {
+    /// Whether the caller may create room messages.
+    pub send_messages: bool,
+    /// Whether the caller may both send messages and attach files to them.
+    pub attach_files: bool,
+    /// Whether the caller may delete messages authored by other members.
+    pub manage_messages: bool,
+    /// Whether the caller may manage room-wide settings.
+    pub manage_server: bool,
+}
+
+/// Converts Rift's authoritative permission mask into the narrow public contract.
+impl RoomPermissions {
+    /// Derive every exposed capability with administrator semantics preserved.
+    fn from_mask(mask: i64) -> Self {
+        let send_messages = perms::has(mask, perms::SEND_MESSAGES);
+        Self {
+            send_messages,
+            attach_files: send_messages && perms::has(mask, perms::ATTACH_FILES),
+            manage_messages: perms::has(mask, perms::MANAGE_MESSAGES),
+            manage_server: perms::has(mask, perms::MANAGE_SERVER),
+        }
+    }
+}
+
 /// POST /api/servers
 pub async fn create_server(
     State(pool): State<PgPool>,
@@ -94,6 +122,17 @@ pub async fn get_server(
         channels,
         roles,
     }))
+}
+
+/// GET /api/servers/:server_id/permissions/@me
+pub async fn current_user_permissions(
+    State(pool): State<PgPool>,
+    auth: AuthUser,
+    Path(server_id): Path<Uuid>,
+) -> Result<Json<RoomPermissions>, AppError> {
+    require_member(&pool, server_id, auth.user_id).await?;
+    let mask = db::get_member_permissions(&pool, server_id, auth.user_id).await?;
+    Ok(Json(RoomPermissions::from_mask(mask)))
 }
 
 /// PATCH /api/servers/:server_id
@@ -277,10 +316,16 @@ pub async fn delete_invite(
 
 /// Reject callers that are not members of the requested server.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
-    if !db::is_member(pool, server_id, user_id).await? {
-        return Err(AppError::Forbidden);
+    require_membership(db::is_member(pool, server_id, user_id).await?)
+}
+
+/// Convert server-truth membership into the shared forbidden boundary.
+fn require_membership(is_member: bool) -> Result<(), AppError> {
+    if is_member {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
     }
-    Ok(())
 }
 
 /// Reject members that lack the requested permission in the server.
@@ -322,8 +367,166 @@ fn generate_invite_code() -> String {
 #[cfg(test)]
 /// Exercises parent-server binding for nested invite mutation routes.
 mod tests {
-    use super::require_invite_server;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+
+    use super::{
+        RoomPermissions, current_user_permissions, require_invite_server, require_membership,
+    };
+    use crate::auth::middleware::AuthUser;
+    use crate::db;
+    use crate::models::permissions::perms;
     use uuid::Uuid;
+
+    /// Connect to the opt-in PostgreSQL test database without exposing its URL.
+    async fn live_test_pool() -> Option<sqlx::PgPool> {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping live room permission test: HENOSIS_RIFT_TEST_DATABASE_URL is unset"
+            );
+            return None;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+        Some(pool)
+    }
+
+    /// The current-user response contains only the four camel-case booleans.
+    #[test]
+    fn current_user_permissions_serialize_as_boolean_capabilities() {
+        let response = RoomPermissions::from_mask(perms::SEND_MESSAGES | perms::MANAGE_MESSAGES);
+        assert_eq!(
+            serde_json::to_value(response).expect("permissions must serialize"),
+            json!({
+                "sendMessages": true,
+                "attachFiles": false,
+                "manageMessages": true,
+                "manageServer": false,
+            })
+        );
+    }
+
+    /// Administrator authority grants every capability represented publicly.
+    #[test]
+    fn current_user_permissions_preserve_administrator_semantics() {
+        assert_eq!(
+            RoomPermissions::from_mask(perms::ADMINISTRATOR),
+            RoomPermissions {
+                send_messages: true,
+                attach_files: true,
+                manage_messages: true,
+                manage_server: true,
+            }
+        );
+    }
+
+    /// Attachment affordance stays disabled when the caller cannot send.
+    #[test]
+    fn current_user_permissions_require_send_for_attachments() {
+        let permissions = RoomPermissions::from_mask(perms::ATTACH_FILES);
+        assert!(!permissions.send_messages);
+        assert!(!permissions.attach_files);
+    }
+
+    /// Non-members are forbidden before effective permissions are exposed.
+    #[test]
+    fn current_user_permissions_forbid_non_members() {
+        assert!(require_membership(true).is_ok());
+        let response = require_membership(false)
+            .expect_err("non-member must be forbidden")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Live PostgreSQL proves the handler uses membership and authoritative roles.
+    #[tokio::test]
+    async fn current_user_permissions_enforce_live_membership() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("owner_{suffix}"),
+            &format!("owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("test owner must be created");
+        let member = db::create_user(
+            &pool,
+            &format!("member_{suffix}"),
+            &format!("member-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("test member must be created");
+        let outsider = db::create_user(
+            &pool,
+            &format!("outside_{suffix}"),
+            &format!("outside-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("test outsider must be created");
+        let server = db::create_server(&pool, &format!("permissions-{suffix}"), None, owner.id)
+            .await
+            .expect("test server must be created");
+        db::add_member(&pool, server.id, owner.id)
+            .await
+            .expect("test owner membership must be created");
+        db::add_member(&pool, server.id, member.id)
+            .await
+            .expect("test member membership must be created");
+        db::create_default_role(&pool, server.id)
+            .await
+            .expect("default role must be created");
+
+        let response = current_user_permissions(
+            State(pool.clone()),
+            AuthUser {
+                user_id: member.id,
+                username: member.username,
+            },
+            Path(server.id),
+        )
+        .await
+        .expect("member permissions must load");
+        assert_eq!(
+            response.0,
+            RoomPermissions {
+                send_messages: true,
+                attach_files: true,
+                manage_messages: false,
+                manage_server: false,
+            }
+        );
+
+        let error = current_user_permissions(
+            State(pool),
+            AuthUser {
+                user_id: outsider.id,
+                username: outsider.username,
+            },
+            Path(server.id),
+        )
+        .await
+        .expect_err("non-member must not receive permission details");
+        assert!(matches!(error, crate::error::AppError::Forbidden));
+    }
 
     /// An invite is accepted only under its authoritative server identifier.
     #[test]
