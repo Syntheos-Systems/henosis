@@ -41,6 +41,9 @@ const DEFAULT_CORS_ORIGINS: &str = "http://localhost:5173,http://127.0.0.1:5173,
 /// Default persistent directory for managed scheduled jobs and their results.
 const DEFAULT_CRON_DIR: &str = "data/synapse-cron";
 
+/// Default feature-gate value keeping deployment TOML authoritative.
+const DEFAULT_AGENT_CONTROL: &str = "0";
+
 /// Complete room configuration after environment validation.
 pub struct RoomRuntimeConfig {
     /// Rift HTTP server settings.
@@ -51,6 +54,8 @@ pub struct RoomRuntimeConfig {
     room: ManagedRoomConfig,
     /// Persistent Synapse cron state owned by this managed runtime.
     cron_dir: PathBuf,
+    /// Whether Rift desired-state writes and reconciliation are enabled.
+    agent_control_enabled: bool,
 }
 
 /// Whether this Henosis process owns the full room stack.
@@ -167,7 +172,10 @@ pub async fn prepare_room_runtime(
     let bindings = credential_binding_resolver_from_environment().map_err(|error| {
         RoomRuntimeError::InvalidConfig(format!("credential binding configuration failed: {error}"))
     })?;
-    let (handle, reconciler) = build_room_reconciler(
+    let managed_control = config
+        .agent_control_enabled
+        .then_some((room.owner_id, agent_control));
+    let reconciler = build_room_reconciler(
         rift.pool().clone(),
         bridge,
         RuntimeDependencies {
@@ -175,12 +183,8 @@ pub async fn prepare_room_runtime(
             cron_dir: Some(config.cron_dir.clone()),
         },
         bindings,
+        managed_control,
     );
-    agent_control.install(Arc::new(handle)).map_err(|_| {
-        RoomRuntimeError::InvalidConfig(
-            "managed agent controller was already installed".to_string(),
-        )
-    })?;
     Ok(PreparedRoomRuntime { rift, reconciler })
 }
 
@@ -256,6 +260,17 @@ pub(crate) fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError>
     }
 }
 
+/// Parse the exact opt-in managed-agent feature gate.
+pub(crate) fn parse_agent_control(value: &str) -> Result<bool, RoomRuntimeError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(RoomRuntimeError::InvalidConfig(format!(
+            "HENOSIS_ROOM_AGENT_CONTROL must be \"0\" or \"1\", got {other:?}"
+        ))),
+    }
+}
+
 /// Load required environment state only after room mode selects it.
 impl RoomRuntimeConfig {
     /// Build the server and managed room configuration.
@@ -272,6 +287,10 @@ impl RoomRuntimeConfig {
         let max_upload = env::var("HENOSIS_RIFT_MAX_UPLOAD_BYTES").ok();
         let max_upload_bytes =
             parse_upload_limit(max_upload.as_deref()).map_err(RoomRuntimeError::InvalidConfig)?;
+        let agent_control_enabled = parse_agent_control(&env_or_default(
+            "HENOSIS_ROOM_AGENT_CONTROL",
+            DEFAULT_AGENT_CONTROL,
+        )?)?;
         Ok(Self {
             rift: RiftConfig {
                 database_url: required_env("HENOSIS_RIFT_DATABASE_URL")?,
@@ -291,6 +310,7 @@ impl RoomRuntimeConfig {
                     .unwrap_or_else(|_| "general".to_string()),
             },
             cron_dir: PathBuf::from(env_or_default("HENOSIS_CRON_DIR", DEFAULT_CRON_DIR)?),
+            agent_control_enabled,
         })
     }
 }
@@ -352,7 +372,10 @@ where
 /// Pure configuration and endpoint tests.
 #[cfg(test)]
 mod tests {
-    use super::{internal_urls, parse_room_mode, RoomMode, DEFAULT_CRON_DIR};
+    use super::{
+        internal_urls, parse_agent_control, parse_room_mode, RoomMode, DEFAULT_AGENT_CONTROL,
+        DEFAULT_CRON_DIR,
+    };
 
     /// Production room startup is the default contract value.
     #[test]
@@ -365,6 +388,23 @@ mod tests {
     fn invalid_mode_fails_closed() {
         assert!(parse_room_mode("off").is_err());
         assert!(parse_room_mode("disabled ").is_err());
+    }
+
+    /// Managed roster writes require the exact numeric opt-in value.
+    #[test]
+    fn agent_control_gate_accepts_only_zero_or_one() {
+        assert!(!parse_agent_control("0").unwrap());
+        assert!(parse_agent_control("1").unwrap());
+        for invalid in ["", "true", "enabled", "2", "1 "] {
+            assert!(parse_agent_control(invalid).is_err());
+        }
+    }
+
+    /// An absent feature gate resolves to the disabled contract value.
+    #[test]
+    fn agent_control_defaults_to_disabled() {
+        assert_eq!(DEFAULT_AGENT_CONTROL, "0");
+        assert!(!parse_agent_control(DEFAULT_AGENT_CONTROL).unwrap());
     }
 
     /// Managed cron state defaults beneath the runtime's existing data directory.

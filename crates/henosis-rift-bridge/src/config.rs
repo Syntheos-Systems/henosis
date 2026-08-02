@@ -458,6 +458,24 @@ impl BridgeConfig {
         Ok(config)
     }
 
+    /// Export only the ordered agent roster as deterministic recovery TOML.
+    ///
+    /// Connection secrets, resolved credential bindings, command environment
+    /// values, and provider tokens are intentionally absent. Recovery tooling
+    /// can inject deployment-owned connection and credential state separately.
+    pub fn export_roster_toml(&self) -> Result<String, BridgeError> {
+        let agents = self
+            .agents
+            .iter()
+            .map(export_agent)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut root = toml::map::Map::new();
+        root.insert("agents".to_string(), toml::Value::Array(agents));
+        toml::to_string(&toml::Value::Table(root)).map_err(|error| {
+            BridgeError::Config(format!("failed to export recovery roster: {error}"))
+        })
+    }
+
     /// Parse one bridge file before applying deployment-owned connection data.
     fn parse(path: &std::path::Path) -> Result<Self, BridgeError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
@@ -541,6 +559,175 @@ impl BridgeConfig {
         }
         Ok(())
     }
+}
+
+/// Convert one agent to the explicit secret-free recovery representation.
+fn export_agent(agent: &AgentConfig) -> Result<toml::Value, BridgeError> {
+    let mut table = toml::map::Map::new();
+    table.insert("name".to_string(), toml::Value::String(agent.name.clone()));
+    table.insert(
+        "username".to_string(),
+        toml::Value::String(agent.username.clone()),
+    );
+    table.insert(
+        "base_chance".to_string(),
+        toml::Value::Float(agent.base_chance),
+    );
+    table.insert(
+        "system_prompt".to_string(),
+        toml::Value::String(agent.system_prompt.clone()),
+    );
+    table.insert("executor".to_string(), export_executor(&agent.executor)?);
+    Ok(toml::Value::Table(table))
+}
+
+/// Convert one executor while omitting every field that can carry secret values.
+fn export_executor(executor: &ExecutorConfig) -> Result<toml::Value, BridgeError> {
+    let mut table = toml::map::Map::new();
+    match executor {
+        ExecutorConfig::Command {
+            binary,
+            discuss_args,
+            execute_args,
+            cwd,
+            max_runtime_secs,
+            progress_format,
+            inherit_env,
+            env_clear,
+            ..
+        } => {
+            table.insert(
+                "type".to_string(),
+                toml::Value::String("Command".to_string()),
+            );
+            insert_path(&mut table, "binary", binary)?;
+            table.insert("discuss_args".to_string(), string_array(discuss_args));
+            table.insert("execute_args".to_string(), string_array(execute_args));
+            if let Some(cwd) = cwd {
+                insert_path(&mut table, "cwd", cwd)?;
+            }
+            if let Some(seconds) = max_runtime_secs {
+                table.insert(
+                    "max_runtime_secs".to_string(),
+                    checked_integer("max_runtime_secs", *seconds)?,
+                );
+            }
+            if let Some(format) = progress_format {
+                let value = match format {
+                    crate::executors::ProgressFormat::Text => "text",
+                    crate::executors::ProgressFormat::Jsonl => "jsonl",
+                };
+                table.insert(
+                    "progress_format".to_string(),
+                    toml::Value::String(value.to_string()),
+                );
+            }
+            table.insert("inherit_env".to_string(), string_array(inherit_env));
+            table.insert("env_clear".to_string(), toml::Value::Boolean(*env_clear));
+        }
+        ExecutorConfig::ClaudeCode {
+            binary,
+            model,
+            max_tokens,
+        } => {
+            table.insert(
+                "type".to_string(),
+                toml::Value::String("ClaudeCode".to_string()),
+            );
+            insert_path(&mut table, "binary", binary)?;
+            insert_optional_string(&mut table, "model", model);
+            if let Some(max_tokens) = max_tokens {
+                table.insert(
+                    "max_tokens".to_string(),
+                    toml::Value::Integer(i64::from(*max_tokens)),
+                );
+            }
+        }
+        ExecutorConfig::Codex {
+            binary,
+            model,
+            reasoning_effort,
+        } => {
+            table.insert("type".to_string(), toml::Value::String("Codex".to_string()));
+            insert_path(&mut table, "binary", binary)?;
+            table.insert("model".to_string(), toml::Value::String(model.clone()));
+            insert_optional_string(&mut table, "reasoning_effort", reasoning_effort);
+        }
+        ExecutorConfig::Synapse {
+            provider,
+            model,
+            max_tokens,
+            max_turns,
+            cwd,
+            ..
+        } => {
+            table.insert(
+                "type".to_string(),
+                toml::Value::String("Synapse".to_string()),
+            );
+            table.insert(
+                "provider".to_string(),
+                toml::Value::String(provider.clone()),
+            );
+            insert_optional_string(&mut table, "model", model);
+            if let Some(max_tokens) = max_tokens {
+                table.insert(
+                    "max_tokens".to_string(),
+                    toml::Value::Integer(i64::from(*max_tokens)),
+                );
+            }
+            if let Some(max_turns) = max_turns {
+                table.insert(
+                    "max_turns".to_string(),
+                    checked_integer("max_turns", *max_turns)?,
+                );
+            }
+            if let Some(cwd) = cwd {
+                insert_path(&mut table, "cwd", cwd)?;
+            }
+        }
+    }
+    Ok(toml::Value::Table(table))
+}
+
+/// Insert one Unicode path into a recovery table without lossy conversion.
+fn insert_path(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    path: &std::path::Path,
+) -> Result<(), BridgeError> {
+    let value = path.to_str().ok_or_else(|| {
+        BridgeError::Config(format!(
+            "failed to export recovery roster: {key} is not valid Unicode"
+        ))
+    })?;
+    table.insert(key.to_string(), toml::Value::String(value.to_string()));
+    Ok(())
+}
+
+/// Insert an optional string while preserving TOML's absent-value semantics.
+fn insert_optional_string(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: &Option<String>,
+) {
+    if let Some(value) = value {
+        table.insert(key.to_string(), toml::Value::String(value.clone()));
+    }
+}
+
+/// Convert an ordered list of strings into a TOML array.
+fn string_array(values: &[String]) -> toml::Value {
+    toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
+}
+
+/// Convert an unsigned recovery value into TOML's signed integer domain.
+fn checked_integer(field: &str, value: impl TryInto<i64>) -> Result<toml::Value, BridgeError> {
+    value.try_into().map(toml::Value::Integer).map_err(|_| {
+        BridgeError::Config(format!(
+            "failed to export recovery roster: {field} exceeds TOML integer range"
+        ))
+    })
 }
 
 /// Keep generic harnesses isolated from ambient process credentials unless explicitly overridden.
@@ -1070,5 +1257,74 @@ mod tests {
                 "setting {setting:?} must report {expected:?}"
             );
         }
+    }
+
+    /// Recovery export is stable, parseable, and omits every secret-bearing field.
+    #[test]
+    fn recovery_roster_export_is_deterministic_and_secret_free() {
+        let config: BridgeConfig = toml::from_str(
+            r#"
+                [rift]
+                jwt_secret = "rift-jwt-secret-value"
+                bridge_secret = "rift-bridge-secret-value"
+
+                [[agents]]
+                name = "Adapter"
+                username = "adapter"
+                base_chance = 0.7
+                system_prompt = "Use the adapter."
+
+                [agents.executor]
+                # Command executor fixture.
+                "type" = "Command"
+                binary = "/opt/bin/adapter"
+                discuss_args = ["--discuss", "{prompt}"]
+                execute_args = ["--execute", "{prompt}"]
+                inherit_env = ["PATH"]
+                env_clear = true
+
+                [agents.executor.env]
+                PRIVATE_VALUE = "command-environment-secret"
+
+                [[agents]]
+                name = "Synapse"
+                username = "synapse"
+                base_chance = 0.3
+                system_prompt = "Use Synapse."
+
+                [agents.executor]
+                # Synapse executor fixture.
+                "type" = "Synapse"
+                provider = "anthropic"
+                model = "claude-sonnet-4-6"
+                host = "https://host-secret@example.invalid?token=host-secret"
+                token = "provider-token-secret"
+                api_key = "provider-api-key-secret"
+                max_tokens = 4096
+                max_turns = 4
+            "#,
+        )
+        .expect("secret-bearing source roster parses");
+
+        let first = config.export_roster_toml().expect("recovery export");
+        let second = config.export_roster_toml().expect("repeat recovery export");
+        assert_eq!(first, second);
+        let parsed: BridgeConfig = toml::from_str(&first).expect("exported roster parses");
+        assert_eq!(parsed.agents.len(), 2);
+        assert_eq!(parsed.agents[0].username, "adapter");
+        assert_eq!(parsed.agents[1].username, "synapse");
+        for secret in [
+            "rift-jwt-secret-value",
+            "rift-bridge-secret-value",
+            "command-environment-secret",
+            "host-secret",
+            "provider-token-secret",
+            "provider-api-key-secret",
+        ] {
+            assert!(!first.contains(secret));
+        }
+        assert!(!first.contains("PRIVATE_VALUE"));
+        assert!(!first.contains("api_key"));
+        assert!(!first.contains("token ="));
     }
 }

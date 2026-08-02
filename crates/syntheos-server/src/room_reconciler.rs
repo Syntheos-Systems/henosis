@@ -1,22 +1,27 @@
 //! Desired-state reconciliation for one managed Rift room bridge.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use henosis_rift_bridge::catalog::discover_catalog;
-use henosis_rift_bridge::config::{AgentConfig, BridgeConfig};
+use henosis_rift_bridge::config::{AgentConfig, BridgeConfig, ExecutorConfig};
 use henosis_rift_bridge::materialize::{
     materialize_error, materialize_loaded_revision, preflight_revision, validate_seats,
     CredentialBindingResolver, ManagedSeat, MaterializeError, ResolvedCredentialBinding,
 };
 use henosis_rift_bridge::runtime::{run_managed, BridgeReady, RuntimeDependencies};
-use henosis_rift_server::agent_control::{ManagedAgentControl, ManagedAgentControlError};
+use henosis_rift_server::agent_control::{
+    ManagedAgentControl, ManagedAgentControlError, ManagedAgentControlRegistry,
+};
+use henosis_rift_server::bootstrap::{import_initial_agent_roster, InitialRosterImport};
 use henosis_rift_server::db;
 use henosis_rift_server::models::agent_control::{
     AgentSeatInput, AgentSeatView, ApplyState, ApplyStatusUpdate, ExecutionCapabilityCatalog,
-    RoomAgentRoster,
+    RoomAgentRoster, UpdateRoomAgentRoster,
 };
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::PgPool;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -49,6 +54,13 @@ struct RuntimeAgentIdentity {
 /// Persistence boundary used by the reconciler and deterministic lifecycle tests.
 #[async_trait]
 trait RoomRevisionStore: Send + Sync {
+    /// Atomically install the ready TOML roster when no desired revision exists.
+    async fn import_initial_roster(
+        &self,
+        created_by: Uuid,
+        seats: &[AgentSeatInput],
+    ) -> Result<InitialRosterImport, String>;
+
     /// Read desired and applied state for the managed room.
     async fn current_roster(&self) -> Result<RoomAgentRoster, String>;
 
@@ -76,6 +88,17 @@ struct PostgresRoomRevisionStore {
 /// Reads Rift state without exposing database failures through public control routes.
 #[async_trait]
 impl RoomRevisionStore for PostgresRoomRevisionStore {
+    /// Import through Rift's row-locked initial-revision transaction.
+    async fn import_initial_roster(
+        &self,
+        created_by: Uuid,
+        seats: &[AgentSeatInput],
+    ) -> Result<InitialRosterImport, String> {
+        import_initial_agent_roster(&self.pool, self.server_id, created_by, seats)
+            .await
+            .map_err(|error| sanitized_store_failure("initial roster import", &error))
+    }
+
     /// Read the latest room roster and apply status.
     async fn current_roster(&self) -> Result<RoomAgentRoster, String> {
         db::agent_control::read_room_agent_roster(&self.pool, self.server_id)
@@ -335,18 +358,34 @@ pub struct RoomReconciler {
     poll_interval: Duration,
     /// Bound for both startup and graceful bridge stop.
     lifecycle_timeout: Duration,
+    /// Revision author when managed control is enabled; none keeps TOML authoritative.
+    initial_roster_author: Option<Uuid>,
+    /// Controller withheld from Rift until initial durable-state selection commits.
+    pending_control_activation: Option<PendingControlActivation>,
 }
 
-/// Build the production handle and supervisor over an initialized Rift pool.
+/// One deferred installation of the Rift-facing desired-state controller.
+struct PendingControlActivation {
+    /// Shared one-time registry already embedded in the Rift application state.
+    registry: ManagedAgentControlRegistry,
+    /// Reconciler handle installed only after the initial import decision succeeds.
+    controller: Arc<dyn ManagedAgentControl>,
+}
+
+/// Build the production supervisor and defer optional Rift control installation.
 pub fn build_room_reconciler(
     pool: PgPool,
     base: BridgeConfig,
     dependencies: RuntimeDependencies,
     bindings: Arc<dyn CredentialBindingResolver>,
-) -> (RoomReconcilerHandle, RoomReconciler) {
+    managed_control: Option<(Uuid, ManagedAgentControlRegistry)>,
+) -> RoomReconciler {
     let server_id = base.rift.server_id;
     let store: Arc<dyn RoomRevisionStore> = Arc::new(PostgresRoomRevisionStore { pool, server_id });
-    build_room_reconciler_with_parts(
+    let initial_roster_author = managed_control
+        .as_ref()
+        .map(|(initial_roster_author, _)| *initial_roster_author);
+    let (handle, mut reconciler) = build_room_reconciler_with_parts(
         base,
         dependencies,
         bindings,
@@ -354,7 +393,12 @@ pub fn build_room_reconciler(
         Arc::new(NativeBridgeRunner),
         Duration::from_secs(5),
         Duration::from_secs(30),
-    )
+        initial_roster_author,
+    );
+    if let Some((_, registry)) = managed_control {
+        reconciler.defer_control_activation(registry, Arc::new(handle.clone()));
+    }
+    reconciler
 }
 
 /// Assemble a reconciler with replaceable persistence and runner boundaries.
@@ -366,6 +410,7 @@ fn build_room_reconciler_with_parts(
     runner: Arc<dyn BridgeRunner>,
     poll_interval: Duration,
     lifecycle_timeout: Duration,
+    initial_roster_author: Option<Uuid>,
 ) -> (RoomReconcilerHandle, RoomReconciler) {
     let core = Arc::new(RoomReconcilerCore {
         server_id: base.rift.server_id,
@@ -387,6 +432,8 @@ fn build_room_reconciler_with_parts(
             runner,
             poll_interval,
             lifecycle_timeout,
+            initial_roster_author,
+            pending_control_activation: None,
         },
     )
 }
@@ -492,6 +539,106 @@ impl RoomReconcilerCore {
         }
         Ok(managed)
     }
+}
+
+/// Project a provisioned ready roster into the immutable, secret-free seat schema.
+fn initial_roster_seats(
+    base: &BridgeConfig,
+    ready: &BridgeReady,
+) -> Result<Vec<AgentSeatInput>, String> {
+    if base.agents.len() != ready.roster.len() {
+        return Err(format!(
+            "ready roster contained {} agents for {} TOML entries",
+            ready.roster.len(),
+            base.agents.len()
+        ));
+    }
+
+    let mut user_ids = HashSet::with_capacity(ready.roster.len());
+    let mut usernames = HashSet::with_capacity(ready.roster.len());
+    let mut seats = Vec::with_capacity(ready.roster.len());
+    for (index, (agent, provisioned)) in base.agents.iter().zip(&ready.roster).enumerate() {
+        if agent.username != provisioned.username {
+            return Err(format!(
+                "ready roster username at position {index} did not match the TOML roster"
+            ));
+        }
+        if provisioned.user_id.is_nil() {
+            return Err(format!("ready roster user ID at position {index} was nil"));
+        }
+        if !user_ids.insert(provisioned.user_id) {
+            return Err("ready roster contained a duplicate user ID".to_string());
+        }
+        if !usernames.insert(provisioned.username.as_str()) {
+            return Err("ready roster contained a duplicate username".to_string());
+        }
+        let position = i32::try_from(index)
+            .map_err(|_| "ready roster exceeded the supported position range".to_string())?;
+        let (harness_id, model_id, settings) = imported_executor_fields(&agent.executor);
+        seats.push(AgentSeatInput {
+            // The imported roster allows one seat per agent identity, so the
+            // stable provisioned user ID is also a deterministic seat ID.
+            seat_id: provisioned.user_id,
+            agent_user_id: provisioned.user_id,
+            harness_id,
+            model_id,
+            settings,
+            credential_binding_id: None,
+            enabled: true,
+            position,
+        });
+    }
+
+    UpdateRoomAgentRoster {
+        expected_revision: None,
+        seats: seats.clone(),
+    }
+    .validate()
+    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    Ok(seats)
+}
+
+/// Extract the managed harness, model, and non-secret settings from one TOML executor.
+fn imported_executor_fields(executor: &ExecutorConfig) -> (String, String, JsonValue) {
+    let mut settings = JsonMap::new();
+    let (harness_id, model_id) = match executor {
+        ExecutorConfig::Command { .. } => ("command".to_string(), "deployment".to_string()),
+        ExecutorConfig::ClaudeCode { model, .. } => (
+            "claude-code".to_string(),
+            model.clone().unwrap_or_else(|| "default".to_string()),
+        ),
+        ExecutorConfig::Codex {
+            model,
+            reasoning_effort,
+            ..
+        } => {
+            if let Some(reasoning_effort) = reasoning_effort {
+                settings.insert(
+                    "reasoning_effort".to_string(),
+                    JsonValue::String(reasoning_effort.clone()),
+                );
+            }
+            ("codex".to_string(), model.clone())
+        }
+        ExecutorConfig::Synapse {
+            model,
+            max_tokens,
+            max_turns,
+            ..
+        } => {
+            if let Some(max_tokens) = max_tokens {
+                settings.insert("max_tokens".to_string(), JsonValue::from(*max_tokens));
+            }
+            if let Some(max_turns) = max_turns {
+                settings.insert("max_turns".to_string(), JsonValue::from(*max_turns));
+            }
+            (
+                "synapse".to_string(),
+                model.clone().unwrap_or_else(|| "default".to_string()),
+            )
+        }
+    };
+    (harness_id, model_id, JsonValue::Object(settings))
 }
 
 /// Deterministically select the deployment behavior template for one seat.
@@ -606,6 +753,30 @@ impl ManagedAgentControl for RoomReconcilerHandle {
 
 /// Supervises one bridge process against durable Rift desired state.
 impl RoomReconciler {
+    /// Hold the Rift control handle until startup has selected durable initial state.
+    fn defer_control_activation(
+        &mut self,
+        registry: ManagedAgentControlRegistry,
+        controller: Arc<dyn ManagedAgentControl>,
+    ) {
+        debug_assert!(self.initial_roster_author.is_some());
+        self.pending_control_activation = Some(PendingControlActivation {
+            registry,
+            controller,
+        });
+    }
+
+    /// Install managed control after the import transaction or existing-state check commits.
+    fn activate_control(&mut self) -> Result<(), String> {
+        let Some(activation) = self.pending_control_activation.take() else {
+            return Ok(());
+        };
+        activation
+            .registry
+            .install(activation.controller)
+            .map_err(|error| error.to_string())
+    }
+
     /// Supervise the room bridge until the parent requests a stop.
     ///
     /// The deployment TOML roster starts first and must reach its explicit
@@ -615,21 +786,43 @@ impl RoomReconciler {
     /// are absorbed by fallback and restart.
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> Result<(), String> {
         let base = self.core.base.clone();
-        let active = match self.start_bridge(base.clone(), &mut stop).await {
-            StartupOutcome::Ready(running, _ready) => Some(ActiveBridge {
-                revision: None,
-                running,
-            }),
+        let (running, ready) = match self.start_bridge(base.clone(), &mut stop).await {
+            StartupOutcome::Ready(running, ready) => (running, ready),
             StartupOutcome::Cancelled => return Ok(()),
             StartupOutcome::Failed(detail) => {
                 return Err(format!("initial bridge startup failed: {detail}"));
             }
         };
+        let initial_revision = match self.import_ready_roster(&ready).await {
+            Ok(revision) => revision,
+            Err(detail) => {
+                if let Err(stop_detail) = running.stop(self.lifecycle_timeout).await {
+                    tracing::warn!(
+                        %stop_detail,
+                        "initial bridge stop after roster import failure reported an error"
+                    );
+                }
+                return Err(format!("initial roster import failed: {detail}"));
+            }
+        };
+        if let Err(detail) = self.activate_control() {
+            if let Err(stop_detail) = running.stop(self.lifecycle_timeout).await {
+                tracing::warn!(
+                    %stop_detail,
+                    "initial bridge stop after control activation failure reported an error"
+                );
+            }
+            return Err(format!("managed agent control activation failed: {detail}"));
+        }
+        let active = Some(ActiveBridge {
+            revision: initial_revision,
+            running,
+        });
         let mut state = Supervision {
             active,
-            last_good: (None, base),
+            last_good: (initial_revision, base),
             failed_revision: None,
-            durable_last_good: None,
+            durable_last_good: initial_revision,
             hints_open: true,
         };
         loop {
@@ -646,6 +839,42 @@ impl RoomReconciler {
             }
         }
         Ok(())
+    }
+
+    /// Import a ready TOML roster only when managed control is explicitly enabled.
+    async fn import_ready_roster(&self, ready: &BridgeReady) -> Result<Option<i64>, String> {
+        let Some(created_by) = self.initial_roster_author else {
+            return Ok(None);
+        };
+        let seats = initial_roster_seats(&self.core.base, ready)?;
+        match self
+            .core
+            .store
+            .import_initial_roster(created_by, &seats)
+            .await?
+        {
+            InitialRosterImport::Imported { revision } => Ok(Some(revision)),
+            InitialRosterImport::Existing { desired_revision } => {
+                let roster = match self.core.store.current_roster().await {
+                    Ok(roster) => roster,
+                    Err(detail) => {
+                        tracing::warn!(
+                            %detail,
+                            "existing roster comparison failed; normal reconciliation will retry"
+                        );
+                        return Ok(None);
+                    }
+                };
+                let ready_revision_is_desired = roster.desired_revision == Some(desired_revision)
+                    && roster.seats.len() == seats.len()
+                    && roster
+                        .seats
+                        .iter()
+                        .zip(&seats)
+                        .all(|(stored, ready)| &stored.seat == ready);
+                Ok(ready_revision_is_desired.then_some(desired_revision))
+            }
+        }
     }
 
     /// Sleep until a hint, poll tick, parent stop, or bridge exit needs attention.
@@ -737,18 +966,26 @@ impl RoomReconciler {
                 StartupOutcome::Cancelled => return LoopControl::Stop,
                 StartupOutcome::Failed(detail) => {
                     tracing::error!(%detail, "restart of the last known good bridge failed");
-                    self.persist_status(ApplyStatusUpdate {
-                        active_revision: None,
-                        last_good_revision: state.last_good.0.or(state.durable_last_good),
-                        apply_state: ApplyState::Failed,
-                        error_code: Some("bridge_unavailable".to_string()),
-                        error_message: Some(bounded_detail(&detail)),
-                    })
-                    .await;
+                    if self.initial_roster_author.is_some() {
+                        self.persist_status(ApplyStatusUpdate {
+                            active_revision: None,
+                            last_good_revision: state.last_good.0.or(state.durable_last_good),
+                            apply_state: ApplyState::Failed,
+                            error_code: Some("bridge_unavailable".to_string()),
+                            error_message: Some(bounded_detail(&detail)),
+                        })
+                        .await;
+                    }
                     // The next poll tick retries the restart.
                     return LoopControl::Continue;
                 }
             }
+        }
+        if self.initial_roster_author.is_none() {
+            // The feature gate keeps deployment TOML authoritative. The
+            // supervisor still restarts that exact bridge after a crash, but
+            // it neither reads nor writes managed roster state.
+            return LoopControl::Continue;
         }
         let roster = match self.core.store.current_roster().await {
             Ok(roster) => roster,
@@ -1073,6 +1310,11 @@ mod tests {
         Uuid::from_u128(1)
     }
 
+    /// Produce the deterministic provisioned user ID emitted by the fake runner.
+    fn ready_user_id(position: usize) -> Uuid {
+        Uuid::from_u128(100 + position as u128)
+    }
+
     /// Build the two-template base configuration around live fixture binaries.
     fn test_base(claude: &ExecutableFixture, codex: &ExecutableFixture) -> BridgeConfig {
         BridgeConfig {
@@ -1124,8 +1366,21 @@ mod tests {
         }
     }
 
+    /// One recorded attempt to import the initial ready roster.
+    #[derive(Clone)]
+    struct InitialImportAttempt {
+        /// Revision author supplied by managed-room bootstrap.
+        created_by: Uuid,
+        /// Stable seats projected from the ready payload.
+        seats: Vec<AgentSeatInput>,
+    }
+
     /// Mutable durable-state fixture shared between the test and the reconciler.
     struct FakeStoreState {
+        /// Every initial-import call observed by the fake store.
+        initial_import_attempts: Vec<InitialImportAttempt>,
+        /// Number of attempts that actually installed revision one.
+        initial_import_writes: usize,
         /// Roster status served to the reconciler.
         roster: RoomAgentRoster,
         /// Immutable revision snapshots by revision number.
@@ -1156,6 +1411,8 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(FakeStoreState {
+                    initial_import_attempts: Vec::new(),
+                    initial_import_writes: 0,
                     roster: RoomAgentRoster {
                         server_id: server_id(),
                         desired_revision: None,
@@ -1251,6 +1508,23 @@ mod tests {
             self.state.lock().expect("fake store lock").roster.clone()
         }
 
+        /// Snapshot every ready-roster import attempt.
+        fn initial_import_attempts(&self) -> Vec<InitialImportAttempt> {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .initial_import_attempts
+                .clone()
+        }
+
+        /// Return how many initial-import attempts committed revision one.
+        fn initial_import_writes(&self) -> usize {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .initial_import_writes
+        }
+
         /// Snapshot every attempted status write.
         fn status_updates(&self) -> Vec<ApplyStatusUpdate> {
             self.state
@@ -1281,11 +1555,66 @@ mod tests {
                 .map(|view| view.seat.clone())
                 .collect()
         }
+
+        /// Return the complete stored views for one immutable revision.
+        fn revision_views(&self, revision: i64) -> Vec<AgentSeatView> {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .revisions
+                .get(&revision)
+                .expect("test revision exists")
+                .clone()
+        }
+
+        /// Report whether one immutable revision exists in the fake store.
+        fn has_revision(&self, revision: i64) -> bool {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .revisions
+                .contains_key(&revision)
+        }
     }
 
     /// Serves durable state from the shared fixture.
     #[async_trait]
     impl RoomRevisionStore for FakeStore {
+        /// Import revision one exactly once while recording every call.
+        async fn import_initial_roster(
+            &self,
+            created_by: Uuid,
+            seats: &[AgentSeatInput],
+        ) -> Result<InitialRosterImport, String> {
+            let mut state = self.state.lock().expect("fake store lock");
+            state.initial_import_attempts.push(InitialImportAttempt {
+                created_by,
+                seats: seats.to_vec(),
+            });
+            if let Some(desired_revision) = state.roster.desired_revision {
+                return Ok(InitialRosterImport::Existing { desired_revision });
+            }
+            let views = seats
+                .iter()
+                .cloned()
+                .map(|seat| AgentSeatView {
+                    seat,
+                    owner_user_id: None,
+                    credential_readiness: CredentialReadiness::HostSession,
+                })
+                .collect::<Vec<_>>();
+            state.initial_import_writes += 1;
+            state.revisions.insert(1, views.clone());
+            state.roster.desired_revision = Some(1);
+            state.roster.active_revision = Some(1);
+            state.roster.last_good_revision = Some(1);
+            state.roster.apply_state = ApplyState::Active;
+            state.roster.apply_error_code = None;
+            state.roster.apply_error_message = None;
+            state.roster.seats = views;
+            Ok(InitialRosterImport::Imported { revision: 1 })
+        }
+
         /// Read the current roster snapshot, honoring scripted failures.
         async fn current_roster(&self) -> Result<RoomAgentRoster, String> {
             let mut state = self.state.lock().expect("fake store lock");
@@ -1448,6 +1777,16 @@ mod tests {
                 .lock()
                 .expect("fake crash lock")
                 .push(crash.clone());
+            let ready_roster = usernames
+                .iter()
+                .enumerate()
+                .map(
+                    |(position, username)| henosis_rift_bridge::runtime::ReadyAgent {
+                        username: username.clone(),
+                        user_id: ready_user_id(position),
+                    },
+                )
+                .collect();
             let (cancellation, mut cancel_rx) = watch::channel(false);
             let (ready_tx, ready) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -1457,7 +1796,9 @@ mod tests {
                         Err(anyhow::anyhow!("scripted startup failure"))
                     }
                     SpawnScript::Ready => {
-                        let _ = ready_tx.send(BridgeReady { roster: Vec::new() });
+                        let _ = ready_tx.send(BridgeReady {
+                            roster: ready_roster,
+                        });
                         loop {
                             tokio::select! {
                                 changed = cancel_rx.changed() => {
@@ -1507,6 +1848,8 @@ mod tests {
         task: JoinHandle<Result<(), String>>,
         /// Parent stop signal.
         stop: watch::Sender<bool>,
+        /// Rift registry activated only for enabled-control harnesses.
+        control_registry: ManagedAgentControlRegistry,
         /// Executable fixtures kept alive for catalog availability.
         _fixtures: (ExecutableFixture, ExecutableFixture),
     }
@@ -1517,11 +1860,30 @@ mod tests {
         scripts: Vec<SpawnScript>,
         preflights: Vec<Result<(), MaterializeError>>,
     ) -> Harness {
+        start_harness_with_author(store, scripts, preflights, Some(Uuid::from_u128(3)))
+    }
+
+    /// Start one reconciler with deployment TOML remaining authoritative.
+    fn start_disabled_harness(
+        store: Arc<FakeStore>,
+        scripts: Vec<SpawnScript>,
+        preflights: Vec<Result<(), MaterializeError>>,
+    ) -> Harness {
+        start_harness_with_author(store, scripts, preflights, None)
+    }
+
+    /// Start one reconciler with an explicit optional initial-revision author.
+    fn start_harness_with_author(
+        store: Arc<FakeStore>,
+        scripts: Vec<SpawnScript>,
+        preflights: Vec<Result<(), MaterializeError>>,
+        initial_roster_author: Option<Uuid>,
+    ) -> Harness {
         let claude = ExecutableFixture::new("claude");
         let codex = ExecutableFixture::new("codex");
         let base = test_base(&claude, &codex);
         let runner = FakeRunner::new(scripts, preflights);
-        let (handle, reconciler) = build_room_reconciler_with_parts(
+        let (handle, mut reconciler) = build_room_reconciler_with_parts(
             base,
             RuntimeDependencies::default(),
             Arc::new(EmptyCredentialBindingResolver),
@@ -1529,7 +1891,13 @@ mod tests {
             runner.clone(),
             Duration::from_millis(50),
             Duration::from_secs(5),
+            initial_roster_author,
         );
+        let control_registry = ManagedAgentControlRegistry::default();
+        if initial_roster_author.is_some() {
+            reconciler.defer_control_activation(control_registry.clone(), Arc::new(handle.clone()));
+        }
+        assert!(!control_registry.is_installed());
         let (stop, stop_rx) = watch::channel(false);
         let task = tokio::spawn(reconciler.run(stop_rx));
         Harness {
@@ -1538,6 +1906,7 @@ mod tests {
             runner,
             task,
             stop,
+            control_registry,
             _fixtures: (claude, codex),
         }
     }
@@ -1567,7 +1936,8 @@ mod tests {
     /// The deployment TOML bridge starts first and reaches explicit readiness.
     #[tokio::test(start_paused = true)]
     async fn initial_toml_bridge_reaches_ready() {
-        let harness = start_harness(FakeStore::new(), vec![SpawnScript::Ready], Vec::new());
+        let harness =
+            start_disabled_harness(FakeStore::new(), vec![SpawnScript::Ready], Vec::new());
         wait_until(|| harness.runner.spawned().len() == 1).await;
         assert_eq!(
             harness.runner.spawned(),
@@ -1582,6 +1952,127 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, RunnerEvent::Stopped(_))));
+    }
+
+    /// Disabled control ignores durable desired state and keeps the TOML bridge unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn disabled_control_keeps_toml_authoritative() {
+        let store = FakeStore::new();
+        store.install_revision(2);
+        let harness = start_disabled_harness(store, Vec::new(), Vec::new());
+        wait_until(|| harness.runner.spawned().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            harness.runner.spawned(),
+            vec![vec![
+                "claude-template".to_string(),
+                "codex-template".to_string()
+            ]]
+        );
+        assert!(harness.store.initial_import_attempts().is_empty());
+        assert!(harness.store.revision_reads().is_empty());
+        assert!(harness.store.status_updates().is_empty());
+        assert_eq!(harness.store.latest_roster().active_revision, None);
+        stop_and_join(harness).await;
+    }
+
+    /// Enabled control imports ready IDs as active revision one without a restart.
+    #[tokio::test(start_paused = true)]
+    async fn enabled_control_imports_ready_roster_without_reprovisioning() {
+        let harness = start_harness(FakeStore::new(), Vec::new(), Vec::new());
+        wait_until(|| {
+            harness.store.latest_roster().desired_revision == Some(1)
+                && harness.control_registry.is_installed()
+        })
+        .await;
+
+        let roster = harness.store.latest_roster();
+        assert_eq!(roster.active_revision, Some(1));
+        assert_eq!(roster.last_good_revision, Some(1));
+        assert_eq!(roster.apply_state, ApplyState::Active);
+        assert_eq!(harness.store.initial_import_writes(), 1);
+        let attempts = harness.store.initial_import_attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].created_by, Uuid::from_u128(3));
+        assert_eq!(attempts[0].seats.len(), 2);
+        assert_eq!(attempts[0].seats[0].agent_user_id, ready_user_id(0));
+        assert_eq!(attempts[0].seats[1].agent_user_id, ready_user_id(1));
+        assert_eq!(attempts[0].seats[0].harness_id, "claude-code");
+        assert_eq!(attempts[0].seats[0].model_id, "sonnet");
+        assert_eq!(attempts[0].seats[1].harness_id, "codex");
+        assert_eq!(attempts[0].seats[1].model_id, "gpt-5.6-sol");
+        assert!(harness
+            .store
+            .revision_views(1)
+            .iter()
+            .all(|view| view.owner_user_id.is_none()));
+        assert_eq!(harness.runner.spawned().len(), 1);
+        assert!(harness.store.status_updates().is_empty());
+        assert!(harness.control_registry.is_installed());
+        stop_and_join(harness).await;
+    }
+
+    /// An existing desired revision wins the import lock and is reconciled normally.
+    #[tokio::test(start_paused = true)]
+    async fn existing_desired_revision_prevents_second_import() {
+        let store = FakeStore::new();
+        store.install_revision(2);
+        let harness = start_harness(store, Vec::new(), Vec::new());
+        wait_until(|| harness.store.latest_roster().active_revision == Some(2)).await;
+
+        assert_eq!(harness.store.initial_import_attempts().len(), 1);
+        assert_eq!(harness.store.initial_import_writes(), 0);
+        assert!(!harness.store.has_revision(1));
+        assert_eq!(harness.runner.spawned().len(), 2);
+        assert_eq!(harness.runner.spawned()[1], vec!["agent-r2".to_string()]);
+        stop_and_join(harness).await;
+    }
+
+    /// A process restart recognizes its exact imported revision without swapping bridges.
+    #[tokio::test(start_paused = true)]
+    async fn existing_imported_revision_keeps_ready_bridge() {
+        let first = start_harness(FakeStore::new(), Vec::new(), Vec::new());
+        wait_until(|| {
+            first.store.latest_roster().desired_revision == Some(1)
+                && first.control_registry.is_installed()
+        })
+        .await;
+        let (store, _) = stop_and_join(first).await;
+
+        let second = start_harness(store, Vec::new(), Vec::new());
+        wait_until(|| {
+            second.store.initial_import_attempts().len() == 2
+                && second.control_registry.is_installed()
+        })
+        .await;
+
+        assert_eq!(second.store.initial_import_writes(), 1);
+        assert_eq!(second.store.latest_roster().active_revision, Some(1));
+        assert_eq!(second.runner.spawned().len(), 1);
+        stop_and_join(second).await;
+    }
+
+    /// Ready payload order and usernames must exactly match the source TOML roster.
+    #[test]
+    fn initial_roster_rejects_mismatched_ready_mapping() {
+        let claude = ExecutableFixture::new("claude");
+        let codex = ExecutableFixture::new("codex");
+        let base = test_base(&claude, &codex);
+        let ready = BridgeReady {
+            roster: vec![
+                henosis_rift_bridge::runtime::ReadyAgent {
+                    username: "codex-template".to_string(),
+                    user_id: ready_user_id(0),
+                },
+                henosis_rift_bridge::runtime::ReadyAgent {
+                    username: "claude-template".to_string(),
+                    user_id: ready_user_id(1),
+                },
+            ],
+        };
+
+        assert!(initial_roster_seats(&base, &ready).is_err());
     }
 
     /// A failed candidate preflight leaves the current bridge untouched.
@@ -1728,7 +2219,7 @@ mod tests {
     /// Parent stop terminates the bridge before the reconciler returns.
     #[tokio::test(start_paused = true)]
     async fn parent_stop_stops_bridge_before_reconciler_returns() {
-        let harness = start_harness(FakeStore::new(), Vec::new(), Vec::new());
+        let harness = start_disabled_harness(FakeStore::new(), Vec::new(), Vec::new());
         wait_until(|| harness.runner.spawned().len() == 1).await;
         let _ = harness.stop.send(true);
         harness
@@ -1759,7 +2250,7 @@ mod tests {
     /// An unexpected bridge crash restarts the last known good configuration.
     #[tokio::test(start_paused = true)]
     async fn crashed_bridge_restarts_last_known_good() {
-        let harness = start_harness(FakeStore::new(), Vec::new(), Vec::new());
+        let harness = start_disabled_harness(FakeStore::new(), Vec::new(), Vec::new());
         wait_until(|| harness.runner.spawned().len() == 1).await;
         harness.runner.crash_latest();
         wait_until(|| harness.runner.spawned().len() == 2).await;
@@ -1770,6 +2261,29 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, RunnerEvent::Crashed(_))));
+        stop_and_join(harness).await;
+    }
+
+    /// Disabled control does not persist failure state when a TOML restart fails.
+    #[tokio::test(start_paused = true)]
+    async fn disabled_control_does_not_persist_restart_failure() {
+        let harness = start_disabled_harness(
+            FakeStore::new(),
+            vec![
+                SpawnScript::Ready,
+                SpawnScript::FailStartup,
+                SpawnScript::Ready,
+            ],
+            Vec::new(),
+        );
+        wait_until(|| harness.runner.spawned().len() == 1).await;
+        harness.runner.crash_latest();
+        wait_until(|| harness.runner.spawned().len() == 3).await;
+
+        assert!(harness.store.initial_import_attempts().is_empty());
+        assert!(harness.store.revision_reads().is_empty());
+        assert!(harness.store.status_updates().is_empty());
+        assert!(!harness.control_registry.is_installed());
         stop_and_join(harness).await;
     }
 
