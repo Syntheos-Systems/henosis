@@ -55,7 +55,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      HENOSIS_E2E_ARTIFACT_DIR: ${{ runner.temp }}/henosis-e2e-artifacts
       HENOSIS_TEST_CONTAINER_ENGINE: docker
       RUSTUP_TOOLCHAIN: 1.94.0
     steps:
@@ -76,6 +75,8 @@ jobs:
       - run: cargo +1.94.0 install tauri-driver --version 2.0.6 --locked
       - run: ./tests/rift-postgres-live.sh
       - run: pnpm --dir apps/desktop test:e2e
+        env:
+          HENOSIS_E2E_ARTIFACT_DIR: ${{ runner.temp }}/henosis-e2e-artifacts
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
