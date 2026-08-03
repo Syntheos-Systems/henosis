@@ -121,7 +121,7 @@ pub struct EditMessageRequest {
 pub struct MessageQuery {
     /// Return messages created strictly before this message id.
     pub before: Option<Uuid>,
-    /// Return messages created strictly after this message id.
+    /// Return messages strictly after this id, or from the beginning when it is the channel id.
     pub after: Option<Uuid>,
     /// Maximum number of messages to return (server caps at 100).
     pub limit: Option<i64>,

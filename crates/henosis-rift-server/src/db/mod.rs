@@ -774,6 +774,24 @@ pub async fn get_messages(
         .fetch_all(pool)
         .await
     } else if let Some(after) = query.after {
+        if after == channel_id {
+            return sqlx::query_as::<_, MessageWithAuthor>(
+                r#"SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
+                          m.message_type,
+                          u.username AS author_username,
+                          u.display_name AS author_display_name,
+                          u.avatar_url AS author_avatar_url
+                   FROM messages m
+                   INNER JOIN users u ON m.author_id = u.id
+                   WHERE m.channel_id = $1
+                   ORDER BY m.created_at ASC, m.id ASC
+                   LIMIT $2"#,
+            )
+            .bind(channel_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await;
+        }
         sqlx::query_as::<_, MessageWithAuthor>(
             r#"WITH boundary AS (
                    SELECT created_at, id

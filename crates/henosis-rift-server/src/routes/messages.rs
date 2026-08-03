@@ -31,9 +31,8 @@ pub async fn list_messages(
 
     require_member(&pool, channel.server_id, auth.user_id).await?;
     let cursor = select_list_message_cursor(&query)?;
-
     let messages = db::get_messages(&pool, channel_id, &query).await?;
-    require_existing_message_cursor(cursor, |cursor| {
+    require_existing_message_cursor(cursor, channel_id, |cursor| {
         db::message_cursor_exists_in_channel(&pool, channel_id, cursor)
     })
     .await?;
@@ -292,20 +291,41 @@ fn resolve_message_type(requested: Option<&str>, author_is_agent: bool) -> Resul
     }
 }
 
+/// Direction-bearing message boundary selected from one unambiguous page query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListMessageCursor {
+    /// Existing message before which older history is requested.
+    Before(Uuid),
+    /// Existing message, or the requested channel itself, after which history is requested.
+    After(Uuid),
+}
+
+/// Return the opaque identifier carried by one selected page boundary.
+impl ListMessageCursor {
+    /// Extract the identifier without discarding its pagination direction.
+    fn id(self) -> Uuid {
+        match self {
+            Self::Before(cursor) | Self::After(cursor) => cursor,
+        }
+    }
+}
+
 /// Select one pagination direction and reject ambiguous list queries.
-fn select_list_message_cursor(query: &MessageQuery) -> Result<Option<Uuid>, AppError> {
+fn select_list_message_cursor(query: &MessageQuery) -> Result<Option<ListMessageCursor>, AppError> {
     match (query.before, query.after) {
         (Some(_), Some(_)) => Err(AppError::BadRequest(
             "before and after cursors cannot be combined".to_string(),
         )),
-        (Some(cursor), None) | (None, Some(cursor)) => Ok(Some(cursor)),
+        (Some(cursor), None) => Ok(Some(ListMessageCursor::Before(cursor))),
+        (None, Some(cursor)) => Ok(Some(ListMessageCursor::After(cursor))),
         (None, None) => Ok(None),
     }
 }
 
-/// Confirm the page boundary still belongs to this channel after the page read.
+/// Confirm after the page read that its boundary exists or is the reserved beginning cursor.
 async fn require_existing_message_cursor<F, Fut>(
-    cursor: Option<Uuid>,
+    cursor: Option<ListMessageCursor>,
+    channel_id: Uuid,
     cursor_exists: F,
 ) -> Result<(), AppError>
 where
@@ -315,7 +335,10 @@ where
     let Some(cursor) = cursor else {
         return Ok(());
     };
-    if !cursor_exists(cursor).await? {
+    if cursor == ListMessageCursor::After(channel_id) {
+        return Ok(());
+    }
+    if !cursor_exists(cursor.id()).await? {
         return Err(invalid_message_cursor());
     }
     Ok(())
@@ -356,6 +379,8 @@ async fn require_permission(
 /// Covers message parent binding and message-type authorization rules.
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
     use sqlx::postgres::PgPoolOptions;
@@ -412,7 +437,9 @@ mod tests {
     /// Assert that one unavailable cursor maps to Rift's stable coded 404.
     async fn assert_invalid_message_cursor(query: MessageQuery) {
         let cursor = select_list_message_cursor(&query).expect("one cursor must be selectable");
-        let error = require_existing_message_cursor(cursor, |_| async { Ok(false) })
+        let channel_id = Uuid::nil();
+        assert_ne!(cursor.expect("cursor must exist").id(), channel_id);
+        let error = require_existing_message_cursor(cursor, channel_id, |_| async { Ok(false) })
             .await
             .expect_err("unavailable cursor must fail");
         assert_invalid_message_cursor_error(error).await;
@@ -441,9 +468,32 @@ mod tests {
     async fn list_messages_accepts_valid_boundary_cursor() {
         let query = message_query(None, Some(Uuid::new_v4()));
         let cursor = select_list_message_cursor(&query).expect("one cursor must be selectable");
-        require_existing_message_cursor(cursor, |_| async { Ok(true) })
+        require_existing_message_cursor(cursor, Uuid::new_v4(), |_| async { Ok(true) })
             .await
             .expect("channel-owned cursor must pass");
+    }
+
+    /// A channel's own identifier is accepted only as its beginning after cursor.
+    #[tokio::test]
+    async fn list_messages_accepts_room_scoped_beginning_after_cursor() {
+        let channel_id = Uuid::new_v4();
+        let after = select_list_message_cursor(&message_query(None, Some(channel_id)))
+            .expect("beginning cursor must be selectable");
+        let existence_checked = Cell::new(false);
+        require_existing_message_cursor(after, channel_id, |_| {
+            existence_checked.set(true);
+            async { Ok(false) }
+        })
+        .await
+        .expect("room-scoped beginning after cursor must pass");
+        assert!(!existence_checked.get());
+
+        let before = select_list_message_cursor(&message_query(Some(channel_id), None))
+            .expect("before cursor must be selectable");
+        let error = require_existing_message_cursor(before, channel_id, |_| async { Ok(false) })
+            .await
+            .expect_err("channel identifier is not a valid before cursor");
+        assert_invalid_message_cursor_error(error).await;
     }
 
     /// Combining pagination directions remains a client error.
@@ -532,6 +582,22 @@ mod tests {
         } else {
             (second.id, first.id)
         };
+        let from_start = list_messages(
+            State(pool.clone()),
+            auth.clone(),
+            Path(channel.id),
+            Query(message_query(None, Some(channel.id))),
+        )
+        .await
+        .expect("room-scoped beginning cursor must return the oldest page");
+        assert_eq!(
+            from_start
+                .0
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![lower_id, higher_id]
+        );
         let before = db::get_messages(&pool, channel.id, &message_query(Some(higher_id), None))
             .await
             .expect("before page must load");
