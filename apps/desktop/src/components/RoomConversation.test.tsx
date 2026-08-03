@@ -14,9 +14,11 @@ import type {
   PendingRoomAttachment,
   RoomConversationCommandResult,
   RoomConversationEvent,
+  RoomConversationEventEnvelope,
   RoomConversationSnapshot,
   RoomMessage,
 } from "../domain/conversation";
+import { FixtureHenosisClient } from "../services/fixtureClient";
 import { HenosisClientError } from "../services/henosisClient";
 import type { HenosisClient, RoomEventListener } from "../services/henosisClient";
 import { RoomConversation } from "./RoomConversation";
@@ -339,6 +341,81 @@ describe("RoomConversation", () => {
     );
     fireEvent.click(screen.getAllByText("Inspect original message")[0]);
     expect(screen.getByText("[AGREE] Ship the bounded change.")).toBeVisible();
+  });
+
+  it("renders one snapshot message after its duplicate live create and applies later presence", async () => {
+    const client = new FixtureHenosisClient();
+    const openRoom = vi.spyOn(client, "openRoom");
+    const observedEvents: RoomConversationEventEnvelope[] = [];
+    const unlisten = await client.subscribeRoomEvents((event) =>
+      observedEvents.push(event),
+    );
+    render(<RoomConversation client={client} roomId="room-orchard" />);
+
+    const timeline = await screen.findByRole("log", {
+      name: "Room message timeline",
+    });
+    const messageId = "room-orchard-message-5";
+    const messageSelector = `[data-message-id="${messageId}"]`;
+    await waitFor(() => {
+      expect(timeline.querySelectorAll(messageSelector)).toHaveLength(1);
+    });
+    expect(openRoom).toHaveBeenCalledOnce();
+
+    const openResult = openRoom.mock.results[0];
+    if (!openResult || openResult.type !== "return") {
+      throw new Error("The concrete fixture must return its opening snapshot.");
+    }
+    const openingSnapshot = await openResult.value;
+    const duplicateMessage = openingSnapshot.page.messages.find(
+      (candidate) => candidate.id === messageId,
+    );
+    if (!duplicateMessage) {
+      throw new Error("The concrete fixture must expose the duplicate message.");
+    }
+    const streamId = openRoom.mock.calls[0]?.[1];
+    if (!streamId) {
+      throw new Error("RoomConversation must supply a fixture stream identifier.");
+    }
+
+    act(() => {
+      client.emitRoomEvent("room-orchard", streamId, {
+        type: "messageCreate",
+        data: { roomId: "room-orchard", message: duplicateMessage },
+      });
+    });
+    await waitFor(() => {
+      expect(timeline.querySelectorAll(messageSelector)).toHaveLength(1);
+    });
+
+    act(() => {
+      client.emitRoomEvent("room-orchard", streamId, {
+        type: "presenceUpdate",
+        data: {
+          roomId: "room-orchard",
+          userId: "fixture-agent",
+          status: "online",
+        },
+      });
+    });
+    await waitFor(() => {
+      const renderedMessage =
+        timeline.querySelector<HTMLElement>(messageSelector);
+      if (!renderedMessage) {
+        throw new Error("The duplicate fixture message must remain rendered.");
+      }
+      expect(
+        within(renderedMessage).getByLabelText("Mira is online"),
+      ).toBeVisible();
+    });
+    expect(timeline.querySelectorAll(messageSelector)).toHaveLength(1);
+    expect(
+      observedEvents.map((event) => [event.sequence, event.event.type]),
+    ).toEqual([
+      [1, "messageCreate"],
+      [2, "presenceUpdate"],
+    ]);
+    unlisten();
   });
 
   it("marks only a visibly reached live edge and offers a jump while away", async () => {

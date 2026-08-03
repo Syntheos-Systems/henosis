@@ -120,6 +120,59 @@ describe("FixtureHenosisClient", () => {
     expect(events).toHaveLength(3);
   });
 
+  it("publishes explicit events only through the exact active generation", async () => {
+    const client = new FixtureHenosisClient();
+    const firstStreamId = fixtureStream("explicit-events-first");
+    const nextStreamId = fixtureStream("explicit-events-next");
+    const events: RoomConversationEventEnvelope[] = [];
+    await client.subscribeRoomEvents((event) => events.push(event));
+    const snapshot = await client.openRoom("room-orchard", firstStreamId);
+    const duplicateMessage = snapshot.page.messages.at(-1);
+    if (!duplicateMessage) {
+      throw new Error("The fixture snapshot must include its newest message.");
+    }
+
+    client.emitRoomEvent("room-orchard", firstStreamId, {
+      type: "messageCreate",
+      data: { roomId: "room-orchard", message: duplicateMessage },
+    });
+    expect(() =>
+      client.emitRoomEvent("room-orchard", firstStreamId, {
+        type: "presenceUpdate",
+        data: {
+          roomId: "room-workshop",
+          userId: "fixture-agent",
+          status: "online",
+        },
+      }),
+    ).toThrow("A fixture room event must target its active room.");
+    client.emitRoomEvent("room-orchard", firstStreamId, {
+      type: "presenceUpdate",
+      data: {
+        roomId: "room-orchard",
+        userId: "fixture-agent",
+        status: "online",
+      },
+    });
+
+    expect(events.map((event) => [event.sequence, event.event.type])).toEqual([
+      [1, "messageCreate"],
+      [2, "presenceUpdate"],
+    ]);
+
+    await client.openRoom("room-orchard", nextStreamId);
+    expect(() =>
+      client.emitRoomEvent("room-orchard", firstStreamId, {
+        type: "presenceUpdate",
+        data: {
+          roomId: "room-orchard",
+          userId: "fixture-agent",
+          status: "idle",
+        },
+      }),
+    ).toThrow("That fixture room generation is no longer active.");
+  });
+
   it("stages path-free attachments and emits bounded upload progress", async () => {
     const client = new FixtureHenosisClient();
     const streamId = fixtureStream("uploads");

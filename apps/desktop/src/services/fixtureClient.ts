@@ -428,6 +428,22 @@ export class FixtureHenosisClient implements HenosisClient {
     };
   }
 
+  /** Publish one validated native-style event through the active fixture stream. */
+  emitRoomEvent(
+    roomId: string,
+    streamId: string,
+    event: RoomConversationEvent,
+  ): void {
+    const openGeneration = this.requireOpenGeneration(roomId, streamId);
+    if (event.data.roomId !== roomId) {
+      throw new HenosisClientError(
+        "validation",
+        "A fixture room event must target its active room.",
+      );
+    }
+    this.emit(openGeneration, event);
+  }
+
   /** Assemble a visibly fixture-backed directory snapshot. */
   private snapshot(): RoomDirectorySnapshot {
     return {
