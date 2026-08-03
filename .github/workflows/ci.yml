@@ -50,6 +50,39 @@ jobs:
       - run: cargo +1.88.0 clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo +1.88.0 test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
 
+  live-conversation:
+    name: Live desktop conversation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      HENOSIS_E2E_ARTIFACT_DIR: ${{ runner.temp }}/henosis-e2e-artifacts
+      HENOSIS_TEST_CONTAINER_ENGINE: docker
+      RUSTUP_TOOLCHAIN: 1.94.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -y libappindicator3-dev libpq-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config protobuf-compiler webkit2gtk-driver xdg-utils xvfb
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - run: npm install --global pnpm@11.3.0
+      - run: pnpm --dir apps/desktop install --frozen-lockfile
+      - run: cargo +1.94.0 install tauri-driver --version 2.0.6 --locked
+      - run: ./tests/rift-postgres-live.sh
+      - run: pnpm --dir apps/desktop test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: henosis-live-conversation-diagnostics
+          path: ${{ runner.temp }}/henosis-e2e-artifacts
+          if-no-files-found: ignore
+
   cognition:
     name: Cognition quality
     runs-on: ubuntu-24.04
