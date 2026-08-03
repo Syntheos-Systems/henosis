@@ -20,9 +20,10 @@ path = "src/main.rs"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = { version = "0.3.33", default-features = false, features = ["async-await", "sink", "std"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
