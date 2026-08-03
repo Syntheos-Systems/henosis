@@ -2,6 +2,8 @@
 
 /// Sanitized commands exposed to the React webview.
 mod commands;
+/// Native Rift WebSocket ownership and event translation.
+mod gateway;
 /// Serialized native-to-webview contracts.
 mod model;
 /// Rift HTTP transport and room aggregation.

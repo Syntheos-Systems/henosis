@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::gateway::RiftGateway;
 use crate::model::{
     CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, RoomDirectorySnapshot,
     RoomStatus,
@@ -41,8 +42,16 @@ pub struct RoomReadMarker {
 
 /// Process-local secret state for the current Rift login.
 pub struct AppState {
-    /// Opaque shared native client protected only while its handle is replaced.
-    session: Mutex<Option<AuthenticatedRiftClient>>,
+    /// Authenticated client and its sole gateway owner replaced under one lock.
+    session: Mutex<Option<ActiveRiftSession>>,
+}
+
+/// One authenticated native session and its optional live room gateway.
+struct ActiveRiftSession {
+    /// Opaque shared native HTTP and token-rotation client.
+    client: AuthenticatedRiftClient,
+    /// Sole cancellable gateway for the currently open room.
+    gateway: Option<RiftGateway>,
 }
 
 /// Native session access and mutation operations.
@@ -56,12 +65,15 @@ impl AppState {
 
     /// Clone the current native client handle without cloning independent tokens.
     pub fn session(&self) -> Result<Option<AuthenticatedRiftClient>, CommandError> {
-        self.session.lock().map(|guard| guard.clone()).map_err(|_| {
-            CommandError::new(
-                CommandErrorKind::Storage,
-                "Henosis could not access the native session.",
-            )
-        })
+        self.session
+            .lock()
+            .map(|guard| guard.as_ref().map(|active| active.client.clone()))
+            .map_err(|_| {
+                CommandError::new(
+                    CommandErrorKind::Storage,
+                    "Henosis could not access the native session.",
+                )
+            })
     }
 
     /// Replace the current client and invalidate any previously cloned handle.
@@ -72,8 +84,58 @@ impl AppState {
                 "Henosis could not update the native session.",
             )
         })?;
-        if let Some(previous) = guard.replace(session) {
-            previous.invalidate();
+        if let Some(mut previous) = guard.replace(ActiveRiftSession {
+            client: session,
+            gateway: None,
+        }) {
+            if let Some(gateway) = previous.gateway.take() {
+                gateway.cancel();
+            }
+            previous.client.invalidate();
+        }
+        Ok(())
+    }
+
+    /// Atomically install one gateway only when its client is still current.
+    pub(crate) fn replace_gateway(
+        &self,
+        session: &AuthenticatedRiftClient,
+        gateway: RiftGateway,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.session.lock().map_err(|_| {
+            CommandError::new(
+                CommandErrorKind::Storage,
+                "Henosis could not update the native gateway.",
+            )
+        })?;
+        let Some(active) = guard.as_mut() else {
+            return Err(CommandError::new(
+                CommandErrorKind::ConnectionRequired,
+                "Connect to Rift before opening a room.",
+            ));
+        };
+        if !active.client.same_session(session) {
+            return Err(CommandError::new(
+                CommandErrorKind::ConnectionRequired,
+                "The Rift session changed while the room was opening. Open the room again.",
+            ));
+        }
+        if let Some(previous) = active.gateway.replace(gateway) {
+            previous.cancel();
+        }
+        Ok(())
+    }
+
+    /// Cancel and remove the current room gateway without logging out of Rift.
+    pub(crate) fn clear_gateway(&self) -> Result<(), CommandError> {
+        let mut guard = self.session.lock().map_err(|_| {
+            CommandError::new(
+                CommandErrorKind::Storage,
+                "Henosis could not clear the native gateway.",
+            )
+        })?;
+        if let Some(gateway) = guard.as_mut().and_then(|active| active.gateway.take()) {
+            gateway.cancel();
         }
         Ok(())
     }
@@ -86,8 +148,11 @@ impl AppState {
                 "Henosis could not clear the native session.",
             )
         })?;
-        if let Some(session) = guard.take() {
-            session.invalidate();
+        if let Some(mut session) = guard.take() {
+            if let Some(gateway) = session.gateway.take() {
+                gateway.cancel();
+            }
+            session.client.invalidate();
         }
         Ok(())
     }

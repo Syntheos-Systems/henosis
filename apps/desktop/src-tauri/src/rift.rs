@@ -56,6 +56,41 @@ struct RiftSession {
     token_generation: u64,
 }
 
+/// One non-serializable access-token snapshot consumed only by the native gateway.
+pub(crate) struct GatewayAuthentication {
+    /// Short-lived token sent in Rift's first WebSocket command.
+    access_token: String,
+    /// Monotonic generation used to avoid consuming a rotated refresh token twice.
+    token_generation: u64,
+}
+
+/// Native gateway accessors that never implement serialization or debug output.
+impl GatewayAuthentication {
+    /// Construct one gateway-only authentication snapshot.
+    fn new(access_token: String, token_generation: u64) -> Self {
+        Self {
+            access_token,
+            token_generation,
+        }
+    }
+
+    /// Construct one fake authentication snapshot for native gateway tests.
+    #[cfg(test)]
+    pub(crate) fn for_gateway_test(access_token: String, token_generation: u64) -> Self {
+        Self::new(access_token, token_generation)
+    }
+
+    /// Borrow the access token only while serializing Rift's Identify command.
+    pub(crate) fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    /// Return the observed token generation for single-flight refresh coordination.
+    pub(crate) fn token_generation(&self) -> u64 {
+        self.token_generation
+    }
+}
+
 /// Rebuildable authenticated request metadata safe to replay once.
 #[derive(Clone)]
 struct ReplayableRequest {
@@ -283,7 +318,7 @@ struct ApiRoomAttachment {
 
 /// Full Rift message returned by room conversation endpoints.
 #[derive(Deserialize)]
-struct ApiRoomMessage {
+pub(crate) struct ApiRoomMessage {
     /// Stable message identifier.
     id: String,
     /// Rift channel identifier normalized as a Henosis room identifier.
@@ -484,6 +519,24 @@ impl AuthenticatedRiftClient {
         }
     }
 
+    /// Construct an isolated active client for native gateway ownership tests.
+    #[cfg(test)]
+    pub(crate) fn gateway_test_client(base_url: Url, user_id: &str) -> Self {
+        let endpoint = base_url.as_str().trim_end_matches('/').to_owned();
+        Self::new(
+            Client::new(),
+            base_url,
+            SanitizedConnection {
+                endpoint,
+                username: "gateway-test-user".into(),
+                user_id: user_id.into(),
+                display_name: "Gateway Test User".into(),
+            },
+            "gateway-test-access".into(),
+            "gateway-test-refresh".into(),
+        )
+    }
+
     /// Reject work after AppState has cleared or replaced this handle.
     fn ensure_active(&self) -> Result<(), RiftError> {
         if !self.inner.active.load(Ordering::Acquire) {
@@ -496,6 +549,71 @@ impl AuthenticatedRiftClient {
     async fn token_snapshot(&self) -> Result<RiftSession, RiftError> {
         self.ensure_active()?;
         Ok(self.inner.session.read().await.clone())
+    }
+
+    /// Snapshot only the access token and generation needed by one gateway attempt.
+    pub(crate) async fn gateway_authentication(&self) -> Result<GatewayAuthentication, RiftError> {
+        let session = self.token_snapshot().await?;
+        Ok(GatewayAuthentication::new(
+            session.access_token,
+            session.token_generation,
+        ))
+    }
+
+    /// Refresh one rejected gateway generation through the existing single-flight lock.
+    pub(crate) async fn refresh_gateway_authentication(
+        &self,
+        observed_generation: u64,
+    ) -> Result<(), RiftError> {
+        self.ensure_active()?;
+        let refresh_guard = self.inner.refresh.lock().await;
+        let current = self.token_snapshot().await?;
+        if current.token_generation == observed_generation {
+            self.refresh_tokens(&current).await?;
+        }
+        drop(refresh_guard);
+        self.ensure_active()
+    }
+
+    /// Derive Rift's fixed WebSocket endpoint without accepting a redirect target.
+    pub(crate) fn gateway_websocket_url(&self) -> Result<Url, RiftError> {
+        let mut url = self.inner.base_url.clone();
+        let websocket_scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => return Err(RiftError::ProtocolContract),
+        };
+        url.set_scheme(websocket_scheme)
+            .map_err(|_| RiftError::ProtocolContract)?;
+        url.set_path("/ws");
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url)
+    }
+
+    /// Clone the authenticated user identifier expected in Rift's Ready event.
+    pub(crate) fn gateway_user_id(&self) -> String {
+        self.inner.connection.user_id.clone()
+    }
+
+    /// Report whether two handles point at the same native authenticated session.
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Report whether this session may still emit native gateway events.
+    pub(crate) fn gateway_is_active(&self) -> bool {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
+    /// Reuse the HTTP boundary's message and attachment validation for gateway events.
+    pub(crate) fn sanitize_gateway_message(
+        &self,
+        message: ApiRoomMessage,
+        expected_room_id: &str,
+    ) -> Result<RoomMessage, RiftError> {
+        self.ensure_active()?;
+        message.into_room_message(&self.inner.base_url, expected_room_id)
     }
 
     /// Clone the final token state for best-effort logout after invalidation.
@@ -781,7 +899,10 @@ impl ApiRoomAttachment {
         base_url: &Url,
         expected_message_id: &str,
     ) -> Result<RoomAttachment, RiftError> {
-        if self.message_id != expected_message_id {
+        if self.id.is_empty()
+            || self.message_id != expected_message_id
+            || expected_message_id.is_empty()
+        {
             return Err(RiftError::ProtocolContract);
         }
         validate_display_filename(&self.filename)?;
@@ -798,12 +919,18 @@ impl ApiRoomAttachment {
 /// Sanitization of one Rift message before timeline insertion.
 impl ApiRoomMessage {
     /// Validate its room binding and convert all nested attachment metadata.
-    fn into_room_message(
+    pub(crate) fn into_room_message(
         self,
         base_url: &Url,
         expected_room_id: &str,
     ) -> Result<RoomMessage, RiftError> {
-        if self.channel_id != expected_room_id {
+        if self.id.is_empty()
+            || self.channel_id != expected_room_id
+            || expected_room_id.is_empty()
+            || self.author_id.is_empty()
+            || self.author_username.is_empty()
+            || self.message_type.is_empty()
+        {
             return Err(RiftError::ProtocolContract);
         }
         let attachments = self
