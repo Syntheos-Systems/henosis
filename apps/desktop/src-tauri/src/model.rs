@@ -591,14 +591,14 @@ mod tests {
                 RoomConversationEvent::TypingStart {
                     room_id: "room-1".into(),
                     user_id: "user-2".into(),
-                    username: "zan".into(),
+                    username: "operator".into(),
                 },
                 json!({
                     "type": "typingStart",
                     "data": {
                         "roomId": "room-1",
                         "userId": "user-2",
-                        "username": "zan",
+                        "username": "operator",
                     },
                 }),
             ),
