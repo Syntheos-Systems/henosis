@@ -4,11 +4,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  diagnosticTail,
   processGroupExists,
+  redactDiagnosticContents,
   runCommand,
   spawnSupervisedProcess,
   terminateService,
 } from "./run-live-e2e.mjs";
+
+test(
+  "retained diagnostics redact secrets before printing a bounded tail",
+  /** Prove a failed live run cannot print credentials or unbounded logs. */
+  function redactsAndBoundsDiagnostics() {
+    const secret = "ephemeral-password";
+    const redacted = redactDiagnosticContents(
+      `${"x".repeat(20_000)} ${secret}`,
+      [secret],
+    );
+    const tail = diagnosticTail(redacted);
+
+    assert.doesNotMatch(tail, /ephemeral-password/);
+    assert.match(tail, /\[REDACTED\]$/);
+    assert.match(tail, /^\[earlier diagnostic output truncated\]/);
+    assert.ok(tail.length <= 16_500);
+  },
+);
 
 test(
   "the persistent supervisor removes descendants after its command exits",

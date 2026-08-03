@@ -39,6 +39,7 @@ const SERVER_BUILD_TIMEOUT_MS = 15 * 60_000;
 const DESKTOP_BUILD_TIMEOUT_MS = 20 * 60_000;
 const WDIO_TIMEOUT_MS = 3 * 60_000;
 const HARNESS_TIMEOUT_MS = 44 * 60_000;
+const DIAGNOSTIC_TAIL_CHARACTERS = 16_384;
 const SUPERVISOR_ARGUMENT = "--supervise-owned-process";
 const CHILD_SECRET_NAMES = [
   "DATABASE_URL",
@@ -560,6 +561,23 @@ async function terminateServices(services) {
   }
 }
 
+/** Replace every exact ephemeral credential before diagnostics leave the harness. */
+function redactDiagnosticContents(contents, secrets) {
+  let redacted = contents;
+  for (const secret of secrets) {
+    redacted = redacted.replaceAll(secret, "[REDACTED]");
+  }
+  return redacted;
+}
+
+/** Keep the newest bounded section of one already-redacted diagnostic log. */
+function diagnosticTail(contents) {
+  if (contents.length <= DIAGNOSTIC_TAIL_CHARACTERS) {
+    return contents;
+  }
+  return `[earlier diagnostic output truncated]\n${contents.slice(-DIAGNOSTIC_TAIL_CHARACTERS)}`;
+}
+
 /** Replace ephemeral credentials in one retained diagnostic log. */
 async function redactLog(logPath, secrets) {
   let contents;
@@ -571,11 +589,19 @@ async function redactLog(logPath, secrets) {
     }
     throw error;
   }
-  let redacted = contents;
-  for (const secret of secrets) {
-    redacted = redacted.replaceAll(secret, "[REDACTED]");
-  }
+  const redacted = redactDiagnosticContents(contents, secrets);
   await writeFile(logPath, redacted, { encoding: "utf8", mode: 0o600 });
+}
+
+/** Print one bounded diagnostic only after its persisted contents were redacted. */
+async function reportRedactedLog(logPath, label) {
+  try {
+    const contents = await readFile(logPath, "utf8");
+    console.error(`${label} diagnostic follows:`);
+    console.error(diagnosticTail(contents) || "[empty diagnostic log]");
+  } catch {
+    console.error(`${label} diagnostic could not be read`);
+  }
 }
 
 /** Re-enter this runner beneath Xvfb when Linux has no display server. */
@@ -631,6 +657,7 @@ async function runLiveE2e() {
   const artifactRoot = process.env.HENOSIS_E2E_ARTIFACT_DIR
     ? resolve(process.env.HENOSIS_E2E_ARTIFACT_DIR)
     : join(testDirectory, "artifacts");
+  const artifactRootIsExternal = process.env.HENOSIS_E2E_ARTIFACT_DIR !== undefined;
   const artifactDirectory = join(artifactRoot, `run-${suffix}`);
   const xdgDataDirectory = join(testDirectory, "xdg-data");
   const xdgConfigDirectory = join(testDirectory, "xdg-config");
@@ -825,8 +852,12 @@ async function runLiveE2e() {
       redactLog(driverLog, [databaseUrl, jwtSecret, bridgeSecret, password]),
     ]);
     if (passed && cleanupError === undefined) {
+      if (artifactRootIsExternal) {
+        await rm(artifactDirectory, { recursive: true });
+      }
       await rm(testDirectory, { recursive: true });
     } else {
+      await reportRedactedLog(driverLog, "tauri-driver");
       console.error(`Live E2E diagnostics retained at ${artifactDirectory}`);
     }
     if (cleanupError !== undefined) {
@@ -874,7 +905,9 @@ if (isMainModule()) {
 }
 
 export {
+  diagnosticTail,
   processGroupExists,
+  redactDiagnosticContents,
   runCommand,
   spawnSupervisedProcess,
   terminateService,
