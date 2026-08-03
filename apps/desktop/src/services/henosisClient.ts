@@ -4,6 +4,15 @@
  * These response types intentionally contain no access-token or refresh-token
  * fields. Rift credentials and tokens remain in the Tauri Rust process.
  */
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  MessagePage,
+  PendingRoomAttachment,
+  RoomConversationCommandResult,
+  RoomConversationEventEnvelope,
+  RoomConversationSnapshot,
+  RoomMessage,
+} from "../domain/conversation";
 import type { DirectorySource, RoomSummary } from "../domain/rooms";
 
 /** Credentials collected by the first-run connection form. */
@@ -56,6 +65,11 @@ export interface BootstrapResult {
   requiresAuthentication: boolean;
 }
 
+/** Callback receiving one sanitized, generation-scoped native room event. */
+export type RoomEventListener = (
+  envelope: RoomConversationEventEnvelope,
+) => void;
+
 /** Stable error categories used for actionable GUI recovery states. */
 export type ClientErrorKind =
   | "authentication"
@@ -79,7 +93,7 @@ export class HenosisClientError extends Error {
   }
 }
 
-/** Operations the room selector is allowed to request from the native process. */
+/** Operations the desktop webview is allowed to request from its runtime adapter. */
 export interface HenosisClient {
   /** Inspect saved profile and cached/native session state. */
   bootstrap(): Promise<BootstrapResult>;
@@ -89,6 +103,51 @@ export interface HenosisClient {
   refresh(): Promise<RoomDirectorySnapshot>;
   /** End the native Rift session and clear secret process state. */
   disconnect(): Promise<void>;
+  /** Open one exact room generation and return its sanitized live window. */
+  openRoom(roomId: string, streamId: string): Promise<RoomConversationSnapshot>;
+  /** Close only the exact room generation identified by the caller. */
+  closeRoom(roomId: string, streamId: string): Promise<void>;
+  /** Load one bounded page before the current oldest visible message. */
+  loadOlderMessages(
+    roomId: string,
+    streamId: string,
+    beforeMessageId: string,
+  ): Promise<RoomConversationCommandResult<MessagePage>>;
+  /** Send text and opaque staged upload identifiers to the open room. */
+  sendRoomMessage(
+    roomId: string,
+    streamId: string,
+    content: string,
+    pendingUploadIds: string[],
+  ): Promise<RoomConversationCommandResult<RoomMessage | null>>;
+  /** Replace the body of one currently loaded room message. */
+  editRoomMessage(
+    roomId: string,
+    streamId: string,
+    messageId: string,
+    content: string,
+  ): Promise<RoomConversationCommandResult<RoomMessage | null>>;
+  /** Delete one currently loaded message from the open room. */
+  deleteRoomMessage(
+    roomId: string,
+    streamId: string,
+    messageId: string,
+  ): Promise<RoomConversationCommandResult<string>>;
+  /** Let native code select and stage bounded files without exposing paths. */
+  selectAndUploadRoomAttachments(
+    roomId: string,
+    streamId: string,
+  ): Promise<RoomConversationCommandResult<PendingRoomAttachment[]>>;
+  /** Send one coalesced typing signal for the current room generation. */
+  sendRoomTyping(roomId: string, streamId: string): Promise<void>;
+  /** Persist a monotonic read marker for one currently loaded message. */
+  markRoomRead(
+    roomId: string,
+    streamId: string,
+    messageId: string,
+  ): Promise<void>;
+  /** Subscribe to the fixed sanitized room event channel. */
+  subscribeRoomEvents(listener: RoomEventListener): Promise<UnlistenFn>;
 }
 
 /** Serialized Tauri command error shape returned by the Rust boundary. */

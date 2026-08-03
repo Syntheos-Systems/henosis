@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { createFixtureRooms } from "./data/fixtureRooms";
+import { FixtureHenosisClient } from "./services/fixtureClient";
 import type {
   BootstrapResult,
   HenosisClient,
@@ -27,7 +28,7 @@ function fixtureDirectory(): RoomDirectorySnapshot {
 }
 
 /** Minimal injected client that records App requests without native IPC. */
-class TestClient implements HenosisClient {
+class TestClient extends FixtureHenosisClient implements HenosisClient {
   /** Bootstrap response supplied by each test. */
   readonly bootstrapResult: BootstrapResult;
   /** Connect spy shared with assertions. */
@@ -37,6 +38,7 @@ class TestClient implements HenosisClient {
 
   /** Create a client with a selected bootstrap state. */
   constructor(bootstrapResult: BootstrapResult) {
+    super();
     this.bootstrapResult = bootstrapResult;
   }
 
