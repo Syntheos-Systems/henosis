@@ -23,7 +23,7 @@ export interface AppProps {
   client?: HenosisClient;
 }
 
-/** Render the complete slice 1 Henosis desktop experience. */
+/** Render the room-first Henosis shell and integrated conversation workspace. */
 export function App({ client = DEFAULT_CLIENT }: AppProps) {
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState(false);
@@ -114,7 +114,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
     setShowSetup(false);
   }
 
-  /** Display an honest boundary for work scheduled after slice 1. */
+  /** Display an honest boundary for controls scheduled after conversation integration. */
   function handleDeferredAction(action: string) {
     setNotice(
       `${action} is not wired in this slice. It will land as a visible Henosis control, not a terminal workaround.`,
@@ -154,6 +154,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
 
       {selectedRoom ? (
         <RoomDetail
+          client={client}
           room={selectedRoom}
           onBack={handleRooms}
           onDeferredAction={handleDeferredAction}

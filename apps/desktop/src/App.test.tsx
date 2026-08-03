@@ -1,4 +1,4 @@
-/** End-to-end component tests for the slice 1 room-first experience. */
+/** End-to-end component tests for room selection and conversation integration. */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -8,6 +8,7 @@ import type {
   BootstrapResult,
   HenosisClient,
   RiftConnectionInput,
+  RoomEventListener,
   RoomDirectorySnapshot,
 } from "./services/henosisClient";
 
@@ -35,6 +36,14 @@ class TestClient extends FixtureHenosisClient implements HenosisClient {
   readonly connectSpy = vi.fn();
   /** Refresh spy shared with assertions. */
   readonly refreshSpy = vi.fn();
+  /** Room-open spy retaining each room and one-use generation identifier. */
+  readonly openRoomSpy = vi.fn();
+  /** Room-close spy proving exact generation release during navigation. */
+  readonly closeRoomSpy = vi.fn();
+  /** Subscription spy proving the workspace registers one native listener. */
+  readonly subscribeRoomEventsSpy = vi.fn();
+  /** Listener cleanup spy proving old room events cannot survive navigation. */
+  readonly unlistenRoomEventsSpy = vi.fn();
 
   /** Create a client with a selected bootstrap state. */
   constructor(bootstrapResult: BootstrapResult) {
@@ -57,6 +66,32 @@ class TestClient extends FixtureHenosisClient implements HenosisClient {
   async refresh(): Promise<RoomDirectorySnapshot> {
     this.refreshSpy();
     return fixtureDirectory();
+  }
+
+  /** Record and delegate one sanitized fixture room generation open. */
+  async openRoom(roomId: string, streamId: string) {
+    this.openRoomSpy(roomId, streamId);
+    return super.openRoom(roomId, streamId);
+  }
+
+  /** Record and delegate exact fixture generation cleanup. */
+  async closeRoom(roomId: string, streamId: string): Promise<void> {
+    this.closeRoomSpy(roomId, streamId);
+    return super.closeRoom(roomId, streamId);
+  }
+
+  /** Wrap the fixture event listener with observable idempotent cleanup. */
+  async subscribeRoomEvents(listener: RoomEventListener) {
+    this.subscribeRoomEventsSpy(listener);
+    const unlisten = await super.subscribeRoomEvents(listener);
+    let listening = true;
+    return () => {
+      if (listening) {
+        listening = false;
+        this.unlistenRoomEventsSpy();
+        unlisten();
+      }
+    };
   }
 
   /** Satisfy the client contract without remote state. */
@@ -82,33 +117,91 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Athena" })).not.toBeInTheDocument();
   });
 
-  it("searches room context and enters a selected room through the GUI", async () => {
+  it("opens the primary room conversation beside its dashboard and closes it on return", async () => {
     const client = new TestClient({
       directory: fixtureDirectory(),
       requiresAuthentication: false,
     });
     render(<App client={client} />);
 
-    const search = await screen.findByLabelText(
-      "Search rooms, servers, messages, and participants",
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Continue room" }),
     );
-    fireEvent.change(search, { target: { value: "Trust Lab" } });
-
-    expect(screen.getByText("#governance")).toBeInTheDocument();
-    expect(screen.queryByText("#orchard")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Continue room" }));
 
     expect(
-      screen.getByRole("heading", { name: "governance" }),
+      screen.getByRole("heading", { name: "orchard" }),
     ).toBeInTheDocument();
+    await waitFor(() => expect(client.openRoomSpy).toHaveBeenCalledOnce());
+    expect(client.subscribeRoomEventsSpy).toHaveBeenCalledOnce();
+
+    const [roomId, streamId] = client.openRoomSpy.mock.calls[0];
+    expect(roomId).toBe("room-orchard");
+    expect(streamId).toMatch(/^[a-f0-9]{32,}$/);
+
+    const conversation = await screen.findByRole("region", {
+      name: "Room conversation",
+    });
+    const timeline = screen.getByRole("log", { name: "Room message timeline" });
+    const dashboard = screen.getByRole("complementary", {
+      name: "Room dashboard",
+    });
+    expect(conversation).toContainElement(timeline);
     expect(
-      screen.getByText("The room is visible. Full conversation sync is next."),
+      conversation.compareDocumentPosition(dashboard) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Open room dashboard" }),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "All rooms" }));
     expect(
       screen.getByRole("heading", { name: "Return to the current." }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(client.unlistenRoomEventsSpy).toHaveBeenCalledOnce();
+      expect(client.closeRoomSpy).toHaveBeenCalledWith(roomId, streamId);
+    });
+  });
+
+  it("releases the old room generation before opening a different room", async () => {
+    const client = new TestClient({
+      directory: fixtureDirectory(),
+      requiresAuthentication: false,
+    });
+    render(<App client={client} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Continue room" }),
+    );
+    await waitFor(() => expect(client.openRoomSpy).toHaveBeenCalledOnce());
+    const firstStreamId = client.openRoomSpy.mock.calls[0][1];
+
+    fireEvent.click(screen.getByRole("button", { name: "All rooms" }));
+    await waitFor(() => {
+      expect(client.unlistenRoomEventsSpy).toHaveBeenCalledOnce();
+      expect(client.closeRoomSpy).toHaveBeenCalledWith(
+        "room-orchard",
+        firstStreamId,
+      );
+    });
+
+    const search = screen.getByLabelText(
+      "Search rooms, servers, messages, and participants",
+    );
+    fireEvent.change(search, { target: { value: "Trust Lab" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue room" }));
+
+    await waitFor(() => expect(client.openRoomSpy).toHaveBeenCalledTimes(2));
+    const [secondRoomId, secondStreamId] = client.openRoomSpy.mock.calls[1];
+    expect(secondRoomId).toBe("room-governance");
+    expect(secondStreamId).not.toBe(firstStreamId);
+    expect(client.subscribeRoomEventsSpy).toHaveBeenCalledTimes(2);
+    expect(client.closeRoomSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      client.openRoomSpy.mock.invocationCallOrder[1],
+    );
+    expect(
+      screen.getByRole("heading", { name: "governance" }),
     ).toBeInTheDocument();
   });
 
