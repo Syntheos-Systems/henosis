@@ -421,7 +421,7 @@ impl Gateway {
         tx: tokio::sync::mpsc::Sender<GatewayEvent>,
     ) {
         let receiver = self.subscribe_channel(channel_id);
-        let _ = spawn_event_forwarder(receiver, tx);
+        drop(spawn_event_forwarder(receiver, tx));
     }
 }
 
@@ -510,7 +510,10 @@ where
                         };
                         if let GatewayEvent::ChannelCreate { id: channel_id, .. } = &event {
                             let receiver = channel_gateway.subscribe_channel(*channel_id);
-                            let _ = spawn_event_forwarder(receiver, dynamic_channel_tx.clone());
+                            drop(spawn_event_forwarder(
+                                receiver,
+                                dynamic_channel_tx.clone(),
+                            ));
                         }
                         if server_tx.send(event).await.is_err() {
                             break;
@@ -521,7 +524,7 @@ where
         });
 
         for channel_rx in channel_receivers {
-            let _ = spawn_event_forwarder(channel_rx, internal_tx.clone());
+            drop(spawn_event_forwarder(channel_rx, internal_tx.clone()));
         }
 
         session.subscribed_servers.insert(server_id);
