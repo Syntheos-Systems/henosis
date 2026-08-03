@@ -249,6 +249,10 @@ pub enum RoomConnectionStatus {
 pub struct RoomConversationSnapshot {
     /// Open room identifier.
     pub room_id: String,
+    /// Caller-generated one-use token bound to the exact native room generation.
+    pub stream_id: String,
+    /// Highest event sequence already reflected in this snapshot.
+    pub last_event_sequence: u64,
     /// Signed-in Rift user used for authorship affordances.
     pub current_user_id: String,
     /// Server-authoritative capabilities for the signed-in human.
@@ -344,6 +348,30 @@ pub enum RoomConversationEvent {
     },
 }
 
+/// One generation-scoped, monotonically ordered event crossing the native webview boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomConversationEventEnvelope {
+    /// Caller-generated one-use token shared with its opening snapshot.
+    pub stream_id: String,
+    /// Strictly increasing sequence within this room generation.
+    pub sequence: u64,
+    /// Sanitized room update applied to native state before delivery.
+    pub event: RoomConversationEvent,
+}
+
+/// One command value ordered on the same stream sequence as native room events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomConversationCommandResult<T> {
+    /// Caller-generated one-use token shared with the opening snapshot and events.
+    pub stream_id: String,
+    /// Strictly increasing sequence within this room generation.
+    pub sequence: u64,
+    /// Sanitized command value committed to native state at this sequence.
+    pub value: T,
+}
+
 /// Initial state used to choose setup or the room directory.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -430,6 +458,8 @@ mod tests {
     fn room_snapshot_serializes_sanitized_camel_case_contract() {
         let snapshot = RoomConversationSnapshot {
             room_id: "room-1".into(),
+            stream_id: "stream-0000000007".into(),
+            last_event_sequence: 12,
             current_user_id: "user-1".into(),
             permissions: RoomPermissions {
                 send_messages: true,
@@ -452,6 +482,8 @@ mod tests {
             value,
             json!({
                 "roomId": "room-1",
+                "streamId": "stream-0000000007",
+                "lastEventSequence": 12,
                 "currentUserId": "user-1",
                 "permissions": {
                     "sendMessages": true,
@@ -675,6 +707,50 @@ mod tests {
                 event
             );
         }
+    }
+
+    /// Event envelopes carry only the ordering cursor and the existing sanitized event contract.
+    #[test]
+    fn room_event_envelope_serializes_ordering_contract() {
+        let envelope = RoomConversationEventEnvelope {
+            stream_id: "stream-0000000007".into(),
+            sequence: 13,
+            event: RoomConversationEvent::MessageDelete {
+                room_id: "room-1".into(),
+                message_id: "message-1".into(),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(&envelope).expect("event envelope must serialize"),
+            json!({
+                "streamId": "stream-0000000007",
+                "sequence": 13,
+                "event": {
+                    "type": "messageDelete",
+                    "data": { "roomId": "room-1", "messageId": "message-1" },
+                },
+            })
+        );
+    }
+
+    /// Command results expose their sanitized value on the same stream ordering contract.
+    #[test]
+    fn room_command_result_serializes_ordering_contract() {
+        let result = RoomConversationCommandResult {
+            stream_id: "stream-0000000007".into(),
+            sequence: 14,
+            value: Some(room_message()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&result).expect("command result must serialize"),
+            json!({
+                "streamId": "stream-0000000007",
+                "sequence": 14,
+                "value": room_message(),
+            })
+        );
     }
 
     /// Connection states remain compact string values for React status rendering.

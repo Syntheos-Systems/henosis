@@ -10,8 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message as WebSocketMessage};
@@ -22,6 +23,7 @@ use url::Url;
 use crate::model::{RoomConnectionStatus, RoomConversationEvent, RoomMessage};
 use crate::reconcile::{MessagePageSource, ReconcileError, reconcile_open_room};
 use crate::rift::{ApiRoomMessage, AuthenticatedRiftClient, GatewayAuthentication, RiftError};
+use crate::state::{AppState, RoomLease};
 
 /// Fixed Tauri event used for every sanitized room conversation update.
 pub(crate) const ROOM_CONVERSATION_EVENT: &str = "henosis://room-conversation";
@@ -40,6 +42,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum time allowed for one complete WebSocket protocol write.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One pending typing signal coalesces every additional signal until the actor receives it.
+const OUTBOUND_TYPING_CAPACITY: usize = 1;
 
 /// Initial reconnect delay before bounded jitter.
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
@@ -65,21 +70,53 @@ pub(crate) enum RiftGatewayError {
     /// The initial sanitized message could not supply a safe reconnect ordering key.
     #[error("The initial native room message was invalid.")]
     InvalidInitialMessage,
+    /// The deferred production actor ended before its snapshot barrier was released.
+    #[error("The native room connection ended before startup completed.")]
+    StartUnavailable,
 }
 
 /// Cancellable owner for exactly one native Rift gateway actor.
 pub(crate) struct RiftGateway {
     /// Shared stop signal checked around every transport wait and emission.
     cancellation: CancellationToken,
+    /// Bounded coalescing mailbox read only by the sole socket actor.
+    typing: mpsc::Sender<()>,
+    /// One-shot production barrier released only after the opening snapshot is sealed.
+    start: Option<oneshot::Sender<()>>,
     /// Sole actor task aborted if synchronous state teardown cannot await it.
     task: Option<JoinHandle<()>>,
 }
 
+/// Stable enqueue failure that exposes no socket or native channel details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RiftGatewayEnqueueError;
+
 /// Lifecycle operations for the sole native gateway actor.
 impl RiftGateway {
+    /// Release a deferred actor after AppState seals its initial snapshot boundary.
+    pub(crate) fn start(&mut self) -> Result<(), RiftGatewayError> {
+        let Some(start) = self.start.take() else {
+            return Ok(());
+        };
+        start
+            .send(())
+            .map_err(|_| RiftGatewayError::StartUnavailable)
+    }
+
     /// Signal cancellation without waiting or holding AppState's mutex.
     pub(crate) fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    /// Coalesce one typing request into the actor's single bounded mailbox slot.
+    pub(crate) fn enqueue_typing(&self) -> Result<(), RiftGatewayEnqueueError> {
+        if self.cancellation.is_cancelled() {
+            return Err(RiftGatewayEnqueueError);
+        }
+        match self.typing.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(RiftGatewayEnqueueError),
+        }
     }
 
     /// Cancel and await the actor during deterministic tests or async teardown.
@@ -233,15 +270,29 @@ trait GatewayEventSink: Send + Sync {
 struct TauriGatewayEventSink {
     /// Application handle used to publish to every current webview listener.
     app: AppHandle,
+    /// Exact room generation that must accept an event before emission.
+    lease: RoomLease,
 }
 
 /// Restrict Tauri emission to RoomConversationEvent values.
 impl GatewayEventSink for TauriGatewayEventSink {
     /// Emit one sanitized event on the fixed native channel.
     fn emit(&self, event: RoomConversationEvent) -> Result<(), ()> {
-        self.app
-            .emit(ROOM_CONVERSATION_EVENT, event)
-            .map_err(|_| ())
+        let result = self
+            .app
+            .state::<AppState>()
+            .apply_room_event_before_release(&self.lease, &event, |envelope| {
+                self.app
+                    .emit(ROOM_CONVERSATION_EVENT, envelope.clone())
+                    .is_ok()
+            });
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => {
+                self.lease.cancellation().cancel();
+                Err(())
+            }
+        }
     }
 }
 
@@ -407,6 +458,11 @@ enum GatewayCommand<'a> {
         /// Canonical unique server identifiers.
         server_ids: &'a [String],
     },
+    /// Notify Rift that the signed-in human is typing in the open room.
+    Typing {
+        /// Exact channel identifier owned by this gateway actor.
+        channel_id: &'a str,
+    },
 }
 
 /// Minimal envelope header used to distinguish unknown event types safely.
@@ -518,8 +574,7 @@ fn websocket_config() -> WebSocketConfig {
 /// Spawn the sole production gateway for one open room and its latest native cursor.
 pub(crate) fn spawn_rift_gateway(
     app: AppHandle,
-    session: AuthenticatedRiftClient,
-    room_id: String,
+    lease: RoomLease,
     server_ids: Vec<String>,
     last_known_message: Option<&RoomMessage>,
 ) -> Result<RiftGateway, RiftGatewayError> {
@@ -527,6 +582,9 @@ pub(crate) fn spawn_rift_gateway(
         .map(NativeMessageCursor::from_message)
         .transpose()
         .map_err(|_| RiftGatewayError::InvalidInitialMessage)?;
+    let room_id = lease.room_id().to_owned();
+    let actor_cancellation = lease.cancellation().clone();
+    let session = lease.session().clone();
     let native_session = Arc::new(session);
     let reconcile_source: Arc<dyn MessagePageSource> = native_session.clone();
     let session: Arc<dyn GatewaySession> = native_session;
@@ -537,30 +595,62 @@ pub(crate) fn spawn_rift_gateway(
         reconcile_source,
         last_known_message,
         connector: Arc::new(TokioGatewayConnector),
-        sink: Arc::new(TauriGatewayEventSink { app }),
+        sink: Arc::new(TauriGatewayEventSink { app, lease }),
         jitter: Arc::new(ProcessGatewayJitter::new()),
     };
-    spawn_gateway_actor(runtime)
+    spawn_gateway_actor_with_cancellation(runtime, actor_cancellation, true)
 }
 
 /// Start one actor on the current Tokio runtime.
-fn spawn_gateway_actor(mut runtime: GatewayRuntime) -> Result<RiftGateway, RiftGatewayError> {
+fn spawn_gateway_actor(runtime: GatewayRuntime) -> Result<RiftGateway, RiftGatewayError> {
+    spawn_gateway_actor_with_cancellation(runtime, CancellationToken::new(), false)
+}
+
+/// Start one actor using a room generation's shared cancellation signal.
+fn spawn_gateway_actor_with_cancellation(
+    mut runtime: GatewayRuntime,
+    cancellation: CancellationToken,
+    deferred_start: bool,
+) -> Result<RiftGateway, RiftGatewayError> {
     runtime.server_ids = canonical_server_ids(runtime.server_ids)?;
     let handle =
         tokio::runtime::Handle::try_current().map_err(|_| RiftGatewayError::RuntimeUnavailable)?;
-    let cancellation = CancellationToken::new();
     let actor_cancellation = cancellation.clone();
+    let (typing, typing_receiver) = mpsc::channel(OUTBOUND_TYPING_CAPACITY);
+    let (start, start_receiver) = if deferred_start {
+        let (sender, receiver) = oneshot::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let task = handle.spawn(async move {
-        run_gateway(runtime, actor_cancellation).await;
+        if let Some(start_receiver) = start_receiver {
+            tokio::select! {
+                biased;
+                _ = actor_cancellation.cancelled() => return,
+                result = start_receiver => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        run_gateway(runtime, actor_cancellation, typing_receiver).await;
     });
     Ok(RiftGateway {
         cancellation,
+        typing,
+        start,
         task: Some(task),
     })
 }
 
 /// Supervise authentication, connection attempts, refresh, and bounded reconnects.
-async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
+async fn run_gateway(
+    runtime: GatewayRuntime,
+    cancellation: CancellationToken,
+    mut typing: mpsc::Receiver<()>,
+) {
     if !emit_status(&runtime, &cancellation, RoomConnectionStatus::Connecting) {
         return;
     }
@@ -569,6 +659,7 @@ async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
     let mut reconcile_after_ready = false;
 
     loop {
+        discard_pending_typing(&mut typing);
         if cancellation.is_cancelled() || !runtime.session.is_active() {
             return;
         }
@@ -625,6 +716,7 @@ async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
             &authentication,
             &mut last_known_message,
             reconcile_after_ready,
+            &mut typing,
         )
         .await
         {
@@ -690,7 +782,9 @@ async fn run_connection(
     authentication: &GatewayAuthentication,
     last_known_message: &mut Option<NativeMessageCursor>,
     reconcile_after_ready: bool,
+    typing: &mut mpsc::Receiver<()>,
 ) -> ConnectionOutcome {
+    discard_pending_typing(typing);
     let identify = match serde_json::to_string(&GatewayCommand::Identify {
         token: authentication.access_token(),
     }) {
@@ -734,6 +828,43 @@ async fn run_connection(
                     reached_ready: false,
                     refresh_generation: None,
                 };
+            }
+            typing_request = typing.recv() => {
+                if typing_request.is_none() {
+                    return ConnectionOutcome::Cancelled;
+                }
+                if !ready {
+                    continue;
+                }
+                let typing_command = match serde_json::to_string(&GatewayCommand::Typing {
+                    channel_id: &runtime.room_id,
+                }) {
+                    Ok(command) => command,
+                    Err(_) => {
+                        return ConnectionOutcome::Reconnect {
+                            reached_ready: true,
+                            refresh_generation: None,
+                        };
+                    }
+                };
+                if send_frame(
+                    socket,
+                    cancellation,
+                    WebSocketMessage::Text(typing_command.into()),
+                )
+                .await
+                .is_err()
+                {
+                    return if cancellation.is_cancelled() {
+                        ConnectionOutcome::Cancelled
+                    } else {
+                        ConnectionOutcome::Reconnect {
+                            reached_ready: true,
+                            refresh_generation: None,
+                        }
+                    };
+                }
+                continue;
             }
             received = socket.receive() => received,
         };
@@ -891,6 +1022,7 @@ async fn run_connection(
                                 advance_message_cursor(last_known_message, next_cursor);
                             }
                         }
+                        discard_pending_typing(typing);
                         ready = true;
                         if !emit_status(runtime, cancellation, RoomConnectionStatus::Connected) {
                             return ConnectionOutcome::Cancelled;
@@ -959,6 +1091,11 @@ async fn run_connection(
             | WebSocketMessage::Frame(_) => {}
         }
     }
+}
+
+/// Drop every typing signal captured outside the current Ready connection.
+fn discard_pending_typing(typing: &mut mpsc::Receiver<()>) {
+    while typing.try_recv().is_ok() {}
 }
 
 /// Send one frame with cancellation priority.
@@ -1097,6 +1234,8 @@ fn emit_event(
     }
     if runtime.sink.emit(event).is_err() {
         tracing::debug!(phase = "emit", "Rift gateway event had no active recipient");
+        cancellation.cancel();
+        return false;
     }
     true
 }
@@ -1141,16 +1280,34 @@ async fn wait_for_reconnect(
 pub(crate) fn test_rift_gateway() -> (RiftGateway, CancellationToken) {
     let cancellation = CancellationToken::new();
     let actor_cancellation = cancellation.clone();
+    let (typing, typing_receiver) = mpsc::channel(OUTBOUND_TYPING_CAPACITY);
     let task = tokio::spawn(async move {
+        let _typing_receiver = typing_receiver;
         actor_cancellation.cancelled().await;
     });
     (
         RiftGateway {
             cancellation: cancellation.clone(),
+            typing,
+            start: None,
             task: Some(task),
         },
         cancellation,
     )
+}
+
+#[cfg(test)]
+/// Construct a current-looking gateway whose outbound mailbox has closed.
+pub(crate) fn test_closed_rift_gateway() -> RiftGateway {
+    let cancellation = CancellationToken::new();
+    let (typing, typing_receiver) = mpsc::channel(OUTBOUND_TYPING_CAPACITY);
+    drop(typing_receiver);
+    RiftGateway {
+        cancellation,
+        typing,
+        start: None,
+        task: None,
+    }
 }
 
 #[cfg(test)]
@@ -1761,6 +1918,7 @@ mod tests {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(READY_TIMEOUT, Duration::from_secs(10));
         assert_eq!(WRITE_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(OUTBOUND_TYPING_CAPACITY, 1);
 
         let mut backoff = ReconnectBackoff::new();
         let no_jitter = FixedJitter { millis: 0 };
@@ -1786,6 +1944,112 @@ mod tests {
             backoff.next_delay(&FixedJitter { millis: u64::MAX }),
             Duration::from_millis(312)
         );
+    }
+
+    /// Outbound typing is coalesced before Ready and serialized exactly after Ready.
+    #[tokio::test]
+    async fn outbound_typing_is_ready_gated_bounded_and_exact() {
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime(session, connector, sink, Vec::new()))
+            .expect("typing actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _url = attempts.recv().await.expect("typing connection attempt");
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Identify", "data": {"token": "access-one"}})
+        );
+        gateway
+            .enqueue_typing()
+            .expect("first pre-Ready typing signal must enqueue");
+        gateway
+            .enqueue_typing()
+            .expect("full mailbox must coalesce another typing signal");
+        tokio::task::yield_now().await;
+        assert!(peer.outbound.try_recv().is_err());
+
+        peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        tokio::task::yield_now().await;
+        assert!(peer.outbound.try_recv().is_err());
+
+        gateway
+            .enqueue_typing()
+            .expect("post-Ready typing signal must enqueue");
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Typing", "data": {"channel_id": "room-1"}})
+        );
+        gateway.cancel();
+        tokio::task::yield_now().await;
+        drop(gateway);
+    }
+
+    /// A typing signal captured during reconnect backoff is never replayed on the next socket.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_discards_stale_outbound_typing() {
+        let (first_socket, mut first_peer) = fake_socket_pair();
+        let (second_socket, mut second_peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![
+            ConnectScript::Socket(first_socket),
+            ConnectScript::Socket(second_socket),
+        ]);
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime(session, connector, sink, Vec::new()))
+            .expect("reconnecting typing actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _first_url = attempts.recv().await.expect("first typing attempt");
+        let _first_identify = first_peer.next_json().await;
+        first_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        gateway
+            .enqueue_typing()
+            .expect("connected typing signal must enqueue");
+        assert_eq!(
+            first_peer.next_json().await,
+            json!({"type": "Typing", "data": {"channel_id": "room-1"}})
+        );
+
+        first_peer.send(WebSocketMessage::Close(None));
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        gateway
+            .enqueue_typing()
+            .expect("backoff typing signal must coalesce without transport details");
+        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
+        let _second_url = attempts.recv().await.expect("second typing attempt");
+        assert_eq!(
+            second_peer.next_json().await,
+            json!({"type": "Identify", "data": {"token": "access-one"}})
+        );
+        second_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        tokio::task::yield_now().await;
+        assert!(second_peer.outbound.try_recv().is_err());
+
+        gateway
+            .enqueue_typing()
+            .expect("fresh typing signal must enqueue after reconnect");
+        assert_eq!(
+            second_peer.next_json().await,
+            json!({"type": "Typing", "data": {"channel_id": "room-1"}})
+        );
+        gateway.cancel();
+        tokio::task::yield_now().await;
+        drop(gateway);
     }
 
     /// WebSocket URL derivation preserves only the authenticated service origin.
@@ -2266,8 +2530,20 @@ mod tests {
         state
             .set_session(owner.clone())
             .expect("owner session must install");
+        let owner_lease = state
+            .begin_room_open(&owner, "room-1", "stream-owner-0001")
+            .expect("owner room must begin");
         state
-            .replace_gateway(&owner, gateway)
+            .install_room_page(
+                &owner_lease,
+                MessagePage {
+                    messages: vec![reconciled_message("message-1")],
+                    has_older: false,
+                },
+            )
+            .expect("owner room page must install");
+        state
+            .install_room_gateway(&owner_lease, gateway)
             .expect("pending gateway must install");
 
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
@@ -2291,8 +2567,20 @@ mod tests {
         source.wait_for_request().await;
 
         let (replacement, replacement_cancellation) = test_rift_gateway();
+        let replacement_lease = state
+            .begin_room_open(&owner, "room-1", "stream-owner-0002")
+            .expect("same-room replacement must begin");
         state
-            .replace_gateway(&owner, replacement)
+            .install_room_page(
+                &replacement_lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("replacement room page must install");
+        state
+            .install_room_gateway(&replacement_lease, replacement)
             .expect("replacement gateway must install");
         assert!(old_cancellation.is_cancelled());
         tokio::task::yield_now().await;
@@ -2479,24 +2767,47 @@ mod tests {
         gateway.shutdown().await;
     }
 
-    /// A transient Tauri delivery failure does not terminate the native socket.
+    /// A delivery failure cancels the actor before it can create an unobservable sequence gap.
     #[tokio::test]
-    async fn event_sink_failure_does_not_kill_gateway() {
-        let (socket, mut peer) = fake_socket_pair();
-        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+    async fn event_sink_failure_cancels_gateway_before_connecting() {
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Pending]);
         let session = Arc::new(FakeSession::new());
         let (sink, mut events) = recording_sink();
         sink.fail_next.store(true, Ordering::Release);
         let gateway = spawn_gateway_actor(fake_runtime(session, connector, sink, Vec::new()))
             .expect("test runtime must spawn");
 
-        let _url = attempts.recv().await.expect("connection attempt");
-        let _identify = peer.next_json().await;
-        peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
-        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        tokio::time::timeout(Duration::from_secs(1), gateway.cancellation.cancelled())
+            .await
+            .expect("failed delivery must cancel the actor");
+        assert!(attempts.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+        gateway.shutdown().await;
+    }
+
+    /// A deferred actor neither emits nor connects until its snapshot barrier is released.
+    #[tokio::test]
+    async fn deferred_actor_waits_for_explicit_start() {
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Pending]);
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let mut gateway = spawn_gateway_actor_with_cancellation(
+            fake_runtime(session, connector, sink, Vec::new()),
+            CancellationToken::new(),
+            true,
+        )
+        .expect("deferred test runtime must spawn");
+
+        tokio::task::yield_now().await;
+        assert!(attempts.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+
+        gateway.start().expect("snapshot barrier must release");
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        attempts
+            .recv()
+            .await
+            .expect("released actor must begin connecting");
         gateway.shutdown().await;
     }
 
@@ -2511,13 +2822,38 @@ mod tests {
             .set_session(first.clone())
             .expect("first session must install");
 
+        let first_lease = state
+            .begin_room_open(&first, "room-1", "stream-first-0001")
+            .expect("first room must begin");
+        state
+            .install_room_page(
+                &first_lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("first page must install");
         let (first_gateway, first_cancelled) = test_rift_gateway();
         state
-            .replace_gateway(&first, first_gateway)
+            .install_room_gateway(&first_lease, first_gateway)
             .expect("first gateway must install");
+        let replacement_lease = state
+            .begin_room_open(&first, "room-1", "stream-first-0002")
+            .expect("replacement room must begin");
+        assert!(first_lease.cancellation().is_cancelled());
+        state
+            .install_room_page(
+                &replacement_lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("replacement page must install");
         let (replacement_gateway, replacement_cancelled) = test_rift_gateway();
         state
-            .replace_gateway(&first, replacement_gateway)
+            .install_room_gateway(&replacement_lease, replacement_gateway)
             .expect("replacement gateway must install");
         assert!(first_cancelled.is_cancelled());
 
@@ -2529,12 +2865,28 @@ mod tests {
         assert!(second.gateway_is_active());
 
         let (stale_gateway, stale_cancelled) = test_rift_gateway();
-        assert!(state.replace_gateway(&first, stale_gateway).is_err());
+        assert!(
+            state
+                .install_room_gateway(&replacement_lease, stale_gateway)
+                .is_err()
+        );
         assert!(stale_cancelled.is_cancelled());
 
+        let current_lease = state
+            .begin_room_open(&second, "room-2", "stream-second-0001")
+            .expect("current room must begin");
+        state
+            .install_room_page(
+                &current_lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("current page must install");
         let (current_gateway, current_cancelled) = test_rift_gateway();
         state
-            .replace_gateway(&second, current_gateway)
+            .install_room_gateway(&current_lease, current_gateway)
             .expect("current gateway must install");
         state.clear_gateway().expect("current gateway must clear");
         assert!(current_cancelled.is_cancelled());
@@ -2545,9 +2897,21 @@ mod tests {
                 .is_some_and(|current| current.same_session(&second))
         );
 
+        let logout_lease = state
+            .begin_room_open(&second, "room-2", "stream-second-0002")
+            .expect("logout room must begin");
+        state
+            .install_room_page(
+                &logout_lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("logout page must install");
         let (logout_gateway, logout_cancelled) = test_rift_gateway();
         state
-            .replace_gateway(&second, logout_gateway)
+            .install_room_gateway(&logout_lease, logout_gateway)
             .expect("logout gateway must install");
         state.clear_session().expect("session must clear");
         assert!(logout_cancelled.is_cancelled());

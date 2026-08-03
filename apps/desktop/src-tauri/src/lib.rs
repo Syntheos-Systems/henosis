@@ -25,6 +25,15 @@ pub fn run() {
             commands::connect_rift,
             commands::get_room_directory,
             commands::disconnect_rift,
+            commands::open_room,
+            commands::load_older_messages,
+            commands::send_room_message,
+            commands::edit_room_message,
+            commands::delete_room_message,
+            commands::select_and_upload_room_attachments,
+            commands::send_room_typing,
+            commands::mark_room_read,
+            commands::close_room,
         ])
         .run(tauri::generate_context!())
         .expect("Henosis failed to start");

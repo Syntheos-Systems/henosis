@@ -16,11 +16,14 @@ use url::Url;
 use crate::model::{
     CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, MessagePage,
     PendingRoomAttachment, RiftConnectionInput, RoomAttachment, RoomDirectorySnapshot, RoomMessage,
-    RoomParticipant, RoomStatus, RoomSummary, SanitizedConnection,
+    RoomParticipant, RoomPermissions, RoomStatus, RoomSummary, SanitizedConnection,
 };
 
 /// Hard cap on retained file bytes for one replayable native upload request.
-const MAX_NATIVE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_NATIVE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of files accepted by one native attachment selection.
+pub(crate) const MAX_NATIVE_UPLOAD_FILES: usize = 10;
 
 /// Shared native owner for authenticated Rift HTTP and token rotation.
 #[derive(Clone)]
@@ -197,9 +200,9 @@ impl From<RiftError> for CommandError {
                 CommandErrorKind::Protocol,
                 "Henosis could not encode the Rift request.",
             ),
-            RiftError::Remote { status, message } => Self::new(
+            RiftError::Remote { .. } => Self::new(
                 CommandErrorKind::Protocol,
-                format!("Rift returned {status}: {message}"),
+                "Rift rejected the request. Refresh and try again.",
             ),
             RiftError::Protocol(_) | RiftError::ProtocolContract => Self::new(
                 CommandErrorKind::Protocol,
@@ -970,8 +973,11 @@ impl ApiRoomMessage {
 
 /// Sanitization of one staged upload before returning safe pending metadata.
 impl ApiPendingRoomAttachment {
-    /// Validate its display name, URL, and byte count while discarding the URL.
+    /// Validate its opaque identifier, display name, URL, and byte count while discarding the URL.
     fn into_pending_attachment(self, base_url: &Url) -> Result<PendingRoomAttachment, RiftError> {
+        if self.upload_id.is_empty() || self.upload_id.trim() != self.upload_id {
+            return Err(RiftError::ProtocolContract);
+        }
         validate_display_filename(&self.filename)?;
         let _validated_url = resolve_attachment_url(base_url, &self.url)?;
         Ok(PendingRoomAttachment {
@@ -999,6 +1005,9 @@ fn room_message_page(
     limit: u32,
     exposes_older_cursor: bool,
 ) -> Result<MessagePage, RiftError> {
+    if messages.len() > limit as usize {
+        return Err(RiftError::ProtocolContract);
+    }
     messages.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
@@ -1035,6 +1044,18 @@ pub(crate) async fn latest_messages(
     limit: u32,
 ) -> Result<MessagePage, RiftError> {
     fetch_message_page(client, room_id, None, limit, true).await
+}
+
+/// Fetch server-authoritative capabilities for the signed-in room member.
+pub(crate) async fn room_permissions(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<RoomPermissions, RiftError> {
+    let path = format!(
+        "api/servers/{}/permissions/@me",
+        encode_path_segment(server_id)?
+    );
+    get_json(client, &path).await
 }
 
 /// Fetch messages strictly older than one opaque cursor and return them oldest-first.
@@ -1078,6 +1099,19 @@ pub(crate) async fn create_message(
     content: &str,
     upload_ids: &[String],
 ) -> Result<RoomMessage, RiftError> {
+    if upload_ids.len() > MAX_NATIVE_UPLOAD_FILES {
+        return Err(RiftError::Validation(
+            "A room message can include no more than 10 attachments.".into(),
+        ));
+    }
+    if upload_ids
+        .iter()
+        .any(|upload_id| upload_id.is_empty() || upload_id.trim() != upload_id)
+    {
+        return Err(RiftError::Validation(
+            "Pending attachment identifiers were invalid.".into(),
+        ));
+    }
     if upload_ids
         .iter()
         .enumerate()
@@ -1125,7 +1159,11 @@ pub(crate) async fn edit_message(
         &EditRoomMessageRequest { content },
     )?;
     let message: ApiRoomMessage = send_json_request(client, &request).await?;
-    message.into_room_message(&client.inner.base_url, room_id)
+    let message = message.into_room_message(&client.inner.base_url, room_id)?;
+    if message.id != message_id {
+        return Err(RiftError::ProtocolContract);
+    }
+    Ok(message)
 }
 
 /// Delete one room-bound message and require Rift's positive acknowledgement.
@@ -1146,6 +1184,193 @@ pub(crate) async fn delete_message(
     Ok(())
 }
 
+/// Stable native file identity used to bind validation to the bytes that are read.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeUploadIdentity {
+    /// Device containing the selected file.
+    device: u64,
+    /// Inode identifying the selected file on its device.
+    inode: u64,
+}
+
+/// Stable Windows file identity used to bind validation to the bytes that are read.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeUploadIdentity {
+    /// Volume containing the selected file.
+    volume: u32,
+    /// File index identifying the selected file on its volume.
+    index: u64,
+}
+
+/// Open a Unix upload path without following a final symbolic link.
+#[cfg(unix)]
+fn open_native_upload_file(path: &Path) -> Result<std::fs::File, RiftError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                RiftError::Validation("Selected attachments must be regular files.".into())
+            } else {
+                RiftError::FileRead(error)
+            }
+        })
+}
+
+/// Open a Windows upload path as the reparse entry itself instead of following it.
+#[cfg(windows)]
+fn open_native_upload_file(path: &Path) -> Result<std::fs::File, RiftError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(RiftError::FileRead)
+}
+
+/// Extract a Unix device and inode pair from filesystem metadata.
+#[cfg(unix)]
+fn native_upload_identity(
+    _file: Option<&std::fs::File>,
+    metadata: &std::fs::Metadata,
+) -> Result<NativeUploadIdentity, RiftError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(NativeUploadIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Extract a Windows volume and file-index pair while rejecting every reparse entry.
+#[cfg(windows)]
+fn native_upload_identity(
+    file: Option<&std::fs::File>,
+    _metadata: &std::fs::Metadata,
+) -> Result<NativeUploadIdentity, RiftError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+
+    let file = file.ok_or(RiftError::ProtocolContract)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live Windows handle and `information` is a writable output buffer.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::from_mut(&mut information))
+    };
+    if succeeded == 0 {
+        return Err(RiftError::FileRead(std::io::Error::last_os_error()));
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(RiftError::Validation(
+            "Selected attachments must be regular files.".into(),
+        ));
+    }
+    Ok(NativeUploadIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: u64::from(information.nFileIndexHigh) << 32 | u64::from(information.nFileIndexLow),
+    })
+}
+
+/// Capture the identity of the selected entry before the final readable handle is opened.
+#[cfg(unix)]
+fn selected_upload_identity(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<NativeUploadIdentity, RiftError> {
+    native_upload_identity(None, metadata)
+}
+
+/// Capture a Windows selected entry through a no-follow handle before the final open.
+#[cfg(windows)]
+fn selected_upload_identity(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<NativeUploadIdentity, RiftError> {
+    let selected_file = open_native_upload_file(path)?;
+    let selected_metadata = selected_file.metadata().map_err(RiftError::FileRead)?;
+    if !selected_metadata.is_file() {
+        return Err(RiftError::Validation(
+            "Selected attachments must be regular files.".into(),
+        ));
+    }
+    native_upload_identity(Some(&selected_file), &selected_metadata)
+}
+
+/// Read a selected file only when its opened handle still matches the validated entry.
+fn read_upload_bytes_with<F>(
+    path: &Path,
+    remaining_bytes: u64,
+    before_open: F,
+) -> Result<(Bytes, u64), RiftError>
+where
+    F: FnOnce(),
+{
+    use std::io::Read as _;
+
+    let selected_metadata = std::fs::symlink_metadata(path).map_err(RiftError::FileRead)?;
+    if selected_metadata.file_type().is_symlink() || !selected_metadata.is_file() {
+        return Err(RiftError::Validation(
+            "Selected attachments must be regular files.".into(),
+        ));
+    }
+    let selected_identity = selected_upload_identity(path, &selected_metadata)?;
+    before_open();
+    let file = open_native_upload_file(path)?;
+    let opened_metadata = file.metadata().map_err(RiftError::FileRead)?;
+    if !opened_metadata.is_file() {
+        return Err(RiftError::Validation(
+            "Selected attachments must be regular files.".into(),
+        ));
+    }
+    let opened_identity = native_upload_identity(Some(&file), &opened_metadata)?;
+    if opened_identity != selected_identity {
+        return Err(RiftError::Validation(
+            "The selected attachment changed before it could be read.".into(),
+        ));
+    }
+    let declared_size = opened_metadata.len();
+    if declared_size == 0 {
+        return Err(RiftError::Validation(
+            "Selected attachments cannot be empty.".into(),
+        ));
+    }
+    if declared_size > remaining_bytes {
+        return Err(RiftError::Validation(
+            "Selected attachments cannot exceed 100 MiB in one upload.".into(),
+        ));
+    }
+    let capacity = usize::try_from(declared_size).map_err(|_| {
+        RiftError::Validation("Selected attachments cannot exceed 100 MiB in one upload.".into())
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(remaining_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(RiftError::FileRead)?;
+    let size_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        RiftError::Validation("Selected attachments cannot exceed 100 MiB in one upload.".into())
+    })?;
+    if size_bytes == 0 {
+        return Err(RiftError::Validation(
+            "Selected attachments cannot be empty.".into(),
+        ));
+    }
+    if size_bytes > remaining_bytes {
+        return Err(RiftError::Validation(
+            "Selected attachments cannot exceed 100 MiB in one upload.".into(),
+        ));
+    }
+    Ok((Bytes::from(bytes), size_bytes))
+}
+
 /// Read one selected path within the remaining aggregate allowance and discard its directory.
 async fn read_upload_part(
     path: &Path,
@@ -1160,45 +1385,7 @@ async fn read_upload_part(
         .map_err(|_| RiftError::Validation("Select a file with a valid display name.".into()))?;
     let owned_path = path.to_owned();
     let (bytes, size_bytes) = tokio::task::spawn_blocking(move || {
-        use std::io::Read as _;
-
-        let file = std::fs::File::open(owned_path).map_err(RiftError::FileRead)?;
-        let declared_size = file.metadata().map_err(RiftError::FileRead)?.len();
-        if declared_size == 0 {
-            return Err(RiftError::Validation(
-                "Selected attachments cannot be empty.".into(),
-            ));
-        }
-        if declared_size > remaining_bytes {
-            return Err(RiftError::Validation(
-                "Selected attachments cannot exceed 100 MiB in one upload.".into(),
-            ));
-        }
-        let capacity = usize::try_from(declared_size).map_err(|_| {
-            RiftError::Validation(
-                "Selected attachments cannot exceed 100 MiB in one upload.".into(),
-            )
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.take(remaining_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(RiftError::FileRead)?;
-        let size_bytes = u64::try_from(bytes.len()).map_err(|_| {
-            RiftError::Validation(
-                "Selected attachments cannot exceed 100 MiB in one upload.".into(),
-            )
-        })?;
-        if size_bytes == 0 {
-            return Err(RiftError::Validation(
-                "Selected attachments cannot be empty.".into(),
-            ));
-        }
-        if size_bytes > remaining_bytes {
-            return Err(RiftError::Validation(
-                "Selected attachments cannot exceed 100 MiB in one upload.".into(),
-            ));
-        }
-        Ok((Bytes::from(bytes), size_bytes))
+        read_upload_bytes_with(&owned_path, remaining_bytes, || {})
     })
     .await
     .map_err(RiftError::FileTask)??;
@@ -1214,6 +1401,11 @@ async fn read_upload_parts(paths: &[PathBuf]) -> Result<Vec<NativeUploadPart>, R
     if paths.is_empty() {
         return Err(RiftError::Validation(
             "Select at least one attachment to upload.".into(),
+        ));
+    }
+    if paths.len() > MAX_NATIVE_UPLOAD_FILES {
+        return Err(RiftError::Validation(
+            "Select no more than 10 attachments at once.".into(),
         ));
     }
     let mut parts = Vec::with_capacity(paths.len());
@@ -1847,6 +2039,72 @@ mod tests {
         assert!(!after.has_older);
     }
 
+    /// An oversized older-page response is rejected before it can cross the native boundary.
+    #[tokio::test]
+    async fn room_http_rejects_oversized_before_page() {
+        let server = MockHttpServer::start(1, |request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/api/channels/room-1/messages?before=message-3&limit=2"
+            );
+            MockResponse::json(
+                200,
+                json!([
+                    room_message_response("message-0", "2026-08-03T12:00:00Z", None),
+                    room_message_response("message-1", "2026-08-03T12:01:00Z", None),
+                    room_message_response("message-2", "2026-08-03T12:02:00Z", None),
+                ]),
+            )
+        });
+        let client = authenticated_client(&server.endpoint, "current-access", "refresh-one");
+
+        let error = messages_before(&client, "room-1", "message-3", 2)
+            .await
+            .expect_err("oversized older page must fail closed");
+        server.finish();
+
+        assert!(matches!(error, RiftError::ProtocolContract));
+    }
+
+    /// Room permissions use the member-scoped server route and boolean contract.
+    #[tokio::test]
+    async fn room_http_fetches_server_authoritative_permissions() {
+        let server = MockHttpServer::start(1, |request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer current-access")
+            );
+            assert_eq!(request.path, "/api/servers/server%2Fone/permissions/@me");
+            MockResponse::json(
+                200,
+                json!({
+                    "sendMessages": true,
+                    "attachFiles": true,
+                    "manageMessages": false,
+                    "manageServer": false,
+                }),
+            )
+        });
+        let client = authenticated_client(&server.endpoint, "current-access", "refresh-one");
+
+        let permissions = room_permissions(&client, "server/one")
+            .await
+            .expect("room permissions must parse");
+        server.finish();
+
+        assert_eq!(
+            permissions,
+            RoomPermissions {
+                send_messages: true,
+                attach_files: true,
+                manage_messages: false,
+                manage_server: false,
+            }
+        );
+    }
+
     /// Rift's stable invalid-cursor code remains distinguishable from other missing resources.
     #[tokio::test]
     async fn room_http_preserves_invalid_after_cursor_code() {
@@ -1914,7 +2172,7 @@ mod tests {
         ));
     }
 
-    /// Create omits an empty upload list, preserves multiple IDs, and rejects duplicate IDs.
+    /// Create omits an empty upload list and validates bounded opaque upload identifiers.
     #[tokio::test]
     async fn room_http_create_supports_zero_or_multiple_upload_ids() {
         let requests = StdArc::new(AtomicUsize::new(0));
@@ -1981,6 +2239,17 @@ mod tests {
         let duplicate_ids = vec!["upload-alpha".to_owned(), "upload-alpha".to_owned()];
         assert!(matches!(
             create_message(&client, "room-1", "", &duplicate_ids).await,
+            Err(RiftError::Validation(_))
+        ));
+        let too_many_ids = (0..=MAX_NATIVE_UPLOAD_FILES)
+            .map(|index| format!("upload-{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            create_message(&client, "room-1", "", &too_many_ids).await,
+            Err(RiftError::Validation(_))
+        ));
+        assert!(matches!(
+            create_message(&client, "room-1", "", &[" upload-alpha".into()]).await,
             Err(RiftError::Validation(_))
         ));
     }
@@ -2057,6 +2326,23 @@ mod tests {
         server.finish();
 
         assert_eq!(edited.id, "message-1");
+    }
+
+    /// Edit rejects a valid room message response bound to a different message identifier.
+    #[tokio::test]
+    async fn room_http_edit_rejects_a_different_response_message() {
+        let server = MockHttpServer::start(1, |_| {
+            MockResponse::json(
+                200,
+                room_message_response("message-other", "2026-08-03T12:00:00Z", None),
+            )
+        });
+        let client = authenticated_client(&server.endpoint, "current-access", "refresh-one");
+
+        let result = edit_message(&client, "room-1", "message-1", "updated").await;
+        server.finish();
+
+        assert!(matches!(result, Err(RiftError::ProtocolContract)));
     }
 
     /// Attachment URLs become absolute only when they remain on the configured Rift origin.
@@ -2199,6 +2485,125 @@ mod tests {
         let result = read_upload_parts(&[first_path, second_path]).await;
 
         assert!(matches!(result, Err(RiftError::Validation(_))));
+    }
+
+    /// Native upload rejects an oversized selection before inspecting any path.
+    #[tokio::test]
+    async fn room_http_upload_rejects_more_than_ten_files() {
+        let paths = (0..=MAX_NATIVE_UPLOAD_FILES)
+            .map(|index| PathBuf::from(format!("unread-{index}.bin")))
+            .collect::<Vec<_>>();
+
+        let result = read_upload_parts(&paths).await;
+
+        assert!(matches!(result, Err(RiftError::Validation(_))));
+    }
+
+    /// Native upload accepts files only, never directories or device-like entries.
+    #[tokio::test]
+    async fn room_http_upload_rejects_non_regular_paths() {
+        let selected = tempfile::tempdir().expect("upload fixture directory must create");
+
+        let result = read_upload_parts(&[selected.path().to_owned()]).await;
+
+        assert!(matches!(result, Err(RiftError::Validation(_))));
+    }
+
+    /// Native upload rejects symbolic links before reading their targets.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn room_http_upload_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let selected = tempfile::tempdir().expect("upload fixture directory must create");
+        let target_path = selected.path().join("target.txt");
+        let link_path = selected.path().join("selected.txt");
+        std::fs::write(&target_path, b"link-target").expect("symlink target must write");
+        symlink(&target_path, &link_path).expect("upload fixture symlink must create");
+
+        let result = read_upload_parts(&[link_path]).await;
+
+        assert!(matches!(result, Err(RiftError::Validation(_))));
+    }
+
+    /// Native upload rejects an atomic regular-file replacement at the former check-open seam.
+    #[cfg(unix)]
+    #[test]
+    fn room_http_upload_rejects_regular_file_swap_before_open() {
+        let selected = tempfile::tempdir().expect("upload fixture directory must create");
+        let upload_path = selected.path().join("selected.txt");
+        let replacement_path = selected.path().join("replacement.txt");
+        std::fs::write(&upload_path, b"selected-body").expect("selected fixture must write");
+        std::fs::write(&replacement_path, b"replacement-body")
+            .expect("replacement fixture must write");
+
+        let result = read_upload_bytes_with(&upload_path, MAX_NATIVE_UPLOAD_BYTES, || {
+            std::fs::rename(&replacement_path, &upload_path)
+                .expect("replacement must atomically take selected path");
+        });
+
+        assert!(matches!(result, Err(RiftError::Validation(_))));
+    }
+
+    /// Native upload rejects a FIFO swap without blocking its filesystem worker.
+    #[cfg(unix)]
+    #[test]
+    fn room_http_upload_rejects_fifo_swap_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::sync::mpsc::sync_channel;
+
+        let selected = tempfile::tempdir().expect("upload fixture directory must create");
+        let upload_path = selected.path().join("selected.txt");
+        let fifo_path = selected.path().join("replacement.fifo");
+        std::fs::write(&upload_path, b"selected-body").expect("selected fixture must write");
+        let fifo_c_path = CString::new(fifo_path.as_os_str().as_bytes())
+            .expect("FIFO fixture path cannot contain a null byte");
+        // SAFETY: `fifo_c_path` is a live null-terminated path and the mode contains permission bits only.
+        let created = unsafe { libc::mkfifo(fifo_c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "FIFO fixture must create: {}",
+            std::io::Error::last_os_error()
+        );
+        let (sender, receiver) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = read_upload_bytes_with(&upload_path, MAX_NATIVE_UPLOAD_BYTES, || {
+                std::fs::rename(&fifo_path, &upload_path)
+                    .expect("FIFO must atomically take selected path");
+            });
+            sender
+                .send(matches!(result, Err(RiftError::Validation(_))))
+                .expect("FIFO test receiver must remain available");
+        });
+
+        let rejected = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("FIFO replacement must not block the upload worker");
+        worker.join().expect("FIFO upload worker must finish");
+
+        assert!(rejected);
+    }
+
+    /// Upload response conversion rejects empty and trim-changed opaque identifiers.
+    #[test]
+    fn room_http_upload_rejects_malformed_response_identifiers() {
+        let base_url = Url::parse("https://rift.example/")
+            .expect("upload response fixture endpoint must parse");
+
+        for upload_id in ["", " upload-alpha", "upload-alpha ", "\tupload-alpha"] {
+            let result = ApiPendingRoomAttachment {
+                upload_id: upload_id.to_owned(),
+                filename: "alpha.txt".to_owned(),
+                url: "/uploads/opaque-alpha".to_owned(),
+                content_type: None,
+                size_bytes: 1,
+            }
+            .into_pending_attachment(&base_url);
+
+            assert!(matches!(result, Err(RiftError::ProtocolContract)));
+        }
     }
 
     /// Multipart upload retries rebuild filenames and exact bytes after one token refresh.
@@ -2692,6 +3097,23 @@ mod tests {
         assert!(normalize_endpoint("https://user:secret@example.test").is_err());
         assert!(normalize_endpoint("https://example.test/api").is_err());
         assert!(normalize_endpoint("https://example.test?token=nope").is_err());
+    }
+
+    /// Upstream error text never crosses the serialized command boundary.
+    #[test]
+    fn command_errors_discard_remote_error_bodies() {
+        let error = CommandError::from(RiftError::Remote {
+            status: StatusCode::BAD_REQUEST,
+            message: "token=must-not-cross-the-boundary".into(),
+        });
+        let serialized = serde_json::to_string(&error).expect("command error must serialize");
+
+        assert!(matches!(error.kind, CommandErrorKind::Protocol));
+        assert!(!serialized.contains("must-not-cross-the-boundary"));
+        assert_eq!(
+            error.message,
+            "Rift rejected the request. Refresh and try again."
+        );
     }
 
     /// Sort equal timestamps by case-insensitive room name and opaque id.
