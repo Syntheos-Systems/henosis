@@ -634,26 +634,32 @@ mod tests {
         );
         let concurrent_one = concurrent_one.expect("first concurrent message must be created");
         let concurrent_two = concurrent_two.expect("second concurrent message must be created");
-        assert_ne!(concurrent_one.created_at, concurrent_two.created_at);
         let concurrent_page =
             db::get_messages(&pool, channel.id, &message_query(None, Some(newest.id)))
                 .await
                 .expect("concurrent forward page must load");
+        let expected_concurrent_ids = if concurrent_one
+            .created_at
+            .cmp(&concurrent_two.created_at)
+            .then(concurrent_one.id.cmp(&concurrent_two.id))
+            .is_lt()
+        {
+            vec![concurrent_one.id, concurrent_two.id]
+        } else {
+            vec![concurrent_two.id, concurrent_one.id]
+        };
         assert_eq!(
             concurrent_page
                 .iter()
                 .map(|message| message.id)
-                .collect::<std::collections::HashSet<_>>(),
-            [concurrent_one.id, concurrent_two.id]
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<Vec<_>>(),
+            expected_concurrent_ids
         );
 
-        let newest_concurrent_id = if concurrent_one.created_at > concurrent_two.created_at {
-            concurrent_one.id
-        } else {
-            concurrent_two.id
-        };
+        let newest_concurrent_id = concurrent_page
+            .last()
+            .expect("concurrent page must contain its newest boundary")
+            .id;
         let boundary = list_messages(
             State(pool),
             auth,
