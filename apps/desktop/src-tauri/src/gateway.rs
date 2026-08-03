@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::model::{RoomConnectionStatus, RoomConversationEvent, RoomMessage};
+use crate::reconcile::{MessagePageSource, ReconcileError, reconcile_open_room};
 use crate::rift::{ApiRoomMessage, AuthenticatedRiftClient, GatewayAuthentication, RiftError};
 
 /// Fixed Tauri event used for every sanitized room conversation update.
@@ -61,6 +62,9 @@ pub(crate) enum RiftGatewayError {
     /// The gateway was started outside a Tokio runtime.
     #[error("The native async runtime is unavailable.")]
     RuntimeUnavailable,
+    /// The initial sanitized message could not supply a safe reconnect ordering key.
+    #[error("The initial native room message was invalid.")]
+    InvalidInitialMessage,
 }
 
 /// Cancellable owner for exactly one native Rift gateway actor.
@@ -338,12 +342,55 @@ struct GatewayRuntime {
     server_ids: Vec<String>,
     /// Authenticated native session and sanitizer.
     session: Arc<dyn GatewaySession>,
+    /// HTTP page source used only after a usable socket is lost.
+    reconcile_source: Arc<dyn MessagePageSource>,
+    /// Latest ordered message cursor known to native state before the actor begins.
+    last_known_message: Option<NativeMessageCursor>,
     /// Direct WebSocket connector.
     connector: Arc<dyn GatewayConnector>,
     /// Sanitized room-event destination.
     sink: Arc<dyn GatewayEventSink>,
     /// Bounded reconnect jitter source.
     jitter: Arc<dyn GatewayJitter>,
+}
+
+/// Opaque Rift cursor paired with its channel-monotonic server creation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeMessageCursor {
+    /// Opaque message identifier sent back to Rift's after endpoint.
+    id: String,
+    /// Server-assigned order key used only to prevent local cursor regression.
+    created_at: DateTime<Utc>,
+}
+
+/// Construct and compare native message cursors without inferring order from opaque IDs.
+impl NativeMessageCursor {
+    /// Parse one already-sanitized room message into its native cursor state.
+    fn from_message(message: &RoomMessage) -> Result<Self, RiftError> {
+        if message.id.is_empty() {
+            return Err(RiftError::ProtocolContract);
+        }
+        let created_at = DateTime::parse_from_rfc3339(&message.created_at)
+            .map_err(|_| RiftError::ProtocolContract)?
+            .with_timezone(&Utc);
+        Ok(Self {
+            id: message.id.clone(),
+            created_at,
+        })
+    }
+}
+
+/// Advance only when Rift's per-channel creation timestamp proves the candidate is newer.
+fn advance_message_cursor(
+    current: &mut Option<NativeMessageCursor>,
+    candidate: NativeMessageCursor,
+) {
+    if current
+        .as_ref()
+        .is_none_or(|current| candidate.created_at > current.created_at)
+    {
+        *current = Some(candidate);
+    }
 }
 
 /// Client commands accepted by Rift's gateway.
@@ -442,6 +489,8 @@ enum ConnectionOutcome {
     },
     /// Ready identified a different user and retrying would be unsafe.
     IdentityMismatch,
+    /// Reconciliation proved that the native authenticated session is no longer usable.
+    AuthenticationFailed,
 }
 
 /// Canonicalize subscriptions before opening a token-bearing transport.
@@ -466,17 +515,27 @@ fn websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES))
 }
 
-/// Spawn the sole production gateway for one open room.
+/// Spawn the sole production gateway for one open room and its latest native cursor.
 pub(crate) fn spawn_rift_gateway(
     app: AppHandle,
     session: AuthenticatedRiftClient,
     room_id: String,
     server_ids: Vec<String>,
+    last_known_message: Option<&RoomMessage>,
 ) -> Result<RiftGateway, RiftGatewayError> {
+    let last_known_message = last_known_message
+        .map(NativeMessageCursor::from_message)
+        .transpose()
+        .map_err(|_| RiftGatewayError::InvalidInitialMessage)?;
+    let native_session = Arc::new(session);
+    let reconcile_source: Arc<dyn MessagePageSource> = native_session.clone();
+    let session: Arc<dyn GatewaySession> = native_session;
     let runtime = GatewayRuntime {
         room_id,
         server_ids,
-        session: Arc::new(session),
+        session,
+        reconcile_source,
+        last_known_message,
         connector: Arc::new(TokioGatewayConnector),
         sink: Arc::new(TauriGatewayEventSink { app }),
         jitter: Arc::new(ProcessGatewayJitter::new()),
@@ -506,6 +565,8 @@ async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
         return;
     }
     let mut backoff = ReconnectBackoff::new();
+    let mut last_known_message = runtime.last_known_message.clone();
+    let mut reconcile_after_ready = false;
 
     loop {
         if cancellation.is_cancelled() || !runtime.session.is_active() {
@@ -557,12 +618,29 @@ async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
             },
         };
 
-        match run_connection(&runtime, &cancellation, socket.as_mut(), &authentication).await {
+        match run_connection(
+            &runtime,
+            &cancellation,
+            socket.as_mut(),
+            &authentication,
+            &mut last_known_message,
+            reconcile_after_ready,
+        )
+        .await
+        {
             ConnectionOutcome::Cancelled => return,
             ConnectionOutcome::IdentityMismatch => {
                 tracing::warn!(
                     phase = "ready",
                     "Rift gateway Ready identity did not match the native session"
+                );
+                let _ = emit_status(&runtime, &cancellation, RoomConnectionStatus::Disconnected);
+                return;
+            }
+            ConnectionOutcome::AuthenticationFailed => {
+                tracing::debug!(
+                    phase = "reconcile",
+                    "Rift gateway reconciliation authentication failed"
                 );
                 let _ = emit_status(&runtime, &cancellation, RoomConnectionStatus::Disconnected);
                 return;
@@ -573,6 +651,7 @@ async fn run_gateway(runtime: GatewayRuntime, cancellation: CancellationToken) {
             } => {
                 if reached_ready {
                     backoff.reset();
+                    reconcile_after_ready = true;
                 }
                 if let Some(generation) = refresh_generation {
                     let refresh_result = tokio::select! {
@@ -609,6 +688,8 @@ async fn run_connection(
     cancellation: &CancellationToken,
     socket: &mut dyn GatewaySocket,
     authentication: &GatewayAuthentication,
+    last_known_message: &mut Option<NativeMessageCursor>,
+    reconcile_after_ready: bool,
 ) -> ConnectionOutcome {
     let identify = match serde_json::to_string(&GatewayCommand::Identify {
         token: authentication.access_token(),
@@ -743,6 +824,73 @@ async fn run_connection(
                                 };
                             }
                         }
+                        if reconcile_after_ready {
+                            let reconciliation = match reconcile_open_room(
+                                runtime.reconcile_source.as_ref(),
+                                &runtime.room_id,
+                                last_known_message.as_ref().map(|cursor| cursor.id.as_str()),
+                                cancellation,
+                            )
+                            .await
+                            {
+                                Ok(reconciliation) => reconciliation,
+                                Err(ReconcileError::Cancelled) => {
+                                    return ConnectionOutcome::Cancelled;
+                                }
+                                Err(ReconcileError::Rift(RiftError::Authentication)) => {
+                                    return ConnectionOutcome::AuthenticationFailed;
+                                }
+                                Err(ReconcileError::Rift(_)) => {
+                                    tracing::debug!(
+                                        phase = "reconcile",
+                                        "Rift gateway reconciliation did not complete"
+                                    );
+                                    return ConnectionOutcome::Reconnect {
+                                        reached_ready: false,
+                                        refresh_generation: None,
+                                    };
+                                }
+                            };
+                            let next_cursor = match reconciliation
+                                .page
+                                .messages
+                                .last()
+                                .map(NativeMessageCursor::from_message)
+                                .transpose()
+                            {
+                                Ok(next_cursor) => next_cursor,
+                                Err(_) => {
+                                    tracing::debug!(
+                                        phase = "reconcile",
+                                        "Rift gateway reconciliation returned an invalid cursor"
+                                    );
+                                    return ConnectionOutcome::Reconnect {
+                                        reached_ready: false,
+                                        refresh_generation: None,
+                                    };
+                                }
+                            };
+                            let should_emit = reconciliation.replace_live_window
+                                || !reconciliation.page.messages.is_empty();
+                            if should_emit
+                                && !emit_event(
+                                    runtime,
+                                    cancellation,
+                                    RoomConversationEvent::Reconciliation {
+                                        room_id: runtime.room_id.clone(),
+                                        page: reconciliation.page,
+                                        replace_live_window: reconciliation.replace_live_window,
+                                    },
+                                )
+                            {
+                                return ConnectionOutcome::Cancelled;
+                            }
+                            if reconciliation.replace_live_window {
+                                *last_known_message = next_cursor;
+                            } else if let Some(next_cursor) = next_cursor {
+                                advance_message_cursor(last_known_message, next_cursor);
+                            }
+                        }
                         ready = true;
                         if !emit_status(runtime, cancellation, RoomConnectionStatus::Connected) {
                             return ConnectionOutcome::Cancelled;
@@ -756,10 +904,31 @@ async fn run_connection(
                         drop(event);
                     }
                     ParsedGatewayEvent::Supported(event) => {
-                        if let Some(event) = translate_event(runtime, event)
-                            && !emit_event(runtime, cancellation, event)
-                        {
-                            return ConnectionOutcome::Cancelled;
+                        if let Some(event) = translate_event(runtime, event) {
+                            let created_message_cursor = match &event {
+                                RoomConversationEvent::MessageCreate { message, .. } => {
+                                    match NativeMessageCursor::from_message(message) {
+                                        Ok(cursor) => Some(cursor),
+                                        Err(_) => {
+                                            tracing::debug!(
+                                                phase = "event",
+                                                "Rift gateway message had an invalid cursor"
+                                            );
+                                            return ConnectionOutcome::Reconnect {
+                                                reached_ready: true,
+                                                refresh_generation: None,
+                                            };
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if !emit_event(runtime, cancellation, event) {
+                                return ConnectionOutcome::Cancelled;
+                            }
+                            if let Some(created_message_cursor) = created_message_cursor {
+                                advance_message_cursor(last_known_message, created_message_cursor);
+                            }
                         }
                     }
                 }
@@ -988,13 +1157,17 @@ pub(crate) fn test_rift_gateway() -> (RiftGateway, CancellationToken) {
 /// Exercises the native gateway protocol and lifecycle contract.
 mod tests {
     use std::collections::VecDeque;
+    use std::future::pending;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    use futures_util::future::BoxFuture;
     use serde_json::{Value, json};
     use tokio::sync::{Notify, mpsc};
 
     use super::*;
+    use crate::model::MessagePage;
+    use crate::reconcile::MessagePageSource;
 
     /// One in-memory socket endpoint owned by the gateway actor.
     struct FakeSocket {
@@ -1308,6 +1481,123 @@ mod tests {
         }
     }
 
+    /// One page request observed by the gateway reconciliation seam.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum GatewayPageRequest {
+        /// One newest-window request.
+        Latest {
+            /// Requested room identifier.
+            room_id: String,
+            /// Requested bounded page size.
+            limit: u32,
+        },
+        /// One forward request after an opaque message cursor.
+        After {
+            /// Requested room identifier.
+            room_id: String,
+            /// Opaque cursor supplied by the gateway actor.
+            cursor: String,
+            /// Requested bounded page size.
+            limit: u32,
+        },
+    }
+
+    /// One deterministic reconciliation response used by gateway lifecycle tests.
+    enum GatewayPageReply {
+        /// Return one sanitized page immediately.
+        Page(MessagePage),
+        /// Remain pending until room replacement cancels the actor.
+        Pending,
+    }
+
+    /// Scripted page source that records the gateway actor's cursor progression.
+    struct FakeMessagePageSource {
+        /// Ordered replies consumed by latest and after requests alike.
+        replies: StdMutex<VecDeque<GatewayPageReply>>,
+        /// Ordered requests made by the gateway actor.
+        requests: StdMutex<Vec<GatewayPageRequest>>,
+        /// Notification released whenever one request is constructed.
+        request_started: Notify,
+    }
+
+    /// Construct and inspect one gateway-specific reconciliation source.
+    impl FakeMessagePageSource {
+        /// Create a source from its ordered replies.
+        fn new(replies: impl IntoIterator<Item = GatewayPageReply>) -> Self {
+            Self {
+                replies: StdMutex::new(replies.into_iter().collect()),
+                requests: StdMutex::new(Vec::new()),
+                request_started: Notify::new(),
+            }
+        }
+
+        /// Wait until the gateway constructs its next page request.
+        async fn wait_for_request(&self) {
+            self.request_started.notified().await;
+        }
+
+        /// Clone every request observed so far.
+        fn requests(&self) -> Vec<GatewayPageRequest> {
+            self.requests
+                .lock()
+                .expect("gateway page request lock must remain healthy")
+                .clone()
+        }
+
+        /// Record one request and return its scripted future.
+        fn respond<'a>(
+            &'a self,
+            request: GatewayPageRequest,
+        ) -> BoxFuture<'a, Result<MessagePage, RiftError>> {
+            self.requests
+                .lock()
+                .expect("gateway page request lock must remain healthy")
+                .push(request);
+            let reply = self
+                .replies
+                .lock()
+                .expect("gateway page reply lock must remain healthy")
+                .pop_front()
+                .expect("every gateway page request must have a scripted reply");
+            self.request_started.notify_one();
+            match reply {
+                GatewayPageReply::Page(page) => Box::pin(async move { Ok(page) }),
+                GatewayPageReply::Pending => {
+                    Box::pin(async { pending::<Result<MessagePage, RiftError>>().await })
+                }
+            }
+        }
+    }
+
+    /// Supply newest and forward pages to the gateway without a backward-history method.
+    impl MessagePageSource for FakeMessagePageSource {
+        /// Answer one newest-window request.
+        fn latest<'a>(
+            &'a self,
+            room_id: &'a str,
+            limit: u32,
+        ) -> BoxFuture<'a, Result<MessagePage, RiftError>> {
+            self.respond(GatewayPageRequest::Latest {
+                room_id: room_id.to_owned(),
+                limit,
+            })
+        }
+
+        /// Answer one forward request after the supplied cursor.
+        fn after<'a>(
+            &'a self,
+            room_id: &'a str,
+            after_message_id: &'a str,
+            limit: u32,
+        ) -> BoxFuture<'a, Result<MessagePage, RiftError>> {
+            self.respond(GatewayPageRequest::After {
+                room_id: room_id.to_owned(),
+                cursor: after_message_id.to_owned(),
+                limit,
+            })
+        }
+    }
+
     /// Assemble one deterministic actor runtime for the open test room.
     fn fake_runtime(
         session: Arc<FakeSession>,
@@ -1315,6 +1605,35 @@ mod tests {
         sink: Arc<RecordingSink>,
         server_ids: Vec<String>,
     ) -> GatewayRuntime {
+        let reconcile_source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
+            MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            },
+        )]));
+        fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            server_ids,
+            reconcile_source,
+            None,
+        )
+    }
+
+    /// Assemble an actor runtime with an explicit reconciliation source and cursor.
+    fn fake_runtime_with_reconciliation(
+        session: Arc<FakeSession>,
+        connector: Arc<FakeConnector>,
+        sink: Arc<RecordingSink>,
+        server_ids: Vec<String>,
+        reconcile_source: Arc<dyn MessagePageSource>,
+        last_known_message: Option<RoomMessage>,
+    ) -> GatewayRuntime {
+        let last_known_message = last_known_message.map(|message| {
+            NativeMessageCursor::from_message(&message)
+                .expect("test gateway cursor message must remain valid")
+        });
         GatewayRuntime {
             room_id: "room-1".into(),
             server_ids,
@@ -1322,6 +1641,8 @@ mod tests {
             connector,
             sink,
             jitter: Arc::new(FixedJitter { millis: 0 }),
+            reconcile_source,
+            last_known_message,
         }
     }
 
@@ -1354,10 +1675,15 @@ mod tests {
 
     /// Construct a complete valid MessageCreate gateway envelope.
     fn message_create(url: &str) -> Value {
+        message_create_at(url, "message-1", "2026-08-03T12:00:00Z")
+    }
+
+    /// Construct a valid MessageCreate envelope with an explicit order key.
+    fn message_create_at(url: &str, message_id: &str, created_at: &str) -> Value {
         json!({
             "type": "MessageCreate",
             "data": {
-                "id": "message-1",
+                "id": message_id,
                 "channel_id": "room-1",
                 "author_id": "agent-1",
                 "author_username": "planner",
@@ -1366,7 +1692,7 @@ mod tests {
                 "content": "A bounded update",
                 "attachments": [{
                     "id": "attachment-1",
-                    "message_id": "message-1",
+                    "message_id": message_id,
                     "filename": "notes.txt",
                     "url": url,
                     "content_type": "text/plain",
@@ -1374,9 +1700,31 @@ mod tests {
                     "created_at": "2026-08-03T12:00:00Z"
                 }],
                 "message_type": "agent",
-                "created_at": "2026-08-03T12:00:00Z"
+                "created_at": created_at
             }
         })
+    }
+
+    /// Construct one sanitized message returned by the reconciliation source.
+    fn reconciled_message(id: &str) -> RoomMessage {
+        reconciled_message_at(id, "2026-08-03T12:01:00+00:00")
+    }
+
+    /// Construct one sanitized reconciliation message with an explicit order key.
+    fn reconciled_message_at(id: &str, created_at: &str) -> RoomMessage {
+        RoomMessage {
+            id: id.into(),
+            room_id: "room-1".into(),
+            author_id: "user-2".into(),
+            author_username: "collaborator".into(),
+            author_display_name: Some("Collaborator".into()),
+            author_avatar_url: None,
+            content: format!("reconciled {id}"),
+            edited_at: None,
+            created_at: created_at.into(),
+            message_type: "user".into(),
+            attachments: Vec::new(),
+        }
     }
 
     /// Subscription input is canonicalized before any token-bearing connection begins.
@@ -1704,6 +2052,260 @@ mod tests {
             json!({"type": "Identify", "data": {"token": "access-two"}})
         );
         gateway.shutdown().await;
+    }
+
+    /// Reconnect catches up after live and reconciled cursors without refetching initial history.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_reconciles_after_the_latest_native_cursor() {
+        let (first_socket, mut first_peer) = fake_socket_pair();
+        let (second_socket, mut second_peer) = fake_socket_pair();
+        let (third_socket, mut third_peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![
+            ConnectScript::Socket(first_socket),
+            ConnectScript::Socket(second_socket),
+            ConnectScript::Socket(third_socket),
+        ]);
+        let source = Arc::new(FakeMessagePageSource::new([
+            GatewayPageReply::Page(MessagePage {
+                messages: vec![reconciled_message("message-2")],
+                has_older: false,
+            }),
+            GatewayPageReply::Page(MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            }),
+        ]));
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            Vec::new(),
+            source.clone(),
+            Some(reconciled_message_at(
+                "snapshot-message",
+                "2026-08-03T11:59:00+00:00",
+            )),
+        ))
+        .expect("reconciling actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _first_url = attempts.recv().await.expect("first connection attempt");
+        let _first_identify = first_peer.next_json().await;
+        first_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        assert!(source.requests().is_empty());
+
+        first_peer.send_json(message_create("/api/attachments/attachment-1"));
+        assert!(matches!(
+            next_room_event(&mut events).await,
+            RoomConversationEvent::MessageCreate { message, .. } if message.id == "message-1"
+        ));
+        first_peer.send(WebSocketMessage::Close(None));
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
+
+        let _second_url = attempts.recv().await.expect("second connection attempt");
+        let _second_identify = second_peer.next_json().await;
+        second_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        source.wait_for_request().await;
+        assert!(matches!(
+            events.recv().await.expect("reconciliation event"),
+            RoomConversationEvent::Reconciliation {
+                room_id,
+                page,
+                replace_live_window: false,
+            } if room_id == "room-1"
+                && page.messages.len() == 1
+                && page.messages[0].id == "message-2"
+        ));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+
+        second_peer.send(WebSocketMessage::Close(None));
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
+        let _third_url = attempts.recv().await.expect("third connection attempt");
+        let _third_identify = third_peer.next_json().await;
+        third_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        source.wait_for_request().await;
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+
+        assert_eq!(
+            source.requests(),
+            vec![
+                GatewayPageRequest::After {
+                    room_id: "room-1".into(),
+                    cursor: "message-1".into(),
+                    limit: crate::reconcile::RECONCILE_PAGE_SIZE,
+                },
+                GatewayPageRequest::After {
+                    room_id: "room-1".into(),
+                    cursor: "message-2".into(),
+                    limit: crate::reconcile::RECONCILE_PAGE_SIZE,
+                },
+            ]
+        );
+        gateway.shutdown().await;
+    }
+
+    /// Delayed older live events never move the reconnect cursor behind a newer message.
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_live_create_does_not_regress_reconnect_cursor() {
+        let (first_socket, mut first_peer) = fake_socket_pair();
+        let (second_socket, mut second_peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![
+            ConnectScript::Socket(first_socket),
+            ConnectScript::Socket(second_socket),
+        ]);
+        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
+            MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            },
+        )]));
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            Vec::new(),
+            source.clone(),
+            Some(reconciled_message_at(
+                "snapshot-message",
+                "2026-08-03T11:59:00+00:00",
+            )),
+        ))
+        .expect("ordered-cursor actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _first_url = attempts.recv().await.expect("first connection attempt");
+        let _first_identify = first_peer.next_json().await;
+        first_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+
+        first_peer.send_json(message_create_at(
+            "/api/attachments/attachment-1",
+            "newer-message",
+            "2026-08-03T12:02:00Z",
+        ));
+        assert!(matches!(
+            next_room_event(&mut events).await,
+            RoomConversationEvent::MessageCreate { message, .. } if message.id == "newer-message"
+        ));
+        first_peer.send_json(message_create_at(
+            "/api/attachments/attachment-1",
+            "delayed-older-message",
+            "2026-08-03T12:00:00Z",
+        ));
+        assert!(matches!(
+            next_room_event(&mut events).await,
+            RoomConversationEvent::MessageCreate { message, .. }
+                if message.id == "delayed-older-message"
+        ));
+        first_peer.send(WebSocketMessage::Close(None));
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
+
+        let _second_url = attempts.recv().await.expect("second connection attempt");
+        let _second_identify = second_peer.next_json().await;
+        second_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        source.wait_for_request().await;
+        assert!(matches!(
+            source.requests().as_slice(),
+            [GatewayPageRequest::After { cursor, .. }] if cursor == "newer-message"
+        ));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        gateway.shutdown().await;
+    }
+
+    /// Replacing a room gateway cancels a pending reconciliation before it can emit.
+    #[tokio::test(start_paused = true)]
+    async fn room_replacement_cancels_pending_reconciliation() {
+        let (first_socket, mut first_peer) = fake_socket_pair();
+        let (second_socket, mut second_peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![
+            ConnectScript::Socket(first_socket),
+            ConnectScript::Socket(second_socket),
+        ]);
+        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Pending]));
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            Vec::new(),
+            source.clone(),
+            Some(reconciled_message("message-1")),
+        ))
+        .expect("pending reconciliation actor must spawn");
+        let old_cancellation = gateway.cancellation.clone();
+
+        let owner = AuthenticatedRiftClient::gateway_test_client(
+            Url::parse("https://rift.example/").expect("owner endpoint must parse"),
+            "user-1",
+        );
+        let state = crate::state::AppState::new();
+        state
+            .set_session(owner.clone())
+            .expect("owner session must install");
+        state
+            .replace_gateway(&owner, gateway)
+            .expect("pending gateway must install");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _first_url = attempts.recv().await.expect("first connection attempt");
+        let _first_identify = first_peer.next_json().await;
+        first_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        first_peer.send(WebSocketMessage::Close(None));
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
+
+        let _second_url = attempts.recv().await.expect("second connection attempt");
+        let _second_identify = second_peer.next_json().await;
+        second_peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+        source.wait_for_request().await;
+
+        let (replacement, replacement_cancellation) = test_rift_gateway();
+        state
+            .replace_gateway(&owner, replacement)
+            .expect("replacement gateway must install");
+        assert!(old_cancellation.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        assert!(matches!(
+            source.requests().as_slice(),
+            [GatewayPageRequest::After { cursor, .. }] if cursor == "message-1"
+        ));
+
+        state
+            .clear_gateway()
+            .expect("replacement gateway must clear");
+        assert!(replacement_cancellation.is_cancelled());
     }
 
     /// Cancellation interrupts connector, socket-read, and backoff waits immediately.

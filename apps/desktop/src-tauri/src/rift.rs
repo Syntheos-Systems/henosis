@@ -136,6 +136,9 @@ pub enum RiftError {
     /// Rift rejected both the current access token and its allowed refresh path.
     #[error("Rift rejected the current credentials.")]
     Authentication,
+    /// Rift rejected a message cursor that no longer belongs to the requested room.
+    #[error("Rift no longer recognizes the saved message cursor.")]
+    InvalidMessageCursor,
     /// HTTP transport could not reach Rift.
     #[error("Rift could not be reached.")]
     Network(#[source] reqwest::Error),
@@ -177,6 +180,10 @@ impl From<RiftError> for CommandError {
             RiftError::Authentication => Self::new(
                 CommandErrorKind::Authentication,
                 "Your Rift session expired. Sign in again to continue.",
+            ),
+            RiftError::InvalidMessageCursor => Self::new(
+                CommandErrorKind::Protocol,
+                "Rift no longer recognizes the saved message cursor.",
             ),
             RiftError::Network(_) => Self::new(
                 CommandErrorKind::Network,
@@ -395,6 +402,9 @@ struct ApiBridgeStatus {
 struct ApiError {
     /// Safe error message from the Rift server.
     error: String,
+    /// Stable machine-readable error code when Rift supplies one.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// Configure bounded Rift transport behavior shared by production and deterministic tests.
@@ -762,11 +772,15 @@ async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Res
         return Err(RiftError::Authentication);
     }
     if !status.is_success() {
-        let message = response
-            .json::<ApiError>()
-            .await
+        let body = response.json::<ApiError>().await.ok();
+        if status == StatusCode::NOT_FOUND
+            && body.as_ref().and_then(|body| body.code.as_deref()) == Some("invalid_message_cursor")
+        {
+            return Err(RiftError::InvalidMessageCursor);
+        }
+        let message = body
             .map(|body| body.error)
-            .unwrap_or_else(|_| "Unexpected service error".into());
+            .unwrap_or_else(|| "Unexpected service error".into());
         return Err(RiftError::Remote { status, message });
     }
     response.json().await.map_err(RiftError::Protocol)
@@ -1831,6 +1845,57 @@ mod tests {
         assert!(latest.has_older);
         assert!(before.has_older);
         assert!(!after.has_older);
+    }
+
+    /// Rift's stable invalid-cursor code remains distinguishable from other missing resources.
+    #[tokio::test]
+    async fn room_http_preserves_invalid_after_cursor_code() {
+        let server = MockHttpServer::start(1, |request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/api/channels/room-1/messages?after=missing&limit=100"
+            );
+            MockResponse::json(
+                404,
+                json!({
+                    "error": "Message cursor does not exist in this channel",
+                    "code": "invalid_message_cursor",
+                }),
+            )
+        });
+        let client = authenticated_client(&server.endpoint, "current-access", "refresh-one");
+
+        let result = messages_after(&client, "room-1", "missing", 100).await;
+        server.finish();
+
+        assert!(matches!(result, Err(RiftError::InvalidMessageCursor)));
+    }
+
+    /// Other missing-resource codes remain ordinary remote failures.
+    #[tokio::test]
+    async fn room_http_does_not_reclassify_other_not_found_codes() {
+        let server = MockHttpServer::start(1, |_| {
+            MockResponse::json(
+                404,
+                json!({
+                    "error": "Channel not found",
+                    "code": "channel_not_found",
+                }),
+            )
+        });
+        let client = authenticated_client(&server.endpoint, "current-access", "refresh-one");
+
+        let result = messages_after(&client, "room-1", "missing", 100).await;
+        server.finish();
+
+        assert!(matches!(
+            result,
+            Err(RiftError::Remote {
+                status: StatusCode::NOT_FOUND,
+                message,
+            }) if message == "Channel not found"
+        ));
     }
 
     /// Invalid local page limits never reach Rift's underspecified negative-limit path.

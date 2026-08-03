@@ -6,6 +6,8 @@ mod commands;
 mod gateway;
 /// Serialized native-to-webview contracts.
 mod model;
+/// Bounded latest and forward-page reconciliation for the open room.
+mod reconcile;
 /// Rift HTTP transport and room aggregation.
 mod rift;
 /// Process-local session and native cache state.
