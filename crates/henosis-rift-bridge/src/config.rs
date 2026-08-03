@@ -458,11 +458,14 @@ impl BridgeConfig {
         Ok(config)
     }
 
-    /// Export only the ordered agent roster as deterministic recovery TOML.
+    /// Export the ordered agent roster as deterministic recovery TOML.
     ///
-    /// Connection secrets, resolved credential bindings, command environment
-    /// values, and provider tokens are intentionally absent. Recovery tooling
-    /// can inject deployment-owned connection and credential state separately.
+    /// The export retains operator-authored prompts, paths, and argument
+    /// templates required to reconstruct the roster, so callers must protect it
+    /// as configuration data. Rift connection state, runtime-only credential
+    /// mediation, command environment values, and provider connection or
+    /// credential fields are intentionally absent; recovery tooling injects
+    /// deployment-owned connection and credential state separately.
     pub fn export_roster_toml(&self) -> Result<String, BridgeError> {
         let agents = self
             .agents
@@ -561,7 +564,7 @@ impl BridgeConfig {
     }
 }
 
-/// Convert one agent to the explicit secret-free recovery representation.
+/// Convert one agent while excluding runtime-only credential mediation.
 fn export_agent(agent: &AgentConfig) -> Result<toml::Value, BridgeError> {
     let mut table = toml::map::Map::new();
     table.insert("name".to_string(), toml::Value::String(agent.name.clone()));
@@ -581,7 +584,7 @@ fn export_agent(agent: &AgentConfig) -> Result<toml::Value, BridgeError> {
     Ok(toml::Value::Table(table))
 }
 
-/// Convert one executor while omitting every field that can carry secret values.
+/// Convert one executor while omitting explicit environment and provider secret fields.
 fn export_executor(executor: &ExecutorConfig) -> Result<toml::Value, BridgeError> {
     let mut table = toml::map::Map::new();
     match executor {
@@ -1259,9 +1262,9 @@ mod tests {
         }
     }
 
-    /// Recovery export is stable, parseable, and omits every secret-bearing field.
+    /// Recovery export is stable, parseable, and omits explicit runtime secret fields.
     #[test]
-    fn recovery_roster_export_is_deterministic_and_secret_free() {
+    fn recovery_roster_export_is_deterministic_and_omits_runtime_secrets() {
         let config: BridgeConfig = toml::from_str(
             r#"
                 [rift]
@@ -1313,7 +1316,10 @@ mod tests {
         assert_eq!(parsed.agents.len(), 2);
         assert_eq!(parsed.agents[0].username, "adapter");
         assert_eq!(parsed.agents[1].username, "synapse");
-        for secret in [
+        assert!(first.contains("Use the adapter."));
+        assert!(first.contains("/opt/bin/adapter"));
+        assert!(first.contains("--discuss"));
+        for excluded_value in [
             "rift-jwt-secret-value",
             "rift-bridge-secret-value",
             "command-environment-secret",
@@ -1321,7 +1327,7 @@ mod tests {
             "provider-token-secret",
             "provider-api-key-secret",
         ] {
-            assert!(!first.contains(secret));
+            assert!(!first.contains(excluded_value));
         }
         assert!(!first.contains("PRIVATE_VALUE"));
         assert!(!first.contains("api_key"));
