@@ -41,6 +41,7 @@ const WDIO_TIMEOUT_MS = 3 * 60_000;
 const HARNESS_TIMEOUT_MS = 44 * 60_000;
 const DIAGNOSTIC_TAIL_CHARACTERS = 16_384;
 const SUPERVISOR_ARGUMENT = "--supervise-owned-process";
+const TAURI_DRIVER_PREFLIGHT_ARGUMENTS = Object.freeze(["--help"]);
 const CHILD_SECRET_NAMES = [
   "DATABASE_URL",
   "HENOSIS_RIFT_TEST_DATABASE_URL",
@@ -578,6 +579,34 @@ function diagnosticTail(contents) {
   return `[earlier diagnostic output truncated]\n${contents.slice(-DIAGNOSTIC_TAIL_CHARACTERS)}`;
 }
 
+/** Format one bounded, credential-redacted summary of the harness result. */
+function formatHarnessDiagnostic(stage, runError, cleanupError, secrets) {
+  const lines = [
+    `stage=${stage}`,
+    `result=${runError === undefined && cleanupError === undefined ? "success" : "failure"}`,
+  ];
+  if (runError !== undefined) {
+    lines.push(
+      `run_error=${runError instanceof Error ? runError.message : String(runError)}`,
+    );
+  }
+  if (cleanupError !== undefined) {
+    lines.push(
+      `cleanup_error=${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+    );
+  }
+  const redacted = redactDiagnosticContents(lines.join("\n"), secrets);
+  return `${diagnosticTail(redacted)}\n`;
+}
+
+/** Create an uploadable private diagnostic before any executable preflight runs. */
+async function initializeHarnessDiagnostic(logPath) {
+  await writeFile(logPath, "stage=preflight\nresult=running\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
 /** Replace ephemeral credentials in one retained diagnostic log. */
 async function redactLog(logPath, secrets) {
   let contents;
@@ -663,6 +692,7 @@ async function runLiveE2e() {
   const xdgConfigDirectory = join(testDirectory, "xdg-config");
   const xdgCacheDirectory = join(testDirectory, "xdg-cache");
   const uploadDirectory = join(testDirectory, "uploads");
+  const harnessLog = join(artifactDirectory, "harness.log");
   const riftLog = join(artifactDirectory, "rift.log");
   const driverLog = join(artifactDirectory, "tauri-driver.log");
   const jwtSecret = randomBytes(32).toString("hex");
@@ -671,6 +701,8 @@ async function runLiveE2e() {
   const services = [];
   let cleanupPromise;
   let passed = false;
+  let runError;
+  let stage = "preflight";
 
   await Promise.all([
     mkdir(artifactDirectory, { recursive: true, mode: 0o700 }),
@@ -679,6 +711,7 @@ async function runLiveE2e() {
     mkdir(xdgCacheDirectory, { recursive: true, mode: 0o700 }),
     mkdir(uploadDirectory, { recursive: true, mode: 0o700 }),
   ]);
+  await initializeHarnessDiagnostic(harnessLog);
 
   /** Start idempotent cleanup for every service owned by this invocation. */
   function startCleanup() {
@@ -704,7 +737,7 @@ async function runLiveE2e() {
   try {
     await requireAvailablePort(riftPort, "Rift");
     await requireAvailablePort(DRIVER_PORT, "tauri-driver");
-    await runCommand("tauri-driver", ["--version"], {
+    await runCommand("tauri-driver", TAURI_DRIVER_PREFLIGHT_ARGUMENTS, {
       ownedServices: services,
       stdio: "ignore",
       timeoutMs: PREFLIGHT_TIMEOUT_MS,
@@ -715,6 +748,7 @@ async function runLiveE2e() {
       timeoutMs: PREFLIGHT_TIMEOUT_MS,
     });
 
+    stage = "rift-build";
     const serverBuildEnvironment = childEnvironment({
       RUSTUP_TOOLCHAIN:
         process.env.HENOSIS_E2E_SERVER_TOOLCHAIN ?? "1.94.0",
@@ -743,6 +777,7 @@ async function runLiveE2e() {
     const riftBinary = join(serverTargetDirectory, "debug", "henosis-rift-server");
     await requireExecutable(riftBinary, "Rift");
 
+    stage = "desktop-build";
     console.log("Building the compiled Tauri application for live desktop E2E");
     await runCommand(
       "pnpm",
@@ -778,6 +813,7 @@ async function runLiveE2e() {
       RUST_LOG: "henosis_rift_server=info,tower_http=warn",
     };
 
+    stage = "rift-startup";
     const riftService = spawnService("Rift", riftBinary, [], {
       cwd: REPOSITORY_DIRECTORY,
       env: riftEnvironment,
@@ -787,6 +823,7 @@ async function runLiveE2e() {
     await riftService.started;
     await waitForHttp(riftService, `${riftEndpoint}/api/auth/login`);
 
+    stage = "tauri-driver-startup";
     const driverService = spawnService("tauri-driver", "tauri-driver", [], {
       cwd: DESKTOP_DIRECTORY,
       env: runtimeEnvironment,
@@ -814,6 +851,7 @@ async function runLiveE2e() {
       HENOSIS_E2E_UI_MESSAGE: `ui-${suffix}`,
     };
 
+    stage = "webdriverio";
     console.log("Running the black-box Tauri and Rift conversation proof");
     await runCommand(
       "pnpm",
@@ -837,7 +875,11 @@ async function runLiveE2e() {
       throw new Error("Live desktop E2E was interrupted");
     }
     passed = true;
+    stage = "complete";
     console.log("Live desktop E2E passed");
+  } catch (error) {
+    runError = error;
+    throw error;
   } finally {
     let cleanupError;
     try {
@@ -847,9 +889,15 @@ async function runLiveE2e() {
     }
     process.off("SIGINT", handleInterrupt);
     process.off("SIGTERM", handleTermination);
+    const diagnosticSecrets = [databaseUrl, jwtSecret, bridgeSecret, password];
+    await writeFile(
+      harnessLog,
+      formatHarnessDiagnostic(stage, runError, cleanupError, diagnosticSecrets),
+      { encoding: "utf8", mode: 0o600 },
+    );
     await Promise.all([
-      redactLog(riftLog, [databaseUrl, jwtSecret, bridgeSecret, password]),
-      redactLog(driverLog, [databaseUrl, jwtSecret, bridgeSecret, password]),
+      redactLog(riftLog, diagnosticSecrets),
+      redactLog(driverLog, diagnosticSecrets),
     ]);
     if (passed && cleanupError === undefined) {
       if (artifactRootIsExternal) {
@@ -857,6 +905,7 @@ async function runLiveE2e() {
       }
       await rm(testDirectory, { recursive: true });
     } else {
+      await reportRedactedLog(harnessLog, "E2E harness");
       await reportRedactedLog(driverLog, "tauri-driver");
       console.error(`Live E2E diagnostics retained at ${artifactDirectory}`);
     }
@@ -905,7 +954,10 @@ if (isMainModule()) {
 }
 
 export {
+  TAURI_DRIVER_PREFLIGHT_ARGUMENTS,
   diagnosticTail,
+  formatHarnessDiagnostic,
+  initializeHarnessDiagnostic,
   processGroupExists,
   redactDiagnosticContents,
   runCommand,
