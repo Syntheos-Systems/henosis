@@ -618,6 +618,7 @@ pub(crate) fn spawn_rift_gateway(
 }
 
 /// Start one actor on the current Tokio runtime.
+#[cfg(test)]
 fn spawn_gateway_actor(runtime: GatewayRuntime) -> Result<RiftGateway, RiftGatewayError> {
     spawn_gateway_actor_with_cancellation(runtime, CancellationToken::new(), false)
 }

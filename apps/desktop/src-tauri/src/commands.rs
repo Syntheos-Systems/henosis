@@ -945,7 +945,7 @@ fn mark_room_read_with<S: RoomReadMarkerStore>(
             "Henosis could not update native room history.",
         )
     })?;
-    let (rift_origin, user_id) = marker_scope(&lease)?;
+    let (rift_origin, user_id) = marker_scope(lease)?;
     state.commit_room_read_marker(lease, message_id, |messages, candidate_index| {
         let mut markers = store.read_markers()?;
         let existing_index = markers.iter().position(|marker| {

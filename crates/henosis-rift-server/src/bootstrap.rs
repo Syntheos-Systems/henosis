@@ -1,8 +1,8 @@
 //! Transactional bootstrap for the managed Henosis Rift room.
 
 use argon2::{
-    password_hash::{rand_core::OsRng, SaltString},
     Argon2, PasswordHasher,
+    password_hash::{SaltString, rand_core::OsRng},
 };
 use rand::Rng as _;
 use sqlx::PgPool;

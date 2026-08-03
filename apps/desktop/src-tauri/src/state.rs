@@ -153,6 +153,7 @@ impl RoomLease {
     }
 
     /// Return the opaque stream identifier required by every post-open command.
+    #[cfg(test)]
     pub(crate) fn stream_id(&self) -> &str {
         &self.stream_id
     }
@@ -357,6 +358,7 @@ impl AppState {
     }
 
     /// Acquire a lease for the exact current room attempt before or after page installation.
+    #[cfg(test)]
     pub(crate) fn room_attempt(
         &self,
         room_id: &str,
@@ -474,15 +476,14 @@ impl AppState {
             .room
             .as_ref()
             .is_some_and(|room| room.matches_lease(&active.client, lease));
-        if should_abort {
-            if let Some(mut room) = active.room.take() {
-                room.cancel();
-            }
+        if should_abort && let Some(mut room) = active.room.take() {
+            room.cancel();
         }
         Ok(())
     }
 
     /// Merge an explicitly requested older page or replace the entire live window.
+    #[cfg(test)]
     pub(crate) fn merge_room_page(
         &self,
         lease: &RoomLease,
@@ -559,6 +560,7 @@ impl AppState {
     }
 
     /// Apply one generation-scoped gateway event without an external delivery action.
+    #[cfg(test)]
     pub(crate) fn apply_room_event(
         &self,
         lease: &RoomLease,
@@ -707,6 +709,7 @@ impl AppState {
     }
 
     /// Clone the active oldest-first message window after generation validation.
+    #[cfg(test)]
     pub(crate) fn active_room_messages(
         &self,
         lease: &RoomLease,
@@ -788,6 +791,7 @@ impl AppState {
     }
 
     /// Return the newest loaded opaque message identifier for reconciliation and reads.
+    #[cfg(test)]
     pub(crate) fn newest_room_message_id(
         &self,
         lease: &RoomLease,
@@ -813,6 +817,7 @@ impl AppState {
     }
 
     /// Close only the exact leased room generation and cancel all of its work.
+    #[cfg(test)]
     pub(crate) fn close_room(&self, lease: &RoomLease) -> Result<(), CommandError> {
         let mut guard = self.lock_inner()?;
         let active = guard
@@ -833,6 +838,7 @@ impl AppState {
     }
 
     /// Cancel and remove the current room attempt and gateway without logging out.
+    #[cfg(test)]
     pub(crate) fn clear_gateway(&self) -> Result<(), CommandError> {
         let mut guard = self.lock_inner()?;
         if let Some(mut room) = guard.session.as_mut().and_then(|active| active.room.take()) {
