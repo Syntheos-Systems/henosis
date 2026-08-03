@@ -15,7 +15,7 @@ use crate::model::{
     CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, RoomDirectorySnapshot,
     RoomStatus,
 };
-use crate::rift::RiftSession;
+use crate::rift::AuthenticatedRiftClient;
 
 /// Fixed application-data filename for non-secret per-room read cursors.
 const ROOM_READ_MARKERS_FILENAME: &str = "rift-room-read-markers.json";
@@ -41,8 +41,8 @@ pub struct RoomReadMarker {
 
 /// Process-local secret state for the current Rift login.
 pub struct AppState {
-    /// Session tokens protected by a synchronous lock never held across await.
-    session: Mutex<Option<RiftSession>>,
+    /// Opaque shared native client protected only while its handle is replaced.
+    session: Mutex<Option<AuthenticatedRiftClient>>,
 }
 
 /// Native session access and mutation operations.
@@ -54,8 +54,8 @@ impl AppState {
         }
     }
 
-    /// Clone the current session without exposing it to serialization.
-    pub fn session(&self) -> Result<Option<RiftSession>, CommandError> {
+    /// Clone the current native client handle without cloning independent tokens.
+    pub fn session(&self) -> Result<Option<AuthenticatedRiftClient>, CommandError> {
         self.session.lock().map(|guard| guard.clone()).map_err(|_| {
             CommandError::new(
                 CommandErrorKind::Storage,
@@ -64,19 +64,21 @@ impl AppState {
         })
     }
 
-    /// Replace the current native Rift session after successful authentication.
-    pub fn set_session(&self, session: RiftSession) -> Result<(), CommandError> {
+    /// Replace the current client and invalidate any previously cloned handle.
+    pub fn set_session(&self, session: AuthenticatedRiftClient) -> Result<(), CommandError> {
         let mut guard = self.session.lock().map_err(|_| {
             CommandError::new(
                 CommandErrorKind::Storage,
                 "Henosis could not update the native session.",
             )
         })?;
-        *guard = Some(session);
+        if let Some(previous) = guard.replace(session) {
+            previous.invalidate();
+        }
         Ok(())
     }
 
-    /// Remove all process-local Rift token state.
+    /// Invalidate and remove all process-local Rift token state.
     pub fn clear_session(&self) -> Result<(), CommandError> {
         let mut guard = self.session.lock().map_err(|_| {
             CommandError::new(
@@ -84,7 +86,9 @@ impl AppState {
                 "Henosis could not clear the native session.",
             )
         })?;
-        *guard = None;
+        if let Some(session) = guard.take() {
+            session.invalidate();
+        }
         Ok(())
     }
 }
