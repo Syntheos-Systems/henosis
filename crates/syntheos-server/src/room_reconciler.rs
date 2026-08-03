@@ -504,6 +504,16 @@ struct PendingControlActivation {
     controller: Arc<dyn ManagedAgentControl>,
 }
 
+/// Construction options shared by production and test reconciler assembly.
+struct RoomReconcilerOptions {
+    /// Durable-state poll interval.
+    poll_interval: Duration,
+    /// Bound for both startup and graceful bridge stop.
+    lifecycle_timeout: Duration,
+    /// Revision author when managed control is enabled; none keeps TOML authoritative.
+    initial_roster_author: Option<Uuid>,
+}
+
 /// Build the production supervisor and defer optional Rift control installation.
 pub fn build_room_reconciler(
     pool: PgPool,
@@ -523,9 +533,11 @@ pub fn build_room_reconciler(
         bindings,
         store,
         Arc::new(NativeBridgeRunner),
-        Duration::from_secs(5),
-        Duration::from_secs(30),
-        initial_roster_author,
+        RoomReconcilerOptions {
+            poll_interval: Duration::from_secs(5),
+            lifecycle_timeout: Duration::from_secs(30),
+            initial_roster_author,
+        },
     );
     if let Some((_, registry)) = managed_control {
         reconciler.defer_control_activation(registry, Arc::new(handle.clone()));
@@ -540,9 +552,7 @@ fn build_room_reconciler_with_parts(
     bindings: Arc<dyn CredentialBindingResolver>,
     store: Arc<dyn RoomRevisionStore>,
     runner: Arc<dyn BridgeRunner>,
-    poll_interval: Duration,
-    lifecycle_timeout: Duration,
-    initial_roster_author: Option<Uuid>,
+    options: RoomReconcilerOptions,
 ) -> (RoomReconcilerHandle, RoomReconciler) {
     let core = Arc::new(RoomReconcilerCore {
         server_id: base.rift.server_id,
@@ -562,9 +572,9 @@ fn build_room_reconciler_with_parts(
             notifications: notifications_rx,
             dependencies,
             runner,
-            poll_interval,
-            lifecycle_timeout,
-            initial_roster_author,
+            poll_interval: options.poll_interval,
+            lifecycle_timeout: options.lifecycle_timeout,
+            initial_roster_author: options.initial_roster_author,
             pending_control_activation: None,
         },
     )
@@ -2265,9 +2275,11 @@ mod tests {
             Arc::new(EmptyCredentialBindingResolver),
             store.clone(),
             runner.clone(),
-            Duration::from_millis(50),
-            Duration::from_secs(5),
-            initial_roster_author,
+            RoomReconcilerOptions {
+                poll_interval: Duration::from_millis(50),
+                lifecycle_timeout: Duration::from_secs(5),
+                initial_roster_author,
+            },
         );
         let control_registry = ManagedAgentControlRegistry::default();
         if initial_roster_author.is_some() {
