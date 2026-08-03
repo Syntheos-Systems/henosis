@@ -37,8 +37,8 @@ const MAX_INBOUND_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum time allowed for DNS, TCP, TLS, and WebSocket setup.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum time allowed for Rift to confirm an Identify command with Ready.
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time allowed for Rift to confirm Identify and the exact subscription set.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum time allowed for one complete WebSocket protocol write.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,7 +61,7 @@ type GatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Safe setup failures returned before a native gateway actor starts.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RiftGatewayError {
-    /// Server subscription identifiers were empty or exceeded Rift's fixed bound.
+    /// Server subscription identifiers were malformed or exceeded Rift's fixed bound.
     #[error("Rift gateway subscriptions were invalid.")]
     InvalidSubscriptions,
     /// The gateway was started outside a Tokio runtime.
@@ -349,7 +349,7 @@ impl GatewayJitter for ProcessGatewayJitter {
     }
 }
 
-/// Exponential reconnect state reset only after a usable Ready handshake.
+/// Exponential reconnect state reset only after a usable acknowledged subscription.
 struct ReconnectBackoff {
     /// Number of consecutive unsuccessful connection cycles.
     attempt: u32,
@@ -379,7 +379,7 @@ impl ReconnectBackoff {
         delay.min(MAX_RECONNECT_DELAY)
     }
 
-    /// Restart the sequence after a usable Ready handshake.
+    /// Restart the sequence after a usable acknowledged subscription.
     fn reset(&mut self) {
         self.attempt = 0;
     }
@@ -393,7 +393,7 @@ struct GatewayRuntime {
     server_ids: Vec<String>,
     /// Authenticated native session and sanitizer.
     session: Arc<dyn GatewaySession>,
-    /// HTTP page source used only after a usable socket is lost.
+    /// HTTP page source used after every acknowledged subscription handoff.
     reconcile_source: Arc<dyn MessagePageSource>,
     /// Latest ordered message cursor known to native state before the actor begins.
     last_known_message: Option<NativeMessageCursor>,
@@ -484,6 +484,11 @@ enum GatewayInboundEvent {
         /// Rift login handle retained only to validate the wire shape.
         username: String,
     },
+    /// Confirms the exact canonical server receivers installed for this socket.
+    Subscribed {
+        /// Canonical server identifiers accepted by Rift without hidden refusals.
+        server_ids: Vec<String>,
+    },
     /// Carries one complete conversation message.
     MessageCreate(Box<ApiRoomMessage>),
     /// Carries the editable fields of one message.
@@ -532,14 +537,25 @@ enum ParsedGatewayEvent {
     Malformed,
 }
 
+/// Explicit progress through one authenticated subscription handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionPhase {
+    /// Identify was sent and the actor is waiting for a valid Ready identity.
+    AwaitingReady,
+    /// Ready matched and one Subscribe was sent, but Rift has not acknowledged it.
+    AwaitingSubscribed,
+    /// The exact subscription was acknowledged and reconciliation completed.
+    Connected,
+}
+
 /// Reason one connected socket returned to the reconnect supervisor.
 enum ConnectionOutcome {
     /// AppState canceled or invalidated the actor.
     Cancelled,
     /// Transport ended and may be retried.
     Reconnect {
-        /// True only after identity, subscription, and Connected emission.
-        reached_ready: bool,
+        /// True only after identity, exact subscription ACK, reconciliation, and Connected.
+        reached_connected: bool,
         /// Generation rejected by a clean close before Ready.
         refresh_generation: Option<u64>,
     },
@@ -656,7 +672,6 @@ async fn run_gateway(
     }
     let mut backoff = ReconnectBackoff::new();
     let mut last_known_message = runtime.last_known_message.clone();
-    let mut reconcile_after_ready = false;
 
     loop {
         discard_pending_typing(&mut typing);
@@ -715,7 +730,6 @@ async fn run_gateway(
             socket.as_mut(),
             &authentication,
             &mut last_known_message,
-            reconcile_after_ready,
             &mut typing,
         )
         .await
@@ -738,12 +752,11 @@ async fn run_gateway(
                 return;
             }
             ConnectionOutcome::Reconnect {
-                reached_ready,
+                reached_connected,
                 refresh_generation,
             } => {
-                if reached_ready {
+                if reached_connected {
                     backoff.reset();
-                    reconcile_after_ready = true;
                 }
                 if let Some(generation) = refresh_generation {
                     let refresh_result = tokio::select! {
@@ -781,7 +794,6 @@ async fn run_connection(
     socket: &mut dyn GatewaySocket,
     authentication: &GatewayAuthentication,
     last_known_message: &mut Option<NativeMessageCursor>,
-    reconcile_after_ready: bool,
     typing: &mut mpsc::Receiver<()>,
 ) -> ConnectionOutcome {
     discard_pending_typing(typing);
@@ -792,7 +804,7 @@ async fn run_connection(
         Err(_) => {
             tracing::warn!(phase = "identify", "Rift gateway could not encode Identify");
             return ConnectionOutcome::Reconnect {
-                reached_ready: false,
+                reached_connected: false,
                 refresh_generation: None,
             };
         }
@@ -809,23 +821,23 @@ async fn run_connection(
             ConnectionOutcome::Cancelled
         } else {
             ConnectionOutcome::Reconnect {
-                reached_ready: false,
+                reached_connected: false,
                 refresh_generation: None,
             }
         };
     }
 
-    let ready_deadline = tokio::time::sleep(READY_TIMEOUT);
-    tokio::pin!(ready_deadline);
-    let mut ready = false;
+    let handshake_deadline = tokio::time::sleep(HANDSHAKE_TIMEOUT);
+    tokio::pin!(handshake_deadline);
+    let mut phase = ConnectionPhase::AwaitingReady;
     loop {
         let received = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return ConnectionOutcome::Cancelled,
-            _ = &mut ready_deadline, if !ready => {
-                tracing::debug!(phase = "ready", outcome = "timeout", "Rift gateway Ready timed out");
+            _ = &mut handshake_deadline, if phase != ConnectionPhase::Connected => {
+                tracing::debug!(phase = "handshake", outcome = "timeout", "Rift gateway handshake timed out");
                 return ConnectionOutcome::Reconnect {
-                    reached_ready: false,
+                    reached_connected: false,
                     refresh_generation: None,
                 };
             }
@@ -833,7 +845,7 @@ async fn run_connection(
                 if typing_request.is_none() {
                     return ConnectionOutcome::Cancelled;
                 }
-                if !ready {
+                if phase != ConnectionPhase::Connected {
                     continue;
                 }
                 let typing_command = match serde_json::to_string(&GatewayCommand::Typing {
@@ -842,7 +854,7 @@ async fn run_connection(
                     Ok(command) => command,
                     Err(_) => {
                         return ConnectionOutcome::Reconnect {
-                            reached_ready: true,
+                            reached_connected: true,
                             refresh_generation: None,
                         };
                     }
@@ -859,7 +871,7 @@ async fn run_connection(
                         ConnectionOutcome::Cancelled
                     } else {
                         ConnectionOutcome::Reconnect {
-                            reached_ready: true,
+                            reached_connected: true,
                             refresh_generation: None,
                         }
                     };
@@ -873,14 +885,15 @@ async fn run_connection(
             Some(Err(_)) => {
                 tracing::debug!(phase = "read", "Rift gateway transport failed");
                 return ConnectionOutcome::Reconnect {
-                    reached_ready: ready,
+                    reached_connected: phase == ConnectionPhase::Connected,
                     refresh_generation: None,
                 };
             }
             None => {
                 return ConnectionOutcome::Reconnect {
-                    reached_ready: ready,
-                    refresh_generation: (!ready).then_some(authentication.token_generation()),
+                    reached_connected: phase == ConnectionPhase::Connected,
+                    refresh_generation: (phase == ConnectionPhase::AwaitingReady)
+                        .then_some(authentication.token_generation()),
                 };
             }
         };
@@ -907,7 +920,7 @@ async fn run_connection(
                         user_id,
                         username,
                     }) => {
-                        if ready {
+                        if phase != ConnectionPhase::AwaitingReady {
                             tracing::debug!(
                                 phase = "ready",
                                 "Ignored duplicate Rift gateway Ready"
@@ -924,114 +937,85 @@ async fn run_connection(
                         if user_id != runtime.session.expected_user_id() {
                             return ConnectionOutcome::IdentityMismatch;
                         }
-                        if !runtime.server_ids.is_empty() {
-                            let subscribe =
-                                match serde_json::to_string(&GatewayCommand::Subscribe {
-                                    server_ids: &runtime.server_ids,
-                                }) {
-                                    Ok(subscribe) => subscribe,
-                                    Err(_) => {
-                                        return ConnectionOutcome::Reconnect {
-                                            reached_ready: false,
-                                            refresh_generation: None,
-                                        };
-                                    }
-                                };
-                            if send_frame(
-                                socket,
-                                cancellation,
-                                WebSocketMessage::Text(subscribe.into()),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                return if cancellation.is_cancelled() {
-                                    ConnectionOutcome::Cancelled
-                                } else {
-                                    ConnectionOutcome::Reconnect {
-                                        reached_ready: false,
-                                        refresh_generation: None,
-                                    }
+                        let subscribe = match serde_json::to_string(&GatewayCommand::Subscribe {
+                            server_ids: &runtime.server_ids,
+                        }) {
+                            Ok(subscribe) => subscribe,
+                            Err(_) => {
+                                return ConnectionOutcome::Reconnect {
+                                    reached_connected: false,
+                                    refresh_generation: None,
                                 };
                             }
+                        };
+                        if send_frame(
+                            socket,
+                            cancellation,
+                            WebSocketMessage::Text(subscribe.into()),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return if cancellation.is_cancelled() {
+                                ConnectionOutcome::Cancelled
+                            } else {
+                                ConnectionOutcome::Reconnect {
+                                    reached_connected: false,
+                                    refresh_generation: None,
+                                }
+                            };
                         }
-                        if reconcile_after_ready {
-                            let reconciliation = match reconcile_open_room(
-                                runtime.reconcile_source.as_ref(),
-                                &runtime.room_id,
-                                last_known_message.as_ref().map(|cursor| cursor.id.as_str()),
-                                cancellation,
-                            )
-                            .await
-                            {
-                                Ok(reconciliation) => reconciliation,
-                                Err(ReconcileError::Cancelled) => {
-                                    return ConnectionOutcome::Cancelled;
-                                }
-                                Err(ReconcileError::Rift(RiftError::Authentication)) => {
-                                    return ConnectionOutcome::AuthenticationFailed;
-                                }
-                                Err(ReconcileError::Rift(_)) => {
-                                    tracing::debug!(
-                                        phase = "reconcile",
-                                        "Rift gateway reconciliation did not complete"
-                                    );
-                                    return ConnectionOutcome::Reconnect {
-                                        reached_ready: false,
-                                        refresh_generation: None,
-                                    };
-                                }
+                        phase = ConnectionPhase::AwaitingSubscribed;
+                    }
+                    ParsedGatewayEvent::Supported(GatewayInboundEvent::Subscribed {
+                        server_ids,
+                    }) => {
+                        if phase == ConnectionPhase::AwaitingReady {
+                            tracing::debug!(
+                                phase = "subscribed",
+                                "Rift gateway acknowledged subscriptions before Ready"
+                            );
+                            return ConnectionOutcome::Reconnect {
+                                reached_connected: false,
+                                refresh_generation: None,
                             };
-                            let next_cursor = match reconciliation
-                                .page
-                                .messages
-                                .last()
-                                .map(NativeMessageCursor::from_message)
-                                .transpose()
-                            {
-                                Ok(next_cursor) => next_cursor,
-                                Err(_) => {
-                                    tracing::debug!(
-                                        phase = "reconcile",
-                                        "Rift gateway reconciliation returned an invalid cursor"
-                                    );
-                                    return ConnectionOutcome::Reconnect {
-                                        reached_ready: false,
-                                        refresh_generation: None,
-                                    };
-                                }
+                        }
+                        if phase == ConnectionPhase::Connected {
+                            tracing::debug!(
+                                phase = "subscribed",
+                                "Ignored duplicate Rift gateway subscription acknowledgement"
+                            );
+                            continue;
+                        }
+                        if server_ids != runtime.server_ids {
+                            tracing::debug!(
+                                phase = "subscribed",
+                                "Rift gateway acknowledged a different subscription set"
+                            );
+                            return ConnectionOutcome::Reconnect {
+                                reached_connected: false,
+                                refresh_generation: None,
                             };
-                            let should_emit = reconciliation.replace_live_window
-                                || !reconciliation.page.messages.is_empty();
-                            if should_emit
-                                && !emit_event(
-                                    runtime,
-                                    cancellation,
-                                    RoomConversationEvent::Reconciliation {
-                                        room_id: runtime.room_id.clone(),
-                                        page: reconciliation.page,
-                                        replace_live_window: reconciliation.replace_live_window,
-                                    },
-                                )
-                            {
-                                return ConnectionOutcome::Cancelled;
-                            }
-                            if reconciliation.replace_live_window {
-                                *last_known_message = next_cursor;
-                            } else if let Some(next_cursor) = next_cursor {
-                                advance_message_cursor(last_known_message, next_cursor);
-                            }
+                        }
+                        if let Err(outcome) = reconcile_subscription_handoff(
+                            runtime,
+                            cancellation,
+                            last_known_message,
+                        )
+                        .await
+                        {
+                            return outcome;
                         }
                         discard_pending_typing(typing);
-                        ready = true;
+                        phase = ConnectionPhase::Connected;
                         if !emit_status(runtime, cancellation, RoomConnectionStatus::Connected) {
                             return ConnectionOutcome::Cancelled;
                         }
                     }
-                    ParsedGatewayEvent::Supported(event) if !ready => {
+                    ParsedGatewayEvent::Supported(event) if phase != ConnectionPhase::Connected => {
                         tracing::debug!(
-                            phase = "pre_ready",
-                            "Ignored Rift gateway event before Ready"
+                            phase = "pre_connected",
+                            "Ignored Rift gateway event before subscription acknowledgement"
                         );
                         drop(event);
                     }
@@ -1047,7 +1031,7 @@ async fn run_connection(
                                                 "Rift gateway message had an invalid cursor"
                                             );
                                             return ConnectionOutcome::Reconnect {
-                                                reached_ready: true,
+                                                reached_connected: true,
                                                 refresh_generation: None,
                                             };
                                         }
@@ -1074,7 +1058,7 @@ async fn run_connection(
                         ConnectionOutcome::Cancelled
                     } else {
                         ConnectionOutcome::Reconnect {
-                            reached_ready: ready,
+                            reached_connected: phase == ConnectionPhase::Connected,
                             refresh_generation: None,
                         }
                     };
@@ -1082,8 +1066,9 @@ async fn run_connection(
             }
             WebSocketMessage::Close(_) => {
                 return ConnectionOutcome::Reconnect {
-                    reached_ready: ready,
-                    refresh_generation: (!ready).then_some(authentication.token_generation()),
+                    reached_connected: phase == ConnectionPhase::Connected,
+                    refresh_generation: (phase == ConnectionPhase::AwaitingReady)
+                        .then_some(authentication.token_generation()),
                 };
             }
             WebSocketMessage::Binary(_)
@@ -1093,7 +1078,82 @@ async fn run_connection(
     }
 }
 
-/// Drop every typing signal captured outside the current Ready connection.
+/// Reconcile every acknowledged subscription from the latest native or room-start cursor.
+async fn reconcile_subscription_handoff(
+    runtime: &GatewayRuntime,
+    cancellation: &CancellationToken,
+    last_known_message: &mut Option<NativeMessageCursor>,
+) -> Result<(), ConnectionOutcome> {
+    let after_cursor = last_known_message
+        .as_ref()
+        .map_or(runtime.room_id.as_str(), |cursor| cursor.id.as_str());
+    let reconciliation = match reconcile_open_room(
+        runtime.reconcile_source.as_ref(),
+        &runtime.room_id,
+        Some(after_cursor),
+        cancellation,
+    )
+    .await
+    {
+        Ok(reconciliation) => reconciliation,
+        Err(ReconcileError::Cancelled) => return Err(ConnectionOutcome::Cancelled),
+        Err(ReconcileError::Rift(RiftError::Authentication)) => {
+            return Err(ConnectionOutcome::AuthenticationFailed);
+        }
+        Err(ReconcileError::Rift(_)) => {
+            tracing::debug!(
+                phase = "reconcile",
+                "Rift gateway reconciliation did not complete"
+            );
+            return Err(ConnectionOutcome::Reconnect {
+                reached_connected: false,
+                refresh_generation: None,
+            });
+        }
+    };
+    let next_cursor = match reconciliation
+        .page
+        .messages
+        .last()
+        .map(NativeMessageCursor::from_message)
+        .transpose()
+    {
+        Ok(next_cursor) => next_cursor,
+        Err(_) => {
+            tracing::debug!(
+                phase = "reconcile",
+                "Rift gateway reconciliation returned an invalid cursor"
+            );
+            return Err(ConnectionOutcome::Reconnect {
+                reached_connected: false,
+                refresh_generation: None,
+            });
+        }
+    };
+    let should_emit =
+        reconciliation.replace_live_window || !reconciliation.page.messages.is_empty();
+    if should_emit
+        && !emit_event(
+            runtime,
+            cancellation,
+            RoomConversationEvent::Reconciliation {
+                room_id: runtime.room_id.clone(),
+                page: reconciliation.page,
+                replace_live_window: reconciliation.replace_live_window,
+            },
+        )
+    {
+        return Err(ConnectionOutcome::Cancelled);
+    }
+    if reconciliation.replace_live_window {
+        *last_known_message = next_cursor;
+    } else if let Some(next_cursor) = next_cursor {
+        advance_message_cursor(last_known_message, next_cursor);
+    }
+    Ok(())
+}
+
+/// Drop every typing signal captured outside the current acknowledged connection.
 fn discard_pending_typing(typing: &mut mpsc::Receiver<()>) {
     while typing.try_recv().is_ok() {}
 }
@@ -1121,6 +1181,7 @@ fn parse_gateway_text(text: &str) -> ParsedGatewayEvent {
     if !matches!(
         header.event_type.as_str(),
         "Ready"
+            | "Subscribed"
             | "MessageCreate"
             | "MessageUpdate"
             | "MessageDelete"
@@ -1134,14 +1195,17 @@ fn parse_gateway_text(text: &str) -> ParsedGatewayEvent {
         .unwrap_or(ParsedGatewayEvent::Malformed)
 }
 
-/// Convert one supported post-Ready event into the sanitized shared model.
+/// Convert one supported post-subscription event into the sanitized shared model.
 fn translate_event(
     runtime: &GatewayRuntime,
     event: GatewayInboundEvent,
 ) -> Option<RoomConversationEvent> {
     match event {
-        GatewayInboundEvent::Ready { .. } => {
-            tracing::debug!(phase = "ready", "Ignored duplicate Rift gateway Ready");
+        GatewayInboundEvent::Ready { .. } | GatewayInboundEvent::Subscribed { .. } => {
+            tracing::debug!(
+                phase = "handshake",
+                "Ignored duplicate Rift gateway handshake event"
+            );
             None
         }
         GatewayInboundEvent::MessageCreate(message) => runtime
@@ -1422,6 +1486,32 @@ mod tests {
         )
     }
 
+    /// Send one valid Ready envelope for the fake authenticated identity.
+    fn send_ready(peer: &FakePeer) {
+        peer.send_json(json!({
+            "type": "Ready",
+            "data": {"user_id": "user-1", "username": "gateway-user"}
+        }));
+    }
+
+    /// Send one typed subscription acknowledgement with the supplied exact wire order.
+    fn send_subscription_ack(peer: &FakePeer, server_ids: &[&str]) {
+        peer.send_json(json!({
+            "type": "Subscribed",
+            "data": {"server_ids": server_ids}
+        }));
+    }
+
+    /// Complete one exact Ready, Subscribe, and Subscribed exchange.
+    async fn complete_subscription_handshake(peer: &mut FakePeer, server_ids: &[&str]) {
+        send_ready(peer);
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Subscribe", "data": {"server_ids": server_ids}})
+        );
+        send_subscription_ack(peer, server_ids);
+    }
+
     /// One scripted result for a connector invocation.
     enum ConnectScript {
         /// Return one connected in-memory socket.
@@ -1609,6 +1699,31 @@ mod tests {
         }
     }
 
+    /// Apply actor events through real native room state before recording deliveries.
+    struct StateBackedRecordingSink {
+        /// Native room state that performs ordering and identifier deduplication.
+        state: Arc<AppState>,
+        /// Exact room generation allowed to accept actor events.
+        lease: RoomLease,
+        /// Effective events released after native state mutation.
+        events: mpsc::UnboundedSender<RoomConversationEvent>,
+    }
+
+    /// Exercise the production state-before-release ordering contract without Tauri.
+    impl GatewayEventSink for StateBackedRecordingSink {
+        /// Apply one actor event and record only its effective released form.
+        fn emit(&self, event: RoomConversationEvent) -> Result<(), ()> {
+            match self
+                .state
+                .apply_room_event_before_release(&self.lease, &event, |envelope| {
+                    self.events.send(envelope.event.clone()).is_ok()
+                }) {
+                Ok(true) => Ok(()),
+                Ok(false) | Err(_) => Err(()),
+            }
+        }
+    }
+
     /// Construct a recording sink and its event receiver.
     fn recording_sink() -> (
         Arc<RecordingSink>,
@@ -1619,6 +1734,25 @@ mod tests {
             Arc::new(RecordingSink {
                 events,
                 fail_next: AtomicBool::new(false),
+            }),
+            receiver,
+        )
+    }
+
+    /// Construct a state-backed event sink and its effective-event receiver.
+    fn state_backed_recording_sink(
+        state: Arc<AppState>,
+        lease: RoomLease,
+    ) -> (
+        Arc<StateBackedRecordingSink>,
+        mpsc::UnboundedReceiver<RoomConversationEvent>,
+    ) {
+        let (events, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(StateBackedRecordingSink {
+                state,
+                lease,
+                events,
             }),
             receiver,
         )
@@ -1762,12 +1896,12 @@ mod tests {
         sink: Arc<RecordingSink>,
         server_ids: Vec<String>,
     ) -> GatewayRuntime {
-        let reconcile_source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
-            MessagePage {
+        let reconcile_source = Arc::new(FakeMessagePageSource::new((0..8).map(|_| {
+            GatewayPageReply::Page(MessagePage {
                 messages: Vec::new(),
                 has_older: false,
-            },
-        )]));
+            })
+        })));
         fake_runtime_with_reconciliation(
             session,
             connector,
@@ -1782,7 +1916,7 @@ mod tests {
     fn fake_runtime_with_reconciliation(
         session: Arc<FakeSession>,
         connector: Arc<FakeConnector>,
-        sink: Arc<RecordingSink>,
+        sink: Arc<dyn GatewayEventSink>,
         server_ids: Vec<String>,
         reconcile_source: Arc<dyn MessagePageSource>,
         last_known_message: Option<RoomMessage>,
@@ -1916,7 +2050,7 @@ mod tests {
         assert_eq!(config.max_message_size, Some(MAX_INBOUND_MESSAGE_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_INBOUND_MESSAGE_BYTES));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
-        assert_eq!(READY_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(10));
         assert_eq!(WRITE_TIMEOUT, Duration::from_secs(10));
         assert_eq!(OUTBOUND_TYPING_CAPACITY, 1);
 
@@ -1946,7 +2080,7 @@ mod tests {
         );
     }
 
-    /// Outbound typing is coalesced before Ready and serialized exactly after Ready.
+    /// Outbound typing is coalesced before ACK and serialized only after reconciliation.
     #[tokio::test]
     async fn outbound_typing_is_ready_gated_bounded_and_exact() {
         let (socket, mut peer) = fake_socket_pair();
@@ -1964,24 +2098,21 @@ mod tests {
         );
         gateway
             .enqueue_typing()
-            .expect("first pre-Ready typing signal must enqueue");
+            .expect("first pre-ACK typing signal must enqueue");
         gateway
             .enqueue_typing()
             .expect("full mailbox must coalesce another typing signal");
         tokio::task::yield_now().await;
         assert!(peer.outbound.try_recv().is_err());
 
-        peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut peer, &[]).await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
         tokio::task::yield_now().await;
         assert!(peer.outbound.try_recv().is_err());
 
         gateway
             .enqueue_typing()
-            .expect("post-Ready typing signal must enqueue");
+            .expect("post-ACK typing signal must enqueue");
         assert_eq!(
             peer.next_json().await,
             json!({"type": "Typing", "data": {"channel_id": "room-1"}})
@@ -2008,10 +2139,7 @@ mod tests {
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
         let _first_url = attempts.recv().await.expect("first typing attempt");
         let _first_identify = first_peer.next_json().await;
-        first_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut first_peer, &[]).await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
         gateway
             .enqueue_typing()
@@ -2032,10 +2160,7 @@ mod tests {
             second_peer.next_json().await,
             json!({"type": "Identify", "data": {"token": "access-one"}})
         );
-        second_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut second_peer, &[]).await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
         tokio::task::yield_now().await;
         assert!(second_peer.outbound.try_recv().is_err());
@@ -2087,7 +2212,7 @@ mod tests {
         assert!(invalid_client.gateway_websocket_url().is_err());
     }
 
-    /// Identify, Ready, Subscribe, heartbeat, filtering, and all five event mappings agree.
+    /// The exact ACK barrier, duplicate Ready handling, and five event mappings agree.
     #[tokio::test]
     async fn gateway_identifies_subscribes_and_translates_supported_events() {
         let (socket, mut peer) = fake_socket_pair();
@@ -2127,10 +2252,7 @@ mod tests {
         }));
         tokio::task::yield_now().await;
         assert!(peer.outbound.try_recv().is_err());
-        peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        send_ready(&peer);
         assert_eq!(
             peer.next_json().await,
             json!({
@@ -2138,6 +2260,15 @@ mod tests {
                 "data": {"server_ids": ["server-1", "server-2"]}
             })
         );
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+
+        send_ready(&peer);
+        tokio::task::yield_now().await;
+        assert!(peer.outbound.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+
+        send_subscription_ack(&peer, &["server-1", "server-2"]);
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
 
         peer.send_json(json!({"type": "FutureEvent", "data": {"secret": "ignored"}}));
@@ -2235,24 +2366,52 @@ mod tests {
         gateway.shutdown().await;
     }
 
-    /// An empty server set reaches Ready without sending a meaningless Subscribe.
+    /// An empty set still uses the ACK barrier and room-start reconciliation cursor.
     #[tokio::test]
-    async fn empty_subscription_omits_subscribe_after_ready() {
+    async fn empty_subscription_waits_for_ack_and_reconciles_from_room_start() {
         let (socket, mut peer) = fake_socket_pair();
         let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
+            MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            },
+        )]));
         let session = Arc::new(FakeSession::new());
         let (sink, mut events) = recording_sink();
-        let gateway = spawn_gateway_actor(fake_runtime(session, connector, sink, Vec::new()))
-            .expect("test runtime must spawn");
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            Vec::new(),
+            source.clone(),
+            None,
+        ))
+        .expect("test runtime must spawn");
 
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
         let _url = attempts.recv().await.expect("connection attempt");
         let _identify = peer.next_json().await;
-        peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        send_ready(&peer);
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Subscribe", "data": {"server_ids": []}})
+        );
+        tokio::task::yield_now().await;
+        assert!(source.requests().is_empty());
+        assert!(events.try_recv().is_err());
+
+        send_subscription_ack(&peer, &[]);
+        source.wait_for_request().await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        assert_eq!(
+            source.requests(),
+            vec![GatewayPageRequest::After {
+                room_id: "room-1".into(),
+                cursor: "room-1".into(),
+                limit: crate::reconcile::RECONCILE_PAGE_SIZE,
+            }]
+        );
         peer.send(WebSocketMessage::Ping(vec![5].into()));
         assert!(matches!(
             peer.next_frame().await,
@@ -2261,9 +2420,208 @@ mod tests {
         gateway.shutdown().await;
     }
 
-    /// A clean pre-Ready rejection refreshes before a paused bounded retry.
+    /// A queued live duplicate after ACK leaves one identifier in native room state.
+    #[tokio::test]
+    async fn queued_live_duplicate_and_reconciliation_leave_one_native_message() {
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
+            MessagePage {
+                messages: vec![reconciled_message_at(
+                    "message-1",
+                    "2026-08-03T12:00:00+00:00",
+                )],
+                has_older: false,
+            },
+        )]));
+        let owner = AuthenticatedRiftClient::gateway_test_client(
+            Url::parse("https://rift.example/").expect("state-backed endpoint must parse"),
+            "user-1",
+        );
+        let state = Arc::new(AppState::new());
+        state
+            .set_session(owner.clone())
+            .expect("state-backed session must install");
+        let lease = state
+            .begin_room_open(&owner, "room-1", "stream-state-backed-0001")
+            .expect("state-backed room must begin");
+        state
+            .install_room_page(
+                &lease,
+                MessagePage {
+                    messages: Vec::new(),
+                    has_older: false,
+                },
+            )
+            .expect("state-backed opening page must install");
+        let (sink, mut events) = state_backed_recording_sink(Arc::clone(&state), lease.clone());
+        let session = Arc::new(FakeSession::new());
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session,
+            connector,
+            sink,
+            vec!["server-1".into()],
+            source.clone(),
+            None,
+        ))
+        .expect("state-backed actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _url = attempts
+            .recv()
+            .await
+            .expect("state-backed connection attempt");
+        let _identify = peer.next_json().await;
+        send_ready(&peer);
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Subscribe", "data": {"server_ids": ["server-1"]}})
+        );
+        send_subscription_ack(&peer, &["server-1"]);
+        peer.send_json(message_create_at(
+            "/api/attachments/attachment-1",
+            "message-1",
+            "2026-08-03T12:00:00Z",
+        ));
+
+        source.wait_for_request().await;
+        assert!(matches!(
+            events.recv().await.expect("state-backed reconciliation event"),
+            RoomConversationEvent::Reconciliation { page, .. }
+                if page.messages.len() == 1 && page.messages[0].id == "message-1"
+        ));
+        expect_status(&mut events, RoomConnectionStatus::Connected).await;
+        assert!(matches!(
+            events.recv().await.expect("queued live duplicate event"),
+            RoomConversationEvent::MessageCreate { message, .. }
+                if message.id == "message-1"
+        ));
+        assert!(matches!(
+            source.requests().as_slice(),
+            [GatewayPageRequest::After { cursor, .. }] if cursor == "room-1"
+        ));
+        let messages = state
+            .active_room_messages(&lease)
+            .expect("state-backed messages must remain readable");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "message-1");
+        gateway.shutdown().await;
+    }
+
+    /// A partial ACK reconnects without exposing Connected or starting reconciliation.
     #[tokio::test(start_paused = true)]
-    async fn rejected_identify_refreshes_and_ready_resets_backoff() {
+    async fn partial_subscription_ack_reconnects_without_reconciliation() {
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
+            MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            },
+        )]));
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
+            session.clone(),
+            connector,
+            sink,
+            vec!["server-2".into(), "server-1".into()],
+            source.clone(),
+            None,
+        ))
+        .expect("partial-ACK actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _url = attempts
+            .recv()
+            .await
+            .expect("partial-ACK connection attempt");
+        let _identify = peer.next_json().await;
+        send_ready(&peer);
+        assert_eq!(
+            peer.next_json().await,
+            json!({
+                "type": "Subscribe",
+                "data": {"server_ids": ["server-1", "server-2"]}
+            })
+        );
+        send_subscription_ack(&peer, &["server-1"]);
+
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        assert!(source.requests().is_empty());
+        assert_eq!(session.refresh_count(), 0);
+        gateway.shutdown().await;
+    }
+
+    /// The subscription ACK deadline remains active after valid Ready.
+    #[tokio::test(start_paused = true)]
+    async fn missing_subscription_ack_is_bounded_without_refreshing_authentication() {
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime(
+            session.clone(),
+            connector,
+            sink,
+            vec!["server-1".into()],
+        ))
+        .expect("missing-ACK actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _url = attempts
+            .recv()
+            .await
+            .expect("missing-ACK connection attempt");
+        let _identify = peer.next_json().await;
+        send_ready(&peer);
+        assert_eq!(
+            peer.next_json().await,
+            json!({"type": "Subscribe", "data": {"server_ids": ["server-1"]}})
+        );
+
+        tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        assert_eq!(session.refresh_count(), 0);
+        gateway.shutdown().await;
+    }
+
+    /// A clean close after Ready but before ACK preserves the accepted token generation.
+    #[tokio::test(start_paused = true)]
+    async fn close_after_ready_before_ack_does_not_refresh_authentication() {
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
+        let session = Arc::new(FakeSession::new());
+        let (sink, mut events) = recording_sink();
+        let gateway = spawn_gateway_actor(fake_runtime(
+            session.clone(),
+            connector,
+            sink,
+            vec!["server-1".into()],
+        ))
+        .expect("pre-ACK close actor must spawn");
+
+        expect_status(&mut events, RoomConnectionStatus::Connecting).await;
+        let _url = attempts
+            .recv()
+            .await
+            .expect("pre-ACK close connection attempt");
+        let _identify = peer.next_json().await;
+        send_ready(&peer);
+        let _subscribe = peer.next_json().await;
+        peer.send(WebSocketMessage::Close(None));
+
+        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
+        assert_eq!(session.refresh_count(), 0);
+        gateway.shutdown().await;
+    }
+
+    /// A clean pre-Ready rejection refreshes before a connected retry resets backoff.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_identify_refreshes_and_connected_resets_backoff() {
         let (first_socket, mut first_peer) = fake_socket_pair();
         let (second_socket, mut second_peer) = fake_socket_pair();
         let (third_socket, mut third_peer) = fake_socket_pair();
@@ -2298,10 +2656,7 @@ mod tests {
             second_peer.next_json().await,
             json!({"type": "Identify", "data": {"token": "access-two"}})
         );
-        second_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut second_peer, &[]).await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
         second_peer.send(WebSocketMessage::Close(None));
         expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
@@ -2318,7 +2673,7 @@ mod tests {
         gateway.shutdown().await;
     }
 
-    /// Reconnect catches up after live and reconciled cursors without refetching initial history.
+    /// Every acknowledged connection catches up from the newest native cursor.
     #[tokio::test(start_paused = true)]
     async fn reconnect_reconciles_after_the_latest_native_cursor() {
         let (first_socket, mut first_peer) = fake_socket_pair();
@@ -2330,6 +2685,10 @@ mod tests {
             ConnectScript::Socket(third_socket),
         ]);
         let source = Arc::new(FakeMessagePageSource::new([
+            GatewayPageReply::Page(MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            }),
             GatewayPageReply::Page(MessagePage {
                 messages: vec![reconciled_message("message-2")],
                 has_older: false,
@@ -2357,12 +2716,9 @@ mod tests {
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
         let _first_url = attempts.recv().await.expect("first connection attempt");
         let _first_identify = first_peer.next_json().await;
-        first_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut first_peer, &[]).await;
+        source.wait_for_request().await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
-        assert!(source.requests().is_empty());
 
         first_peer.send_json(message_create("/api/attachments/attachment-1"));
         assert!(matches!(
@@ -2375,10 +2731,7 @@ mod tests {
 
         let _second_url = attempts.recv().await.expect("second connection attempt");
         let _second_identify = second_peer.next_json().await;
-        second_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut second_peer, &[]).await;
         source.wait_for_request().await;
         assert!(matches!(
             events.recv().await.expect("reconciliation event"),
@@ -2397,16 +2750,18 @@ mod tests {
         tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
         let _third_url = attempts.recv().await.expect("third connection attempt");
         let _third_identify = third_peer.next_json().await;
-        third_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut third_peer, &[]).await;
         source.wait_for_request().await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
 
         assert_eq!(
             source.requests(),
             vec![
+                GatewayPageRequest::After {
+                    room_id: "room-1".into(),
+                    cursor: "snapshot-message".into(),
+                    limit: crate::reconcile::RECONCILE_PAGE_SIZE,
+                },
                 GatewayPageRequest::After {
                     room_id: "room-1".into(),
                     cursor: "message-1".into(),
@@ -2431,12 +2786,16 @@ mod tests {
             ConnectScript::Socket(first_socket),
             ConnectScript::Socket(second_socket),
         ]);
-        let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Page(
-            MessagePage {
+        let source = Arc::new(FakeMessagePageSource::new([
+            GatewayPageReply::Page(MessagePage {
                 messages: Vec::new(),
                 has_older: false,
-            },
-        )]));
+            }),
+            GatewayPageReply::Page(MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+            }),
+        ]));
         let session = Arc::new(FakeSession::new());
         let (sink, mut events) = recording_sink();
         let gateway = spawn_gateway_actor(fake_runtime_with_reconciliation(
@@ -2455,10 +2814,8 @@ mod tests {
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
         let _first_url = attempts.recv().await.expect("first connection attempt");
         let _first_identify = first_peer.next_json().await;
-        first_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut first_peer, &[]).await;
+        source.wait_for_request().await;
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
 
         first_peer.send_json(message_create_at(
@@ -2486,28 +2843,24 @@ mod tests {
 
         let _second_url = attempts.recv().await.expect("second connection attempt");
         let _second_identify = second_peer.next_json().await;
-        second_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        complete_subscription_handshake(&mut second_peer, &[]).await;
         source.wait_for_request().await;
         assert!(matches!(
             source.requests().as_slice(),
-            [GatewayPageRequest::After { cursor, .. }] if cursor == "newer-message"
+            [
+                GatewayPageRequest::After { cursor: first, .. },
+                GatewayPageRequest::After { cursor: second, .. },
+            ] if first == "snapshot-message" && second == "newer-message"
         ));
         expect_status(&mut events, RoomConnectionStatus::Connected).await;
         gateway.shutdown().await;
     }
 
-    /// Replacing a room gateway cancels a pending reconciliation before it can emit.
+    /// Replacing a room cancels its first post-ACK reconciliation before emission.
     #[tokio::test(start_paused = true)]
     async fn room_replacement_cancels_pending_reconciliation() {
-        let (first_socket, mut first_peer) = fake_socket_pair();
-        let (second_socket, mut second_peer) = fake_socket_pair();
-        let (connector, mut attempts) = fake_connector(vec![
-            ConnectScript::Socket(first_socket),
-            ConnectScript::Socket(second_socket),
-        ]);
+        let (socket, mut peer) = fake_socket_pair();
+        let (connector, mut attempts) = fake_connector(vec![ConnectScript::Socket(socket)]);
         let source = Arc::new(FakeMessagePageSource::new([GatewayPageReply::Pending]));
         let session = Arc::new(FakeSession::new());
         let (sink, mut events) = recording_sink();
@@ -2547,23 +2900,9 @@ mod tests {
             .expect("pending gateway must install");
 
         expect_status(&mut events, RoomConnectionStatus::Connecting).await;
-        let _first_url = attempts.recv().await.expect("first connection attempt");
-        let _first_identify = first_peer.next_json().await;
-        first_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
-        expect_status(&mut events, RoomConnectionStatus::Connected).await;
-        first_peer.send(WebSocketMessage::Close(None));
-        expect_status(&mut events, RoomConnectionStatus::Reconnecting).await;
-        tokio::time::advance(INITIAL_RECONNECT_DELAY).await;
-
-        let _second_url = attempts.recv().await.expect("second connection attempt");
-        let _second_identify = second_peer.next_json().await;
-        second_peer.send_json(json!({
-            "type": "Ready",
-            "data": {"user_id": "user-1", "username": "gateway-user"}
-        }));
+        let _url = attempts.recv().await.expect("first connection attempt");
+        let _identify = peer.next_json().await;
+        complete_subscription_handshake(&mut peer, &[]).await;
         source.wait_for_request().await;
 
         let (replacement, replacement_cancellation) = test_rift_gateway();

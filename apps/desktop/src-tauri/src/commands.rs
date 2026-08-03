@@ -1283,8 +1283,20 @@ mod tests {
         }
     }
 
-    /// Supplies an inert native gateway and no cached read cursor to open-room tests.
-    struct FakeRoomOpenRuntime;
+    /// Supplies one counted inert gateway and no cached read cursor to open-room tests.
+    #[derive(Default)]
+    struct FakeRoomOpenRuntime {
+        /// Number of generation-owned gateway actors requested by room opening.
+        gateway_spawns: AtomicUsize,
+    }
+
+    /// Inspect exact room-open gateway ownership without exposing actor internals.
+    impl FakeRoomOpenRuntime {
+        /// Return the number of gateway actors requested so far.
+        fn gateway_spawn_count(&self) -> usize {
+            self.gateway_spawns.load(Ordering::Acquire)
+        }
+    }
 
     /// Complete open-room native setup without filesystem or Tauri runtime dependencies.
     impl RoomOpenRuntime for FakeRoomOpenRuntime {
@@ -1300,6 +1312,7 @@ mod tests {
             _server_ids: Vec<String>,
             _last_message: Option<&RoomMessage>,
         ) -> Result<RiftGateway, RiftGatewayError> {
+            self.gateway_spawns.fetch_add(1, Ordering::AcqRel);
             Ok(crate::gateway::test_closed_rift_gateway())
         }
     }
@@ -1485,19 +1498,14 @@ mod tests {
             .set_session(session.clone())
             .expect("open test session must install");
         let transport = FakeRoomTransport::new();
+        let runtime = FakeRoomOpenRuntime::default();
 
         let lease = state
             .begin_room_open(&session, "room-1", "stream-open-test-0001")
             .expect("open test room must begin");
-        let snapshot = open_room_with(
-            &FakeRoomOpenRuntime,
-            &state,
-            lease,
-            room_summary(),
-            &transport,
-        )
-        .await
-        .expect("bounded room open must succeed");
+        let snapshot = open_room_with(&runtime, &state, lease, room_summary(), &transport)
+            .await
+            .expect("bounded room open must succeed");
 
         assert_eq!(
             transport.calls(),
@@ -1507,6 +1515,7 @@ mod tests {
         assert_eq!(snapshot.last_event_sequence, 0);
         assert_eq!(snapshot.page.messages.len(), 2);
         assert!(snapshot.permissions.send_messages);
+        assert_eq!(runtime.gateway_spawn_count(), 1);
         assert!(state.room_operation("room-1", &snapshot.stream_id).is_ok());
         close_room_with(&state, "room-1", &snapshot.stream_id)
             .expect("opened room must close by exact stream");
