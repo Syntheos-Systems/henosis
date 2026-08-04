@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   TAURI_DRIVER_PREFLIGHT_ARGUMENTS,
   diagnosticTail,
@@ -17,6 +18,48 @@ import {
   spawnSupervisedProcess,
   terminateService,
 } from "./run-live-e2e.mjs";
+
+test(
+  "the WebdriverIO config names the existing live conversation spec",
+  { concurrency: false },
+  /** Prove config-relative resolution cannot silently produce zero workers. */
+  async function resolvesLiveConversationSpec() {
+    const environmentNames = [
+      "HENOSIS_E2E_APP_BINARY",
+      "HENOSIS_E2E_ARTIFACT_DIR",
+      "HENOSIS_E2E_DRIVER_PORT",
+    ];
+    const previousEnvironment = new Map(
+      environmentNames.map((name) => [name, process.env[name]]),
+    );
+    Object.assign(process.env, {
+      HENOSIS_E2E_APP_BINARY: "/tmp/henosis-e2e-test-app",
+      HENOSIS_E2E_ARTIFACT_DIR: "/tmp/henosis-e2e-test-artifacts",
+      HENOSIS_E2E_DRIVER_PORT: "4445",
+    });
+
+    try {
+      const { config, LIVE_CONVERSATION_SPEC } = await import(
+        "../e2e/wdio.conf.mjs"
+      );
+      const expectedSpec = fileURLToPath(
+        new URL("../e2e/live-conversation.e2e.mjs", import.meta.url),
+      );
+
+      assert.equal(LIVE_CONVERSATION_SPEC, expectedSpec);
+      assert.deepEqual(config.specs, [expectedSpec]);
+      assert.equal((await stat(expectedSpec)).isFile(), true);
+    } finally {
+      for (const [name, value] of previousEnvironment) {
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
+  },
+);
 
 test(
   "the tauri-driver preflight uses a supported non-starting argument",

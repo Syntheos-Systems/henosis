@@ -2,6 +2,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Read one required test setting without printing its contents. */
 function requireEnvironment(name) {
@@ -24,6 +25,11 @@ function driverPort() {
 
 const artifactDirectory = requireEnvironment("HENOSIS_E2E_ARTIFACT_DIR");
 
+/** Absolute acceptance-spec path, independent of the launcher working directory. */
+export const LIVE_CONVERSATION_SPEC = fileURLToPath(
+  new URL("./live-conversation.e2e.mjs", import.meta.url),
+);
+
 /** Capture the controlled application on failure without replacing the test error. */
 async function captureFailureScreenshot(_test, _context, result) {
   if (result.passed) {
@@ -41,7 +47,7 @@ async function captureFailureScreenshot(_test, _context, result) {
 
 export const config = {
   runner: "local",
-  specs: ["./e2e/live-conversation.e2e.mjs"],
+  specs: [LIVE_CONVERSATION_SPEC],
   maxInstances: 1,
   capabilities: [
     {
