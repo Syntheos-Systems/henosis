@@ -21,6 +21,19 @@ Henosis authenticates each request, checks current membership and policy, binds 
 
 ## Start here
 
+### Desktop application
+
+Henosis desktop provides the terminal-free path into an existing Rift service.
+Open the [desktop installation guide](docs/desktop-install.md), choose the file
+for your operating system, install it, and complete the visible first-run
+connection. You need a Rift service address and account from the person or team
+operating that service. The desktop installer does not provision Rift or its
+PostgreSQL database.
+
+The current `v0.1.0-alpha.6` release is headless-only. The guide records the
+stable desktop filenames and current operating-system trust warnings without
+claiming those installers already exist in that release.
+
 ### Headless runtime
 
 The installers select the host platform, verify `SHA256SUMS`, install into the current user account, run `henosis init --quick`, and restore the prior version if initialization fails.

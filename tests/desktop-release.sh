@@ -6,6 +6,7 @@ set -eu
 REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 TEST_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/henosis-desktop-release-test.XXXXXX")
 RELEASE_DIRECTORY="$TEST_DIRECTORY/release"
+DESKTOP_INSTALL_GUIDE="$REPOSITORY_DIR/docs/desktop-install.md"
 VERSION=0.1.0-alpha.6
 
 # Remove only the isolated desktop release test workspace.
@@ -46,6 +47,25 @@ desktop_config_version=$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",*$/\1/p' 
 [ "$desktop_config_version" = "$VERSION" ] || fail 'desktop Tauri version differs from server'
 grep -Fx '[workspace]' "$REPOSITORY_DIR/apps/desktop/src-tauri/Cargo.toml" >/dev/null ||
     fail 'desktop crate is not isolated from the server Cargo workspace'
+
+for installer_name in \
+    'henosis-desktop-{version}-linux-x86_64.AppImage' \
+    'henosis-desktop-{version}-linux-x86_64.deb' \
+    'henosis-desktop-{version}-macos-aarch64.dmg' \
+    'henosis-desktop-{version}-macos-x86_64.dmg' \
+    'henosis-desktop-{version}-windows-x86_64.exe'
+do
+    grep -F "$installer_name" "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+        fail "desktop install guide omits $installer_name"
+done
+grep -F '`v0.1.0-alpha.6` contains headless archives' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+    fail 'desktop install guide misstates the current release'
+grep -F 'does not start or install Rift' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+    fail 'desktop install guide implies local Rift provisioning'
+grep -F 'not Apple-notarized' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+    fail 'desktop install guide omits the macOS trust boundary'
+grep -F 'not Authenticode-signed' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+    fail 'desktop install guide omits the Windows trust boundary'
 
 create_release_fixture
 "$REPOSITORY_DIR/scripts/validate-release-assets.sh" "$RELEASE_DIRECTORY" "$VERSION"

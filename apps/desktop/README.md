@@ -11,6 +11,10 @@ crate is intentionally a nested Cargo workspace. This keeps desktop platform
 dependencies out of the headless server workspace while preserving one source
 of truth.
 
+For the terminal-free operator path, supported installer names, and current
+platform trust warnings, use the public [desktop installation
+guide](../../docs/desktop-install.md).
+
 ## Local development
 
 Install the pinned JavaScript dependencies:
