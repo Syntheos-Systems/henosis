@@ -133,7 +133,7 @@ async function proveLiveConversation() {
   await conversation.waitForDisplayed();
   const connectionStatus = await $("[aria-label='Connection status']");
   await browser.waitUntil(
-    async () => (await connectionStatus.getText()) === "Connected",
+    async () => (await connectionStatus.getText()).trim().toLowerCase() === "connected",
     {
       timeout: 20_000,
       interval: 200,
