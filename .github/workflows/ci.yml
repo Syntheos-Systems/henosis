@@ -149,9 +149,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - shell: pwsh
         run: |
-          choco install protoc --version=35.1.0 --no-progress -y
+          ./scripts/setup-windows-protoc.ps1
           rustup toolchain install 1.94.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup target add --toolchain 1.94.0 x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - shell: pwsh
         run: cargo +1.94.0 test --locked -p synapse-tools confined_fs::tests --target x86_64-pc-windows-msvc
       - shell: pwsh
@@ -218,9 +220,11 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install protoc --version=35.1.0 --no-progress -y
+          ./scripts/setup-windows-protoc.ps1
           rustup toolchain install 1.94.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup target add --toolchain 1.94.0 ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - if: runner.os != 'Windows'
         run: cargo +1.94.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target ${{ matrix.target }}
       - if: runner.os != 'Windows'
