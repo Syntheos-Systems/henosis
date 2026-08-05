@@ -8,6 +8,7 @@ import { RoomDirectory } from "./components/RoomDirectory";
 import { createHenosisClient } from "./services/client";
 import type {
   ConnectionProfile,
+  HenosisClientError,
   HenosisClient,
   RiftConnectionInput,
   RoomDirectorySnapshot,
@@ -32,7 +33,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
   const [profile, setProfile] = useState<ConnectionProfile>();
   const [directory, setDirectory] = useState<RoomDirectorySnapshot>();
   const [selectedRoom, setSelectedRoom] = useState<RoomSummary>();
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<HenosisClientError>();
   const [notice, setNotice] = useState<string>();
 
   useEffect(() => {
@@ -50,7 +51,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
         setShowSetup(!result.directory);
       } catch (bootstrapError) {
         if (active) {
-          setError(normalizeClientError(bootstrapError).message);
+          setError(normalizeClientError(bootstrapError));
           setShowSetup(true);
         }
       } finally {
@@ -76,7 +77,9 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
       setProfile({ endpoint: input.endpoint, username: input.username });
       setShowSetup(false);
     } catch (connectionError) {
-      setError(normalizeClientError(connectionError).message);
+      const normalized = normalizeClientError(connectionError);
+      setError(normalized);
+      throw normalized;
     } finally {
       setConnecting(false);
     }
@@ -112,6 +115,12 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
   function handleRooms() {
     setSelectedRoom(undefined);
     setShowSetup(false);
+  }
+
+  /** Return to setup without carrying an obsolete connection failure. */
+  function handleReconnect() {
+    setError(undefined);
+    setShowSetup(true);
   }
 
   /** Display an honest boundary for controls scheduled after conversation integration. */
@@ -165,7 +174,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
           refreshing={refreshing}
           onOpenRoom={handleOpenRoom}
           onRefresh={handleRefresh}
-          onReconnect={() => setShowSetup(true)}
+          onReconnect={handleReconnect}
           onDeferredAction={handleDeferredAction}
         />
       )}

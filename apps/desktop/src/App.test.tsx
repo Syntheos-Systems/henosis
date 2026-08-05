@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { createFixtureRooms } from "./data/fixtureRooms";
 import { FixtureHenosisClient } from "./services/fixtureClient";
+import { HenosisClientError } from "./services/henosisClient";
 import type {
   BootstrapResult,
   HenosisClient,
@@ -32,6 +33,8 @@ function fixtureDirectory(): RoomDirectorySnapshot {
 class TestClient extends FixtureHenosisClient implements HenosisClient {
   /** Bootstrap response supplied by each test. */
   readonly bootstrapResult: BootstrapResult;
+  /** Optional connection failure used by recovery-path tests. */
+  readonly connectFailure?: unknown;
   /** Connect spy shared with assertions. */
   readonly connectSpy = vi.fn();
   /** Refresh spy shared with assertions. */
@@ -46,9 +49,10 @@ class TestClient extends FixtureHenosisClient implements HenosisClient {
   readonly unlistenRoomEventsSpy = vi.fn();
 
   /** Create a client with a selected bootstrap state. */
-  constructor(bootstrapResult: BootstrapResult) {
+  constructor(bootstrapResult: BootstrapResult, connectFailure?: unknown) {
     super();
     this.bootstrapResult = bootstrapResult;
+    this.connectFailure = connectFailure;
   }
 
   /** Return the selected initial state. */
@@ -59,6 +63,9 @@ class TestClient extends FixtureHenosisClient implements HenosisClient {
   /** Record credentials and return a fixture directory. */
   async connect(input: RiftConnectionInput): Promise<RoomDirectorySnapshot> {
     this.connectSpy(input);
+    if (this.connectFailure) {
+      throw this.connectFailure;
+    }
     return fixtureDirectory();
   }
 
@@ -210,17 +217,52 @@ describe("App", () => {
     render(<App client={client} />);
 
     expect(await screen.findByLabelText("Rift endpoint")).toBeInTheDocument();
+    expect(screen.getByLabelText("Rift endpoint")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("Rift endpoint"), {
+      target: { value: "https://rift.example.test" },
+    });
     fireEvent.change(screen.getByLabelText("Username"), {
       target: { value: "operator" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "secret-value" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Connect and view rooms" }));
+    fireEvent.click(screen.getByRole("button", { name: "Connect and open rooms" }));
 
     await waitFor(() => expect(client.connectSpy).toHaveBeenCalledOnce());
+    expect(client.connectSpy).toHaveBeenCalledWith({
+      endpoint: "https://rift.example.test",
+      username: "operator",
+      password: "secret-value",
+    });
     expect(
       await screen.findByRole("heading", { name: "Return to the current." }),
     ).toBeInTheDocument();
+  });
+
+  it("preserves non-secret fields and clears the password after App rejects a connection", async () => {
+    const client = new TestClient(
+      { requiresAuthentication: true },
+      new HenosisClientError("authentication", "Rift rejected that account."),
+    );
+    render(<App client={client} />);
+
+    const endpoint = await screen.findByLabelText("Rift endpoint");
+    fireEvent.change(endpoint, {
+      target: { value: "https://rift.example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "operator" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "rejected-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Connect and open rooms" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Password")).toHaveValue(""));
+    expect(endpoint).toHaveValue("https://rift.example.test");
+    expect(screen.getByLabelText("Username")).toHaveValue("operator");
+    expect(screen.getByRole("alert")).toHaveTextContent("Rift rejected that account.");
+    expect(screen.getByLabelText("Password")).toHaveFocus();
   });
 });
