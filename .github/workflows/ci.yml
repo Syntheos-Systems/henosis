@@ -163,6 +163,8 @@ jobs:
       - shell: pwsh
         run: cargo +1.94.0 test --locked -p syntheos-server windows_symbolic_link --target x86_64-pc-windows-msvc
       - shell: pwsh
+        run: cargo +1.94.0 test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib windows_atomic_json_replacement_overwrites_existing_file --target x86_64-pc-windows-msvc
+      - shell: pwsh
         run: |
           cargo +1.94.0 build --locked --release --no-default-features -p syntheos-server -p crucible --features crucible/http-bridge --target x86_64-pc-windows-msvc
       - shell: powershell

@@ -1310,25 +1310,96 @@ fn read_json<T: DeserializeOwned>(
     })
 }
 
+/// Persist a synced temporary file over its destination on supported platforms.
+fn persist_temporary_file(
+    temporary: tempfile::NamedTempFile,
+    path: &Path,
+) -> Result<(), std::io::Error> {
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+/// Replace one file from a synced temporary sibling and flush directory metadata on Unix.
+fn atomic_replace_bytes_with<F>(
+    path: &Path,
+    temporary_prefix: &str,
+    content: &[u8],
+    replace: F,
+) -> Result<(), std::io::Error>
+where
+    F: FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), std::io::Error>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic file target has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(temporary_prefix)
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(content)?;
+    temporary.as_file().sync_all()?;
+    replace(temporary, path)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Serialize before touching the destination and atomically replace it through an injectable seam.
+fn write_json_at_with_replace<T, F>(
+    path: &Path,
+    temporary_prefix: &str,
+    value: &T,
+    encode_error: &str,
+    save_error: &str,
+    replace: F,
+) -> Result<(), CommandError>
+where
+    T: Serialize,
+    F: FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), std::io::Error>,
+{
+    let content = serde_json::to_vec_pretty(value)
+        .map_err(|_| CommandError::new(CommandErrorKind::Storage, encode_error))?;
+    atomic_replace_bytes_with(path, temporary_prefix, &content, replace)
+        .map_err(|_| CommandError::new(CommandErrorKind::Storage, save_error))
+}
+
+/// Atomically write one JSON value through the platform replacement primitive.
+fn write_json_at<T: Serialize>(
+    path: &Path,
+    temporary_prefix: &str,
+    value: &T,
+    encode_error: &str,
+    save_error: &str,
+) -> Result<(), CommandError> {
+    write_json_at_with_replace(
+        path,
+        temporary_prefix,
+        value,
+        encode_error,
+        save_error,
+        persist_temporary_file,
+    )
+}
+
 /// Write one native JSON record without placing it in browser storage.
 fn write_json<T: Serialize>(
     app: &AppHandle,
     filename: &str,
     value: &T,
 ) -> Result<(), CommandError> {
-    let path = app_data_file(app, filename)?;
-    let content = serde_json::to_vec_pretty(value).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not encode its connection data.",
-        )
-    })?;
-    fs::write(path, content).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not save its connection data.",
-        )
-    })
+    write_json_at(
+        &app_data_file(app, filename)?,
+        ".henosis-connection-",
+        value,
+        "Henosis could not encode its connection data.",
+        "Henosis could not save its connection data. Check free space and application-data permissions, then try again.",
+    )
 }
 
 /// Normalize and validate the Rift origin stored in a read-marker key.
@@ -1418,63 +1489,14 @@ fn read_room_read_markers_at(path: &Path) -> Result<Vec<RoomReadMarker>, Command
 
 /// Atomically replace one marker file through a synced temporary sibling.
 fn write_room_read_markers_at(path: &Path, markers: &[RoomReadMarker]) -> Result<(), CommandError> {
-    let parent = path.parent().ok_or_else(|| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not locate room history storage. Reopen the application and try again.",
-        )
-    })?;
-    fs::create_dir_all(parent).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not prepare room history storage. Check application-data permissions and try again.",
-        )
-    })?;
     let canonical = canonicalize_room_read_markers(markers)?;
-    let content = serde_json::to_vec_pretty(&canonical).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not encode room history state. Reopen the room and try again.",
-        )
-    })?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".rift-room-read-markers-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(|_| {
-            CommandError::new(
-                CommandErrorKind::Storage,
-                "Henosis could not create temporary room history storage. Check free space and application-data permissions, then try again.",
-            )
-        })?;
-    temporary.write_all(&content).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not write room history state. Check free space and try again.",
-        )
-    })?;
-    temporary.as_file().sync_all().map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not flush room history state. Check the application-data filesystem and try again.",
-        )
-    })?;
-    temporary.persist(path).map_err(|_| {
-        CommandError::new(
-            CommandErrorKind::Storage,
-            "Henosis could not replace room history state. Check application-data permissions and try again.",
-        )
-    })?;
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| {
-            CommandError::new(
-                CommandErrorKind::Storage,
-                "Henosis saved room history but could not flush its directory. Check the application-data filesystem before retrying.",
-            )
-        })?;
-    Ok(())
+    write_json_at(
+        path,
+        ".rift-room-read-markers-",
+        &canonical,
+        "Henosis could not encode room history state. Reopen the room and try again.",
+        "Henosis could not save room history state. Check free space and application-data permissions, then try again.",
+    )
 }
 
 /// Load the saved non-secret Rift endpoint and username.
@@ -1560,6 +1582,30 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary marker directory must exist");
         let path = directory.path().join(ROOM_READ_MARKERS_FILENAME);
         (directory, path)
+    }
+
+    /// Construct one non-secret profile for atomic persistence tests.
+    fn connection_profile(endpoint: &str, username: &str) -> ConnectionProfile {
+        ConnectionProfile {
+            endpoint: endpoint.into(),
+            username: username.into(),
+        }
+    }
+
+    /// Construct one sanitized room cache for atomic persistence tests.
+    fn room_cache(endpoint: &str, username: &str, fetched_at: &str) -> RoomDirectorySnapshot {
+        RoomDirectorySnapshot {
+            connection: Some(crate::model::SanitizedConnection {
+                endpoint: endpoint.into(),
+                username: username.into(),
+                user_id: format!("user-{username}"),
+                display_name: username.into(),
+            }),
+            rooms: Vec::new(),
+            source: DirectorySource::Live,
+            fetched_at: fetched_at.into(),
+            connected: true,
+        }
     }
 
     /// Construct one isolated authenticated client for native room ownership tests.
@@ -2531,5 +2577,116 @@ mod tests {
         assert!(matches!(error.kind, CommandErrorKind::Storage));
         assert!(error.message.contains(ROOM_READ_MARKERS_FILENAME));
         assert!(error.message.contains("Move"));
+    }
+
+    /// Failed profile and cache replacements preserve both last-known-good files.
+    #[test]
+    fn connection_json_replacement_failure_preserves_last_known_good_files() {
+        let directory = tempfile::tempdir().expect("temporary connection directory must exist");
+        let profile_path = directory.path().join("rift-profile.json");
+        let cache_path = directory.path().join("rift-room-cache.json");
+        let old_profile = connection_profile("https://old.example", "old-user");
+        let new_profile = connection_profile("https://new.example", "new-user");
+        let old_cache = room_cache("https://old.example", "old-user", "2026-08-04T12:00:00Z");
+        let new_cache = room_cache("https://new.example", "new-user", "2026-08-04T13:00:00Z");
+
+        write_json_at(
+            &profile_path,
+            ".profile-test-",
+            &old_profile,
+            "profile encode failure",
+            "profile save failure",
+        )
+        .expect("initial profile must persist");
+        write_json_at(
+            &cache_path,
+            ".cache-test-",
+            &old_cache,
+            "cache encode failure",
+            "cache save failure",
+        )
+        .expect("initial cache must persist");
+
+        let profile_error = write_json_at_with_replace(
+            &profile_path,
+            ".profile-test-",
+            &new_profile,
+            "profile encode failure",
+            "profile save failure",
+            |_temporary, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected profile replacement failure",
+                ))
+            },
+        )
+        .expect_err("profile replacement must fail");
+        let cache_error = write_json_at_with_replace(
+            &cache_path,
+            ".cache-test-",
+            &new_cache,
+            "cache encode failure",
+            "cache save failure",
+            |_temporary, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cache replacement failure",
+                ))
+            },
+        )
+        .expect_err("cache replacement must fail");
+
+        assert!(matches!(profile_error.kind, CommandErrorKind::Storage));
+        assert!(matches!(cache_error.kind, CommandErrorKind::Storage));
+        let stored_profile: ConnectionProfile = serde_json::from_slice(
+            &fs::read(&profile_path).expect("old profile must remain readable"),
+        )
+        .expect("old profile must remain valid JSON");
+        let stored_cache: RoomDirectorySnapshot =
+            serde_json::from_slice(&fs::read(&cache_path).expect("old cache must remain readable"))
+                .expect("old cache must remain valid JSON");
+        assert_eq!(stored_profile.endpoint, old_profile.endpoint);
+        assert_eq!(stored_profile.username, old_profile.username);
+        assert_eq!(stored_cache.fetched_at, old_cache.fetched_at);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("connection directory must remain readable")
+                .count(),
+            2
+        );
+    }
+
+    /// Windows replacement overwrites an existing JSON file through the supported primitive.
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_json_replacement_overwrites_existing_file() {
+        let directory = tempfile::tempdir().expect("temporary connection directory must exist");
+        let path = directory.path().join("rift-profile.json");
+        let old_profile = connection_profile("https://old.example", "old-user");
+        let new_profile = connection_profile("https://new.example", "new-user");
+
+        write_json_at(
+            &path,
+            ".profile-test-",
+            &old_profile,
+            "profile encode failure",
+            "profile save failure",
+        )
+        .expect("initial Windows profile must persist");
+        write_json_at(
+            &path,
+            ".profile-test-",
+            &new_profile,
+            "profile encode failure",
+            "profile save failure",
+        )
+        .expect("replacement Windows profile must persist");
+
+        let stored: ConnectionProfile = serde_json::from_slice(
+            &fs::read(&path).expect("replacement profile must remain readable"),
+        )
+        .expect("replacement profile must remain valid JSON");
+        assert_eq!(stored.endpoint, new_profile.endpoint);
+        assert_eq!(stored.username, new_profile.username);
     }
 }

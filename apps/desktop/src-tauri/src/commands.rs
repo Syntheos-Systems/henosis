@@ -12,10 +12,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::gateway::{ROOM_CONVERSATION_EVENT, RiftGateway, RiftGatewayError, spawn_rift_gateway};
 use crate::model::{
-    BootstrapResult, CommandError, CommandErrorKind, MessagePage, PendingRoomAttachment,
-    RiftConnectionInput, RoomConversationCommandResult, RoomConversationEvent,
-    RoomConversationEventEnvelope, RoomConversationSnapshot, RoomDirectorySnapshot, RoomMessage,
-    RoomPermissions, RoomSummary,
+    BootstrapResult, CommandError, CommandErrorKind, ConnectionProfile, MessagePage,
+    PendingRoomAttachment, RiftConnectionInput, RoomConversationCommandResult,
+    RoomConversationEvent, RoomConversationEventEnvelope, RoomConversationSnapshot,
+    RoomDirectorySnapshot, RoomMessage, RoomPermissions, RoomSummary,
 };
 use crate::reconcile::{
     MessagePageSource, RECONCILE_PAGE_SIZE, ReconcileError, reconcile_open_room, unread_boundary,
@@ -498,13 +498,35 @@ fn read_cursor_for_room(
         .map(|marker| marker.last_read_message_id))
 }
 
+/// Reject orphaned or mismatched cache data before building a saved-state setup result.
+fn bootstrap_from_saved_state(
+    saved_profile: Option<ConnectionProfile>,
+    directory: Option<RoomDirectorySnapshot>,
+    requires_authentication: bool,
+) -> BootstrapResult {
+    let directory = directory.filter(|snapshot| {
+        let Some(profile) = saved_profile.as_ref() else {
+            return false;
+        };
+        snapshot.connection.as_ref().is_some_and(|connection| {
+            connection.endpoint.as_str() == profile.endpoint.as_str()
+                && connection.username.as_str() == profile.username.as_str()
+        })
+    });
+    BootstrapResult {
+        saved_profile,
+        directory,
+        requires_authentication,
+    }
+}
+
 /// Build a setup result from non-secret profile and cached-room state.
 fn setup_bootstrap(app: &AppHandle) -> Result<BootstrapResult, CommandError> {
-    Ok(BootstrapResult {
-        saved_profile: read_profile(app)?,
-        directory: read_room_cache(app)?,
-        requires_authentication: true,
-    })
+    Ok(bootstrap_from_saved_state(
+        read_profile(app)?,
+        read_room_cache(app)?,
+        true,
+    ))
 }
 
 /// Load live native state when possible and otherwise expose honest cached setup data.
@@ -530,11 +552,11 @@ pub async fn bootstrap(
             state.clear_session()?;
             setup_bootstrap(&app)
         }
-        Err(RiftError::Network(_)) => Ok(BootstrapResult {
-            saved_profile: read_profile(&app)?,
-            directory: read_room_cache(&app)?,
-            requires_authentication: false,
-        }),
+        Err(RiftError::Network(_)) => Ok(bootstrap_from_saved_state(
+            read_profile(&app)?,
+            read_room_cache(&app)?,
+            false,
+        )),
         Err(error) => Err(error.into()),
     }
 }
@@ -1029,6 +1051,66 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::model::{DirectorySource, SanitizedConnection};
+
+    /// Construct one saved non-secret profile for bootstrap recovery tests.
+    fn bootstrap_profile(endpoint: &str, username: &str) -> ConnectionProfile {
+        ConnectionProfile {
+            endpoint: endpoint.into(),
+            username: username.into(),
+        }
+    }
+
+    /// Construct one sanitized cached directory for bootstrap recovery tests.
+    fn bootstrap_cache(endpoint: &str, username: &str) -> RoomDirectorySnapshot {
+        RoomDirectorySnapshot {
+            connection: Some(SanitizedConnection {
+                endpoint: endpoint.into(),
+                username: username.into(),
+                user_id: format!("user-{username}"),
+                display_name: username.into(),
+            }),
+            rooms: Vec::new(),
+            source: DirectorySource::Cached,
+            fetched_at: "2026-08-04T12:00:00Z".into(),
+            connected: false,
+        }
+    }
+
+    /// Saved setup exposes cache only when both files name the same Rift account.
+    #[test]
+    fn bootstrap_rejects_partial_or_mismatched_profile_cache_pairs() {
+        let profile = bootstrap_profile("https://rift.example", "operator");
+        let matching = bootstrap_from_saved_state(
+            Some(profile.clone()),
+            Some(bootstrap_cache("https://rift.example", "operator")),
+            true,
+        );
+        let mismatched = bootstrap_from_saved_state(
+            Some(profile.clone()),
+            Some(bootstrap_cache("https://other.example", "other-user")),
+            false,
+        );
+        let orphaned = bootstrap_from_saved_state(
+            None,
+            Some(bootstrap_cache("https://rift.example", "operator")),
+            true,
+        );
+
+        assert!(matching.directory.is_some());
+        assert!(matching.requires_authentication);
+        assert!(mismatched.directory.is_none());
+        assert!(!mismatched.requires_authentication);
+        assert_eq!(
+            mismatched
+                .saved_profile
+                .expect("saved profile must remain available for recovery")
+                .username,
+            profile.username
+        );
+        assert!(orphaned.directory.is_none());
+        assert!(orphaned.saved_profile.is_none());
+    }
 
     /// Records transport calls and returns deterministic sanitized room data.
     struct FakeRoomTransport {
