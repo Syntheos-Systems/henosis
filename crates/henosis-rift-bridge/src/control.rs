@@ -163,14 +163,58 @@ pub async fn serve(
     approved_tx: mpsc::Sender<PendingProposal>,
 ) -> Result<(), crate::error::BridgeError> {
     let bind_addr = config.validate(&[])?;
-    let state = ControlState {
-        registry,
-        approved_tx,
-        auth_token: config.auth_token.clone(),
-    };
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| crate::error::BridgeError::Execution(format!("control bind failed: {e}")))?;
+    serve_bound(listener, config.auth_token, registry, approved_tx).await
+}
+
+/// Serve the control API on a listener the caller has already reserved.
+///
+/// A configured port of zero accepts the operating system-assigned listener
+/// port. Non-zero addresses must exactly match the listener, preserving the
+/// same validation boundary as [`serve`].
+#[doc(hidden)]
+pub async fn serve_on_listener(
+    config: ControlConfig,
+    listener: tokio::net::TcpListener,
+    registry: ApprovalRegistry,
+    approved_tx: mpsc::Sender<PendingProposal>,
+) -> Result<(), crate::error::BridgeError> {
+    let configured_addr = config.validate(&[])?;
+    let bound_addr = listener.local_addr().map_err(|error| {
+        crate::error::BridgeError::Execution(format!(
+            "control listener address unavailable: {error}"
+        ))
+    })?;
+    let address_matches = configured_addr.ip() == bound_addr.ip()
+        && (configured_addr.port() == 0 || configured_addr.port() == bound_addr.port());
+    if !address_matches {
+        return Err(crate::error::BridgeError::Config(format!(
+            "control listener {bound_addr} does not match configured address {configured_addr}"
+        )));
+    }
+
+    serve_bound(listener, config.auth_token, registry, approved_tx).await
+}
+
+/// Run the control router on a validated, bound listener.
+async fn serve_bound(
+    listener: tokio::net::TcpListener,
+    auth_token: String,
+    registry: ApprovalRegistry,
+    approved_tx: mpsc::Sender<PendingProposal>,
+) -> Result<(), crate::error::BridgeError> {
+    let bind_addr = listener.local_addr().map_err(|error| {
+        crate::error::BridgeError::Execution(format!(
+            "control listener address unavailable: {error}"
+        ))
+    })?;
+    let state = ControlState {
+        registry,
+        approved_tx,
+        auth_token,
+    };
     tracing::info!("control server listening on {bind_addr}");
     axum::serve(listener, router(state))
         .await

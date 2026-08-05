@@ -14,36 +14,37 @@ use henosis_rift_bridge::execution::approval::{
 use henosis_rift_bridge::execution::{PendingProposal, ProposalId};
 use tokio::sync::mpsc;
 
-/// Bring up the control server on a dedicated port and return its base URL.
+/// Bring up the control server on an operating system-assigned port.
 ///
-/// Each test uses a distinct port so they can run concurrently under the
-/// default test harness without racing for a bind address.
+/// Binding before the server task is spawned removes fixed-port collisions and
+/// lets startup failures surface before a request can report connection refused.
 async fn serve_control(
-    port: u16,
     registry: ApprovalRegistry,
-) -> (String, mpsc::Receiver<PendingProposal>) {
+) -> (
+    String,
+    mpsc::Receiver<PendingProposal>,
+    tokio::task::JoinHandle<Result<(), henosis_rift_bridge::error::BridgeError>>,
+) {
     let (tx, rx) = mpsc::channel::<PendingProposal>(8);
     let config = ControlConfig {
-        bind_addr: format!("127.0.0.1:{port}"),
+        bind_addr: "127.0.0.1:0".to_string(),
         auth_token: "smoke-token-that-is-at-least-32-bytes".to_string(),
         allow_insecure_remote: false,
     };
-    tokio::spawn(async move {
-        let _ = control::serve(config, registry, tx).await;
-    });
-
-    // Wait for the listener rather than sleeping a fixed amount.
-    let base = format!("http://127.0.0.1:{port}");
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
+        .await
+        .expect("bind control listener");
+    let address = listener
+        .local_addr()
+        .expect("read control listener address");
+    let server = tokio::spawn(control::serve_on_listener(config, listener, registry, tx));
+    tokio::task::yield_now().await;
+    if server.is_finished() {
+        let outcome = server.await.expect("control server task panicked");
+        panic!("control server exited during startup: {outcome:?}");
     }
-    (base, rx)
+
+    (format!("http://{address}"), rx, server)
 }
 
 /// Register a proposal the operator will act on.
@@ -88,7 +89,7 @@ async fn act(client: &reqwest::Client, base: &str, id: ProposalId, action: &str)
 async fn held_approval_is_visible_and_cancellable_while_paused() {
     let registry = ApprovalRegistry::new(1800);
     let id = seed(&registry);
-    let (base, mut approved_rx) = serve_control(39217, registry.clone()).await;
+    let (base, mut approved_rx, server) = serve_control(registry.clone()).await;
     let client = reqwest::Client::new();
 
     // Operator approves while the bridge is paused.
@@ -130,6 +131,7 @@ async fn held_approval_is_visible_and_cancellable_while_paused() {
         registry.take_approved().is_empty(),
         "a rejected hold must never dispatch on unpause"
     );
+    server.abort();
 }
 
 /// A pending proposal is reported as pending, and unpause flushes a hold.
@@ -137,7 +139,7 @@ async fn held_approval_is_visible_and_cancellable_while_paused() {
 async fn unpause_dispatches_the_held_approval_exactly_once() {
     let registry = ApprovalRegistry::new(1800);
     let id = seed(&registry);
-    let (base, mut approved_rx) = serve_control(39218, registry.clone()).await;
+    let (base, mut approved_rx, server) = serve_control(registry.clone()).await;
     let client = reqwest::Client::new();
 
     // Before any decision it reads as pending.
@@ -172,6 +174,7 @@ async fn unpause_dispatches_the_held_approval_exactly_once() {
         .as_array()
         .expect("pending array")
         .is_empty());
+    server.abort();
 }
 
 /// Approving twice cannot queue two executions of the same task.
@@ -179,7 +182,7 @@ async fn unpause_dispatches_the_held_approval_exactly_once() {
 async fn second_approve_is_rejected_by_the_control_api() {
     let registry = ApprovalRegistry::new(1800);
     let id = seed(&registry);
-    let (base, _rx) = serve_control(39219, registry.clone()).await;
+    let (base, _rx, server) = serve_control(registry.clone()).await;
     let client = reqwest::Client::new();
 
     assert_eq!(act(&client, &base, id, "approve").await, 200);
@@ -188,4 +191,5 @@ async fn second_approve_is_rejected_by_the_control_api() {
         404,
         "an already-approved proposal is not approvable again"
     );
+    server.abort();
 }
