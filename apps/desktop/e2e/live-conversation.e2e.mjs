@@ -110,21 +110,55 @@ async function timelineText(timeline) {
   return timeline.getText();
 }
 
-/** Prove the visible UI uses the native client for live inbound and outbound traffic. */
+/** Prove fresh setup and live conversation traffic through the native client. */
 async function proveLiveConversation() {
   const { token, channelId } = await seedRift();
   assert.equal(await browser.execute(detectTauriRuntime), true);
 
   const endpointInput = await $("#rift-endpoint");
   await endpointInput.waitForDisplayed();
-  await endpointInput.setValue(RIFT_ENDPOINT);
-  await $("#rift-username").setValue(USERNAME);
-  await $("#rift-password").setValue(PASSWORD);
+  const usernameInput = await $("#rift-username");
+  const passwordInput = await $("#rift-password");
+  assert.deepEqual(
+    [
+      await endpointInput.getValue(),
+      await usernameInput.getValue(),
+      await passwordInput.getValue(),
+    ],
+    ["", "", ""],
+  );
 
-  const connectButton = await $("button=Connect and view rooms");
+  const setupProgress = await $("[aria-label='Setup progress']");
+  await setupProgress.waitForDisplayed();
+  const progressText = await setupProgress.getText();
+  assert.ok(progressText.includes("Install"));
+  assert.ok(progressText.includes("Connect"));
+  assert.ok(progressText.includes("Rooms"));
+  const currentStep = await $("[aria-label='Setup progress'] [aria-current='step']");
+  assert.match(await currentStep.getText(), /Connect/);
+
+  const prerequisite = await $("[aria-labelledby='rift-prerequisite-title']");
+  await prerequisite.waitForDisplayed();
+  assert.match(
+    await prerequisite.getText(),
+    /service address and account from your Rift operator/,
+  );
+  assert.match(
+    await prerequisite.getText(),
+    /Henosis desktop does not install or start Rift/,
+  );
+  await $("button=Use an already-running local Rift").waitForDisplayed();
+
+  await endpointInput.setValue(RIFT_ENDPOINT);
+  await usernameInput.setValue(USERNAME);
+  await passwordInput.setValue(PASSWORD);
+
+  const connectButton = await $("button=Connect and open rooms");
   await connectButton.waitForClickable();
   await connectButton.click();
 
+  const roomsHeading = await $("h1=Return to the current.");
+  await roomsHeading.waitForDisplayed();
   const continueButton = await $("button=Continue room");
   await continueButton.waitForClickable();
   await continueButton.click();
@@ -200,7 +234,7 @@ async function proveLiveConversation() {
 describe("compiled Henosis desktop with live Rift", function liveConversationSuite() {
   /** Exercise the native session, snapshot, WebSocket, event, and command paths. */
   it(
-    "receives a post-connect message without refresh and sends through the UI",
+    "starts fresh, reaches Rooms, and exchanges live messages through the UI",
     proveLiveConversation,
   );
 });
