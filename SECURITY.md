@@ -28,6 +28,13 @@ Production startup requires synchronous audit witnessing regardless of listen ad
 
 Review [scripts/known-incomplete.md](scripts/known-incomplete.md) before deployment. The Wasmtime component host is present, but extension loading is not yet connected to the production dispatcher. Existing in-process adapters therefore remain inside the Henosis process boundary.
 
+## Reviewed dependency exceptions
+
+The CI dependency gate rejects RustSec advisories except for two narrow, reviewed conditions:
+
+- `RUSTSEC-2023-0071` has no fixed `rsa` release. Henosis uses `jsonwebtoken` only with HMAC-SHA256 and YubiKey PIV only with ECDSA P-256, so the affected RSA private-key operation is outside supported execution paths. Remove this exception when the transitive dependency is fixed or removed.
+- `RUSTSEC-2026-0235` affects checked access to untrusted `rkyv` archives. Cargo locks `rust_decimal` 1.42.1's optional `rkyv` 0.7 dependency, but Henosis does not activate that feature or compile the crate. Before applying the exception, CI resolves all workspace features and targets and fails if affected `rkyv` code appears through a normal, build, or development edge. CI also fails when `rkyv` 0.7 leaves the lockfile so this exception must be removed rather than retained indefinitely.
+
 ## Release integrity
 
 Verify the SHA-256 entry in the release `SHA256SUMS` file before installation. The installers reject absent, ambiguous, malformed, or mismatched checksums and roll back an installation when initialization fails.
