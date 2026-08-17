@@ -1,6 +1,7 @@
 /** Contract tests for the stateful, network-free room conversation fixture. */
 import { describe, expect, it, vi } from "vitest";
 import type { RoomConversationEventEnvelope } from "../domain/conversation";
+import type { ApplyAgentRosterRequest } from "../domain/agentControl";
 import { FixtureHenosisClient } from "./fixtureClient";
 import { HenosisClientError } from "./henosisClient";
 
@@ -19,6 +20,313 @@ describe("FixtureHenosisClient", () => {
     expect(result.directory?.source).toBe("fixture");
     expect(result.directory?.rooms.length).toBeGreaterThanOrEqual(3);
     expect(serialized).not.toMatch(/access.?token|refresh.?token/i);
+  });
+
+  it("exposes dynamic capabilities and owned, foreign-owned, and unowned roster state", async () => {
+    const client = new FixtureHenosisClient();
+
+    const agents = await client.getMyAgents();
+    const catalog = await client.getAgentCapabilities("server-henosis");
+    const permissions = await client.getRoomPermissions("server-henosis");
+    const roster = await client.getRoomAgentRoster("server-henosis");
+    const serialized = JSON.stringify({ agents, catalog, permissions, roster });
+
+    expect(agents).toEqual([
+      expect.objectContaining({
+        id: "agent-mira",
+        ownerUserId: "fixture-user",
+      }),
+      expect.objectContaining({
+        id: "agent-lumen",
+        ownerUserId: "fixture-user",
+      }),
+    ]);
+    expect(catalog.harnesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "codex-cli",
+          models: expect.arrayContaining([
+            expect.objectContaining({ id: "gpt-5.6-sol" }),
+          ]),
+        }),
+        expect.objectContaining({
+          id: "claude-code",
+          models: expect.arrayContaining([
+            expect.objectContaining({ id: "claude-opus" }),
+            expect.objectContaining({ id: "claude-sonnet" }),
+          ]),
+        }),
+      ]),
+    );
+    expect(permissions).toEqual({
+      sendMessages: true,
+      attachFiles: true,
+      manageMessages: true,
+      manageServer: true,
+    });
+    expect(roster.seats).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agentIdentityId: "agent-mira",
+          agentUsername: "mira",
+          agentDisplayName: "Mira",
+          ownerHumanId: "fixture-user",
+          credentialReadiness: "hostSession",
+        }),
+        expect.objectContaining({
+          agentIdentityId: "agent-cinder",
+          agentUsername: "cinder",
+          agentDisplayName: "Cinder",
+          ownerHumanId: "human-steward",
+          credentialReadiness: "ready",
+        }),
+        expect.objectContaining({
+          agentIdentityId: "agent-imported",
+          agentUsername: "imported-scout",
+          agentDisplayName: "Imported scout",
+          ownerHumanId: null,
+          credentialReadiness: "attention",
+        }),
+      ]),
+    );
+    expect(serialized).not.toMatch(
+      /access.?token|refresh.?token|api.?key|private.?key|executable.?path|\/home\/|[A-Za-z]:\\\\/i,
+    );
+  });
+
+  it("returns detached dashboard data that cannot mutate fixture authority", async () => {
+    const client = new FixtureHenosisClient();
+    const agents = await client.getMyAgents();
+    const catalog = await client.getAgentCapabilities("server-henosis");
+    const roster = await client.getRoomAgentRoster("server-henosis");
+
+    (agents[0] as { displayName: string | null }).displayName = "Mutated";
+    (catalog.harnesses[0] as { label: string }).label = "Mutated";
+    (roster.seats[0].settings as Record<string, unknown>).effort = "mutated";
+
+    await expect(client.getMyAgents()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "agent-mira", displayName: "Mira" }),
+      ]),
+    );
+    await expect(client.getAgentCapabilities("server-henosis")).resolves.toEqual(
+      expect.objectContaining({
+        harnesses: expect.arrayContaining([
+          expect.objectContaining({ id: "codex-cli", label: "Codex CLI" }),
+        ]),
+      }),
+    );
+    await expect(client.getRoomAgentRoster("server-henosis")).resolves.toEqual(
+      expect.objectContaining({
+        seats: expect.arrayContaining([
+          expect.objectContaining({
+            seatId: "seat-mira",
+            settings: expect.objectContaining({ effort: "medium" }),
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("creates owned identities and claims a known imported roster identity", async () => {
+    const client = new FixtureHenosisClient();
+
+    const created = await client.createMyAgent("builder", "Builder");
+    const claimed = await client.claimAgent("agent-imported");
+    const agents = await client.getMyAgents();
+    const roster = await client.getRoomAgentRoster("server-henosis");
+
+    expect(created).toMatchObject({
+      id: "fixture-agent-created-1",
+      username: "builder",
+      displayName: "Builder",
+      ownerUserId: "fixture-user",
+    });
+    expect(claimed).toMatchObject({
+      id: "agent-imported",
+      ownerUserId: "fixture-user",
+    });
+    expect(agents.map((agent) => agent.id)).toEqual([
+      "agent-mira",
+      "agent-lumen",
+      "fixture-agent-created-1",
+      "agent-imported",
+    ]);
+    expect(
+      roster.seats.find((seat) => seat.agentIdentityId === "agent-imported"),
+    ).toMatchObject({
+      agentUsername: "imported-scout",
+      agentDisplayName: "Imported scout",
+      ownerHumanId: "fixture-user",
+    });
+    await expect(client.createMyAgent("builder", null)).rejects.toMatchObject({
+      kind: "conflict",
+      code: "agent_username_taken",
+    });
+  });
+
+  it("advances desired revision atomically and rejects a stale replacement", async () => {
+    const client = new FixtureHenosisClient();
+    const initial = await client.getRoomAgentRoster("server-henosis");
+    const update: ApplyAgentRosterRequest = {
+      expectedRevision: initial.desiredRevision,
+      seats: initial.seats.map((seat) => ({
+        seatId: seat.seatId,
+        agentIdentityId: seat.agentIdentityId,
+        harnessKey: seat.harnessKey,
+        modelKey: seat.modelKey,
+        settings: seat.settings,
+        credentialBindingId: seat.credentialBindingId,
+        enabled: seat.enabled,
+        position: seat.position,
+      })),
+    };
+
+    const applied = await client.applyRoomAgentRoster("server-henosis", update);
+
+    expect(applied).toMatchObject({
+      desiredRevision: 3,
+      activeRevision: 2,
+      lastGoodRevision: 2,
+      runtimeActivation: "pending",
+      runtimeErrorCode: null,
+    });
+    expect(applied.seats.every((seat) => seat.configurationRevision === 3)).toBe(
+      true,
+    );
+    expect(applied.seats[0]).toMatchObject({
+      agentUsername: "mira",
+      agentDisplayName: "Mira",
+    });
+    await expect(
+      client.applyRoomAgentRoster("server-henosis", update),
+    ).rejects.toMatchObject({
+      kind: "conflict",
+      code: "revision_conflict",
+    });
+  });
+
+  it("rejects an unknown roster identity without mutating retained state", async () => {
+    const client = new FixtureHenosisClient();
+    const initial = await client.getRoomAgentRoster("server-henosis");
+    const unknownIdentityUpdate: ApplyAgentRosterRequest = {
+      expectedRevision: initial.desiredRevision,
+      seats: initial.seats.map((seat, index) => ({
+        seatId: seat.seatId,
+        agentIdentityId: index === 0 ? "agent-unknown" : seat.agentIdentityId,
+        harnessKey: seat.harnessKey,
+        modelKey: seat.modelKey,
+        settings: seat.settings,
+        credentialBindingId: seat.credentialBindingId,
+        enabled: seat.enabled,
+        position: seat.position,
+      })),
+    };
+
+    await expect(
+      client.applyRoomAgentRoster("server-henosis", unknownIdentityUpdate),
+    ).rejects.toMatchObject({
+      kind: "validation",
+      code: "fixture_agent_not_found",
+    });
+    await expect(client.getRoomAgentRoster("server-henosis")).resolves.toEqual(
+      initial,
+    );
+  });
+
+  it("transitions pending activation to active or injected failure without losing last-good", async () => {
+    const successfulClient = new FixtureHenosisClient();
+    const successfulInitial = await successfulClient.getRoomAgentRoster(
+      "server-henosis",
+    );
+    const successfulUpdate: ApplyAgentRosterRequest = {
+      expectedRevision: successfulInitial.desiredRevision,
+      seats: successfulInitial.seats.map((seat) => ({
+        seatId: seat.seatId,
+        agentIdentityId: seat.agentIdentityId,
+        harnessKey: seat.harnessKey,
+        modelKey: seat.modelKey,
+        settings: seat.settings,
+        credentialBindingId: seat.credentialBindingId,
+        enabled: seat.enabled,
+        position: seat.position,
+      })),
+    };
+    const pending = await successfulClient.applyRoomAgentRoster(
+      "server-henosis",
+      successfulUpdate,
+    );
+    const active = await successfulClient.getRoomBridgeStatus("server-henosis");
+
+    expect(pending.runtimeActivation).toBe("pending");
+    expect(active).toMatchObject({
+      desiredRevision: 3,
+      activeRevision: 3,
+      lastGoodRevision: 3,
+      runtimeActivation: "active",
+    });
+
+    const failedClient = new FixtureHenosisClient();
+    failedClient.injectNextAgentActivationFailure(
+      "server-henosis",
+      "fixture_start_failed",
+    );
+    const failedInitial = await failedClient.getRoomAgentRoster("server-henosis");
+    const failedUpdate: ApplyAgentRosterRequest = {
+      expectedRevision: failedInitial.desiredRevision,
+      seats: failedInitial.seats.map((seat) => ({
+        seatId: seat.seatId,
+        agentIdentityId: seat.agentIdentityId,
+        harnessKey: seat.harnessKey,
+        modelKey: seat.modelKey,
+        settings: seat.settings,
+        credentialBindingId: seat.credentialBindingId,
+        enabled: seat.enabled,
+        position: seat.position,
+      })),
+    };
+    await failedClient.applyRoomAgentRoster("server-henosis", failedUpdate);
+    const failed = await failedClient.getRoomBridgeStatus("server-henosis");
+    const retrying = await failedClient.reconcileRoomBridge("server-henosis");
+    const recovered = await failedClient.getRoomBridgeStatus("server-henosis");
+
+    expect(failed).toMatchObject({
+      desiredRevision: 3,
+      activeRevision: 2,
+      lastGoodRevision: 2,
+      runtimeActivation: "failed",
+      runtimeErrorCode: "fixture_start_failed",
+    });
+    expect(retrying).toMatchObject({
+      desiredRevision: 3,
+      activeRevision: 2,
+      lastGoodRevision: 2,
+      runtimeActivation: "pending",
+    });
+    expect(recovered).toMatchObject({
+      desiredRevision: 3,
+      activeRevision: 3,
+      lastGoodRevision: 3,
+      runtimeActivation: "active",
+    });
+  });
+
+  it("pauses and resumes one known fixture bridge without changing revisions", async () => {
+    const client = new FixtureHenosisClient();
+
+    const paused = await client.pauseRoomBridge("server-henosis");
+    const resumed = await client.resumeRoomBridge("server-henosis");
+
+    expect(paused).toMatchObject({
+      paused: true,
+      desiredRevision: 2,
+      activeRevision: 2,
+    });
+    expect(resumed).toMatchObject({
+      paused: false,
+      desiredRevision: 2,
+      activeRevision: 2,
+    });
   });
 
   it("opens an oldest-first live window and paginates only from its oldest cursor", async () => {

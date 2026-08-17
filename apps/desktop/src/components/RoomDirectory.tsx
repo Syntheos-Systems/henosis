@@ -26,8 +26,8 @@ export interface RoomDirectoryProps {
   onRefresh(): void;
   /** Open first-run setup to repair a connection. */
   onReconnect(): void;
-  /** Explain an operation scheduled for a later delivery slice. */
-  onDeferredAction(action: string): void;
+  /** Explain an operation unavailable in the current build. */
+  onUnavailableAction(action: string): void;
 }
 
 /** Render the room selector with an automatic newest-room pin. */
@@ -37,7 +37,7 @@ export function RoomDirectory({
   onOpenRoom,
   onRefresh,
   onReconnect,
-  onDeferredAction,
+  onUnavailableAction,
 }: RoomDirectoryProps) {
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<Set<RoomFilter>>(new Set());
@@ -81,7 +81,7 @@ export function RoomDirectory({
           <button
             className="button button-secondary"
             type="button"
-            onClick={() => onDeferredAction("Join room")}
+            onClick={() => onUnavailableAction("Join room")}
           >
             <DoorOpen aria-hidden="true" />
             Join room
@@ -89,7 +89,7 @@ export function RoomDirectory({
           <button
             className="button button-primary"
             type="button"
-            onClick={() => onDeferredAction("New room")}
+            onClick={() => onUnavailableAction("New room")}
           >
             <Plus aria-hidden="true" />
             New room
@@ -172,7 +172,7 @@ export function RoomDirectory({
                   <RoomRow
                     room={room}
                     onOpen={onOpenRoom}
-                    onManage={() => onDeferredAction(`Manage #${room.name}`)}
+                    onManage={() => onUnavailableAction(`Manage #${room.name}`)}
                     key={room.id}
                   />
                 ))}

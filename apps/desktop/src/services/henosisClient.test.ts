@@ -4,6 +4,7 @@ import type {
   RoomConversationEventEnvelope,
   RoomConversationSnapshot,
 } from "../domain/conversation";
+import type { ApplyAgentRosterRequest } from "../domain/agentControl";
 
 /** Hoisted Tauri spies installed before the adapter module is evaluated. */
 const { invokeMock, listenMock } = vi.hoisted(() => ({
@@ -107,6 +108,52 @@ describe("TauriHenosisClient", () => {
     ]);
   });
 
+  it("maps every dashboard operation to its exact native command and payload", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const update: ApplyAgentRosterRequest = {
+      expectedRevision: 7,
+      seats: [
+        {
+          seatId: "seat-1",
+          agentIdentityId: "agent-1",
+          harnessKey: "codex-cli",
+          modelKey: "gpt-5.6-sol",
+          settings: { effort: "medium" },
+          credentialBindingId: null,
+          enabled: true,
+          position: 0,
+        },
+      ],
+    };
+    const client = new TauriHenosisClient();
+
+    await client.getMyAgents();
+    await client.createMyAgent("builder", "Builder");
+    await client.claimAgent("agent-imported");
+    await client.getAgentCapabilities("server-1");
+    await client.getRoomPermissions("server-1");
+    await client.getRoomAgentRoster("server-1");
+    await client.applyRoomAgentRoster("server-1", update);
+    await client.getRoomBridgeStatus("server-1");
+    await client.pauseRoomBridge("server-1");
+    await client.resumeRoomBridge("server-1");
+    await client.reconcileRoomBridge("server-1");
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["get_my_agents"],
+      ["create_my_agent", { username: "builder", displayName: "Builder" }],
+      ["claim_agent", { agentIdentityId: "agent-imported" }],
+      ["get_agent_capabilities", { serverId: "server-1" }],
+      ["get_room_permissions", { serverId: "server-1" }],
+      ["get_room_agent_roster", { serverId: "server-1" }],
+      ["apply_room_agent_roster", { serverId: "server-1", update }],
+      ["get_room_bridge_status", { serverId: "server-1" }],
+      ["pause_room_bridge", { serverId: "server-1" }],
+      ["resume_room_bridge", { serverId: "server-1" }],
+      ["reconcile_room_bridge", { serverId: "server-1" }],
+    ]);
+  });
+
   it("forwards only the fixed-channel event payload and returns native cleanup", async () => {
     const cleanup = vi.fn();
     const listener = vi.fn();
@@ -159,6 +206,20 @@ describe("TauriHenosisClient", () => {
 });
 
 describe("normalizeClientError", () => {
+  it("preserves stable dashboard recovery kinds and machine codes", () => {
+    const result = normalizeClientError({
+      kind: "conflict",
+      code: "revision_conflict",
+      message: "Reload the current roster before applying again.",
+    });
+
+    expect(result).toMatchObject({
+      kind: "conflict",
+      code: "revision_conflict",
+      message: "Reload the current roster before applying again.",
+    });
+  });
+
   it("preserves structured native recovery guidance", () => {
     const result = normalizeClientError({
       kind: "network",

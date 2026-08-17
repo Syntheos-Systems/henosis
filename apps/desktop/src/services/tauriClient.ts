@@ -2,12 +2,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentCapabilityCatalog,
+  AgentRosterSnapshot,
+  ApplyAgentRosterRequest,
+  OwnedAgentIdentity,
+  RoomBridgeStatus,
+} from "../domain/agentControl";
+import type {
   MessagePage,
   PendingRoomAttachment,
   RoomConversationCommandResult,
   RoomConversationEventEnvelope,
   RoomConversationSnapshot,
   RoomMessage,
+  RoomPermissions,
 } from "../domain/conversation";
 import type {
   BootstrapResult,
@@ -38,9 +46,92 @@ export class TauriHenosisClient implements HenosisClient {
     return this.invokeCommand<RoomDirectorySnapshot>("get_room_directory");
   }
 
-  /** Clear native token state and ask Rift to end refresh sessions later. */
+  /** Clear native token state and request Rift refresh-session cleanup. */
   async disconnect(): Promise<void> {
     await this.invokeCommand<void>("disconnect_rift");
+  }
+
+  /** List persistent agent identities owned by the signed-in Rift human. */
+  async getMyAgents(): Promise<OwnedAgentIdentity[]> {
+    return this.invokeCommand<OwnedAgentIdentity[]>("get_my_agents");
+  }
+
+  /** Create one persistent agent identity owned by the signed-in Rift human. */
+  async createMyAgent(
+    username: string,
+    displayName: string | null,
+  ): Promise<OwnedAgentIdentity> {
+    return this.invokeCommand<OwnedAgentIdentity>("create_my_agent", {
+      username,
+      displayName,
+    });
+  }
+
+  /** Claim one known imported agent identity for the signed-in Rift human. */
+  async claimAgent(agentIdentityId: string): Promise<OwnedAgentIdentity> {
+    return this.invokeCommand<OwnedAgentIdentity>("claim_agent", {
+      agentIdentityId,
+    });
+  }
+
+  /** Load one deployment-discovered execution capability catalog. */
+  async getAgentCapabilities(serverId: string): Promise<AgentCapabilityCatalog> {
+    return this.invokeCommand<AgentCapabilityCatalog>("get_agent_capabilities", {
+      serverId,
+    });
+  }
+
+  /** Load authoritative permissions for the signed-in room member. */
+  async getRoomPermissions(serverId: string): Promise<RoomPermissions> {
+    return this.invokeCommand<RoomPermissions>("get_room_permissions", {
+      serverId,
+    });
+  }
+
+  /** Load the authoritative desired room roster and activation state. */
+  async getRoomAgentRoster(serverId: string): Promise<AgentRosterSnapshot> {
+    return this.invokeCommand<AgentRosterSnapshot>("get_room_agent_roster", {
+      serverId,
+    });
+  }
+
+  /** Apply one optimistic complete room roster replacement. */
+  async applyRoomAgentRoster(
+    serverId: string,
+    update: ApplyAgentRosterRequest,
+  ): Promise<AgentRosterSnapshot> {
+    return this.invokeCommand<AgentRosterSnapshot>("apply_room_agent_roster", {
+      serverId,
+      update,
+    });
+  }
+
+  /** Load public pause and activation state for one room bridge. */
+  async getRoomBridgeStatus(serverId: string): Promise<RoomBridgeStatus> {
+    return this.invokeCommand<RoomBridgeStatus>("get_room_bridge_status", {
+      serverId,
+    });
+  }
+
+  /** Pause autonomous activity for one room bridge. */
+  async pauseRoomBridge(serverId: string): Promise<RoomBridgeStatus> {
+    return this.invokeCommand<RoomBridgeStatus>("pause_room_bridge", {
+      serverId,
+    });
+  }
+
+  /** Resume autonomous activity for one room bridge. */
+  async resumeRoomBridge(serverId: string): Promise<RoomBridgeStatus> {
+    return this.invokeCommand<RoomBridgeStatus>("resume_room_bridge", {
+      serverId,
+    });
+  }
+
+  /** Retry the current desired roster without creating another revision. */
+  async reconcileRoomBridge(serverId: string): Promise<AgentRosterSnapshot> {
+    return this.invokeCommand<AgentRosterSnapshot>("reconcile_room_bridge", {
+      serverId,
+    });
   }
 
   /** Open one exact room generation through native permissions and reconciliation. */

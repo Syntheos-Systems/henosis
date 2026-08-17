@@ -46,6 +46,7 @@ const CHILD_SECRET_NAMES = [
   "DATABASE_URL",
   "HENOSIS_RIFT_TEST_DATABASE_URL",
   "JWT_SECRET",
+  "AGENT_JWT_SECRET",
   "RIFT_BRIDGE_SECRET",
   "HENOSIS_E2E_PASSWORD",
 ];
@@ -681,6 +682,10 @@ async function runUnderVirtualDisplay() {
 async function runLiveE2e() {
   const databaseUrl = requireEnvironment("DATABASE_URL");
   const riftPort = parsePort("HENOSIS_E2E_RIFT_PORT", 4010);
+  const riftBridgePort = parsePort("HENOSIS_E2E_RIFT_BRIDGE_PORT", 4011);
+  if (riftBridgePort === riftPort) {
+    throw new Error("Rift public and bridge E2E ports must be distinct");
+  }
   const suffix = randomBytes(6).toString("hex");
   const testDirectory = await mkdtemp(join(tmpdir(), "henosis-desktop-e2e-"));
   const artifactRoot = process.env.HENOSIS_E2E_ARTIFACT_DIR
@@ -696,6 +701,7 @@ async function runLiveE2e() {
   const riftLog = join(artifactDirectory, "rift.log");
   const driverLog = join(artifactDirectory, "tauri-driver.log");
   const jwtSecret = randomBytes(32).toString("hex");
+  const agentJwtSecret = randomBytes(32).toString("hex");
   const bridgeSecret = randomBytes(32).toString("hex");
   const password = randomBytes(18).toString("base64url");
   const services = [];
@@ -736,6 +742,7 @@ async function runLiveE2e() {
 
   try {
     await requireAvailablePort(riftPort, "Rift");
+    await requireAvailablePort(riftBridgePort, "Rift bridge");
     await requireAvailablePort(DRIVER_PORT, "tauri-driver");
     await runCommand("tauri-driver", TAURI_DRIVER_PREFLIGHT_ARGUMENTS, {
       ownedServices: services,
@@ -807,8 +814,10 @@ async function runLiveE2e() {
       ...runtimeEnvironment,
       DATABASE_URL: databaseUrl,
       JWT_SECRET: jwtSecret,
+      AGENT_JWT_SECRET: agentJwtSecret,
       RIFT_BRIDGE_SECRET: bridgeSecret,
       LISTEN_ADDR: `${LOOPBACK_HOST}:${riftPort}`,
+      BRIDGE_LISTEN_ADDR: `${LOOPBACK_HOST}:${riftBridgePort}`,
       UPLOAD_DIR: uploadDirectory,
       RUST_LOG: "henosis_rift_server=info,tower_http=warn",
     };
@@ -889,7 +898,13 @@ async function runLiveE2e() {
     }
     process.off("SIGINT", handleInterrupt);
     process.off("SIGTERM", handleTermination);
-    const diagnosticSecrets = [databaseUrl, jwtSecret, bridgeSecret, password];
+    const diagnosticSecrets = [
+      databaseUrl,
+      jwtSecret,
+      agentJwtSecret,
+      bridgeSecret,
+      password,
+    ];
     await writeFile(
       harnessLog,
       formatHarnessDiagnostic(stage, runError, cleanupError, diagnosticSecrets),

@@ -123,11 +123,9 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
     setShowSetup(true);
   }
 
-  /** Display an honest boundary for controls scheduled after conversation integration. */
-  function handleDeferredAction(action: string) {
-    setNotice(
-      `${action} is not wired in this slice. It will land as a visible Henosis control, not a terminal workaround.`,
-    );
+  /** Explain when the current build does not expose a requested control. */
+  function handleUnavailableAction(action: string) {
+    setNotice(`${action} is not available in this build.`);
   }
 
   if (loading) {
@@ -150,10 +148,10 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
       directory={directory}
       connection={directory.connection}
       onRooms={handleRooms}
-      onDeferredWorkspace={handleDeferredAction}
+      onUnavailableWorkspace={handleUnavailableAction}
     >
       {notice ? (
-        <div className="slice-notice" role="status">
+        <div className="feature-notice" role="status">
           <p>{notice}</p>
           <button type="button" onClick={() => setNotice(undefined)}>
             Dismiss
@@ -165,8 +163,10 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
         <RoomDetail
           client={client}
           room={selectedRoom}
+          currentUserId={directory.connection?.userId}
           onBack={handleRooms}
-          onDeferredAction={handleDeferredAction}
+          onReconnect={handleReconnect}
+          onUnavailableAction={handleUnavailableAction}
         />
       ) : (
         <RoomDirectory
@@ -175,7 +175,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
           onOpenRoom={handleOpenRoom}
           onRefresh={handleRefresh}
           onReconnect={handleReconnect}
-          onDeferredAction={handleDeferredAction}
+          onUnavailableAction={handleUnavailableAction}
         />
       )}
     </AppShell>

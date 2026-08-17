@@ -14,9 +14,13 @@ use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::model::{
-    CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, MessagePage,
-    PendingRoomAttachment, RiftConnectionInput, RoomAttachment, RoomDirectorySnapshot, RoomMessage,
-    RoomParticipant, RoomPermissions, RoomStatus, RoomSummary, SanitizedConnection,
+    AgentCapabilityCatalog, AgentCredentialReadiness, AgentRosterSnapshot, AgentSeatDraft,
+    AgentSeatSnapshot, ApplyAgentRosterRequest, CommandError, CommandErrorKind, ConnectionProfile,
+    DashboardCommandError, DashboardErrorKind, DirectorySource, HarnessCapability,
+    HarnessCredentialMode, MessagePage, ModelCapability, OwnedAgentIdentity, PendingRoomAttachment,
+    RiftConnectionInput, RoomAttachment, RoomBridgeStatus, RoomDirectorySnapshot, RoomMessage,
+    RoomParticipant, RoomPermissions, RoomStatus, RoomSummary, RuntimeActivationState,
+    SanitizedConnection, SettingCapability, SettingCapabilityControl, SettingCapabilityOption,
 };
 
 /// Hard cap on retained file bytes for one replayable native upload request.
@@ -159,6 +163,8 @@ pub enum RiftError {
     Remote {
         /// HTTP status returned by Rift.
         status: StatusCode,
+        /// Stable machine-readable code supplied by Rift when available.
+        code: Option<String>,
         /// Safe error body supplied by Rift.
         message: String,
     },
@@ -206,6 +212,94 @@ impl From<RiftError> for CommandError {
             ),
             RiftError::Protocol(_) | RiftError::ProtocolContract => Self::new(
                 CommandErrorKind::Protocol,
+                "Rift returned data this Henosis build does not understand.",
+            ),
+        }
+    }
+}
+
+/// Preserve stable Rift codes for dashboard recovery behavior without exposing native internals.
+impl From<RiftError> for DashboardCommandError {
+    /// Convert one native Rift failure into a code-aware dashboard command failure.
+    fn from(error: RiftError) -> Self {
+        match error {
+            RiftError::Validation(message) => {
+                Self::new(DashboardErrorKind::Validation, "validation", message)
+            }
+            RiftError::CredentialsRejected => Self::new(
+                DashboardErrorKind::Authentication,
+                "credentials_rejected",
+                "Rift did not accept that username and password.",
+            ),
+            RiftError::Authentication => Self::new(
+                DashboardErrorKind::Authentication,
+                "authentication",
+                "Your Rift session expired. Sign in again to continue.",
+            ),
+            RiftError::InvalidMessageCursor => Self::new(
+                DashboardErrorKind::Protocol,
+                "invalid_message_cursor",
+                "Rift no longer recognizes the saved message cursor.",
+            ),
+            RiftError::Network(_) => Self::new(
+                DashboardErrorKind::Network,
+                "network",
+                "Henosis could not reach Rift. Check the endpoint and service status.",
+            ),
+            RiftError::FileRead(_) | RiftError::FileTask(_) => Self::new(
+                DashboardErrorKind::Storage,
+                "storage",
+                "Henosis could not read native storage.",
+            ),
+            RiftError::Encoding(_) => Self::new(
+                DashboardErrorKind::Protocol,
+                "request_encoding",
+                "Henosis could not encode the Rift request.",
+            ),
+            RiftError::Remote {
+                status,
+                code,
+                message: _,
+            } => {
+                let kind = match status {
+                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+                        if code.as_deref() == Some("bad_request") =>
+                    {
+                        DashboardErrorKind::Validation
+                    }
+                    StatusCode::CONFLICT => DashboardErrorKind::Conflict,
+                    StatusCode::FORBIDDEN => DashboardErrorKind::Forbidden,
+                    StatusCode::UNPROCESSABLE_ENTITY | StatusCode::SERVICE_UNAVAILABLE => {
+                        DashboardErrorKind::Unavailable
+                    }
+                    _ => DashboardErrorKind::Protocol,
+                };
+                let code = code.unwrap_or_else(|| "rift_error".into());
+                let message = match code.as_str() {
+                    "revision_conflict" => {
+                        "The room roster changed while you were editing. Refresh before applying again."
+                    }
+                    "bad_request" => "Rift rejected the submitted dashboard values.",
+                    "conflict" => "That dashboard operation conflicts with current Rift state.",
+                    "forbidden" => {
+                        "You do not have permission to perform that dashboard operation."
+                    }
+                    "capability_unavailable" => {
+                        "The selected harness, model, or setting is unavailable on this host."
+                    }
+                    "credential_not_ready" => {
+                        "The selected credential binding is not ready for use."
+                    }
+                    "managed_runtime_unavailable" => {
+                        "This Rift deployment does not have a managed agent runtime available."
+                    }
+                    _ => "Rift rejected the dashboard request. Refresh and try again.",
+                };
+                Self::new(kind, code, message)
+            }
+            RiftError::Protocol(_) | RiftError::ProtocolContract => Self::new(
+                DashboardErrorKind::Protocol,
+                "protocol",
                 "Rift returned data this Henosis build does not understand.",
             ),
         }
@@ -398,6 +492,504 @@ struct DeleteRoomMessageResponse {
 struct ApiBridgeStatus {
     /// Whether autonomous bridge activity is paused.
     paused: bool,
+}
+
+/// Rift identity response retained only until an owned dashboard identity is validated.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAgentIdentity {
+    /// Stable Rift agent user identifier.
+    id: String,
+    /// Unique Rift username.
+    username: String,
+    /// Optional human-facing display name.
+    display_name: Option<String>,
+    /// Human owner, or none only for an unclaimed roster identity.
+    owner_user_id: Option<String>,
+}
+
+/// JSON body used to create one persistent identity for the signed-in human.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateOwnedAgentRequest<'a> {
+    /// Unique Rift username requested by the human.
+    username: &'a str,
+    /// Optional human-facing display name.
+    display_name: Option<&'a str>,
+}
+
+/// Durable activation state returned by Rift's managed-agent routes.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ApiRuntimeActivationState {
+    /// No managed revision has been requested.
+    Idle,
+    /// A desired revision is waiting for reconciliation.
+    Pending,
+    /// The desired revision is running and proven good.
+    Active,
+    /// The desired revision failed validation, preflight, or startup.
+    Failed,
+}
+
+/// Credential selection behavior declared by a Rift execution harness.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ApiHarnessCredentialMode {
+    /// Use only an authenticated host session.
+    HostSession,
+    /// Allow a host session or an opaque binding.
+    OptionalBinding,
+    /// Require an opaque binding.
+    RequiredBinding,
+}
+
+/// Opaque credential readiness returned for one roster seat.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ApiAgentCredentialReadiness {
+    /// The harness will use an authenticated host session.
+    HostSession,
+    /// The opaque binding is currently usable.
+    Ready,
+    /// No usable host session or binding is available.
+    Unavailable,
+    /// The binding needs human intervention.
+    Attention,
+}
+
+/// One selectable model returned by Rift's dynamic capability catalog.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiModelCapability {
+    /// Stable model identifier.
+    id: String,
+    /// Human-facing model name.
+    label: String,
+    /// Whether the current host can use the model.
+    available: bool,
+    /// Safe explanation when unavailable.
+    unavailable_reason: Option<String>,
+}
+
+/// One selectable value for a dynamic capability setting.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiSettingCapabilityOption {
+    /// Stable submitted value.
+    id: String,
+    /// Human-facing option name.
+    label: String,
+}
+
+/// Typed control metadata returned for one dynamic capability setting.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiSettingCapabilityControl {
+    /// Choose one value from a finite list.
+    Select {
+        /// Allowed values in display order.
+        options: Vec<ApiSettingCapabilityOption>,
+    },
+    /// Choose a bounded stepped integer.
+    Integer {
+        /// Inclusive lower bound.
+        minimum: i64,
+        /// Inclusive upper bound.
+        maximum: i64,
+        /// Positive increment measured from the lower bound.
+        step: i64,
+    },
+    /// Choose an enabled or disabled value.
+    Boolean,
+}
+
+/// One typed non-secret setting returned by a Rift harness.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiSettingCapability {
+    /// Stable settings-object key.
+    id: String,
+    /// Human-facing setting name.
+    label: String,
+    /// Whether every seat must submit a value.
+    required: bool,
+    /// Control type and validation constraints.
+    control: ApiSettingCapabilityControl,
+}
+
+/// One execution harness returned by Rift's dynamic catalog.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiHarnessCapability {
+    /// Stable harness identifier.
+    id: String,
+    /// Human-facing harness name.
+    label: String,
+    /// Whether the current host can use the harness.
+    available: bool,
+    /// Safe explanation when unavailable.
+    unavailable_reason: Option<String>,
+    /// Supported credential selection behavior.
+    credential_mode: ApiHarnessCredentialMode,
+    /// Models currently declared by the harness.
+    models: Vec<ApiModelCapability>,
+    /// Typed non-secret settings currently declared by the harness.
+    settings: Vec<ApiSettingCapability>,
+}
+
+/// Generation-stamped execution catalog returned by Rift.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAgentCapabilityCatalog {
+    /// Opaque catalog generation.
+    generation: String,
+    /// Deployment-discovered harnesses.
+    harnesses: Vec<ApiHarnessCapability>,
+}
+
+/// One desired seat returned by or submitted to Rift.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAgentSeat {
+    /// Stable seat identifier.
+    seat_id: String,
+    /// Persistent Rift agent identity occupying the seat.
+    agent_user_id: String,
+    /// Dynamic catalog harness identifier.
+    harness_id: String,
+    /// Dynamic catalog model identifier.
+    model_id: String,
+    /// Typed non-secret harness settings.
+    settings: serde_json::Value,
+    /// Opaque deployment-owned credential binding identifier.
+    credential_binding_id: Option<String>,
+    /// Whether the seat participates in room responses.
+    enabled: bool,
+    /// Non-negative display and execution order.
+    position: i32,
+}
+
+/// One desired seat enriched by Rift with public identity, ownership, and readiness.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAgentSeatView {
+    /// Submitted non-secret seat configuration.
+    seat: ApiAgentSeat,
+    /// Unique public username of the selected agent identity.
+    agent_username: String,
+    /// Optional human-facing name of the selected agent identity.
+    agent_display_name: Option<String>,
+    /// Current human owner, or none for an imported unclaimed identity.
+    owner_user_id: Option<String>,
+    /// Deployment-resolved readiness without credential contents.
+    credential_readiness: ApiAgentCredentialReadiness,
+}
+
+/// Current durable room roster returned by Rift.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAgentRoster {
+    /// Rift server whose bridge the roster configures.
+    server_id: String,
+    /// Latest desired immutable revision.
+    desired_revision: Option<i64>,
+    /// Revision currently running in the bridge.
+    active_revision: Option<i64>,
+    /// Most recent revision proven to start successfully.
+    last_good_revision: Option<i64>,
+    /// Current asynchronous activation state.
+    apply_state: ApiRuntimeActivationState,
+    /// Stable activation failure code.
+    apply_error_code: Option<String>,
+    /// Bounded safe activation failure detail.
+    apply_error_message: Option<String>,
+    /// Desired seats in server-authoritative position order.
+    seats: Vec<ApiAgentSeatView>,
+}
+
+/// Optimistic whole-roster replacement encoded for Rift.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiApplyAgentRosterRequest {
+    /// Desired revision observed before the local draft was edited.
+    expected_revision: Option<i64>,
+    /// Complete next roster.
+    seats: Vec<ApiAgentSeat>,
+}
+
+/// Public pause and activation status returned by Rift.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiRoomBridgeStatus {
+    /// Whether autonomous bridge activity is paused.
+    paused: bool,
+    /// Latest desired immutable revision.
+    desired_revision: Option<i64>,
+    /// Revision currently running in the bridge.
+    active_revision: Option<i64>,
+    /// Most recent revision proven to start successfully.
+    last_good_revision: Option<i64>,
+    /// Current asynchronous activation state.
+    apply_state: ApiRuntimeActivationState,
+    /// Stable activation failure code.
+    apply_error_code: Option<String>,
+    /// Bounded safe activation failure detail.
+    apply_error_message: Option<String>,
+}
+
+/// Validation and conversion of an identity returned by an ownership endpoint.
+impl ApiAgentIdentity {
+    /// Require the ownership field promised by list, create, and claim responses.
+    fn into_owned(self) -> Result<OwnedAgentIdentity, RiftError> {
+        let owner_user_id = self.owner_user_id.ok_or(RiftError::ProtocolContract)?;
+        if self.id.is_empty() || self.username.is_empty() || owner_user_id.is_empty() {
+            return Err(RiftError::ProtocolContract);
+        }
+        Ok(OwnedAgentIdentity {
+            id: self.id,
+            username: self.username,
+            display_name: self.display_name,
+            owner_user_id,
+        })
+    }
+}
+
+/// Conversion of Rift activation state into the desktop-owned dashboard contract.
+impl From<ApiRuntimeActivationState> for RuntimeActivationState {
+    /// Preserve every durable lifecycle state without interpreting runtime failure as HTTP failure.
+    fn from(state: ApiRuntimeActivationState) -> Self {
+        match state {
+            ApiRuntimeActivationState::Idle => Self::Idle,
+            ApiRuntimeActivationState::Pending => Self::Pending,
+            ApiRuntimeActivationState::Active => Self::Active,
+            ApiRuntimeActivationState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Conversion of Rift credential modes into the desktop-owned catalog contract.
+impl From<ApiHarnessCredentialMode> for HarnessCredentialMode {
+    /// Preserve the host-versus-binding selection contract.
+    fn from(mode: ApiHarnessCredentialMode) -> Self {
+        match mode {
+            ApiHarnessCredentialMode::HostSession => Self::HostSession,
+            ApiHarnessCredentialMode::OptionalBinding => Self::OptionalBinding,
+            ApiHarnessCredentialMode::RequiredBinding => Self::RequiredBinding,
+        }
+    }
+}
+
+/// Conversion of Rift credential readiness into its opaque desktop state.
+impl From<ApiAgentCredentialReadiness> for AgentCredentialReadiness {
+    /// Preserve readiness without adding credential contents or locators.
+    fn from(readiness: ApiAgentCredentialReadiness) -> Self {
+        match readiness {
+            ApiAgentCredentialReadiness::HostSession => Self::HostSession,
+            ApiAgentCredentialReadiness::Ready => Self::Ready,
+            ApiAgentCredentialReadiness::Unavailable => Self::Unavailable,
+            ApiAgentCredentialReadiness::Attention => Self::Attention,
+        }
+    }
+}
+
+/// Conversion of one Rift model into the desktop-owned catalog contract.
+impl From<ApiModelCapability> for ModelCapability {
+    /// Retain only public availability metadata.
+    fn from(model: ApiModelCapability) -> Self {
+        Self {
+            id: model.id,
+            label: model.label,
+            available: model.available,
+            unavailable_reason: model.unavailable_reason,
+        }
+    }
+}
+
+/// Conversion of one Rift setting option into the desktop-owned catalog contract.
+impl From<ApiSettingCapabilityOption> for SettingCapabilityOption {
+    /// Retain one stable value and human-facing label.
+    fn from(option: ApiSettingCapabilityOption) -> Self {
+        Self {
+            id: option.id,
+            label: option.label,
+        }
+    }
+}
+
+/// Conversion of Rift setting controls into the desktop-owned tagged contract.
+impl From<ApiSettingCapabilityControl> for SettingCapabilityControl {
+    /// Preserve dynamic validation constraints without a hardcoded client allowlist.
+    fn from(control: ApiSettingCapabilityControl) -> Self {
+        match control {
+            ApiSettingCapabilityControl::Select { options } => Self::Select {
+                options: options.into_iter().map(Into::into).collect(),
+            },
+            ApiSettingCapabilityControl::Integer {
+                minimum,
+                maximum,
+                step,
+            } => Self::Integer {
+                minimum,
+                maximum,
+                step,
+            },
+            ApiSettingCapabilityControl::Boolean => Self::Boolean,
+        }
+    }
+}
+
+/// Conversion of one Rift setting into the desktop-owned catalog contract.
+impl From<ApiSettingCapability> for SettingCapability {
+    /// Retain only typed non-secret setting metadata.
+    fn from(setting: ApiSettingCapability) -> Self {
+        Self {
+            id: setting.id,
+            label: setting.label,
+            required: setting.required,
+            control: setting.control.into(),
+        }
+    }
+}
+
+/// Conversion of one Rift harness into the desktop-owned catalog contract.
+impl From<ApiHarnessCapability> for HarnessCapability {
+    /// Retain public capability metadata discovered by the connected deployment.
+    fn from(harness: ApiHarnessCapability) -> Self {
+        Self {
+            id: harness.id,
+            label: harness.label,
+            available: harness.available,
+            unavailable_reason: harness.unavailable_reason,
+            credential_mode: harness.credential_mode.into(),
+            models: harness.models.into_iter().map(Into::into).collect(),
+            settings: harness.settings.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Conversion of the Rift catalog envelope into the desktop-owned contract.
+impl From<ApiAgentCapabilityCatalog> for AgentCapabilityCatalog {
+    /// Preserve the generation and dynamic harness order.
+    fn from(catalog: ApiAgentCapabilityCatalog) -> Self {
+        Self {
+            generation: catalog.generation,
+            harnesses: catalog.harnesses.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Conversion of an editable desktop seat into Rift's request contract.
+impl From<AgentSeatDraft> for ApiAgentSeat {
+    /// Rename desktop semantic fields to Rift's wire field names.
+    fn from(seat: AgentSeatDraft) -> Self {
+        Self {
+            seat_id: seat.seat_id,
+            agent_user_id: seat.agent_identity_id,
+            harness_id: seat.harness_key,
+            model_id: seat.model_key,
+            settings: seat.settings,
+            credential_binding_id: seat.credential_binding_id,
+            enabled: seat.enabled,
+            position: seat.position,
+        }
+    }
+}
+
+/// Reduce runtime failure metadata to a bounded code and desktop-owned safe guidance.
+fn sanitized_runtime_failure(
+    state: ApiRuntimeActivationState,
+    code: Option<String>,
+    upstream_message: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let has_failure = matches!(state, ApiRuntimeActivationState::Failed)
+        || code.is_some()
+        || upstream_message.is_some();
+    if !has_failure {
+        return (None, None);
+    }
+    let code = code
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or_else(|| "runtime_failed".into());
+    let message = match code.as_str() {
+        "credential_not_ready" => "One or more agent credentials are not ready for use.",
+        "bridge_start_failed" | "bridge_unavailable" => {
+            "The managed room bridge could not start or remain available."
+        }
+        "store_unavailable" => "The managed runtime could not read the desired room roster.",
+        _ => "The desired room roster revision could not be activated.",
+    };
+    (Some(code), Some(message.into()))
+}
+
+/// Conversion of one Rift roster response into a revision-aware dashboard snapshot.
+impl From<ApiAgentRoster> for AgentRosterSnapshot {
+    /// Flatten each safe seat while retaining roster-wide activation state on every card.
+    fn from(roster: ApiAgentRoster) -> Self {
+        let (runtime_error_code, runtime_error_message) = sanitized_runtime_failure(
+            roster.apply_state,
+            roster.apply_error_code,
+            roster.apply_error_message,
+        );
+        let runtime_activation = RuntimeActivationState::from(roster.apply_state);
+        let seats = roster
+            .seats
+            .into_iter()
+            .map(|view| AgentSeatSnapshot {
+                seat_id: view.seat.seat_id,
+                agent_identity_id: view.seat.agent_user_id,
+                agent_username: view.agent_username,
+                agent_display_name: view.agent_display_name,
+                owner_human_id: view.owner_user_id,
+                harness_key: view.seat.harness_id,
+                model_key: view.seat.model_id,
+                settings: view.seat.settings,
+                credential_binding_id: view.seat.credential_binding_id,
+                enabled: view.seat.enabled,
+                position: view.seat.position,
+                configuration_revision: roster.desired_revision,
+                credential_readiness: view.credential_readiness.into(),
+                runtime_activation,
+            })
+            .collect();
+        Self {
+            server_id: roster.server_id,
+            desired_revision: roster.desired_revision,
+            active_revision: roster.active_revision,
+            last_good_revision: roster.last_good_revision,
+            runtime_activation,
+            runtime_error_code,
+            runtime_error_message,
+            seats,
+        }
+    }
+}
+
+/// Conversion of Rift bridge status into the desktop-owned dashboard contract.
+impl From<ApiRoomBridgeStatus> for RoomBridgeStatus {
+    /// Rename activation fields while retaining safe durable failure detail.
+    fn from(status: ApiRoomBridgeStatus) -> Self {
+        let (runtime_error_code, runtime_error_message) = sanitized_runtime_failure(
+            status.apply_state,
+            status.apply_error_code,
+            status.apply_error_message,
+        );
+        Self {
+            paused: status.paused,
+            desired_revision: status.desired_revision,
+            active_revision: status.active_revision,
+            last_good_revision: status.last_good_revision,
+            runtime_activation: status.apply_state.into(),
+            runtime_error_code,
+            runtime_error_message,
+        }
+    }
 }
 
 /// Rift JSON error body.
@@ -781,10 +1373,14 @@ async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Res
         {
             return Err(RiftError::InvalidMessageCursor);
         }
-        let message = body
-            .map(|body| body.error)
-            .unwrap_or_else(|| "Unexpected service error".into());
-        return Err(RiftError::Remote { status, message });
+        let (code, message) = body
+            .map(|body| (body.code, body.error))
+            .unwrap_or_else(|| (None, "Unexpected service error".into()));
+        return Err(RiftError::Remote {
+            status,
+            code,
+            message,
+        });
     }
     response.json().await.map_err(RiftError::Protocol)
 }
@@ -1056,6 +1652,141 @@ pub(crate) async fn room_permissions(
         encode_path_segment(server_id)?
     );
     get_json(client, &path).await
+}
+
+/// Build one authenticated dashboard route beneath an opaque Rift server identifier.
+fn server_dashboard_path(server_id: &str, suffix: &str) -> Result<String, RiftError> {
+    Ok(format!(
+        "api/servers/{}/{}",
+        encode_path_segment(server_id)?,
+        suffix
+    ))
+}
+
+/// List persistent agent identities owned by the signed-in Rift human.
+pub(crate) async fn get_my_agents(
+    client: &AuthenticatedRiftClient,
+) -> Result<Vec<OwnedAgentIdentity>, RiftError> {
+    let agents: Vec<ApiAgentIdentity> = get_json(client, "api/users/@me/agents").await?;
+    agents
+        .into_iter()
+        .map(ApiAgentIdentity::into_owned)
+        .collect()
+}
+
+/// Create one persistent agent identity owned by the signed-in Rift human.
+pub(crate) async fn create_my_agent(
+    client: &AuthenticatedRiftClient,
+    username: &str,
+    display_name: Option<&str>,
+) -> Result<OwnedAgentIdentity, RiftError> {
+    let request = ReplayableRequest::json(
+        Method::POST,
+        "api/users/@me/agents",
+        &CreateOwnedAgentRequest {
+            username,
+            display_name,
+        },
+    )?;
+    let agent: ApiAgentIdentity = send_json_request(client, &request).await?;
+    agent.into_owned()
+}
+
+/// Claim one known imported agent identity for the signed-in Rift human.
+pub(crate) async fn claim_agent(
+    client: &AuthenticatedRiftClient,
+    agent_identity_id: &str,
+) -> Result<OwnedAgentIdentity, RiftError> {
+    let path = format!(
+        "api/agents/{}/claim",
+        encode_path_segment(agent_identity_id)?
+    );
+    let agent: ApiAgentIdentity = send_json_request(client, &ReplayableRequest::post(path)).await?;
+    agent.into_owned()
+}
+
+/// Fetch the deployment-discovered execution catalog for one room server.
+pub(crate) async fn get_agent_capabilities(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<AgentCapabilityCatalog, RiftError> {
+    let path = server_dashboard_path(server_id, "agent-capabilities")?;
+    let catalog: ApiAgentCapabilityCatalog = get_json(client, &path).await?;
+    Ok(catalog.into())
+}
+
+/// Fetch the server-authoritative desired roster and asynchronous activation state.
+pub(crate) async fn get_room_agent_roster(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<AgentRosterSnapshot, RiftError> {
+    let path = server_dashboard_path(server_id, "agent-roster")?;
+    let roster: ApiAgentRoster = get_json(client, &path).await?;
+    Ok(roster.into())
+}
+
+/// Apply one optimistic whole-roster replacement with its observed desired revision.
+pub(crate) async fn apply_room_agent_roster(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+    update: ApplyAgentRosterRequest,
+) -> Result<AgentRosterSnapshot, RiftError> {
+    let path = server_dashboard_path(server_id, "agent-roster")?;
+    let body = ApiApplyAgentRosterRequest {
+        expected_revision: update.expected_revision,
+        seats: update.seats.into_iter().map(Into::into).collect(),
+    };
+    let request = ReplayableRequest::json(Method::PUT, path, &body)?;
+    let roster: ApiAgentRoster = send_json_request(client, &request).await?;
+    Ok(roster.into())
+}
+
+/// Fetch public pause and activation state for one room bridge.
+pub(crate) async fn get_room_bridge_status(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<RoomBridgeStatus, RiftError> {
+    let path = server_dashboard_path(server_id, "bridge/status")?;
+    let status: ApiRoomBridgeStatus = get_json(client, &path).await?;
+    Ok(status.into())
+}
+
+/// Pause autonomous agent activity for one room bridge.
+pub(crate) async fn pause_room_bridge(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<RoomBridgeStatus, RiftError> {
+    mutate_room_bridge(client, server_id, "bridge/pause").await
+}
+
+/// Resume autonomous agent activity for one room bridge.
+pub(crate) async fn resume_room_bridge(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<RoomBridgeStatus, RiftError> {
+    mutate_room_bridge(client, server_id, "bridge/resume").await
+}
+
+/// Retry the current desired roster revision without creating another revision.
+pub(crate) async fn reconcile_room_bridge(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+) -> Result<AgentRosterSnapshot, RiftError> {
+    let path = server_dashboard_path(server_id, "bridge/reconcile")?;
+    let roster: ApiAgentRoster = send_json_request(client, &ReplayableRequest::post(path)).await?;
+    Ok(roster.into())
+}
+
+/// Execute one body-free bridge mutation and normalize its public status response.
+async fn mutate_room_bridge(
+    client: &AuthenticatedRiftClient,
+    server_id: &str,
+    suffix: &str,
+) -> Result<RoomBridgeStatus, RiftError> {
+    let path = server_dashboard_path(server_id, suffix)?;
+    let status: ApiRoomBridgeStatus =
+        send_json_request(client, &ReplayableRequest::post(path)).await?;
+    Ok(status.into())
 }
 
 /// Fetch messages strictly older than one opaque cursor and return them oldest-first.
@@ -1938,12 +2669,369 @@ mod tests {
         })
     }
 
+    /// Build one complete owned-agent response for dashboard HTTP tests.
+    fn dashboard_agent_response(id: &str, username: &str) -> Value {
+        json!({
+            "id": id,
+            "username": username,
+            "displayName": "Cartographer",
+            "ownerUserId": "human-1",
+        })
+    }
+
+    /// Build one dynamic capability catalog with every supported setting control.
+    fn dashboard_capability_response() -> Value {
+        json!({
+            "generation": "catalog-7",
+            "harnesses": [{
+                "id": "codex-cli",
+                "label": "Codex CLI",
+                "available": true,
+                "unavailableReason": null,
+                "credentialMode": "host_session",
+                "models": [{
+                    "id": "gpt-5.6-sol",
+                    "label": "GPT-5.6 Sol",
+                    "available": true,
+                    "unavailableReason": null,
+                }],
+                "settings": [
+                    {
+                        "id": "effort",
+                        "label": "Reasoning effort",
+                        "required": true,
+                        "control": {
+                            "type": "select",
+                            "options": [{ "id": "medium", "label": "Medium" }],
+                        },
+                    },
+                    {
+                        "id": "turnLimit",
+                        "label": "Turn limit",
+                        "required": false,
+                        "control": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "step": 1,
+                        },
+                    },
+                    {
+                        "id": "webSearch",
+                        "label": "Web search",
+                        "required": false,
+                        "control": { "type": "boolean" },
+                    },
+                ],
+            }],
+        })
+    }
+
+    /// Build one room roster response with a selectable activation state.
+    fn dashboard_roster_response(
+        apply_state: &str,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Value {
+        json!({
+            "serverId": "server-1",
+            "desiredRevision": 7,
+            "activeRevision": 6,
+            "lastGoodRevision": 6,
+            "applyState": apply_state,
+            "applyErrorCode": error_code,
+            "applyErrorMessage": error_message,
+            "seats": [{
+                "seat": {
+                    "seatId": "seat-1",
+                    "agentUserId": "agent-1",
+                    "harnessId": "codex-cli",
+                    "modelId": "gpt-5.6-sol",
+                    "settings": { "effort": "medium" },
+                    "credentialBindingId": null,
+                    "enabled": true,
+                    "position": 0,
+                },
+                "agentUsername": "cartographer",
+                "agentDisplayName": "Cartographer",
+                "ownerUserId": "human-1",
+                "credentialReadiness": "host_session",
+            }],
+        })
+    }
+
+    /// Build one bridge status response with a selectable pause and activation state.
+    fn dashboard_bridge_status_response(
+        paused: bool,
+        apply_state: &str,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Value {
+        json!({
+            "paused": paused,
+            "desiredRevision": 7,
+            "activeRevision": 6,
+            "lastGoodRevision": 6,
+            "applyState": apply_state,
+            "applyErrorCode": error_code,
+            "applyErrorMessage": error_message,
+        })
+    }
+
+    /// Construct one whole-roster update for dashboard HTTP tests.
+    fn dashboard_roster_update() -> ApplyAgentRosterRequest {
+        ApplyAgentRosterRequest {
+            expected_revision: Some(7),
+            seats: vec![AgentSeatDraft {
+                seat_id: "seat-1".into(),
+                agent_identity_id: "agent-1".into(),
+                harness_key: "codex-cli".into(),
+                model_key: "gpt-5.6-sol".into(),
+                settings: json!({ "effort": "medium" }),
+                credential_binding_id: None,
+                enabled: true,
+                position: 0,
+            }],
+        }
+    }
+
     /// Report whether one byte slice contains another without assuming UTF-8 file data.
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty()
             && haystack
                 .windows(needle.len())
                 .any(|window| window == needle)
+    }
+
+    /// Dashboard operations use exact authenticated routes and translate only sanitized bodies.
+    #[tokio::test]
+    async fn dashboard_read_context_http_operations_use_exact_routes_and_wire_contracts() {
+        let server = MockHttpServer::start(10, move |request| {
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer access-token")
+            );
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/api/users/@me/agents") => MockResponse::json(
+                    200,
+                    json!([dashboard_agent_response("agent-1", "cartographer")]),
+                ),
+                ("POST", "/api/users/@me/agents") => {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&request.body)
+                            .expect("create body must be JSON"),
+                        json!({
+                            "username": "builder",
+                            "displayName": "Builder",
+                        })
+                    );
+                    assert_eq!(request.content_type.as_deref(), Some("application/json"));
+                    MockResponse::json(200, dashboard_agent_response("agent-2", "builder"))
+                }
+                ("POST", "/api/agents/agent-legacy/claim") => {
+                    assert!(request.body.is_empty());
+                    MockResponse::json(
+                        200,
+                        dashboard_agent_response("agent-legacy", "legacy-scout"),
+                    )
+                }
+                ("GET", "/api/servers/server-1/agent-capabilities") => {
+                    MockResponse::json(200, dashboard_capability_response())
+                }
+                ("GET", "/api/servers/server-1/agent-roster") => {
+                    MockResponse::json(200, dashboard_roster_response("active", None, None))
+                }
+                ("PUT", "/api/servers/server-1/agent-roster") => {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&request.body)
+                            .expect("roster update body must be JSON"),
+                        json!({
+                            "expectedRevision": 7,
+                            "seats": [{
+                                "seatId": "seat-1",
+                                "agentUserId": "agent-1",
+                                "harnessId": "codex-cli",
+                                "modelId": "gpt-5.6-sol",
+                                "settings": { "effort": "medium" },
+                                "credentialBindingId": null,
+                                "enabled": true,
+                                "position": 0,
+                            }],
+                        })
+                    );
+                    assert_eq!(request.content_type.as_deref(), Some("application/json"));
+                    MockResponse::json(200, dashboard_roster_response("pending", None, None))
+                }
+                ("GET", "/api/servers/server-1/bridge/status") => MockResponse::json(
+                    200,
+                    dashboard_bridge_status_response(false, "active", None, None),
+                ),
+                ("POST", "/api/servers/server-1/bridge/pause") => {
+                    assert!(request.body.is_empty());
+                    MockResponse::json(
+                        200,
+                        dashboard_bridge_status_response(true, "active", None, None),
+                    )
+                }
+                ("POST", "/api/servers/server-1/bridge/resume") => {
+                    assert!(request.body.is_empty());
+                    MockResponse::json(
+                        200,
+                        dashboard_bridge_status_response(false, "active", None, None),
+                    )
+                }
+                ("POST", "/api/servers/server-1/bridge/reconcile") => {
+                    assert!(request.body.is_empty());
+                    MockResponse::json(200, dashboard_roster_response("pending", None, None))
+                }
+                other => panic!("unexpected dashboard request: {other:?}"),
+            }
+        });
+        let client = authenticated_client(&server.endpoint, "access-token", "refresh-token");
+
+        let owned = get_my_agents(&client)
+            .await
+            .expect("owned identities must load");
+        let created = create_my_agent(&client, "builder", Some("Builder"))
+            .await
+            .expect("owned identity must be created");
+        let claimed = claim_agent(&client, "agent-legacy")
+            .await
+            .expect("known imported identity must be claimed");
+        let catalog = get_agent_capabilities(&client, "server-1")
+            .await
+            .expect("catalog must load");
+        let roster = get_room_agent_roster(&client, "server-1")
+            .await
+            .expect("roster must load");
+        let applied = apply_room_agent_roster(&client, "server-1", dashboard_roster_update())
+            .await
+            .expect("whole roster update must apply");
+        let status = get_room_bridge_status(&client, "server-1")
+            .await
+            .expect("bridge status must load");
+        let paused = pause_room_bridge(&client, "server-1")
+            .await
+            .expect("bridge must pause");
+        let resumed = resume_room_bridge(&client, "server-1")
+            .await
+            .expect("bridge must resume");
+        let reconciled = reconcile_room_bridge(&client, "server-1")
+            .await
+            .expect("desired revision must reconcile");
+
+        assert_eq!(owned[0].owner_user_id, "human-1");
+        assert_eq!(created.username, "builder");
+        assert_eq!(claimed.id, "agent-legacy");
+        assert_eq!(catalog.harnesses[0].models[0].id, "gpt-5.6-sol");
+        assert_eq!(roster.seats[0].configuration_revision, Some(7));
+        let roster_json =
+            serde_json::to_value(&roster).expect("dashboard roster snapshot must serialize");
+        assert_eq!(roster_json["seats"][0]["agentUsername"], "cartographer");
+        assert_eq!(roster_json["seats"][0]["agentDisplayName"], "Cartographer");
+        assert_eq!(applied.runtime_activation, RuntimeActivationState::Pending);
+        assert_eq!(status.runtime_activation, RuntimeActivationState::Active);
+        assert!(paused.paused);
+        assert!(!resumed.paused);
+        assert_eq!(
+            reconciled.runtime_activation,
+            RuntimeActivationState::Pending
+        );
+        server.finish();
+    }
+
+    /// Dashboard errors preserve stable codes, discard unsafe text, and retain failed runtime state.
+    #[tokio::test]
+    async fn dashboard_errors_preserve_codes_without_leaking_upstream_bodies() {
+        let response_index = StdArc::new(AtomicUsize::new(0));
+        let observed_index = StdArc::clone(&response_index);
+        let server = MockHttpServer::start(5, move |request| {
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer access-token")
+            );
+            match observed_index.fetch_add(1, Ordering::SeqCst) {
+                0 => MockResponse::json(
+                    409,
+                    json!({
+                        "error": "revision 8 contains token=server-secret /native/private/file",
+                        "code": "revision_conflict",
+                    }),
+                ),
+                1 => MockResponse::json(
+                    400,
+                    json!({ "error": "invalid seat", "code": "bad_request" }),
+                ),
+                2 => MockResponse::json(403, json!({ "error": "Forbidden", "code": "forbidden" })),
+                3 => MockResponse::json(
+                    422,
+                    json!({
+                        "error": "binding unavailable",
+                        "code": "credential_not_ready",
+                    }),
+                ),
+                4 => {
+                    assert_eq!(request.method, "GET");
+                    MockResponse::json(
+                        200,
+                        dashboard_bridge_status_response(
+                            false,
+                            "failed",
+                            Some("process_exited"),
+                            Some("command /native/private/bin/agent --token server-secret exited"),
+                        ),
+                    )
+                }
+                index => panic!("unexpected dashboard response index {index}"),
+            }
+        });
+        let client = authenticated_client(&server.endpoint, "access-token", "refresh-token");
+
+        let conflict = DashboardCommandError::from(
+            apply_room_agent_roster(&client, "server-1", dashboard_roster_update())
+                .await
+                .expect_err("stale revision must fail"),
+        );
+        let validation = DashboardCommandError::from(
+            apply_room_agent_roster(&client, "server-1", dashboard_roster_update())
+                .await
+                .expect_err("invalid roster must fail"),
+        );
+        let forbidden = DashboardCommandError::from(
+            apply_room_agent_roster(&client, "server-1", dashboard_roster_update())
+                .await
+                .expect_err("unauthorized roster must fail"),
+        );
+        let unavailable = DashboardCommandError::from(
+            apply_room_agent_roster(&client, "server-1", dashboard_roster_update())
+                .await
+                .expect_err("unready credential must fail"),
+        );
+        let failed = get_room_bridge_status(&client, "server-1")
+            .await
+            .expect("runtime failure remains a successful status response");
+
+        assert_eq!(conflict.kind, DashboardErrorKind::Conflict);
+        assert_eq!(conflict.code, "revision_conflict");
+        assert_eq!(validation.kind, DashboardErrorKind::Validation);
+        assert_eq!(validation.code, "bad_request");
+        assert_eq!(forbidden.kind, DashboardErrorKind::Forbidden);
+        assert_eq!(forbidden.code, "forbidden");
+        assert_eq!(unavailable.kind, DashboardErrorKind::Unavailable);
+        assert_eq!(unavailable.code, "credential_not_ready");
+        assert_eq!(failed.runtime_activation, RuntimeActivationState::Failed);
+        assert_eq!(failed.runtime_error_code.as_deref(), Some("process_exited"));
+        assert_eq!(
+            failed.runtime_error_message.as_deref(),
+            Some("The desired room roster revision could not be activated.")
+        );
+
+        let encoded =
+            serde_json::to_string(&([conflict, validation, forbidden, unavailable], failed))
+                .expect("dashboard errors and failed runtime state must serialize");
+        assert!(!encoded.contains("server-secret"));
+        assert!(!encoded.contains("/native/private/file"));
+        server.finish();
     }
 
     /// Latest, before, and after responses all cross the native boundary oldest-first.
@@ -2151,6 +3239,7 @@ mod tests {
             result,
             Err(RiftError::Remote {
                 status: StatusCode::NOT_FOUND,
+                code: _,
                 message,
             }) if message == "Channel not found"
         ));
@@ -3104,6 +4193,7 @@ mod tests {
     fn command_errors_discard_remote_error_bodies() {
         let error = CommandError::from(RiftError::Remote {
             status: StatusCode::BAD_REQUEST,
+            code: Some("bad_request".into()),
             message: "token=must-not-cross-the-boundary".into(),
         });
         let serialized = serde_json::to_string(&error).expect("command error must serialize");

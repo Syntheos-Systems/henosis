@@ -6,12 +6,20 @@
  */
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentCapabilityCatalog,
+  AgentRosterSnapshot,
+  ApplyAgentRosterRequest,
+  OwnedAgentIdentity,
+  RoomBridgeStatus,
+} from "../domain/agentControl";
+import type {
   MessagePage,
   PendingRoomAttachment,
   RoomConversationCommandResult,
   RoomConversationEventEnvelope,
   RoomConversationSnapshot,
   RoomMessage,
+  RoomPermissions,
 } from "../domain/conversation";
 import type { DirectorySource, RoomSummary } from "../domain/rooms";
 
@@ -74,9 +82,12 @@ export type RoomEventListener = (
 export type ClientErrorKind =
   | "authentication"
   | "connection-required"
+  | "conflict"
+  | "forbidden"
   | "network"
   | "protocol"
   | "storage"
+  | "unavailable"
   | "validation"
   | "unknown";
 
@@ -85,11 +96,15 @@ export class HenosisClientError extends Error {
   /** Machine-readable category for choosing a recovery action. */
   readonly kind: ClientErrorKind;
 
+  /** Stable native or Rift error code when the boundary supplied one. */
+  readonly code: string | null;
+
   /** Create a structured client error without retaining sensitive request data. */
-  constructor(kind: ClientErrorKind, message: string) {
+  constructor(kind: ClientErrorKind, message: string, code: string | null = null) {
     super(message);
     this.name = "HenosisClientError";
     this.kind = kind;
+    this.code = code;
   }
 }
 
@@ -103,6 +118,34 @@ export interface HenosisClient {
   refresh(): Promise<RoomDirectorySnapshot>;
   /** End the native Rift session and clear secret process state. */
   disconnect(): Promise<void>;
+  /** List persistent agent identities owned by the signed-in human. */
+  getMyAgents(): Promise<OwnedAgentIdentity[]>;
+  /** Create one persistent agent identity owned by the signed-in human. */
+  createMyAgent(
+    username: string,
+    displayName: string | null,
+  ): Promise<OwnedAgentIdentity>;
+  /** Claim one known imported agent identity for the signed-in human. */
+  claimAgent(agentIdentityId: string): Promise<OwnedAgentIdentity>;
+  /** Load one deployment-discovered execution capability catalog. */
+  getAgentCapabilities(serverId: string): Promise<AgentCapabilityCatalog>;
+  /** Load authoritative permissions for the signed-in room member. */
+  getRoomPermissions(serverId: string): Promise<RoomPermissions>;
+  /** Load the authoritative desired room roster and runtime state. */
+  getRoomAgentRoster(serverId: string): Promise<AgentRosterSnapshot>;
+  /** Apply one optimistic complete room roster replacement. */
+  applyRoomAgentRoster(
+    serverId: string,
+    update: ApplyAgentRosterRequest,
+  ): Promise<AgentRosterSnapshot>;
+  /** Load public pause and activation state for one room bridge. */
+  getRoomBridgeStatus(serverId: string): Promise<RoomBridgeStatus>;
+  /** Pause autonomous activity for one room bridge. */
+  pauseRoomBridge(serverId: string): Promise<RoomBridgeStatus>;
+  /** Resume autonomous activity for one room bridge. */
+  resumeRoomBridge(serverId: string): Promise<RoomBridgeStatus>;
+  /** Retry the current desired roster without creating another revision. */
+  reconcileRoomBridge(serverId: string): Promise<AgentRosterSnapshot>;
   /** Open one exact room generation and return its sanitized live window. */
   openRoom(roomId: string, streamId: string): Promise<RoomConversationSnapshot>;
   /** Close only the exact room generation identified by the caller. */
@@ -153,9 +196,52 @@ export interface HenosisClient {
 /** Serialized Tauri command error shape returned by the Rust boundary. */
 interface NativeCommandError {
   /** Machine-readable error category. */
-  kind?: ClientErrorKind;
+  kind?: unknown;
+  /** Stable native or Rift code for dashboard recovery behavior. */
+  code?: unknown;
   /** Human-readable safe error text. */
-  message?: string;
+  message?: unknown;
+}
+
+/** Complete allowlist of native error categories accepted by the webview. */
+const CLIENT_ERROR_KINDS: readonly ClientErrorKind[] = [
+  "authentication",
+  "connection-required",
+  "conflict",
+  "forbidden",
+  "network",
+  "protocol",
+  "storage",
+  "unavailable",
+  "validation",
+  "unknown",
+];
+
+/** Safe stable code shape accepted from native dashboard failures. */
+const CLIENT_ERROR_CODE = /^[a-z0-9_.-]{1,128}$/;
+
+/** Test whether one untrusted boundary value is a supported error category. */
+function isClientErrorKind(value: unknown): value is ClientErrorKind {
+  return (
+    typeof value === "string" &&
+    CLIENT_ERROR_KINDS.includes(value as ClientErrorKind)
+  );
+}
+
+/** Parse one untrusted object into the safe native command error subset. */
+function parseNativeCommandError(error: unknown): HenosisClientError | null {
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+  const candidate = error as NativeCommandError;
+  if (!isClientErrorKind(candidate.kind) || typeof candidate.message !== "string") {
+    return null;
+  }
+  const code =
+    typeof candidate.code === "string" && CLIENT_ERROR_CODE.test(candidate.code)
+      ? candidate.code
+      : null;
+  return new HenosisClientError(candidate.kind, candidate.message, code);
 }
 
 /** Convert any adapter rejection into a stable, user-safe error. */
@@ -164,18 +250,16 @@ export function normalizeClientError(error: unknown): HenosisClientError {
     return error;
   }
 
-  if (typeof error === "object" && error !== null) {
-    const candidate = error as NativeCommandError;
-    if (candidate.kind && candidate.message) {
-      return new HenosisClientError(candidate.kind, candidate.message);
-    }
+  const structured = parseNativeCommandError(error);
+  if (structured) {
+    return structured;
   }
 
   if (typeof error === "string" && error.trim().length > 0) {
     try {
-      const parsed = JSON.parse(error) as NativeCommandError;
-      if (parsed.kind && parsed.message) {
-        return new HenosisClientError(parsed.kind, parsed.message);
+      const parsed = parseNativeCommandError(JSON.parse(error));
+      if (parsed) {
+        return parsed;
       }
     } catch {}
   }

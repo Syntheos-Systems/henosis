@@ -150,6 +150,17 @@ function createHarness(options: { holdOpen?: boolean } = {}): ConversationHarnes
     connect: vi.fn(),
     refresh: vi.fn(),
     disconnect: vi.fn(),
+    getMyAgents: vi.fn(),
+    createMyAgent: vi.fn(),
+    claimAgent: vi.fn(),
+    getAgentCapabilities: vi.fn(),
+    getRoomPermissions: vi.fn(),
+    getRoomAgentRoster: vi.fn(),
+    applyRoomAgentRoster: vi.fn(),
+    getRoomBridgeStatus: vi.fn(),
+    pauseRoomBridge: vi.fn(),
+    resumeRoomBridge: vi.fn(),
+    reconcileRoomBridge: vi.fn(),
     openRoom: vi.fn(async (_roomId: string, streamId: string) => {
       activeStreamId = streamId;
       if (options.holdOpen) {

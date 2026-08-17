@@ -27,7 +27,7 @@ interface WorkspaceItem {
   label: string;
   /** Workspace icon. */
   icon: LucideIcon;
-  /** Whether this delivery slice exposes the workspace. */
+  /** Whether the current build exposes the workspace. */
   available: boolean;
 }
 
@@ -52,8 +52,8 @@ export interface AppShellProps {
   children: ReactNode;
   /** Return to Rooms from an internal workspace. */
   onRooms(): void;
-  /** Explain an unfinished workspace without pretending it exists. */
-  onDeferredWorkspace(workspace: string): void;
+  /** Explain a workspace unavailable in the current build. */
+  onUnavailableWorkspace(workspace: string): void;
 }
 
 /** Render Henosis branding, workspace navigation, and global system state. */
@@ -62,7 +62,7 @@ export function AppShell({
   connection,
   children,
   onRooms,
-  onDeferredWorkspace,
+  onUnavailableWorkspace,
 }: AppShellProps) {
   const approvalCount =
     directory?.rooms.reduce((sum, room) => sum + room.pendingApprovals, 0) ?? 0;
@@ -106,13 +106,13 @@ export function AppShell({
                 onClick={() =>
                   workspace.available
                     ? onRooms()
-                    : onDeferredWorkspace(workspace.label)
+                    : onUnavailableWorkspace(workspace.label)
                 }
                 key={workspace.id}
               >
                 <Icon aria-hidden="true" />
                 <span>{workspace.label}</span>
-                {!workspace.available ? <small>Later</small> : null}
+                {!workspace.available ? <small>Unavailable</small> : null}
               </button>
             );
           })}
@@ -122,11 +122,11 @@ export function AppShell({
           <button
             className="workspace-link"
             type="button"
-            onClick={() => onDeferredWorkspace("Settings")}
+            onClick={() => onUnavailableWorkspace("Settings")}
           >
             <Settings aria-hidden="true" />
             <span>Settings</span>
-            <small>Later</small>
+            <small>Unavailable</small>
           </button>
 
           <div className="system-card">
@@ -163,7 +163,7 @@ export function AppShell({
               <button
                 className="approval-indicator"
                 type="button"
-                onClick={() => onDeferredWorkspace("Governance")}
+                onClick={() => onUnavailableWorkspace("Governance")}
               >
                 {approvalCount} approval{approvalCount === 1 ? "" : "s"}
               </button>

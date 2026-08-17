@@ -12,10 +12,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::gateway::{ROOM_CONVERSATION_EVENT, RiftGateway, RiftGatewayError, spawn_rift_gateway};
 use crate::model::{
-    BootstrapResult, CommandError, CommandErrorKind, ConnectionProfile, MessagePage,
-    PendingRoomAttachment, RiftConnectionInput, RoomConversationCommandResult,
-    RoomConversationEvent, RoomConversationEventEnvelope, RoomConversationSnapshot,
-    RoomDirectorySnapshot, RoomMessage, RoomPermissions, RoomSummary,
+    AgentCapabilityCatalog, AgentRosterSnapshot, ApplyAgentRosterRequest, BootstrapResult,
+    CommandError, CommandErrorKind, ConnectionProfile, DashboardCommandError, DashboardErrorKind,
+    MessagePage, OwnedAgentIdentity, PendingRoomAttachment, RiftConnectionInput, RoomBridgeStatus,
+    RoomConversationCommandResult, RoomConversationEvent, RoomConversationEventEnvelope,
+    RoomConversationSnapshot, RoomDirectorySnapshot, RoomMessage, RoomPermissions, RoomSummary,
 };
 use crate::reconcile::{
     MessagePageSource, RECONCILE_PAGE_SIZE, ReconcileError, reconcile_open_room, unread_boundary,
@@ -611,6 +612,169 @@ pub async fn get_room_directory(
     }
 }
 
+/// Convert an existing safe native-state failure into the dashboard error vocabulary.
+fn dashboard_state_error(error: CommandError) -> DashboardCommandError {
+    let (kind, code) = match error.kind {
+        CommandErrorKind::Authentication => (DashboardErrorKind::Authentication, "authentication"),
+        CommandErrorKind::ConnectionRequired => (
+            DashboardErrorKind::ConnectionRequired,
+            "connection_required",
+        ),
+        CommandErrorKind::Network => (DashboardErrorKind::Network, "network"),
+        CommandErrorKind::Protocol => (DashboardErrorKind::Protocol, "protocol"),
+        CommandErrorKind::Validation => (DashboardErrorKind::Validation, "validation"),
+        CommandErrorKind::Storage => (DashboardErrorKind::Storage, "storage"),
+    };
+    DashboardCommandError::new(kind, code, error.message)
+}
+
+/// Require one authenticated native Rift session for a dashboard operation.
+fn dashboard_session(
+    state: &AppState,
+) -> Result<rift::AuthenticatedRiftClient, DashboardCommandError> {
+    state
+        .session()
+        .map_err(dashboard_state_error)?
+        .ok_or_else(|| {
+            DashboardCommandError::new(
+                DashboardErrorKind::ConnectionRequired,
+                "connection_required",
+                "Connect to Rift before opening room controls.",
+            )
+        })
+}
+
+/// List persistent agent identities owned by the signed-in Rift human.
+#[tauri::command]
+pub async fn get_my_agents(
+    state: State<'_, AppState>,
+) -> Result<Vec<OwnedAgentIdentity>, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::get_my_agents(&session).await.map_err(Into::into)
+}
+
+/// Create one persistent agent identity owned by the signed-in Rift human.
+#[tauri::command]
+pub async fn create_my_agent(
+    state: State<'_, AppState>,
+    username: String,
+    display_name: Option<String>,
+) -> Result<OwnedAgentIdentity, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::create_my_agent(&session, &username, display_name.as_deref())
+        .await
+        .map_err(Into::into)
+}
+
+/// Claim one known imported agent identity for the signed-in Rift human.
+#[tauri::command]
+pub async fn claim_agent(
+    state: State<'_, AppState>,
+    agent_identity_id: String,
+) -> Result<OwnedAgentIdentity, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::claim_agent(&session, &agent_identity_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Fetch the deployment-discovered execution catalog for one room server.
+#[tauri::command]
+pub async fn get_agent_capabilities(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<AgentCapabilityCatalog, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::get_agent_capabilities(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Fetch the signed-in human's authoritative permissions for one room server.
+#[tauri::command]
+pub async fn get_room_permissions(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<RoomPermissions, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::room_permissions(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Fetch the server-authoritative desired roster and activation state.
+#[tauri::command]
+pub async fn get_room_agent_roster(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<AgentRosterSnapshot, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::get_room_agent_roster(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Apply one optimistic whole-roster replacement with its observed revision.
+#[tauri::command]
+pub async fn apply_room_agent_roster(
+    state: State<'_, AppState>,
+    server_id: String,
+    update: ApplyAgentRosterRequest,
+) -> Result<AgentRosterSnapshot, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::apply_room_agent_roster(&session, &server_id, update)
+        .await
+        .map_err(Into::into)
+}
+
+/// Fetch public pause and activation state for one room bridge.
+#[tauri::command]
+pub async fn get_room_bridge_status(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<RoomBridgeStatus, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::get_room_bridge_status(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Pause autonomous agent activity for one room bridge.
+#[tauri::command]
+pub async fn pause_room_bridge(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<RoomBridgeStatus, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::pause_room_bridge(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Resume autonomous agent activity for one room bridge.
+#[tauri::command]
+pub async fn resume_room_bridge(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<RoomBridgeStatus, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::resume_room_bridge(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
+/// Retry the current desired roster revision without creating another revision.
+#[tauri::command]
+pub async fn reconcile_room_bridge(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<AgentRosterSnapshot, DashboardCommandError> {
+    let session = dashboard_session(&state)?;
+    rift::reconcile_room_bridge(&session, &server_id)
+        .await
+        .map_err(Into::into)
+}
+
 /// Complete one generation-scoped room open through an injected native transport.
 async fn open_room_with<T: RoomCommandTransport, R: RoomOpenRuntime>(
     runtime: &R,
@@ -1112,6 +1276,23 @@ mod tests {
         assert!(orphaned.saved_profile.is_none());
     }
 
+    /// Dashboard commands reject missing native sessions with one stable secret-free error.
+    #[test]
+    fn dashboard_commands_require_an_authenticated_native_session() {
+        let state = AppState::new();
+        let error = match dashboard_session(&state) {
+            Ok(_) => panic!("dashboard session unexpectedly existed"),
+            Err(error) => error,
+        };
+        let serialized = serde_json::to_string(&error).expect("dashboard error must serialize");
+
+        assert_eq!(error.kind, DashboardErrorKind::ConnectionRequired);
+        assert_eq!(error.code, "connection_required");
+        assert!(!serialized.contains("accessToken"));
+        assert!(!serialized.contains("refreshToken"));
+        assert!(!serialized.contains("/native/"));
+    }
+
     /// Records transport calls and returns deterministic sanitized room data.
     struct FakeRoomTransport {
         /// Ordered transport operations that were actually polled.
@@ -1284,7 +1465,8 @@ mod tests {
                 if fail_create {
                     return Err(RiftError::Remote {
                         status: StatusCode::BAD_REQUEST,
-                        message: "token=server-secret /home/private/file".into(),
+                        code: Some("bad_request".into()),
+                        message: "token=server-secret /native/private/file".into(),
                     });
                 }
                 let mut message = room_message("message-sent", &room_id, 4);
@@ -2032,7 +2214,7 @@ mod tests {
 
         assert!(matches!(error.kind, CommandErrorKind::Protocol));
         assert!(!serialized.contains("server-secret"));
-        assert!(!serialized.contains("/home/private/file"));
+        assert!(!serialized.contains("/native/private/file"));
         assert_eq!(transport.calls(), vec!["create:room-1:0"]);
     }
 }

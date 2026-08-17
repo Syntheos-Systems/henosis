@@ -18,7 +18,7 @@ export interface RoomRowProps {
   room: RoomSummary;
   /** Enter the selected room. */
   onOpen(room: RoomSummary): void;
-  /** Open an honest slice-status notice for management. */
+  /** Explain when room management is unavailable. */
   onManage(room: RoomSummary): void;
 }
 

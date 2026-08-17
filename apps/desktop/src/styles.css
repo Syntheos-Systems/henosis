@@ -1418,7 +1418,7 @@ h3 {
 
 .room-dashboard-trigger {
   min-height: 44px;
-  display: inline-flex;
+  display: none;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
@@ -1450,7 +1450,7 @@ h3 {
 .room-detail-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr) 340px;
   flex: 1;
   overflow: hidden;
 }
@@ -2031,48 +2031,217 @@ h3 {
   accent-color: var(--mineral-300);
 }
 
-.room-dashboard {
+.room-dashboard-surface {
+  position: relative;
+  min-width: 0;
   overflow-y: auto;
-  padding: var(--space-8) var(--space-6);
   border-left: 1px solid var(--border-subtle);
   background:
     radial-gradient(circle at 100% 0%, rgb(155 195 173 / 7%), transparent 18rem),
     rgb(21 29 24 / 45%);
 }
 
-.room-dashboard h2 {
-  margin-bottom: var(--space-8);
+.room-dashboard-surface[hidden] {
+  display: none;
+}
+
+.room-dashboard-content {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-6);
+}
+
+.room-dashboard-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.room-dashboard-heading h2,
+.dashboard-state h2 {
+  margin-bottom: 0;
   color: var(--bone-100);
-  font-size: 1.05rem;
-  font-weight: 700;
+  font-size: 1.15rem;
+  font-weight: 750;
   line-height: 1.25;
 }
 
-.room-dashboard dl {
+.dashboard-access {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: rgb(155 195 173 / 7%);
+  color: var(--mineral-300);
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.dashboard-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  padding: 3px;
+  border: 1px solid var(--border-quiet);
+  border-radius: var(--radius);
+  background: rgb(12 17 14 / 45%);
+}
+
+.dashboard-tab {
+  min-height: 44px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--bone-400);
+  font-size: 0.66rem;
+  font-weight: 800;
+  transition:
+    background-color var(--duration-fast) ease,
+    border-color var(--duration-fast) ease,
+    color var(--duration-fast) ease;
+}
+
+.dashboard-tab:hover {
+  color: var(--bone-100);
+}
+
+.dashboard-tab[aria-selected="true"] {
+  border-color: var(--border-strong);
+  background: rgb(155 195 173 / 10%);
+  color: var(--bone-50);
+}
+
+.dashboard-panel {
+  min-height: 0;
+  flex: 1;
+  padding-top: var(--space-6);
+}
+
+.dashboard-panel:focus-visible {
+  border-radius: var(--radius);
+  box-shadow:
+    0 0 0 2px var(--ink-950),
+    0 0 0 4px var(--mineral-300);
+}
+
+.dashboard-overview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.dashboard-overview h3 {
+  margin-bottom: 0;
+  color: var(--bone-100);
+  font-size: 1rem;
+}
+
+.dashboard-overview > p,
+.dashboard-state > p {
+  margin: 0;
+  color: var(--bone-300);
+  font-size: 0.72rem;
+}
+
+.dashboard-empty {
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--border-quiet);
+  border-radius: var(--radius);
+  background: rgb(12 17 14 / 25%);
+  text-align: center;
+}
+
+.dashboard-facts {
   margin: 0;
 }
 
-.room-dashboard dl > div {
+.dashboard-facts > div {
   padding: var(--space-4) 0;
   border-top: 1px solid var(--border-subtle);
 }
 
-.room-dashboard dt {
+.dashboard-facts dt {
   margin-bottom: var(--space-1);
   color: var(--bone-400);
   font-size: 0.58rem;
-  font-weight: 700;
+  font-weight: 750;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.room-dashboard dd {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+.dashboard-facts dd {
   margin: 0;
   color: var(--bone-200);
   font-size: 0.7rem;
+}
+
+.dashboard-state {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-4);
+  padding: var(--space-8) var(--space-6);
+}
+
+.dashboard-state--loading::after {
+  width: 100%;
+  height: 2px;
+  display: block;
+  overflow: hidden;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--mineral-300),
+    transparent
+  );
+  content: "";
+  animation: loading-sweep 1.1s var(--ease-out) infinite;
+}
+
+.dashboard-state--unavailable {
+  background: linear-gradient(145deg, rgb(184 111 88 / 7%), transparent 60%);
+}
+
+.dashboard-state__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.room-dashboard-sheet-close {
+  position: sticky;
+  top: var(--space-3);
+  z-index: 2;
+  width: 44px;
+  min-height: 44px;
+  display: none;
+  place-items: center;
+  margin: var(--space-3) var(--space-3) calc(-1 * var(--space-3)) auto;
+  border: 1px solid var(--border-quiet);
+  border-radius: var(--radius);
+  background: var(--ink-850);
+  color: var(--bone-200);
+}
+
+.room-dashboard-sheet-close svg {
+  width: 18px;
+  height: 18px;
+}
+
+.room-dashboard-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 69;
+  display: none;
+  border: 0;
+  background: rgb(5 8 6 / 72%);
 }
 
 .context-participants {
@@ -2451,7 +2620,7 @@ h3 {
 
 /* Global transient and loading states */
 
-.slice-notice {
+.feature-notice {
   position: fixed;
   right: var(--space-6);
   bottom: var(--space-6);
@@ -2469,11 +2638,11 @@ h3 {
   font-size: 0.68rem;
 }
 
-.slice-notice p {
+.feature-notice p {
   margin: 0;
 }
 
-.slice-notice button {
+.feature-notice button {
   min-height: 36px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border-quiet);
@@ -2802,7 +2971,7 @@ h3 {
     grid-row: 2;
   }
 
-  .slice-notice {
+  .feature-notice {
     right: var(--space-3);
     bottom: 82px;
     left: var(--space-3);
@@ -2817,5 +2986,42 @@ h3 {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 1179px) {
+  .room-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .room-dashboard-trigger {
+    display: inline-flex;
+  }
+
+  .room-dashboard-backdrop {
+    display: block;
+  }
+
+  .room-dashboard-surface {
+    position: fixed;
+    inset: 0 0 0 auto;
+    z-index: 70;
+    width: 340px;
+    max-width: 100vw;
+    border-left-color: var(--border-strong);
+    background:
+      radial-gradient(circle at 100% 0%, rgb(155 195 173 / 9%), transparent 22rem),
+      var(--ink-900);
+    box-shadow: var(--shadow-panel);
+  }
+
+  .room-dashboard-sheet-close {
+    display: grid;
+  }
+}
+
+@media (max-width: 639px) {
+  .room-dashboard-surface {
+    width: 100vw;
   }
 }

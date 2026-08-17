@@ -1,15 +1,32 @@
 /** Explicit fixture adapter used by browser development and component tests. */
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentCapabilityCatalog,
+  AgentCredentialReadiness,
+  AgentIdentity,
+  AgentRosterSnapshot,
+  AgentSeatDraft,
+  ApplyAgentRosterRequest,
+  OwnedAgentIdentity,
+  RoomBridgeStatus,
+} from "../domain/agentControl";
+import type {
   MessagePage,
   PendingRoomAttachment,
   RoomConversationCommandResult,
   RoomConversationEvent,
   RoomConversationSnapshot,
   RoomMessage,
+  RoomPermissions,
   RoomUnreadBoundary,
 } from "../domain/conversation";
-import { createFixtureRooms } from "../data/fixtureRooms";
+import type { RoomSummary } from "../domain/rooms";
+import {
+  createFixtureAgentCatalog,
+  createFixtureAgentIdentities,
+  createFixtureAgentRosters,
+  createFixtureRooms,
+} from "../data/fixtureRooms";
 import { HenosisClientError } from "./henosisClient";
 import type {
   BootstrapResult,
@@ -57,6 +74,63 @@ interface OpenFixtureRoom {
   sequence: number;
   /** Messages currently eligible for edit, delete, and read commands. */
   loadedMessageIds: Set<string>;
+}
+
+/** One deterministic failure consumed by the next pending activation poll. */
+interface FixtureActivationFailure {
+  /** Stable safe runtime failure code. */
+  code: string;
+  /** Safe path-free fixture recovery detail. */
+  message: string;
+}
+
+/** Clone one primitive settings object used by a fixture seat. */
+function cloneAgentSettings(
+  settings: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(settings));
+}
+
+/** Test whether one fixture identity is owned by the selected human. */
+function identityIsOwnedBy(
+  identity: AgentIdentity,
+  ownerUserId: string,
+): identity is OwnedAgentIdentity {
+  return identity.ownerUserId === ownerUserId;
+}
+
+/** Clone one deployment capability catalog through every nested collection. */
+function cloneAgentCatalog(
+  catalog: AgentCapabilityCatalog,
+): AgentCapabilityCatalog {
+  return {
+    generation: catalog.generation,
+    harnesses: catalog.harnesses.map((harness) => ({
+      ...harness,
+      models: harness.models.map((model) => ({ ...model })),
+      settings: harness.settings.map((setting) => ({
+        ...setting,
+        control:
+          setting.control.type === "select"
+            ? {
+                type: "select",
+                options: setting.control.options.map((option) => ({ ...option })),
+              }
+            : { ...setting.control },
+      })),
+    })),
+  };
+}
+
+/** Clone one authoritative fixture roster and all non-secret settings objects. */
+function cloneAgentRoster(roster: AgentRosterSnapshot): AgentRosterSnapshot {
+  return {
+    ...roster,
+    seats: roster.seats.map((seat) => ({
+      ...seat,
+      settings: cloneAgentSettings(seat.settings),
+    })),
+  };
 }
 
 /** Build one deterministic sanitized fixture message. */
@@ -122,6 +196,31 @@ export class FixtureHenosisClient implements HenosisClient {
   /** Deterministic minute offset used for fixture message and edit timestamps. */
   private logicalMinute = 6;
 
+  /** Persistent fixture identities cloned per client to prevent cross-test state. */
+  private readonly agentIdentities = createFixtureAgentIdentities();
+
+  /** Deployment-style fixture catalog cloned before every public return. */
+  private readonly agentCatalog = createFixtureAgentCatalog();
+
+  /** Authoritative fixture rosters keyed by their room server identifier. */
+  private readonly agentRosters = new Map(
+    createFixtureAgentRosters().map((roster) => [roster.serverId, roster]),
+  );
+
+  /** Independent public pause state retained for each fixture bridge. */
+  private readonly pausedAgentBridges = new Map<string, boolean>([
+    ["server-operations", true],
+  ]);
+
+  /** One-shot activation failures injected explicitly by deterministic tests. */
+  private readonly nextAgentActivationFailures = new Map<
+    string,
+    FixtureActivationFailure
+  >();
+
+  /** Counter used to create stable fixture-owned agent identifiers. */
+  private createdAgentCounter = 0;
+
   /** Return a fixture-backed connected directory for visual development. */
   async bootstrap(): Promise<BootstrapResult> {
     return {
@@ -158,13 +257,225 @@ export class FixtureHenosisClient implements HenosisClient {
     this.connected = false;
   }
 
+  /** List persistent identities owned by the current fixture human. */
+  async getMyAgents(): Promise<OwnedAgentIdentity[]> {
+    this.requireConnectedSession();
+    return this.agentIdentities
+      .filter((identity) => identityIsOwnedBy(identity, this.connection.userId))
+      .map((identity) => ({ ...identity }));
+  }
+
+  /** Create one new fixture identity owned by the current fixture human. */
+  async createMyAgent(
+    username: string,
+    displayName: string | null,
+  ): Promise<OwnedAgentIdentity> {
+    this.requireConnectedSession();
+    if (!username || username.trim() !== username) {
+      throw new HenosisClientError(
+        "validation",
+        "Choose a non-empty fixture agent username without surrounding spaces.",
+        "agent_username_invalid",
+      );
+    }
+    if (
+      this.agentIdentities.some(
+        (identity) =>
+          identity.username.toLowerCase() === username.toLowerCase(),
+      )
+    ) {
+      throw new HenosisClientError(
+        "conflict",
+        "That fixture agent username is already in use.",
+        "agent_username_taken",
+      );
+    }
+    this.createdAgentCounter += 1;
+    const identity: OwnedAgentIdentity = {
+      id: `fixture-agent-created-${this.createdAgentCounter}`,
+      username,
+      displayName: displayName?.trim() || null,
+      ownerUserId: this.connection.userId,
+    };
+    this.agentIdentities.push(identity);
+    return { ...identity };
+  }
+
+  /** Claim one known imported fixture identity without changing room membership. */
+  async claimAgent(agentIdentityId: string): Promise<OwnedAgentIdentity> {
+    this.requireConnectedSession();
+    const identityIndex = this.agentIdentities.findIndex(
+      (identity) => identity.id === agentIdentityId,
+    );
+    const identity = this.agentIdentities[identityIndex];
+    if (!identity) {
+      throw new HenosisClientError(
+        "validation",
+        "That imported fixture identity is not known to this room context.",
+        "agent_identity_not_found",
+      );
+    }
+    if (identity.ownerUserId === this.connection.userId) {
+      throw new HenosisClientError(
+        "conflict",
+        "That fixture identity is already owned by the current human.",
+        "agent_already_owned",
+      );
+    }
+    if (identity.ownerUserId !== null) {
+      throw new HenosisClientError(
+        "forbidden",
+        "That fixture identity is owned by another human.",
+        "agent_owned_by_another_human",
+      );
+    }
+    const claimed: OwnedAgentIdentity = {
+      ...identity,
+      ownerUserId: this.connection.userId,
+    };
+    this.agentIdentities.splice(identityIndex, 1);
+    this.agentIdentities.push(claimed);
+    for (const [serverId, roster] of this.agentRosters) {
+      const seats = roster.seats.map((seat) =>
+        seat.agentIdentityId === claimed.id
+          ? { ...seat, ownerHumanId: claimed.ownerUserId }
+          : seat,
+      );
+      this.agentRosters.set(serverId, cloneAgentRoster({ ...roster, seats }));
+    }
+    return { ...claimed };
+  }
+
+  /** Load the deployment-style fixture capability catalog for one known server. */
+  async getAgentCapabilities(serverId: string): Promise<AgentCapabilityCatalog> {
+    this.requireAgentRoster(serverId);
+    return cloneAgentCatalog(this.agentCatalog);
+  }
+
+  /** Load deterministic authoritative permissions for one known fixture server. */
+  async getRoomPermissions(serverId: string): Promise<RoomPermissions> {
+    return this.fixtureRoomPermissions(serverId);
+  }
+
+  /** Load one cloned authoritative desired fixture roster. */
+  async getRoomAgentRoster(serverId: string): Promise<AgentRosterSnapshot> {
+    return cloneAgentRoster(this.requireAgentRoster(serverId));
+  }
+
+  /** Apply one optimistic complete fixture roster replacement atomically. */
+  async applyRoomAgentRoster(
+    serverId: string,
+    update: ApplyAgentRosterRequest,
+  ): Promise<AgentRosterSnapshot> {
+    const current = this.requireAgentRoster(serverId);
+    if (update.expectedRevision !== current.desiredRevision) {
+      throw new HenosisClientError(
+        "conflict",
+        "The fixture roster changed. Reload it before applying again.",
+        "revision_conflict",
+      );
+    }
+    const nextRevision = (current.desiredRevision ?? 0) + 1;
+    const seats = update.seats.map((seat) => {
+      const identity = this.agentIdentities.find(
+        (candidate) => candidate.id === seat.agentIdentityId,
+      );
+      if (!identity) {
+        throw new HenosisClientError(
+          "validation",
+          "That fixture agent identity is not available.",
+          "fixture_agent_not_found",
+        );
+      }
+      return {
+        ...seat,
+        agentUsername: identity.username,
+        agentDisplayName: identity.displayName,
+        settings: cloneAgentSettings(seat.settings),
+        ownerHumanId: identity.ownerUserId,
+        configurationRevision: nextRevision,
+        credentialReadiness: this.fixtureCredentialReadiness(seat),
+        runtimeActivation: "pending" as const,
+      };
+    });
+    const applied: AgentRosterSnapshot = {
+      serverId,
+      desiredRevision: nextRevision,
+      activeRevision: current.activeRevision,
+      lastGoodRevision: current.lastGoodRevision,
+      runtimeActivation: "pending",
+      runtimeErrorCode: null,
+      runtimeErrorMessage: null,
+      seats,
+    };
+    this.agentRosters.set(serverId, cloneAgentRoster(applied));
+    return cloneAgentRoster(applied);
+  }
+
+  /** Poll one bridge and deterministically settle its current pending revision. */
+  async getRoomBridgeStatus(serverId: string): Promise<RoomBridgeStatus> {
+    this.settlePendingAgentActivation(serverId);
+    return this.fixtureBridgeStatus(serverId);
+  }
+
+  /** Pause one known fixture bridge without changing roster revisions. */
+  async pauseRoomBridge(serverId: string): Promise<RoomBridgeStatus> {
+    this.requireAgentRoster(serverId);
+    this.pausedAgentBridges.set(serverId, true);
+    return this.fixtureBridgeStatus(serverId);
+  }
+
+  /** Resume one known fixture bridge without changing roster revisions. */
+  async resumeRoomBridge(serverId: string): Promise<RoomBridgeStatus> {
+    this.requireAgentRoster(serverId);
+    this.pausedAgentBridges.set(serverId, false);
+    return this.fixtureBridgeStatus(serverId);
+  }
+
+  /** Retry the current desired fixture revision without creating another revision. */
+  async reconcileRoomBridge(serverId: string): Promise<AgentRosterSnapshot> {
+    const current = this.requireAgentRoster(serverId);
+    if (current.desiredRevision === null) {
+      return cloneAgentRoster(current);
+    }
+    const retrying: AgentRosterSnapshot = {
+      ...current,
+      runtimeActivation: "pending",
+      runtimeErrorCode: null,
+      runtimeErrorMessage: null,
+      seats: current.seats.map((seat) => ({
+        ...seat,
+        settings: cloneAgentSettings(seat.settings),
+        runtimeActivation: "pending",
+      })),
+    };
+    this.agentRosters.set(serverId, cloneAgentRoster(retrying));
+    return cloneAgentRoster(retrying);
+  }
+
+  /** Inject one safe deterministic failure for the next pending activation poll. */
+  injectNextAgentActivationFailure(serverId: string, code: string): void {
+    this.requireAgentRoster(serverId);
+    if (!/^[a-z0-9_]{1,64}$/.test(code)) {
+      throw new HenosisClientError(
+        "validation",
+        "Choose a lowercase fixture activation code.",
+        "fixture_failure_code_invalid",
+      );
+    }
+    this.nextAgentActivationFailures.set(serverId, {
+      code,
+      message: "The fixture bridge could not activate the desired roster.",
+    });
+  }
+
   /** Open one replacement generation over the newest bounded message window. */
   async openRoom(
     roomId: string,
     streamId: string,
   ): Promise<RoomConversationSnapshot> {
     this.requireConnectedSession();
-    this.requireKnownRoom(roomId);
+    const room = this.requireKnownRoom(roomId);
     this.reserveRoomStreamId(streamId);
     const history = this.roomHistory(roomId);
     const messages = history.slice(-FIXTURE_PAGE_SIZE).map(cloneMessage);
@@ -182,12 +493,7 @@ export class FixtureHenosisClient implements HenosisClient {
       streamId,
       lastEventSequence: 0,
       currentUserId: this.connection.userId,
-      permissions: {
-        sendMessages: true,
-        attachFiles: true,
-        manageMessages: true,
-        manageServer: false,
-      },
+      permissions: this.fixtureRoomPermissions(room.serverId),
       unreadBoundary: this.unreadBoundary(roomId, history, messages),
       page: {
         messages,
@@ -444,6 +750,91 @@ export class FixtureHenosisClient implements HenosisClient {
     this.emit(openGeneration, event);
   }
 
+  /** Return one known fixture roster only while the preview session is connected. */
+  private requireAgentRoster(serverId: string): AgentRosterSnapshot {
+    this.requireConnectedSession();
+    const roster = this.agentRosters.get(serverId);
+    if (!roster) {
+      throw new HenosisClientError(
+        "validation",
+        "That server is not available in the browser fixture.",
+        "fixture_server_not_found",
+      );
+    }
+    return roster;
+  }
+
+  /** Return a fresh permission snapshot for one known fixture server. */
+  private fixtureRoomPermissions(serverId: string): RoomPermissions {
+    this.requireAgentRoster(serverId);
+    return {
+      sendMessages: true,
+      attachFiles: true,
+      manageMessages: true,
+      manageServer: serverId === "server-henosis",
+    };
+  }
+
+  /** Derive opaque readiness from one submitted seat and the fixture catalog. */
+  private fixtureCredentialReadiness(
+    seat: AgentSeatDraft,
+  ): AgentCredentialReadiness {
+    const harness = this.agentCatalog.harnesses.find(
+      (candidate) => candidate.id === seat.harnessKey,
+    );
+    if (!harness || !harness.available) {
+      return "unavailable";
+    }
+    if (harness.credentialMode === "hostSession") {
+      return "hostSession";
+    }
+    if (seat.credentialBindingId) {
+      return "ready";
+    }
+    return harness.credentialMode === "optionalBinding"
+      ? "hostSession"
+      : "unavailable";
+  }
+
+  /** Settle one pending fixture roster as active or as its injected failure. */
+  private settlePendingAgentActivation(serverId: string): void {
+    const current = this.requireAgentRoster(serverId);
+    if (current.runtimeActivation !== "pending") {
+      return;
+    }
+    const failure = this.nextAgentActivationFailures.get(serverId);
+    this.nextAgentActivationFailures.delete(serverId);
+    const runtimeActivation = failure ? "failed" : "active";
+    const settled: AgentRosterSnapshot = {
+      ...current,
+      activeRevision: failure ? current.activeRevision : current.desiredRevision,
+      lastGoodRevision: failure ? current.lastGoodRevision : current.desiredRevision,
+      runtimeActivation,
+      runtimeErrorCode: failure?.code ?? null,
+      runtimeErrorMessage: failure?.message ?? null,
+      seats: current.seats.map((seat) => ({
+        ...seat,
+        settings: cloneAgentSettings(seat.settings),
+        runtimeActivation,
+      })),
+    };
+    this.agentRosters.set(serverId, cloneAgentRoster(settled));
+  }
+
+  /** Project one cloned public bridge status from authoritative fixture state. */
+  private fixtureBridgeStatus(serverId: string): RoomBridgeStatus {
+    const roster = this.requireAgentRoster(serverId);
+    return {
+      paused: this.pausedAgentBridges.get(serverId) ?? false,
+      desiredRevision: roster.desiredRevision,
+      activeRevision: roster.activeRevision,
+      lastGoodRevision: roster.lastGoodRevision,
+      runtimeActivation: roster.runtimeActivation,
+      runtimeErrorCode: roster.runtimeErrorCode,
+      runtimeErrorMessage: roster.runtimeErrorMessage,
+    };
+  }
+
   /** Assemble a visibly fixture-backed directory snapshot. */
   private snapshot(): RoomDirectorySnapshot {
     return {
@@ -486,13 +877,17 @@ export class FixtureHenosisClient implements HenosisClient {
   }
 
   /** Reject room identifiers outside the explicit public fixture directory. */
-  private requireKnownRoom(roomId: string): void {
-    if (!createFixtureRooms().some((room) => room.id === roomId)) {
+  private requireKnownRoom(roomId: string): RoomSummary {
+    const room = createFixtureRooms().find(
+      (candidate) => candidate.id === roomId,
+    );
+    if (!room) {
       throw new HenosisClientError(
         "validation",
         "That room is not available in the browser fixture.",
       );
     }
+    return room;
   }
 
   /** Validate and reserve one native-shaped stream capability for this session. */

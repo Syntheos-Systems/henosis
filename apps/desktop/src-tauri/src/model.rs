@@ -384,6 +384,331 @@ pub struct BootstrapResult {
     pub requires_authentication: bool,
 }
 
+/// Persistent agent identity owned by the signed-in Rift human.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedAgentIdentity {
+    /// Stable Rift user identifier for the agent.
+    pub id: String,
+    /// Unique Rift username.
+    pub username: String,
+    /// Optional human-facing display name.
+    pub display_name: Option<String>,
+    /// Stable Rift user identifier for the owning human.
+    pub owner_user_id: String,
+}
+
+/// Imported persistent agent identity that has not been claimed by a human.
+///
+/// Rift exposes these identities through roster context rather than a global
+/// collection endpoint, so the native type remains available to roster views
+/// without broadening the public identity-discovery boundary.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnownedAgentIdentity {
+    /// Stable Rift user identifier for the agent.
+    pub id: String,
+    /// Unique Rift username.
+    pub username: String,
+    /// Optional human-facing display name.
+    pub display_name: Option<String>,
+}
+
+/// Credential selection behavior declared by one host harness.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HarnessCredentialMode {
+    /// Use only an authenticated session already present on the host.
+    HostSession,
+    /// Allow either a host session or an opaque deployment-owned binding.
+    OptionalBinding,
+    /// Require an opaque deployment-owned binding.
+    RequiredBinding,
+}
+
+/// One selectable model reported by a host execution harness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapability {
+    /// Stable catalog identifier submitted with a roster update.
+    pub id: String,
+    /// Human-facing model name.
+    pub label: String,
+    /// Whether this deployment can currently use the model.
+    pub available: bool,
+    /// Safe deployment-supplied explanation when unavailable.
+    pub unavailable_reason: Option<String>,
+}
+
+/// One selectable value for a catalog-defined setting.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingCapabilityOption {
+    /// Stable non-secret value submitted to Rift.
+    pub id: String,
+    /// Human-facing option name.
+    pub label: String,
+}
+
+/// Typed control metadata for one catalog-defined non-secret setting.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SettingCapabilityControl {
+    /// Choose one value from a finite deployment-supplied list.
+    Select {
+        /// Allowed values in display order.
+        options: Vec<SettingCapabilityOption>,
+    },
+    /// Choose a bounded stepped integer.
+    Integer {
+        /// Inclusive lower bound.
+        minimum: i64,
+        /// Inclusive upper bound.
+        maximum: i64,
+        /// Positive increment measured from the lower bound.
+        step: i64,
+    },
+    /// Choose an enabled or disabled value.
+    Boolean,
+}
+
+/// One typed non-secret setting exposed by a host harness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingCapability {
+    /// Stable key used in the seat settings object.
+    pub id: String,
+    /// Human-facing setting name.
+    pub label: String,
+    /// Whether each seat must submit a value.
+    pub required: bool,
+    /// Control type and validation constraints.
+    pub control: SettingCapabilityControl,
+}
+
+/// One execution harness and its deployment-discovered choices.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCapability {
+    /// Stable harness identifier submitted with a roster update.
+    pub id: String,
+    /// Human-facing harness name.
+    pub label: String,
+    /// Whether this deployment can currently use the harness.
+    pub available: bool,
+    /// Safe deployment-supplied explanation when unavailable.
+    pub unavailable_reason: Option<String>,
+    /// Supported credential selection behavior.
+    pub credential_mode: HarnessCredentialMode,
+    /// Models currently declared by this harness.
+    pub models: Vec<ModelCapability>,
+    /// Typed non-secret settings currently declared by this harness.
+    pub settings: Vec<SettingCapability>,
+}
+
+/// Generation-stamped execution catalog discovered from the connected host.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCapabilityCatalog {
+    /// Opaque generation that changes whenever host discovery is rebuilt.
+    pub generation: String,
+    /// Deployment-discovered harnesses without a client-side allowlist.
+    pub harnesses: Vec<HarnessCapability>,
+}
+
+/// Opaque readiness of the host or deployment-owned credential binding.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentCredentialReadiness {
+    /// The harness will use an authenticated host session.
+    HostSession,
+    /// The opaque binding is currently usable.
+    Ready,
+    /// No usable host session or binding is available.
+    Unavailable,
+    /// The binding needs human intervention outside the dashboard.
+    Attention,
+}
+
+/// Durable activation state for the desired room roster revision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeActivationState {
+    /// No managed revision has been requested.
+    Idle,
+    /// A desired revision is waiting for reconciliation.
+    Pending,
+    /// The desired revision is running and proven good.
+    Active,
+    /// The desired revision failed validation, preflight, or startup.
+    Failed,
+}
+
+/// One server-authoritative agent seat safe to expose to the dashboard.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSeatSnapshot {
+    /// Stable seat identifier that survives reordering.
+    pub seat_id: String,
+    /// Persistent Rift agent identity occupying the seat.
+    pub agent_identity_id: String,
+    /// Unique public username of the selected agent identity.
+    pub agent_username: String,
+    /// Optional human-facing name of the selected agent identity.
+    pub agent_display_name: Option<String>,
+    /// Current human owner, or none for an imported unclaimed identity.
+    pub owner_human_id: Option<String>,
+    /// Deployment-discovered execution harness key.
+    pub harness_key: String,
+    /// Deployment-discovered model key beneath the harness.
+    pub model_key: String,
+    /// Typed non-secret settings validated by Rift against the catalog.
+    pub settings: serde_json::Value,
+    /// Opaque deployment-owned credential binding identifier, when selected.
+    pub credential_binding_id: Option<String>,
+    /// Whether this seat participates in room responses.
+    pub enabled: bool,
+    /// Non-negative room display and execution order.
+    pub position: i32,
+    /// Desired immutable roster revision containing this seat.
+    pub configuration_revision: Option<i64>,
+    /// Credential usability without credential contents or host locators.
+    pub credential_readiness: AgentCredentialReadiness,
+    /// Current activation state of the containing roster revision.
+    pub runtime_activation: RuntimeActivationState,
+}
+
+/// Complete server-authoritative room roster and asynchronous activation status.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterSnapshot {
+    /// Rift server whose bridge the roster configures.
+    pub server_id: String,
+    /// Latest desired immutable revision.
+    pub desired_revision: Option<i64>,
+    /// Revision currently running in the bridge.
+    pub active_revision: Option<i64>,
+    /// Most recent revision proven to start successfully.
+    pub last_good_revision: Option<i64>,
+    /// Current asynchronous activation state.
+    pub runtime_activation: RuntimeActivationState,
+    /// Stable activation failure code, when the desired revision failed.
+    pub runtime_error_code: Option<String>,
+    /// Bounded safe activation failure detail.
+    pub runtime_error_message: Option<String>,
+    /// Desired seats in server-authoritative position order.
+    pub seats: Vec<AgentSeatSnapshot>,
+}
+
+/// One editable non-secret seat in a whole-roster replacement.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSeatDraft {
+    /// Stable seat identifier retained across edits and reordering.
+    pub seat_id: String,
+    /// Persistent Rift agent identity assigned to the seat.
+    pub agent_identity_id: String,
+    /// Deployment-discovered execution harness key.
+    pub harness_key: String,
+    /// Deployment-discovered model key beneath the harness.
+    pub model_key: String,
+    /// Typed non-secret settings validated by Rift against the live catalog.
+    pub settings: serde_json::Value,
+    /// Opaque deployment-owned credential binding identifier, when selected.
+    pub credential_binding_id: Option<String>,
+    /// Whether this seat participates in room responses.
+    pub enabled: bool,
+    /// Non-negative room display and execution order.
+    pub position: i32,
+}
+
+/// Optimistic whole-roster replacement submitted by the dashboard.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplyAgentRosterRequest {
+    /// Desired revision observed before the local draft was edited.
+    pub expected_revision: Option<i64>,
+    /// Complete next roster, never a partial patch.
+    pub seats: Vec<AgentSeatDraft>,
+}
+
+/// Public pause and activation state for one room bridge.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomBridgeStatus {
+    /// Whether autonomous bridge activity is paused.
+    pub paused: bool,
+    /// Latest desired immutable revision.
+    pub desired_revision: Option<i64>,
+    /// Revision currently running in the bridge.
+    pub active_revision: Option<i64>,
+    /// Most recent revision proven to start successfully.
+    pub last_good_revision: Option<i64>,
+    /// Current asynchronous activation state.
+    pub runtime_activation: RuntimeActivationState,
+    /// Stable activation failure code, when the desired revision failed.
+    pub runtime_error_code: Option<String>,
+    /// Bounded safe activation failure detail.
+    pub runtime_error_message: Option<String>,
+}
+
+/// Stable dashboard error categories used for recovery-oriented UI behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DashboardErrorKind {
+    /// Rift rejected or expired the authenticated native session.
+    Authentication,
+    /// No authenticated native Rift session exists.
+    ConnectionRequired,
+    /// Rift could not be reached.
+    Network,
+    /// The submitted dashboard data failed validation.
+    Validation,
+    /// The requested state conflicts with current server state.
+    Conflict,
+    /// The signed-in human lacks authority for the operation.
+    Forbidden,
+    /// A runtime capability or opaque credential is unavailable.
+    Unavailable,
+    /// Rift returned data outside the supported dashboard contract.
+    Protocol,
+    /// Native session state could not be read safely.
+    Storage,
+}
+
+/// Safe code-aware failure returned by dashboard Tauri commands.
+#[derive(Clone, Debug, Serialize, thiserror::Error)]
+#[error("{message}")]
+pub struct DashboardCommandError {
+    /// Recovery category used by the dashboard without parsing text.
+    pub kind: DashboardErrorKind,
+    /// Stable machine-readable local or Rift error code.
+    pub code: String,
+    /// Human-readable recovery guidance without secrets or native paths.
+    pub message: String,
+}
+
+/// Construction helpers for consistent dashboard command failures.
+impl DashboardCommandError {
+    /// Create one safe dashboard error with an explicit stable code.
+    pub fn new(
+        kind: DashboardErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// Stable error categories rendered as actionable GUI states.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -450,6 +775,327 @@ mod tests {
                 content_type: Some("text/plain".into()),
                 size_bytes: Some(128),
             }],
+        }
+    }
+
+    /// Construct one dynamic harness with every supported setting control.
+    fn dashboard_harness() -> HarnessCapability {
+        HarnessCapability {
+            id: "codex-cli".into(),
+            label: "Codex CLI".into(),
+            available: true,
+            unavailable_reason: None,
+            credential_mode: HarnessCredentialMode::HostSession,
+            models: vec![ModelCapability {
+                id: "gpt-5.6-sol".into(),
+                label: "GPT-5.6 Sol".into(),
+                available: true,
+                unavailable_reason: None,
+            }],
+            settings: vec![
+                SettingCapability {
+                    id: "effort".into(),
+                    label: "Reasoning effort".into(),
+                    required: true,
+                    control: SettingCapabilityControl::Select {
+                        options: vec![SettingCapabilityOption {
+                            id: "medium".into(),
+                            label: "Medium".into(),
+                        }],
+                    },
+                },
+                SettingCapability {
+                    id: "turnLimit".into(),
+                    label: "Turn limit".into(),
+                    required: false,
+                    control: SettingCapabilityControl::Integer {
+                        minimum: 1,
+                        maximum: 20,
+                        step: 1,
+                    },
+                },
+                SettingCapability {
+                    id: "webSearch".into(),
+                    label: "Web search".into(),
+                    required: false,
+                    control: SettingCapabilityControl::Boolean,
+                },
+            ],
+        }
+    }
+
+    /// Construct one editable dashboard seat with only catalog-defined settings.
+    fn dashboard_seat_draft() -> AgentSeatDraft {
+        AgentSeatDraft {
+            seat_id: "seat-1".into(),
+            agent_identity_id: "agent-1".into(),
+            harness_key: "codex-cli".into(),
+            model_key: "gpt-5.6-sol".into(),
+            settings: json!({ "effort": "medium", "turnLimit": 8, "webSearch": false }),
+            credential_binding_id: None,
+            enabled: true,
+            position: 0,
+        }
+    }
+
+    /// Construct one failed roster snapshot with opaque readiness and revision state.
+    fn dashboard_failed_roster() -> AgentRosterSnapshot {
+        AgentRosterSnapshot {
+            server_id: "server-1".into(),
+            desired_revision: Some(7),
+            active_revision: Some(6),
+            last_good_revision: Some(6),
+            runtime_activation: RuntimeActivationState::Failed,
+            runtime_error_code: Some("process_exited".into()),
+            runtime_error_message: Some("Agent process exited during startup.".into()),
+            seats: vec![AgentSeatSnapshot {
+                seat_id: "seat-1".into(),
+                agent_identity_id: "agent-1".into(),
+                agent_username: "cartographer".into(),
+                agent_display_name: Some("Cartographer".into()),
+                owner_human_id: Some("human-1".into()),
+                harness_key: "codex-cli".into(),
+                model_key: "gpt-5.6-sol".into(),
+                settings: json!({ "effort": "medium" }),
+                credential_binding_id: None,
+                enabled: true,
+                position: 0,
+                configuration_revision: Some(7),
+                credential_readiness: AgentCredentialReadiness::HostSession,
+                runtime_activation: RuntimeActivationState::Failed,
+            }],
+        }
+    }
+
+    /// Dashboard identities and dynamic catalog serialize as stable secret-free contracts.
+    #[test]
+    fn dashboard_identities_and_capabilities_serialize_stably() {
+        let owned = OwnedAgentIdentity {
+            id: "agent-1".into(),
+            username: "cartographer".into(),
+            display_name: Some("Cartographer".into()),
+            owner_user_id: "human-1".into(),
+        };
+        let unowned = UnownedAgentIdentity {
+            id: "agent-legacy".into(),
+            username: "legacy-scout".into(),
+            display_name: None,
+        };
+        let catalog = AgentCapabilityCatalog {
+            generation: "catalog-7".into(),
+            harnesses: vec![dashboard_harness()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(&owned).expect("owned identity must serialize"),
+            json!({
+                "id": "agent-1",
+                "username": "cartographer",
+                "displayName": "Cartographer",
+                "ownerUserId": "human-1",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&unowned).expect("unowned identity must serialize"),
+            json!({
+                "id": "agent-legacy",
+                "username": "legacy-scout",
+                "displayName": null,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&catalog).expect("catalog must serialize"),
+            json!({
+                "generation": "catalog-7",
+                "harnesses": [{
+                    "id": "codex-cli",
+                    "label": "Codex CLI",
+                    "available": true,
+                    "unavailableReason": null,
+                    "credentialMode": "hostSession",
+                    "models": [{
+                        "id": "gpt-5.6-sol",
+                        "label": "GPT-5.6 Sol",
+                        "available": true,
+                        "unavailableReason": null,
+                    }],
+                    "settings": [
+                        {
+                            "id": "effort",
+                            "label": "Reasoning effort",
+                            "required": true,
+                            "control": {
+                                "type": "select",
+                                "options": [{ "id": "medium", "label": "Medium" }],
+                            },
+                        },
+                        {
+                            "id": "turnLimit",
+                            "label": "Turn limit",
+                            "required": false,
+                            "control": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 20,
+                                "step": 1,
+                            },
+                        },
+                        {
+                            "id": "webSearch",
+                            "label": "Web search",
+                            "required": false,
+                            "control": { "type": "boolean" },
+                        },
+                    ],
+                }],
+            })
+        );
+    }
+
+    /// Dashboard roster, update, and bridge state retain revisions and runtime failure detail.
+    #[test]
+    fn dashboard_read_context_roster_update_and_runtime_failure_serialize_stably() {
+        let roster = dashboard_failed_roster();
+        let update = ApplyAgentRosterRequest {
+            expected_revision: Some(7),
+            seats: vec![dashboard_seat_draft()],
+        };
+        let status = RoomBridgeStatus {
+            paused: false,
+            desired_revision: Some(7),
+            active_revision: Some(6),
+            last_good_revision: Some(6),
+            runtime_activation: RuntimeActivationState::Failed,
+            runtime_error_code: Some("process_exited".into()),
+            runtime_error_message: Some("Agent process exited during startup.".into()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&roster).expect("roster must serialize"),
+            json!({
+                "serverId": "server-1",
+                "desiredRevision": 7,
+                "activeRevision": 6,
+                "lastGoodRevision": 6,
+                "runtimeActivation": "failed",
+                "runtimeErrorCode": "process_exited",
+                "runtimeErrorMessage": "Agent process exited during startup.",
+                "seats": [{
+                    "seatId": "seat-1",
+                    "agentIdentityId": "agent-1",
+                    "agentUsername": "cartographer",
+                    "agentDisplayName": "Cartographer",
+                    "ownerHumanId": "human-1",
+                    "harnessKey": "codex-cli",
+                    "modelKey": "gpt-5.6-sol",
+                    "settings": { "effort": "medium" },
+                    "credentialBindingId": null,
+                    "enabled": true,
+                    "position": 0,
+                    "configurationRevision": 7,
+                    "credentialReadiness": "hostSession",
+                    "runtimeActivation": "failed",
+                }],
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&update).expect("roster update must serialize"),
+            json!({
+                "expectedRevision": 7,
+                "seats": [{
+                    "seatId": "seat-1",
+                    "agentIdentityId": "agent-1",
+                    "harnessKey": "codex-cli",
+                    "modelKey": "gpt-5.6-sol",
+                    "settings": {
+                        "effort": "medium",
+                        "turnLimit": 8,
+                        "webSearch": false,
+                    },
+                    "credentialBindingId": null,
+                    "enabled": true,
+                    "position": 0,
+                }],
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&status).expect("bridge status must serialize"),
+            json!({
+                "paused": false,
+                "desiredRevision": 7,
+                "activeRevision": 6,
+                "lastGoodRevision": 6,
+                "runtimeActivation": "failed",
+                "runtimeErrorCode": "process_exited",
+                "runtimeErrorMessage": "Agent process exited during startup.",
+            })
+        );
+    }
+
+    /// Dashboard success and failure bodies contain no credential values or native paths.
+    #[test]
+    fn dashboard_serialized_contracts_exclude_secrets_and_native_paths() {
+        let created = OwnedAgentIdentity {
+            id: "agent-created".into(),
+            username: "builder".into(),
+            display_name: Some("Builder".into()),
+            owner_user_id: "human-1".into(),
+        };
+        let claimed = OwnedAgentIdentity {
+            id: "agent-legacy".into(),
+            username: "legacy-scout".into(),
+            display_name: None,
+            owner_user_id: "human-1".into(),
+        };
+        let errors = [
+            DashboardCommandError::new(
+                DashboardErrorKind::Conflict,
+                "revision_conflict",
+                "Room roster changed at revision 8.",
+            ),
+            DashboardCommandError::new(
+                DashboardErrorKind::Validation,
+                "bad_request",
+                "Choose a valid agent identity.",
+            ),
+            DashboardCommandError::new(
+                DashboardErrorKind::Forbidden,
+                "forbidden",
+                "You cannot change this room roster.",
+            ),
+            DashboardCommandError::new(
+                DashboardErrorKind::Unavailable,
+                "credential_not_ready",
+                "The selected credential binding needs attention.",
+            ),
+        ];
+        let encoded = serde_json::to_string(&(
+            created,
+            claimed,
+            AgentCapabilityCatalog {
+                generation: "catalog-7".into(),
+                harnesses: vec![dashboard_harness()],
+            },
+            dashboard_failed_roster(),
+            ApplyAgentRosterRequest {
+                expected_revision: Some(7),
+                seats: vec![dashboard_seat_draft()],
+            },
+            errors,
+        ))
+        .expect("dashboard contracts must serialize");
+
+        for forbidden in [
+            "accessToken",
+            "refreshToken",
+            "credentialValue",
+            "environmentValue",
+            "executablePath",
+            "commandTemplate",
+            "localPath",
+            "/native/",
+        ] {
+            assert!(!encoded.contains(forbidden));
         }
     }
 
@@ -526,7 +1172,7 @@ mod tests {
             "refreshToken",
             "credentialBinding",
             "localPath",
-            "/home/",
+            "/native/",
         ] {
             assert!(!encoded.contains(forbidden));
         }
