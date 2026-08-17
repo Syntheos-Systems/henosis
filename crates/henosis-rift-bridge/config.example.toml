@@ -4,8 +4,11 @@
 
 [rift]
 api_url = "http://localhost:3200"
+# Bridge-only requests require an explicit loopback IP and port.
+bridge_api_url = "http://127.0.0.1:3201"
 ws_url = "ws://localhost:3200/ws"
-jwt_secret = "replace-with-at-least-32-random-bytes-jwt"
+# The bridge receives only the agent-token signing key, never Rift's human-session key.
+agent_jwt_secret = "replace-with-at-least-32-random-bytes-agent-jwt"
 bridge_secret = "replace-with-at-least-32-random-bytes-bridge"
 server_id = "00000000-0000-0000-0000-000000000000"
 channel_id = "00000000-0000-0000-0000-000000000000"

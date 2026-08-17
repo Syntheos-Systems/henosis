@@ -3,13 +3,11 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::HeaderMap,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
-use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::models::agent_control::BridgeStatus;
@@ -77,6 +75,21 @@ async fn load_bridge_status(pool: &PgPool, server_id: Uuid) -> Result<BridgeStat
     })
 }
 
+/// Read daemon status while one repeatable-read transaction holds the current fence lock.
+async fn load_daemon_bridge_status(
+    pool: &PgPool,
+    server_id: Uuid,
+    fence_headers: &super::bridge::BridgeFenceHeaders,
+) -> Result<BridgeStatus, AppError> {
+    let mut transaction =
+        super::bridge::begin_private_route_fence_transaction(pool, server_id, fence_headers)
+            .await?;
+    let status =
+        db::agent_control::read_bridge_status_on_connection(&mut transaction, server_id).await?;
+    transaction.commit().await?;
+    Ok(status)
+}
+
 /// Pause agent activity for one managed server.
 pub async fn pause_bridge(
     auth: AuthUser,
@@ -116,31 +129,125 @@ pub async fn bridge_status(
 
 /// Return bridge status to the daemon through the bridge-secret boundary.
 pub async fn daemon_bridge_status(
+    _authorization: super::bridge::BridgeAuthorization,
+    fence_headers: super::bridge::BridgeFenceHeaders,
     State(pool): State<PgPool>,
-    State(config): State<Config>,
     Path(server_id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<Json<BridgeStatus>, AppError> {
-    if !super::bridge::bridge_authorized(&headers, &config) {
-        return Err(AppError::Unauthorized);
-    }
-    Ok(Json(load_bridge_status(&pool, server_id).await?))
+    Ok(Json(
+        load_daemon_bridge_status(&pool, server_id, &fence_headers).await?,
+    ))
 }
 
 #[cfg(test)]
 /// Covers human bridge control, public visibility, and daemon auth boundaries.
 mod tests {
-    use axum::http::HeaderValue;
+    use axum::extract::FromRequestParts;
+    use axum::http::Request;
+    use axum::http::{HeaderMap, HeaderValue};
+    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
+    use crate::config::Config;
+    use crate::models::leadership::RoomFence;
+
+    /// Parse one current room fence through the same extractor used by the private router.
+    async fn extracted_fence_headers(
+        fence: &RoomFence,
+    ) -> super::super::bridge::BridgeFenceHeaders {
+        let request = Request::builder()
+            .header(
+                super::super::bridge::FENCE_SERVER_HEADER,
+                fence.server_id.to_string(),
+            )
+            .header(
+                super::super::bridge::FENCE_EPOCH_HEADER,
+                fence.epoch.to_string(),
+            )
+            .header(
+                super::super::bridge::FENCE_LEASE_HEADER,
+                fence.lease_id.to_string(),
+            )
+            .body(())
+            .expect("test fence request must build");
+        let (mut parts, _) = request.into_parts();
+        super::super::bridge::BridgeFenceHeaders::from_request_parts(&mut parts, &())
+            .await
+            .expect("current test fence headers must parse")
+    }
+
+    /// Live PostgreSQL exercises the daemon's fenced status transaction end to end.
+    #[tokio::test]
+    async fn live_daemon_status_reads_under_current_fence() {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!("skipping live daemon status test: HENOSIS_RIFT_TEST_DATABASE_URL is unset");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("status_owner_{suffix}"),
+            &format!("status-owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("status owner must be created");
+        let server = db::create_server(&pool, &format!("status-{suffix}"), None, owner.id)
+            .await
+            .expect("status server must be created");
+        sqlx::query(
+            r#"INSERT INTO bridge_server_state (server_id, paused, fencing_required)
+               VALUES ($1, TRUE, TRUE)"#,
+        )
+        .bind(server.id)
+        .execute(&pool)
+        .await
+        .expect("managed status state must be created");
+        let fence = db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("status fence must be acquired");
+        let headers = extracted_fence_headers(&fence).await;
+
+        let status = load_daemon_bridge_status(&pool, server.id, &headers)
+            .await
+            .expect("current fence must read daemon status");
+        assert!(status.paused);
+        assert_eq!(status.desired_revision, None);
+
+        db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("successor status fence must be acquired");
+        assert!(matches!(
+            load_daemon_bridge_status(&pool, server.id, &headers).await,
+            Err(AppError::Coded {
+                code: "stale_leadership_fence",
+                ..
+            })
+        ));
+    }
 
     /// Build minimal runtime configuration for bridge-secret predicate tests.
     fn config_with_secret(secret: &str) -> Config {
         Config {
             database_url: String::new(),
             jwt_secret: "jwt-secret".to_string(),
+            agent_jwt_secret: "agent-jwt-secret".to_string(),
             bridge_secret: secret.to_string(),
             listen_addr: String::new(),
+            bridge_listen_addr: String::new(),
+            allow_remote_listen: false,
             cors_origins: Vec::new(),
             upload_dir: String::new(),
             max_upload_bytes: 0,

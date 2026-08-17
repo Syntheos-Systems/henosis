@@ -3,10 +3,10 @@
 //! Connects to the Rift server via WebSocket, listens for messages,
 //! and dispatches agent responses through the room state machine.
 
+use henosis_rift_server::models::leadership::RoomFence;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -18,6 +18,7 @@ use crate::cron::{poll_due_jobs, record_job_result, scheduled_job_stimulus};
 #[cfg(feature = "cognition")]
 use crate::embedding::CognitionEmbedder;
 use crate::embedding::{Embedder, OpenAiEmbedder};
+use crate::event_dedupe::DurableEventLedger;
 use crate::execution::approval::{decide_drain_action, ApprovalRegistry, DrainAction};
 use crate::execution::sandbox::SandboxManager;
 use crate::stimulus::{
@@ -52,6 +53,8 @@ struct EmbeddingRuntime {
     cognition: Option<Arc<dyn henosis_cognition::EmbeddingProvider>>,
 }
 
+use crate::leadership::{LeadershipGuard, LeadershipRevocationOnDrop};
+use crate::process_security::secure_std_command;
 use crate::rift_client::{ws_listen, RiftRestClient, RiftWsEvent};
 use crate::room::Room;
 
@@ -63,6 +66,8 @@ pub struct RuntimeDependencies {
     /// Directory holding durable scheduler state, opened per bridge generation
     /// so a replaced bridge always rehydrates the jobs persisted on disk.
     pub cron_dir: Option<std::path::PathBuf>,
+    /// Database-backed capability injected only by a managed room supervisor.
+    pub managed_fence: Option<RoomFence>,
 }
 
 /// One provisioned Rift identity reported when a managed bridge becomes usable.
@@ -132,12 +137,18 @@ async fn run_runtime<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    #[cfg(target_os = "linux")]
+    crate::process_security::protect_authority_process().map_err(|error| {
+        anyhow::anyhow!("failed to protect bridge authority from child inspection: {error}")
+    })?;
+    config.validate_runtime()?;
     tracing::info!("loaded config with {} agents", config.agents.len());
     let mut tasks = JoinSet::new();
     tokio::pin!(stop);
     let RuntimeDependencies {
         kleos: injected_kleos,
         cron_dir,
+        managed_fence,
     } = dependencies;
     // Each bridge generation rehydrates scheduler state from disk so jobs
     // added by a previous generation survive a managed bridge replacement.
@@ -146,16 +157,38 @@ where
         None => None,
     };
 
+    // Full-fsync replay authority is opened and validated before any room
+    // provisioning, and its synchronous filesystem work stays off Tokio.
+    let event_ledger_path = event_ledger_path(
+        cron_dir.as_deref(),
+        config.rift.server_id,
+        config.rift.channel_id,
+    );
+    let event_ledger =
+        tokio::task::spawn_blocking(move || DurableEventLedger::open(&event_ledger_path))
+            .await
+            .map_err(|error| anyhow::anyhow!("Rift event ledger open worker failed: {error}"))?
+            .map_err(|error| {
+                anyhow::anyhow!("Rift event ledger is unavailable or unsafe: {error}")
+            })?;
+
     // Build embeddings before either consumer so cognition and Rift receive
     // clones of the same provider Arc in the in-process configuration.
     let embedding_runtime = build_embedding_runtime(&config).await?;
 
     // Create auth manager and REST client.
     let auth = AgentAuthManager::new(
-        config.rift.jwt_secret.clone(),
+        config.rift.agent_jwt_secret.clone(),
         config.rift.bridge_secret.clone(),
-    );
-    let rift = Arc::new(RiftRestClient::new(config.rift.api_url.clone(), auth));
+    )
+    .with_managed_fence(managed_fence);
+    let rift = Arc::new(RiftRestClient::new(
+        config.rift.api_url.clone(),
+        config.rift.bridge_api_url.clone(),
+        auth,
+    )?);
+    let leadership = Arc::new(LeadershipGuard::new(rift.clone(), managed_fence));
+    let _revoke_leadership_on_runtime_drop = LeadershipRevocationOnDrop::new(leadership.clone());
     let kleos = match injected_kleos {
         Some(kleos) => {
             tracing::info!("kleos backend: injected Henosis kernel stores");
@@ -234,6 +267,8 @@ where
         config.personas,
         embedding_runtime.room,
         embedding_runtime.config,
+        leadership.clone(),
+        event_ledger,
     )
     .await?;
 
@@ -241,9 +276,10 @@ where
 
     // Mint a WS connection token using the first agent's credentials.
     let ws_auth = AgentAuthManager::new(
-        config.rift.jwt_secret.clone(),
+        config.rift.agent_jwt_secret.clone(),
         config.rift.bridge_secret.clone(),
-    );
+    )
+    .with_managed_fence(managed_fence);
     let first_agent = room
         .roster_ref()
         .all()
@@ -277,11 +313,16 @@ where
     let pause_server_id = config.rift.server_id;
     let (pause_tx, pause_rx) = watch::channel(false);
     {
+        let leadership = leadership.clone();
         let rift = rift.clone();
         tasks.spawn(async move {
             loop {
-                tokio::time::sleep(pause_interval).await;
-                match rift.is_paused(pause_server_id).await {
+                let paused = if leadership.is_managed() {
+                    leadership.require_current().await
+                } else {
+                    rift.is_paused(pause_server_id).await
+                };
+                match paused {
                     Ok(p) => {
                         // Send only on transitions: watch::Sender::send marks
                         // the value changed unconditionally, and an
@@ -294,8 +335,18 @@ where
                             }
                         }
                     }
-                    Err(e) => tracing::warn!("failed to check pause status: {e}"),
+                    Err(e) => {
+                        if leadership.is_managed() {
+                            tracing::error!(
+                                server_id = %pause_server_id,
+                                "managed leadership verification failed closed: {e}"
+                            );
+                            return;
+                        }
+                        tracing::warn!("failed to check pause status: {e}");
+                    }
                 }
+                tokio::time::sleep(pause_interval).await;
             }
         });
     }
@@ -402,6 +453,12 @@ where
     let mut cron_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     cron_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending_cron_jobs = VecDeque::new();
+    let mut leadership_rx = leadership.subscribe();
+    if *leadership_rx.borrow() {
+        return Err(anyhow::anyhow!(
+            "managed-room leadership was revoked before runtime event dispatch"
+        ));
+    }
 
     tracing::info!("bridge is running");
 
@@ -411,9 +468,18 @@ where
     // the event receiver and pause watch passed into handle_message.
     loop {
         tokio::select! {
+            changed = leadership_rx.changed() => {
+                if changed.is_err() || *leadership_rx.borrow() {
+                    return Err(anyhow::anyhow!(
+                        "managed-room leadership was revoked; runtime stopped fail-closed"
+                    ));
+                }
+            }
             _ = &mut stop => {
                 tracing::info!("bridge stop requested");
-                if let Some(scheduler) = cron_scheduler.as_ref() {
+                if let (Ok(_), Some(scheduler)) =
+                    (leadership.require_current().await, cron_scheduler.as_ref())
+                {
                     while let Some((job, started_at)) = pending_cron_jobs.pop_front() {
                         let outcome =
                             Err("bridge stopped before the governed room cascade".to_string());
@@ -433,6 +499,7 @@ where
             Some(event) = event_rx.recv() => {
                 match event {
                     RiftWsEvent::Ready => {
+                        leadership.require_current().await?;
                         tracing::info!("WebSocket ready");
                         if let Some(sender) = ready.take() {
                             sender
@@ -443,15 +510,15 @@ where
                         }
                     }
                     RiftWsEvent::MessageCreate(msg) => {
+                        leadership.require_current().await?;
                         let _ = activity_tx.send(std::time::Instant::now());
-                        if *pause_rx.borrow() {
-                            tracing::debug!("bridge paused, ignoring message");
-                            continue;
-                        }
                         if let Err(e) = room
                             .handle_message(msg, &mut event_rx, &mut cascade_pause_rx)
                             .await
                         {
+                            if fatal_room_error(&e) {
+                                return Err(e.into());
+                            }
                             tracing::error!("error handling message: {e}");
                         }
                         // A cascade consumes events internally for its whole
@@ -461,11 +528,13 @@ where
                         let _ = activity_tx.send(std::time::Instant::now());
                     }
                     RiftWsEvent::Disconnected => {
+                        leadership.require_current().await?;
                         tracing::warn!("WebSocket disconnected, will reconnect");
                     }
                 }
             }
             Some(stim) = stim_rx.recv() => {
+                leadership.require_current().await?;
                 if *pause_rx.borrow() {
                     tracing::debug!("bridge paused, dropping stimulus");
                     continue;
@@ -476,23 +545,31 @@ where
                     .handle_stimulus(stim, &mut event_rx, &mut cascade_pause_rx)
                     .await
                 {
+                    if fatal_room_error(&e) {
+                        return Err(e.into());
+                    }
                     tracing::error!("error handling stimulus: {e}");
                 }
                 // Same end-of-cascade stamp as the message arm.
                 let _ = activity_tx.send(std::time::Instant::now());
             }
             _ = std::future::ready(()), if !pending_cron_jobs.is_empty() && !*pause_rx.borrow() => {
+                leadership.require_current().await?;
                 let (job, started_at) = pending_cron_jobs
                     .pop_front()
                     .expect("cron dispatch branch requires a pending job");
                 tracing::info!(job_id = %job.id, "injecting scheduled task into governed room");
                 let _ = activity_tx.send(std::time::Instant::now());
                 let stimulus = scheduled_job_stimulus(&job);
-                let outcome = room
+                let cascade_result = room
                     .handle_stimulus(stimulus, &mut event_rx, &mut cascade_pause_rx)
-                    .await
-                    .map_err(|error| error.to_string());
+                    .await;
+                let outcome = match cascade_result {
+                    Err(error) if fatal_room_error(&error) => return Err(error.into()),
+                    other => other.map_err(|error| error.to_string()),
+                };
                 let _ = activity_tx.send(std::time::Instant::now());
+                leadership.require_current().await?;
                 let scheduler = cron_scheduler
                     .as_ref()
                     .expect("pending cron job requires a scheduler");
@@ -511,6 +588,7 @@ where
                 }
             }
             _ = cron_tick.tick(), if cron_scheduler.is_some() && pending_cron_jobs.is_empty() => {
+                leadership.require_current().await?;
                 let paused = *pause_rx.borrow();
                 let scheduler = cron_scheduler
                     .as_mut()
@@ -529,9 +607,30 @@ where
         }
     }
 
+    leadership.revoke();
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Derive one stable consumer ledger path for a server/channel bridge identity.
+fn event_ledger_path(
+    cron_dir: Option<&Path>,
+    server_id: uuid::Uuid,
+    channel_id: uuid::Uuid,
+) -> PathBuf {
+    let root = cron_dir
+        .map(|directory| directory.join("rift-event-ledgers"))
+        .unwrap_or_else(|| PathBuf::from("data/rift-event-ledgers"));
+    root.join(format!("{server_id}-{channel_id}.sqlite"))
+}
+
+/// Identify room failures that invalidate further automatic dispatch authority.
+fn fatal_room_error(error: &crate::error::BridgeError) -> bool {
+    matches!(
+        error,
+        crate::error::BridgeError::StaleLeadership | crate::error::BridgeError::EventState(_)
+    )
 }
 
 /// Wait until a supervisor cancellation token becomes true or disconnects.
@@ -761,7 +860,7 @@ fn load_cred_secret(reference: &str) -> anyhow::Result<String> {
     let (namespace, key) = reference.split_once('/').ok_or_else(|| {
         anyhow::anyhow!("invalid cred reference '{reference}', expected namespace/key")
     })?;
-    let output = Command::new("cred")
+    let output = secure_std_command("cred")
         .args(["get", namespace, key])
         .output()?;
     if !output.status.success() {
@@ -779,7 +878,47 @@ fn load_cred_secret(reference: &str) -> anyhow::Result<String> {
 /// ONNX session or contacting an HTTP endpoint.
 #[cfg(test)]
 mod tests {
-    use super::{select_embedding_backend, EmbeddingBackendChoice};
+    use super::{
+        event_ledger_path, fatal_room_error, select_embedding_backend, EmbeddingBackendChoice,
+        RuntimeDependencies,
+    };
+    use crate::error::BridgeError;
+
+    /// Standalone bridge construction never fabricates a managed leadership capability.
+    #[test]
+    fn runtime_dependencies_default_is_unfenced() {
+        assert!(RuntimeDependencies::default().managed_fence.is_none());
+    }
+
+    /// Event-state failures terminate dispatch just like revoked leadership.
+    #[test]
+    fn event_state_failures_are_fatal_to_runtime_dispatch() {
+        assert!(fatal_room_error(&BridgeError::EventState(
+            "unsafe ledger".to_string()
+        )));
+        assert!(fatal_room_error(&BridgeError::StaleLeadership));
+        assert!(!fatal_room_error(&BridgeError::Executor(
+            "one agent failed".to_string()
+        )));
+    }
+
+    /// Managed and standalone consumers derive deterministic, scoped ledger paths.
+    #[test]
+    fn event_ledger_path_is_server_and_channel_scoped() {
+        let server_id = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let managed_root = std::path::Path::new("/private/runtime");
+        let leaf = format!("{server_id}-{channel_id}.sqlite");
+
+        assert_eq!(
+            event_ledger_path(Some(managed_root), server_id, channel_id),
+            managed_root.join("rift-event-ledgers").join(&leaf)
+        );
+        assert_eq!(
+            event_ledger_path(None, server_id, channel_id),
+            std::path::Path::new("data/rift-event-ledgers").join(leaf)
+        );
+    }
 
     /// Verifies an explicit URL always preserves the HTTP override.
     #[test]

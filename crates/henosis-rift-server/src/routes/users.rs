@@ -14,6 +14,11 @@ use crate::db;
 use crate::error::AppError;
 use crate::models::user::PublicUser;
 
+/// Minimum encoded byte length accepted by the password-change route.
+const MIN_PASSWORD_BYTES: usize = 8;
+/// Maximum encoded byte length accepted by the password-change route.
+const MAX_PASSWORD_BYTES: usize = 128;
+
 #[derive(Deserialize)]
 /// Fields an authenticated user may change on their own profile.
 pub struct UpdateProfileRequest {
@@ -53,9 +58,8 @@ pub async fn update_me(
 ) -> Result<Json<UserProfile>, AppError> {
     // If email is being changed, validate and check uniqueness
     if let Some(ref email) = req.email {
-        if !email.contains('@') {
-            return Err(AppError::BadRequest("Invalid email".into()));
-        }
+        let email = email.trim();
+        super::auth::validate_human_email(email)?;
         if let Some(existing) = db::get_user_by_email(&pool, email).await?
             && existing.id != auth.user_id
         {
@@ -151,8 +155,39 @@ pub async fn upload_avatar(
 #[derive(Deserialize)]
 /// Current and replacement credentials for a password change.
 pub struct ChangePasswordRequest {
+    /// Existing credential that authorizes the password replacement.
     pub current_password: String,
+    /// Replacement credential to hash and store.
     pub new_password: String,
+}
+
+/// Bound both password-change credentials before database or Argon2 work.
+fn validate_password_change_request(request: &ChangePasswordRequest) -> Result<(), AppError> {
+    if request.new_password.len() < MIN_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(
+            "New password must be at least 8 characters".into(),
+        ));
+    }
+    if request.new_password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(
+            "New password must be at most 128 bytes".into(),
+        ));
+    }
+    if !(MIN_PASSWORD_BYTES..=MAX_PASSWORD_BYTES).contains(&request.current_password.len()) {
+        return Err(AppError::BadRequest(
+            "Current password must be 8-128 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve opaque credential semantics when a concurrent password update wins.
+fn require_password_update_applied(updated: bool) -> Result<(), AppError> {
+    if updated {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
+    }
 }
 
 /// Change the authenticated user's password and revoke all refresh tokens.
@@ -161,49 +196,24 @@ pub async fn change_password(
     auth: AuthUser,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if req.new_password.len() < 8 {
-        return Err(AppError::BadRequest(
-            "New password must be at least 8 characters".into(),
-        ));
-    }
+    validate_password_change_request(&req)?;
 
     let user = db::get_user_by_id(&pool, auth.user_id)
         .await?
         .ok_or(AppError::NotFound("User not found".into()))?;
 
-    // Verify current password
-    verify_password(&req.current_password, &user.password_hash)?;
+    // Retain the verified database value for the conditional update boundary.
+    let expected_password_hash = user.password_hash;
+    super::auth::verify_password_bounded(req.current_password, expected_password_hash.clone())
+        .await?;
 
     // Hash new password
-    let new_hash = hash_password(&req.new_password)?;
-    db::update_user_password(&pool, auth.user_id, &new_hash).await?;
+    let new_hash = super::auth::hash_password_bounded(req.new_password).await?;
+    let updated =
+        db::update_user_password(&pool, auth.user_id, &expected_password_hash, &new_hash).await?;
+    require_password_update_applied(updated)?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-// ── Password helpers ──
-
-fn hash_password(password: &str) -> Result<String, AppError> {
-    use argon2::{
-        Argon2, PasswordHasher,
-        password_hash::{SaltString, rand_core::OsRng},
-    };
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| AppError::Internal(format!("Password hash error: {e}")))
-}
-
-/// Verify a password against its stored Argon2 hash.
-fn verify_password(password: &str, hash: &str) -> Result<(), AppError> {
-    use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
-    let parsed =
-        PasswordHash::new(hash).map_err(|e| AppError::Internal(format!("Invalid hash: {e}")))?;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .map_err(|_| AppError::Unauthorized)
 }
 
 /// GET /api/users/:user_id
@@ -299,17 +309,13 @@ pub async fn list_dm_messages(
     Path(dm_channel_id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<DmMessageQuery>,
 ) -> Result<Json<Vec<db::DmMessageWithAuthor>>, AppError> {
+    let limit = crate::models::message::validated_message_page_limit(query.limit)
+        .map_err(|message| AppError::BadRequest(message.to_string()))?;
     if !db::is_dm_participant(&pool, dm_channel_id, auth.user_id).await? {
         return Err(AppError::Forbidden);
     }
 
-    let messages = db::get_dm_messages(
-        &pool,
-        dm_channel_id,
-        query.limit.unwrap_or(50),
-        query.before,
-    )
-    .await?;
+    let messages = db::get_dm_messages(&pool, dm_channel_id, limit, query.before).await?;
     Ok(Json(messages))
 }
 
@@ -336,6 +342,193 @@ pub async fn send_dm_message(
 #[derive(Deserialize)]
 /// Pagination parameters for direct-message history.
 pub struct DmMessageQuery {
+    /// Return messages created before this direct-message identifier.
     pub before: Option<Uuid>,
+    /// Maximum page size, constrained to the shared message-history boundary.
     pub limit: Option<i64>,
+}
+
+#[cfg(test)]
+/// Exercises direct-message pagination validation at the route boundary.
+mod tests {
+    use std::time::Duration;
+
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+    };
+    use chrono::{Duration as ChronoDuration, Utc};
+    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use uuid::Uuid;
+
+    use super::{
+        ChangePasswordRequest, DmMessageQuery, change_password, list_dm_messages,
+        require_password_update_applied, validate_password_change_request,
+    };
+    use crate::auth::middleware::AuthUser;
+    use crate::db;
+    use crate::error::AppError;
+
+    /// Connect to the opt-in PostgreSQL database for password-update race tests.
+    async fn live_users_test_pool() -> Option<PgPool> {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping live password-update race test: HENOSIS_RIFT_TEST_DATABASE_URL is unset"
+            );
+            return None;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+        Some(pool)
+    }
+
+    /// Invalid page sizes fail before participant lookup can touch the database.
+    #[tokio::test]
+    async fn list_dm_messages_rejects_invalid_limit_before_database_access() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/rift_dm_pagination_must_not_connect")
+            .expect("static database URL must parse");
+        let result = list_dm_messages(
+            State(pool),
+            AuthUser {
+                user_id: Uuid::new_v4(),
+                username: "dm-pagination-test".to_string(),
+                is_agent: false,
+                managed_fence: None,
+            },
+            Path(Uuid::new_v4()),
+            Query(DmMessageQuery {
+                before: None,
+                limit: Some(-1),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    /// Both password-change fields enforce exact encoded-byte work bounds.
+    #[test]
+    fn password_change_fields_have_strict_bounds() {
+        for (current_len, new_len) in [(8, 8), (128, 128)] {
+            let request = ChangePasswordRequest {
+                current_password: "c".repeat(current_len),
+                new_password: "n".repeat(new_len),
+            };
+            assert!(validate_password_change_request(&request).is_ok());
+        }
+
+        for (current_len, new_len) in [(7, 8), (129, 8), (8, 7), (8, 129)] {
+            let request = ChangePasswordRequest {
+                current_password: "c".repeat(current_len),
+                new_password: "n".repeat(new_len),
+            };
+            assert!(validate_password_change_request(&request).is_err());
+        }
+    }
+
+    /// Invalid password sizes fail before the route can acquire a database connection.
+    #[tokio::test]
+    async fn invalid_password_change_fails_before_database_access() {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgresql://localhost:1/rift_password_bounds_must_not_connect")
+            .expect("static unavailable database URL must parse");
+        let auth = AuthUser {
+            user_id: Uuid::new_v4(),
+            username: "password-bounds-test".to_string(),
+            is_agent: false,
+            managed_fence: None,
+        };
+
+        let current_too_long = change_password(
+            State(pool.clone()),
+            auth.clone(),
+            Json(ChangePasswordRequest {
+                current_password: "c".repeat(129),
+                new_password: "n".repeat(8),
+            }),
+        )
+        .await;
+        assert!(matches!(current_too_long, Err(AppError::BadRequest(_))));
+
+        let replacement_too_long = change_password(
+            State(pool),
+            auth,
+            Json(ChangePasswordRequest {
+                current_password: "c".repeat(8),
+                new_password: "n".repeat(129),
+            }),
+        )
+        .await;
+        assert!(matches!(replacement_too_long, Err(AppError::BadRequest(_))));
+    }
+
+    /// A lost password-update race remains an opaque credential failure.
+    #[test]
+    fn stale_password_update_maps_to_unauthorized() {
+        assert!(require_password_update_applied(true).is_ok());
+        assert!(matches!(
+            require_password_update_applied(false),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    /// A stale verified hash cannot overwrite newer credentials or revoke their session.
+    #[tokio::test]
+    async fn live_stale_password_update_preserves_newer_credentials() {
+        let Some(pool) = live_users_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let user = db::create_user(
+            &pool,
+            &format!("password_owner_{suffix}"),
+            &format!("password-owner-{suffix}@example.invalid"),
+            "expected-hash",
+            None,
+        )
+        .await
+        .expect("password-race user must be created");
+        let first_update =
+            db::update_user_password(&pool, user.id, "expected-hash", "newer-password-hash")
+                .await
+                .expect("winning password update must execute");
+        assert!(first_update);
+        let refresh_hash = format!("post-race-refresh-{suffix}");
+        db::store_refresh_token(
+            &pool,
+            user.id,
+            &refresh_hash,
+            Utc::now() + ChronoDuration::days(1),
+        )
+        .await
+        .expect("newer credential session must be stored");
+
+        let stale_update =
+            db::update_user_password(&pool, user.id, "expected-hash", "stale-password-hash")
+                .await
+                .expect("stale conditional update must execute");
+
+        assert!(!stale_update);
+        let persisted = db::get_user_by_id(&pool, user.id)
+            .await
+            .expect("password postcondition lookup must succeed")
+            .expect("password-race user must remain present");
+        assert_eq!(persisted.password_hash, "newer-password-hash");
+        assert_eq!(
+            db::consume_refresh_token(&pool, &refresh_hash)
+                .await
+                .expect("post-race refresh lookup must succeed"),
+            Some(user.id),
+            "losing password update must not revoke the winning session"
+        );
+    }
 }

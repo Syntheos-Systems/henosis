@@ -26,6 +26,10 @@ use crate::executor::{
     AgentExecutor, AgentResponse, Capability, DiscussionContext, ExecutionResult, ExecutionSandbox,
     HealthStatus, ProgressUpdate, TaskContext,
 };
+use crate::process_security::{
+    is_sensitive_environment_name, scrub_sensitive_environment, secure_tokio_command,
+    spawn_direct_executor, wait_for_direct_executor_status,
+};
 
 /// Placeholder replaced by the assembled prompt or task description.
 ///
@@ -266,7 +270,7 @@ impl CommandExecutor {
 
     /// Build the child process for one invocation.
     fn build_command(&self, args: Vec<String>, working_dir: Option<&std::path::Path>) -> Command {
-        let mut cmd = Command::new(&self.binary);
+        let mut cmd = secure_tokio_command(&self.binary);
         cmd.args(args);
         if let Some(dir) = working_dir.or(self.cwd.as_deref()) {
             cmd.current_dir(dir);
@@ -277,17 +281,22 @@ impl CommandExecutor {
             cmd.env_clear();
         }
         for name in &self.inherit_env {
-            if let Some(value) = std::env::var_os(name) {
-                cmd.env(name, value);
+            if !is_sensitive_environment_name(std::ffi::OsStr::new(name)) {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
             }
         }
         for (key, value) in &self.env {
-            cmd.env(key, value);
+            if !is_sensitive_environment_name(std::ffi::OsStr::new(key)) {
+                cmd.env(key, value);
+            }
         }
+        // Apply the boundary last so future configuration paths cannot undo it.
+        scrub_sensitive_environment(cmd.as_std_mut());
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
         cmd
     }
 
@@ -302,8 +311,7 @@ impl CommandExecutor {
         mut cmd: Command,
         progress_tx: Option<&mpsc::Sender<ProgressUpdate>>,
     ) -> Result<CommandOutcome> {
-        let mut child = cmd
-            .spawn()
+        let (mut child, mut process_group_guard) = spawn_direct_executor(&mut cmd)
             .with_context(|| format!("spawning harness {}", self.binary.display()))?;
 
         let stdout = child
@@ -318,10 +326,12 @@ impl CommandExecutor {
         let format = self.progress_format;
         let deadline = std::time::Duration::from_secs(self.max_runtime_secs);
         let combined = async {
+            let wait_for_exit =
+                wait_for_direct_executor_status(&mut child, &mut process_group_guard);
             let (stdout, stderr, status) = tokio::try_join!(
                 read_stdout_capped(stdout, format, progress_tx),
                 read_capped(stderr, MAX_OUTPUT_BYTES),
-                child.wait(),
+                wait_for_exit,
             )?;
             Ok::<CommandOutcome, std::io::Error>(CommandOutcome {
                 stdout: bounded_text(stdout),
@@ -333,11 +343,41 @@ impl CommandExecutor {
         };
 
         match tokio::time::timeout(deadline, combined).await {
-            Ok(result) => Ok(result?),
+            Ok(Ok(outcome)) => {
+                process_group_guard
+                    .cleanup()
+                    .context("cleaning completed harness process group")?;
+                Ok(outcome)
+            }
+            Ok(Err(run_error)) => {
+                let requires_direct_child_kill = process_group_guard.requires_direct_child_kill();
+                let cleanup_result = process_group_guard.cleanup();
+                if requires_direct_child_kill {
+                    let _ = child.start_kill();
+                }
+                if let Err(cleanup_error) = cleanup_result {
+                    // Retry the armed guard before Tokio drops the unreaped child.
+                    drop(process_group_guard);
+                    drop(child);
+                    return Err(cleanup_error).context("cleaning failed harness process group");
+                }
+                let _ = child.wait().await;
+                Err(run_error.into())
+            }
             Err(_) => {
-                // kill_on_drop covers the abnormal paths; this makes the normal
-                // timeout path deterministic instead of leaving an orphan.
-                let _ = child.start_kill();
+                let requires_direct_child_kill = process_group_guard.requires_direct_child_kill();
+                let cleanup_result = process_group_guard.cleanup();
+                // Explicit group cleanup covers remaining in-group descendants;
+                // this fallback keeps leader termination deterministic on every target.
+                if requires_direct_child_kill {
+                    let _ = child.start_kill();
+                }
+                if let Err(cleanup_error) = cleanup_result {
+                    // Retry the armed guard before Tokio drops the unreaped child.
+                    drop(process_group_guard);
+                    drop(child);
+                    return Err(cleanup_error).context("cleaning timed-out harness process group");
+                }
                 let _ = child.wait().await;
                 Ok(CommandOutcome {
                     stdout: String::new(),
@@ -387,7 +427,7 @@ fn parse_progress_line(line: &str) -> Option<String> {
 
 /// Return the worktree's current HEAD commit, or `None` when it is not a repo.
 async fn git_head(dir: &std::path::Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = secure_tokio_command("git")
         .arg("-C")
         .arg(dir)
         .arg("rev-parse")
@@ -729,5 +769,51 @@ mod tests {
             .collect();
 
         assert_eq!(inherited, vec!["PATH"]);
+    }
+
+    /// Harness configuration cannot reintroduce Rift authority into an executed child.
+    #[test]
+    fn authority_environment_is_removed_even_when_inheritance_is_enabled() {
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            "HENOSIS_RIFT_JWT_SECRET".to_string(),
+            "configured-human-root".to_string(),
+        );
+        configured.insert(
+            "SYNTHEOS_OPERATOR_JWT_SECRET".to_string(),
+            "configured-operator-root".to_string(),
+        );
+        configured.insert(
+            "CUSTOM_SIGNING_KEY".to_string(),
+            "configured-custom-root".to_string(),
+        );
+        let executor = CommandExecutor::new(
+            PathBuf::from("sh"),
+            vec!["-c".to_string(), PROMPT_PLACEHOLDER.to_string()],
+            vec!["-c".to_string(), PROMPT_PLACEHOLDER.to_string()],
+            None,
+            Some(30),
+            None,
+            configured,
+            vec![
+                "HENOSIS_RIFT_AGENT_JWT_SECRET".to_string(),
+                "SSH_AUTH_SOCK".to_string(),
+            ],
+            false,
+        );
+        let command = executor.build_command(vec!["-c".to_string(), "true".to_string()], None);
+        let leaked: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value
+                    .map(|_| name.to_string_lossy().into_owned())
+                    .filter(|name| {
+                        name.contains("SECRET") || name.contains("KEY") || name == "SSH_AUTH_SOCK"
+                    })
+            })
+            .collect();
+
+        assert!(leaked.is_empty(), "sensitive child environment: {leaked:?}");
     }
 }

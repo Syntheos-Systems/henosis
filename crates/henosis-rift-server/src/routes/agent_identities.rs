@@ -51,7 +51,8 @@ pub async fn create_owned_agent(
         return Err(AppError::Conflict("Username already taken".to_string()));
     }
 
-    let password_hash = super::auth::hash_password(&super::bridge::random_password())?;
+    let password_hash =
+        super::auth::hash_password_bounded(super::bridge::random_password()).await?;
     let created = db::create_owned_agent_user(
         &pool,
         username,
@@ -182,7 +183,29 @@ fn creation_allowed(caller_is_agent: bool, existing_user_is_agent: Option<bool>)
 #[cfg(test)]
 /// Exercises the human ownership and legacy claim authorization predicates.
 mod tests {
+    use sqlx::postgres::PgPoolOptions;
+
     use super::*;
+
+    /// Connect to the opt-in PostgreSQL database for ownership revalidation tests.
+    async fn live_agent_identity_test_pool() -> Option<PgPool> {
+        let Some(database_url) = std::env::var_os("HENOSIS_RIFT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping live owned-agent authorization test: HENOSIS_RIFT_TEST_DATABASE_URL is unset"
+            );
+            return None;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url.to_string_lossy())
+            .await
+            .expect("test database must be reachable");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+        Some(pool)
+    }
 
     /// Agent callers can neither list nor create owned identities.
     #[test]
@@ -232,5 +255,54 @@ mod tests {
         assert!(validate_identity_input("ab", None).is_err());
         assert!(validate_identity_input(&"x".repeat(33), None).is_err());
         assert!(validate_identity_input("agent", Some(&"x".repeat(65))).is_err());
+    }
+
+    /// Owned-agent creation revalidates human authority transactionally after hashing.
+    #[tokio::test]
+    async fn live_owned_agent_creation_revalidates_human_after_password_hashing() {
+        let Some(pool) = live_agent_identity_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("identity_owner_{suffix}"),
+            &format!("identity-owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("identity owner must be created");
+        let password_hash =
+            super::super::auth::hash_password_bounded(super::super::bridge::random_password())
+                .await
+                .expect("owned-agent password preparation must succeed");
+        sqlx::query("UPDATE users SET is_agent = TRUE WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("test must revoke the owner's human authority");
+        let username = format!("owned_agent_{suffix}");
+
+        let error = db::create_owned_agent_user(
+            &pool,
+            &username,
+            &super::super::bridge::agent_email(&username),
+            &password_hash,
+            None,
+            owner.id,
+        )
+        .await
+        .expect_err("non-human owner must fail the transactional insert predicate");
+
+        assert!(matches!(error, sqlx::Error::RowNotFound));
+        assert!(
+            db::get_user_by_username(&pool, &username)
+                .await
+                .expect("postcondition lookup must succeed")
+                .is_none(),
+            "revoked ownership authority must not create an agent"
+        );
     }
 }

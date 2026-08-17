@@ -1,0 +1,18 @@
+# Product identity policy for the repository rename boundary.
+#
+# The technical values below are permanent machine identifiers. They do not
+# change when the human-facing product brand changes.
+schema_version = 1
+technical_namespace = "syntheos"
+environment_prefix = "SYNTHEOS"
+reverse_dns_root = "systems.syntheos"
+
+# These values describe the replaceable display brand. A future public rename
+# changes them without creating another technical namespace.
+display_name = "Henosis"
+brand_slug = "henosis"
+
+# Comma-separated historical brand slugs remain guarded until their machine
+# debt reaches zero. Never remove a slug merely because the display brand
+# changed.
+legacy_brand_slugs = "henosis"

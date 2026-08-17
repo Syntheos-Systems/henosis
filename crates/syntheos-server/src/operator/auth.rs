@@ -30,11 +30,8 @@ const ACCESS_TOKEN_TTL_SECS: i64 = 15 * 60;
 /// Bounds an operator refresh session to thirty days from its issuance or rotation.
 const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// Caps failed and successful login attempts per identity key within one rate-limit window.
+/// Caps completed invalid-credential attempts per identity key within one rate-limit window.
 const LOGIN_RATE_LIMIT_ATTEMPTS: u32 = 10;
-
-/// Caps all admitted login attempts in one process within one rate-limit window.
-const LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS: u32 = 300;
 
 /// Defines the fixed login rate-limit window in seconds.
 const LOGIN_RATE_LIMIT_WINDOW_SECS: i64 = 5 * 60;
@@ -104,6 +101,7 @@ impl OperatorClaims {
 /// Variants map to HTTP status codes via the [`IntoResponse`] implementation:
 /// - [`Auth`](OperatorError::Auth) -- 401 Unauthorized
 /// - [`Forbidden`](OperatorError::Forbidden) -- 403 Forbidden
+/// - [`Unavailable`](OperatorError::Unavailable) -- 503 Service Unavailable
 /// - [`Backend`](OperatorError::Backend) -- 500 Internal Server Error
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorError {
@@ -116,6 +114,11 @@ pub enum OperatorError {
     /// Maps to HTTP 403.
     #[error("forbidden: {0}")]
     Forbidden(String),
+
+    /// A bounded authentication resource is temporarily unavailable.
+    /// Maps to HTTP 503 without presenting capacity failures as bad credentials.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
 
     /// An internal backend error (store failure, encoding failure, etc.).
     /// Maps to HTTP 500. Details are logged server-side; the response body
@@ -132,6 +135,13 @@ impl IntoResponse for OperatorError {
         let (status, msg) = match &self {
             OperatorError::Auth(m) => (StatusCode::UNAUTHORIZED, m.clone()),
             OperatorError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
+            OperatorError::Unavailable(m) => {
+                tracing::warn!(error = %m, "operator authentication capacity unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service unavailable".into(),
+                )
+            }
             OperatorError::Backend(m) => {
                 tracing::error!(error = %m, "operator authentication backend failure");
                 (
@@ -233,6 +243,17 @@ struct LoginAttempts {
     window_started_at: i64,
     /// Number of attempts consumed inside the current window.
     attempts: u32,
+    /// Unix timestamp of the most recent reservation, used for bounded eviction.
+    last_attempt_at: i64,
+}
+
+/// Identifies one provisional login-attempt charge so non-authentication outcomes can refund it.
+#[derive(Debug)]
+struct LoginAttemptReservation {
+    /// Privacy-preserving identity key charged by the reservation.
+    key: String,
+    /// Window generation charged by the reservation.
+    window_started_at: i64,
 }
 
 /// Maintains a bounded, prunable login rate-limit map.
@@ -240,57 +261,65 @@ struct LoginAttempts {
 struct LoginRateLimiter {
     /// Per-identity rate-limit state indexed by SHA-256 email digests.
     attempts: HashMap<String, LoginAttempts>,
-    /// Process-global admission state that cannot be bypassed with unique email values.
-    global: Option<LoginAttempts>,
 }
 
 /// Implements bounded and prunable login-attempt accounting.
 impl LoginRateLimiter {
-    /// Consume one login attempt for `email`, returning whether it remains permitted.
-    fn allow(&mut self, email: &str, now: i64) -> bool {
-        if !Self::consume_window(&mut self.global, now, LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS) {
-            return false;
-        }
+    /// Reserve one attempt for `email`, returning a refundable charge when permitted.
+    fn reserve(&mut self, email: &str, now: i64) -> Option<LoginAttemptReservation> {
         self.prune(now);
 
         let key = login_rate_limit_key(email);
         if !self.attempts.contains_key(&key) && self.attempts.len() >= LOGIN_RATE_LIMIT_MAX_KEYS {
-            return false;
+            self.evict_oldest();
         }
-        let entry = self.attempts.entry(key).or_insert(LoginAttempts {
+        let entry = self.attempts.entry(key.clone()).or_insert(LoginAttempts {
             window_started_at: now,
             attempts: 0,
+            last_attempt_at: now,
         });
         if now.saturating_sub(entry.window_started_at) >= LOGIN_RATE_LIMIT_WINDOW_SECS {
             *entry = LoginAttempts {
                 window_started_at: now,
                 attempts: 0,
+                last_attempt_at: now,
             };
         }
         if entry.attempts >= LOGIN_RATE_LIMIT_ATTEMPTS {
-            return false;
+            return None;
         }
         entry.attempts += 1;
-        true
+        entry.last_attempt_at = now;
+        Some(LoginAttemptReservation {
+            key,
+            window_started_at: entry.window_started_at,
+        })
     }
 
-    /// Consume one attempt from an optional fixed-window counter.
-    fn consume_window(window: &mut Option<LoginAttempts>, now: i64, limit: u32) -> bool {
-        let entry = window.get_or_insert(LoginAttempts {
-            window_started_at: now,
-            attempts: 0,
-        });
-        if now.saturating_sub(entry.window_started_at) >= LOGIN_RATE_LIMIT_WINDOW_SECS {
-            *entry = LoginAttempts {
-                window_started_at: now,
-                attempts: 0,
-            };
+    /// Refund a reservation when credentials succeeded or verification never completed.
+    fn refund(&mut self, reservation: &LoginAttemptReservation) {
+        let remove = match self.attempts.get_mut(&reservation.key) {
+            Some(entry) if entry.window_started_at == reservation.window_started_at => {
+                entry.attempts = entry.attempts.saturating_sub(1);
+                entry.attempts == 0
+            }
+            _ => false,
+        };
+        if remove {
+            self.attempts.remove(&reservation.key);
         }
-        if entry.attempts >= limit {
-            return false;
+    }
+
+    /// Evict the least-recently used identity when the bounded map reaches capacity.
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .attempts
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_attempt_at)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            self.attempts.remove(&key);
         }
-        entry.attempts += 1;
-        true
     }
 
     /// Remove entries whose fixed attempt windows have elapsed.
@@ -321,11 +350,18 @@ fn unix_timestamp() -> Result<i64, OperatorError> {
         .map_err(|error| OperatorError::Backend(format!("system clock: {error}")))
 }
 
-/// Consume one bounded login attempt from the shared limiter without holding its lock during I/O.
-fn allow_login_attempt(email: &str, now: i64) -> bool {
+/// Reserve one bounded login attempt without holding the limiter lock during verification.
+fn reserve_login_attempt(email: &str, now: i64) -> Option<LoginAttemptReservation> {
     let limiter = LOGIN_RATE_LIMITER.get_or_init(|| Mutex::new(LoginRateLimiter::default()));
     let mut limiter = limiter.lock().unwrap_or_else(|error| error.into_inner());
-    limiter.allow(email, now)
+    limiter.reserve(email, now)
+}
+
+/// Refund a provisional attempt after success or a non-authentication failure.
+fn refund_login_attempt(reservation: &LoginAttemptReservation) {
+    let limiter = LOGIN_RATE_LIMITER.get_or_init(|| Mutex::new(LoginRateLimiter::default()));
+    let mut limiter = limiter.lock().unwrap_or_else(|error| error.into_inner());
+    limiter.refund(reservation);
 }
 
 /// Verify one credential pair inside the bounded blocking-work pool.
@@ -337,9 +373,19 @@ async fn verify_login_bounded(
     let semaphore = LOGIN_VERIFY_SEMAPHORE
         .get_or_init(|| Arc::new(Semaphore::new(LOGIN_VERIFY_CONCURRENCY)))
         .clone();
+    verify_login_with_gate(accounts, email, password, semaphore).await
+}
+
+/// Verify one credential pair with an injected concurrency gate for deterministic tests.
+async fn verify_login_with_gate(
+    accounts: Arc<SqliteDirectory>,
+    email: &str,
+    password: &str,
+    semaphore: Arc<Semaphore>,
+) -> Result<Option<PrincipalId>, OperatorError> {
     let permit = semaphore
         .try_acquire_owned()
-        .map_err(|_| invalid_credentials())?;
+        .map_err(|error| OperatorError::Unavailable(format!("login verification gate: {error}")))?;
     let email = Zeroizing::new(email.to_owned());
     let password = Zeroizing::new(password.to_owned());
     let result = tokio::task::spawn_blocking(move || {
@@ -347,7 +393,9 @@ async fn verify_login_bounded(
         accounts.verify_login(email.as_str(), password.as_str())
     })
     .await
-    .map_err(|_| invalid_credentials())?;
+    .map_err(|error| {
+        OperatorError::Unavailable(format!("login verification worker failed: {error}"))
+    })?;
     result.map_err(|error| OperatorError::Backend(error.to_string()))
 }
 
@@ -517,16 +565,25 @@ pub async fn login(
         return Err(invalid_credentials());
     }
     let now = unix_timestamp()?;
-    if !allow_login_attempt(&body.email, now) {
-        return Err(invalid_credentials());
-    }
-    let grant = resolve_login(
+    let reservation = reserve_login_attempt(&body.email, now).ok_or_else(invalid_credentials)?;
+    let grant = match resolve_login(
         state.accounts.clone(),
         &*state.plutus,
         &body.email,
         &body.password,
     )
-    .await?;
+    .await
+    {
+        Ok(grant) => {
+            refund_login_attempt(&reservation);
+            grant
+        }
+        Err(error @ OperatorError::Auth(_)) => return Err(error),
+        Err(error) => {
+            refund_login_attempt(&reservation);
+            return Err(error);
+        }
+    };
     let refresh = state
         .accounts
         .issue_operator_refresh(
@@ -716,28 +773,31 @@ mod tests {
     fn login_rate_limiter_enforces_per_key_window_and_prunes() {
         let mut limiter = LoginRateLimiter::default();
         for _ in 0..LOGIN_RATE_LIMIT_ATTEMPTS {
-            assert!(limiter.allow("operator@example.com", 100));
+            assert!(limiter.reserve("operator@example.com", 100).is_some());
         }
-        assert!(!limiter.allow("operator@example.com", 100));
-        assert!(limiter.allow("operator@example.com", 100 + LOGIN_RATE_LIMIT_WINDOW_SECS));
+        assert!(limiter.reserve("operator@example.com", 100).is_none());
+        assert!(limiter
+            .reserve("operator@example.com", 100 + LOGIN_RATE_LIMIT_WINDOW_SECS)
+            .is_some());
         limiter.prune(100 + (2 * LOGIN_RATE_LIMIT_WINDOW_SECS));
         assert!(limiter.attempts.is_empty());
     }
 
-    /// The global login budget cannot be bypassed by rotating unique email values.
+    /// Rotating attacker-controlled identities cannot consume a process-wide lockout budget.
     #[test]
-    fn login_rate_limiter_enforces_global_window() {
+    fn rotating_login_identities_do_not_lock_out_an_unrelated_operator() {
         let mut limiter = LoginRateLimiter::default();
-        for index in 0..LOGIN_GLOBAL_RATE_LIMIT_ATTEMPTS {
-            assert!(limiter.allow(&format!("operator-{index}@example.com"), 200));
+        for index in 0..=300 {
+            assert!(limiter
+                .reserve(&format!("attacker-{index}@example.com"), 200)
+                .is_some());
         }
-        assert!(!limiter.allow("one-too-many@example.com", 200));
-        assert!(limiter.allow("new-window@example.com", 200 + LOGIN_RATE_LIMIT_WINDOW_SECS));
+        assert!(limiter.reserve("operator@example.com", 200).is_some());
     }
 
-    /// A full active identity map rejects a new key rather than evicting and admitting it.
+    /// A full identity map evicts one bounded entry instead of denying every unseen operator.
     #[test]
-    fn login_rate_limiter_fails_closed_at_key_capacity() {
+    fn login_rate_limiter_preserves_availability_at_key_capacity() {
         let mut limiter = LoginRateLimiter::default();
         for index in 0..LOGIN_RATE_LIMIT_MAX_KEYS {
             limiter.attempts.insert(
@@ -745,12 +805,40 @@ mod tests {
                 LoginAttempts {
                     window_started_at: 200,
                     attempts: 0,
+                    last_attempt_at: 200,
                 },
             );
         }
-        assert!(!limiter.allow("unknown@example.com", 200));
+        assert!(limiter.reserve("unknown@example.com", 200).is_some());
         assert_eq!(limiter.attempts.len(), LOGIN_RATE_LIMIT_MAX_KEYS);
-        assert!(limiter.allow("operator-0@example.com", 200));
+    }
+
+    /// Refunding a completed non-authentication outcome restores the identity's attempt budget.
+    #[test]
+    fn login_rate_limiter_refunds_non_authentication_outcomes() {
+        let mut limiter = LoginRateLimiter::default();
+        let reservation = limiter
+            .reserve("operator@example.com", 200)
+            .expect("first reservation");
+        limiter.refund(&reservation);
+        for _ in 0..LOGIN_RATE_LIMIT_ATTEMPTS {
+            assert!(limiter.reserve("operator@example.com", 200).is_some());
+        }
+        assert!(limiter.reserve("operator@example.com", 200).is_none());
+    }
+
+    /// A saturated verification pool returns service unavailability instead of bad credentials.
+    #[tokio::test]
+    async fn saturated_login_verification_is_not_an_authentication_failure() {
+        let accounts = Arc::new(SqliteDirectory::open_in_memory().expect("open"));
+        let result = verify_login_with_gate(
+            accounts,
+            "operator@example.com",
+            "password",
+            Arc::new(Semaphore::new(0)),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::Unavailable(_))));
     }
 
     /// Login field limits use encoded byte lengths and accept their exact boundaries.

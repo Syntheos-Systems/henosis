@@ -7,7 +7,9 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp]
+    # The environment file supplies distinct human-JWT, agent-JWT, and bridge-route secrets.
     env_file: ["${HENOSIS_ENV_FILE:-.env.production}"]
+    # Rift bridge ingress remains loopback-only inside the container and is never published.
     volumes:
       - henosis-state:/var/lib/henosis
       - ./secrets:/run/secrets/henosis:ro

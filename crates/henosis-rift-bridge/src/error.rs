@@ -5,6 +5,10 @@ pub enum BridgeError {
     #[error("Rift API error: {0}")]
     RiftApi(String),
 
+    /// The managed-room leadership capability was rejected or could not be verified.
+    #[error("managed-room leadership is no longer authorized")]
+    StaleLeadership,
+
     /// WebSocket connection or protocol error.
     #[error("WebSocket error: {0}")]
     WebSocket(String),
@@ -36,6 +40,10 @@ pub enum BridgeError {
     /// Embeddings endpoint failed or returned an unusable payload.
     #[error("Embedding error: {0}")]
     Embedding(String),
+
+    /// Durable Rift event admission state could not safely authorize dispatch.
+    #[error("Rift event state error: {0}")]
+    EventState(String),
 
     /// Underlying HTTP transport error.
     #[error("HTTP error: {0}")]

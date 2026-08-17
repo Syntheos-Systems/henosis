@@ -90,6 +90,24 @@ impl AppError {
             message: "managed agent runtime is unavailable".to_string(),
         }
     }
+
+    /// Report that a managed-room capability no longer names the active generation.
+    pub fn stale_leadership_fence() -> Self {
+        Self::Coded {
+            status: StatusCode::CONFLICT,
+            code: "stale_leadership_fence",
+            message: "managed room leadership is no longer current".to_string(),
+        }
+    }
+
+    /// Fail closed when PostgreSQL cannot prove a managed-room capability current.
+    pub fn leadership_fence_unavailable() -> Self {
+        Self::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "leadership_fence_unavailable",
+            message: "managed room leadership cannot be verified".to_string(),
+        }
+    }
 }
 
 /// Maps Rift application errors to safe HTTP responses.
@@ -164,6 +182,16 @@ mod tests {
                 AppError::managed_runtime_unavailable(),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "managed_runtime_unavailable",
+            ),
+            (
+                AppError::stale_leadership_fence(),
+                StatusCode::CONFLICT,
+                "stale_leadership_fence",
+            ),
+            (
+                AppError::leadership_fence_unavailable(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "leadership_fence_unavailable",
             ),
         ];
         for (error, expected_status, expected_code) in cases {

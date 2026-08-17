@@ -5,6 +5,21 @@ use uuid::Uuid;
 
 use super::attachment::Attachment;
 
+/// Default number of messages returned when a page size is omitted.
+const DEFAULT_MESSAGE_PAGE_LIMIT: i64 = 50;
+
+/// Largest page accepted by channel and direct-message history endpoints.
+const MAX_MESSAGE_PAGE_LIMIT: i64 = 100;
+
+/// Validate a client-supplied message page size before any database query runs.
+pub fn validated_message_page_limit(limit: Option<i64>) -> Result<i64, &'static str> {
+    let limit = limit.unwrap_or(DEFAULT_MESSAGE_PAGE_LIMIT);
+    if !(1..=MAX_MESSAGE_PAGE_LIMIT).contains(&limit) {
+        return Err("Message page limit must be between 1 and 100");
+    }
+    Ok(limit)
+}
+
 /// Raw message row as stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Message {
@@ -123,6 +138,23 @@ pub struct MessageQuery {
     pub before: Option<Uuid>,
     /// Return messages strictly after this id, or from the beginning when it is the channel id.
     pub after: Option<Uuid>,
-    /// Maximum number of messages to return (server caps at 100).
+    /// Maximum number of messages to return (must be between 1 and 100).
     pub limit: Option<i64>,
+}
+
+#[cfg(test)]
+/// Exercises the shared channel and direct-message page-size boundary.
+mod tests {
+    use super::validated_message_page_limit;
+
+    /// Page sizes must remain positive and no larger than the server maximum.
+    #[test]
+    fn message_page_limit_rejects_non_positive_and_excessive_values() {
+        for invalid in [i64::MIN, -1, 0, 101, i64::MAX] {
+            assert!(validated_message_page_limit(Some(invalid)).is_err());
+        }
+        assert_eq!(validated_message_page_limit(None), Ok(50));
+        assert_eq!(validated_message_page_limit(Some(1)), Ok(1));
+        assert_eq!(validated_message_page_limit(Some(100)), Ok(100));
+    }
 }

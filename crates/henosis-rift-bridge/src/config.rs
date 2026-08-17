@@ -2,7 +2,8 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::error::BridgeError;
 use crate::materialize::ResolvedExecutionMode;
 
 /// Top-level bridge configuration loaded from TOML.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct BridgeConfig {
     /// Connection settings for the Rift server.
     #[serde(default)]
@@ -45,6 +46,27 @@ pub struct BridgeConfig {
     /// Optional stimulus injector settings. Absent (or enabled=false)
     /// disables injection entirely.
     pub stimulus: Option<StimulusSettings>,
+}
+
+/// Keeps bridge-wide diagnostics useful without rendering credentials or prompts.
+impl fmt::Debug for BridgeConfig {
+    /// Render only non-secret runtime shape and redacted Rift authority details.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BridgeConfig")
+            .field("rift", &self.rift)
+            .field("agent_count", &self.agents.len())
+            .field("capability_subjects", &self.capabilities.len())
+            .field("workspace_count", &self.workspaces.len())
+            .field("execution_enabled", &self.execution.is_some())
+            .field("pistis_enabled", &self.pistis.is_some())
+            .field("control_enabled", &self.control.is_some())
+            .field("personas_enabled", &self.personas.is_some())
+            .field("kleos_configured", &self.kleos.is_some())
+            .field("embedding_configured", &self.embedding.is_some())
+            .field("stimulus_configured", &self.stimulus.is_some())
+            .finish()
+    }
 }
 
 /// Embedding provider settings powering the semantic tier of echo suppression
@@ -221,17 +243,19 @@ pub struct KleosBackendConfig {
 }
 
 /// Connection to the Rift server.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Default, Deserialize, Clone)]
 pub struct RiftConfig {
-    /// Rift server base URL (e.g., http://localhost:3200).
+    /// Public Rift server base URL (e.g., http://localhost:3200).
     #[serde(default)]
     pub api_url: String,
+    /// Private bridge-only Rift base URL on an explicit loopback socket.
+    pub bridge_api_url: String,
     /// WebSocket URL (e.g., ws://localhost:3200/ws).
     #[serde(default)]
     pub ws_url: String,
-    /// JWT secret shared with Rift server for agent token issuance.
+    /// Dedicated JWT secret accepted only for bridge-issued agent tokens.
     #[serde(default)]
-    pub jwt_secret: String,
+    pub agent_jwt_secret: String,
     /// Dedicated bearer secret for bridge-only Rift routes.
     #[serde(default)]
     pub bridge_secret: String,
@@ -243,6 +267,24 @@ pub struct RiftConfig {
     pub channel_id: Uuid,
     /// How often to poll bridge pause status in seconds.
     pub pause_poll_secs: Option<u64>,
+}
+
+/// Prevents Rift credentials and potentially credential-bearing URLs from entering diagnostics.
+impl fmt::Debug for RiftConfig {
+    /// Render only stable identifiers, polling behavior, and fixed redaction markers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RiftConfig")
+            .field("api_url", &"[REDACTED]")
+            .field("bridge_api_url", &"[REDACTED]")
+            .field("ws_url", &"[REDACTED]")
+            .field("agent_jwt_secret", &"[REDACTED]")
+            .field("bridge_secret", &"[REDACTED]")
+            .field("server_id", &self.server_id)
+            .field("channel_id", &self.channel_id)
+            .field("pause_poll_secs", &self.pause_poll_secs)
+            .finish()
+    }
 }
 
 /// Bridge daemon settings.
@@ -334,7 +376,7 @@ impl Default for BridgeDaemonConfig {
 }
 
 /// Configuration for a single agent in the roster.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct AgentConfig {
     /// Display name for the agent in Rift.
     pub name: String,
@@ -351,8 +393,24 @@ pub struct AgentConfig {
     pub execution_mode: ResolvedExecutionMode,
 }
 
+/// Redacts behavior prompts while retaining safe agent identity diagnostics.
+impl fmt::Debug for AgentConfig {
+    /// Render the roster identity and executor kind without prompt or credential content.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentConfig")
+            .field("name", &self.name)
+            .field("username", &self.username)
+            .field("executor", &self.executor)
+            .field("base_chance", &self.base_chance)
+            .field("system_prompt", &"[REDACTED]")
+            .field("execution_mode", &self.execution_mode)
+            .finish()
+    }
+}
+
 /// Executor backend configuration (tagged union in TOML).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ExecutorConfig {
     /// Run any external agent CLI as the harness.
@@ -426,36 +484,60 @@ pub enum ExecutorConfig {
     },
 }
 
+/// Prevents command environments and provider credentials from entering diagnostics.
+impl fmt::Debug for ExecutorConfig {
+    /// Render only the selected executor variant.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Command { .. } => "Command",
+            Self::ClaudeCode { .. } => "ClaudeCode",
+            Self::Codex { .. } => "Codex",
+            Self::Synapse { .. } => "Synapse",
+        };
+        formatter
+            .debug_struct("ExecutorConfig")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Implements loading and parsing for bridge configuration files.
 impl BridgeConfig {
     /// Load configuration from a TOML file at the given path.
     pub fn load(path: &std::path::Path) -> Result<Self, BridgeError> {
         let config = Self::parse(path)?;
-        config.validate_security()?;
-        config.validate_rift_target()?;
+        config.validate_runtime()?;
         Ok(config)
     }
 
     /// Load agent behavior while Henosis supplies the managed Rift connection.
+    #[allow(clippy::too_many_arguments)]
     pub fn load_for_managed_room(
         path: &std::path::Path,
         api_url: String,
+        bridge_api_url: String,
         ws_url: String,
-        jwt_secret: String,
+        agent_jwt_secret: String,
         bridge_secret: String,
         server_id: Uuid,
         channel_id: Uuid,
     ) -> Result<Self, BridgeError> {
         let mut config = Self::parse(path)?;
         config.rift.api_url = api_url;
+        config.rift.bridge_api_url = bridge_api_url;
         config.rift.ws_url = ws_url;
-        config.rift.jwt_secret = jwt_secret;
+        config.rift.agent_jwt_secret = agent_jwt_secret;
         config.rift.bridge_secret = bridge_secret;
         config.rift.server_id = server_id;
         config.rift.channel_id = channel_id;
-        config.validate_security()?;
-        config.validate_rift_target()?;
+        config.validate_runtime()?;
         Ok(config)
+    }
+
+    /// Enforce every security invariant required before the bridge starts work.
+    pub(crate) fn validate_runtime(&self) -> Result<(), BridgeError> {
+        self.validate_security()?;
+        self.validate_rift_target()
     }
 
     /// Export the ordered agent roster as deterministic recovery TOML.
@@ -490,19 +572,15 @@ impl BridgeConfig {
 
     /// Reject unsafe listener and secret settings before the bridge connects.
     fn validate_security(&self) -> Result<(), BridgeError> {
-        if self.rift.jwt_secret.len() < 32 || self.rift.bridge_secret.len() < 32 {
+        validate_rift_secret("rift.agent_jwt_secret", &self.rift.agent_jwt_secret)?;
+        validate_rift_secret("rift.bridge_secret", &self.rift.bridge_secret)?;
+        if self.rift.agent_jwt_secret == self.rift.bridge_secret {
             return Err(BridgeError::Config(
-                "rift.jwt_secret and rift.bridge_secret must each contain at least 32 bytes"
-                    .to_string(),
-            ));
-        }
-        if self.rift.jwt_secret == self.rift.bridge_secret {
-            return Err(BridgeError::Config(
-                "rift.jwt_secret and rift.bridge_secret must differ".to_string(),
+                "rift.agent_jwt_secret and rift.bridge_secret must differ".to_string(),
             ));
         }
         if let Some(control) = &self.control {
-            control.validate(&[&self.rift.jwt_secret, &self.rift.bridge_secret])?;
+            control.validate(&[&self.rift.agent_jwt_secret, &self.rift.bridge_secret])?;
         }
         for agent in &self.agents {
             if let ExecutorConfig::Command {
@@ -555,6 +633,9 @@ impl BridgeConfig {
                 "rift.api_url and rift.ws_url must be configured".to_string(),
             ));
         }
+        validate_public_rift_urls(&self.rift.api_url, &self.rift.ws_url)?;
+        validate_bridge_api_url(&self.rift.bridge_api_url)?;
+        validate_distinct_rift_origins(&self.rift.api_url, &self.rift.bridge_api_url)?;
         if self.rift.server_id.is_nil() || self.rift.channel_id.is_nil() {
             return Err(BridgeError::Config(
                 "rift.server_id and rift.channel_id must be configured".to_string(),
@@ -562,6 +643,127 @@ impl BridgeConfig {
         }
         Ok(())
     }
+}
+
+/// Bind JWT-bearing WebSocket handshakes to the semantic public Rift origin.
+fn validate_public_rift_urls(api_value: &str, ws_value: &str) -> Result<(), BridgeError> {
+    const API_REQUIREMENT: &str = "rift.api_url must be an HTTP or HTTPS URL with a host and nonzero effective port, with no credentials, query, or fragment";
+    const WS_REQUIREMENT: &str = "rift.ws_url must be a credential-free WS or WSS URL on the exact rift.api_url origin, with no query or fragment";
+
+    if api_value.trim() != api_value {
+        return Err(BridgeError::Config(API_REQUIREMENT.to_string()));
+    }
+    if ws_value.trim() != ws_value {
+        return Err(BridgeError::Config(WS_REQUIREMENT.to_string()));
+    }
+    let api = reqwest::Url::parse(api_value)
+        .map_err(|_| BridgeError::Config(API_REQUIREMENT.to_string()))?;
+    let ws = reqwest::Url::parse(ws_value)
+        .map_err(|_| BridgeError::Config(WS_REQUIREMENT.to_string()))?;
+    if !matches!(api.scheme(), "http" | "https")
+        || api.host_str().is_none()
+        || api.port_or_known_default().is_none_or(|port| port == 0)
+        || !api.username().is_empty()
+        || api.password().is_some()
+        || api.query().is_some()
+        || api.fragment().is_some()
+    {
+        return Err(BridgeError::Config(API_REQUIREMENT.to_string()));
+    }
+    let expected_ws_scheme = if api.scheme() == "https" { "wss" } else { "ws" };
+    if ws.scheme() != expected_ws_scheme
+        || ws.host_str().is_none()
+        || ws.port_or_known_default().is_none_or(|port| port == 0)
+        || !ws.username().is_empty()
+        || ws.password().is_some()
+        || ws.query().is_some()
+        || ws.fragment().is_some()
+    {
+        return Err(BridgeError::Config(WS_REQUIREMENT.to_string()));
+    }
+    let api_origin = parse_rift_origin(api_value, "rift.api_url")?;
+    let ws_origin = parse_rift_origin(ws_value, "rift.ws_url")?;
+    if api_origin.1 != ws_origin.1 || api_origin.2 != ws_origin.2 {
+        return Err(BridgeError::Config(WS_REQUIREMENT.to_string()));
+    }
+    Ok(())
+}
+
+/// Reject connection secrets outside the shared bounded graphic-ASCII contract.
+fn validate_rift_secret(name: &str, secret: &str) -> Result<(), BridgeError> {
+    if !(32..=256).contains(&secret.len()) || !secret.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(BridgeError::Config(format!(
+            "{name} must contain 32 through 256 printable non-whitespace ASCII bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Require a bridge-only URL whose complete authority is one loopback IP socket.
+pub(crate) fn validate_bridge_api_url(value: &str) -> Result<(), BridgeError> {
+    const REQUIREMENT: &str = "rift.bridge_api_url must be an HTTP URL for an explicit nonzero IPv4 or IPv6 loopback port, with no credentials, non-root path, query, or fragment";
+
+    if value.trim() != value {
+        return Err(BridgeError::Config(REQUIREMENT.to_string()));
+    }
+    let url =
+        reqwest::Url::parse(value).map_err(|_| BridgeError::Config(REQUIREMENT.to_string()))?;
+    let loopback_host = url
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    let explicit_nonzero_port = url.port().is_some_and(|port| port != 0);
+    if url.scheme() != "http"
+        || !loopback_host
+        || !explicit_nonzero_port
+        || value.contains('@')
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(BridgeError::Config(REQUIREMENT.to_string()));
+    }
+    Ok(())
+}
+
+/// Parse a Rift URL into its semantic scheme, host, and effective port origin.
+fn parse_rift_origin(
+    value: &str,
+    name: &str,
+) -> Result<(String, String, Option<u16>), BridgeError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| BridgeError::Config(format!("{name} must be a valid URL origin")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| BridgeError::Config(format!("{name} must include a host")))?;
+    let unbracketed_host = host.trim_start_matches('[').trim_end_matches(']');
+    let normalized_host = unbracketed_host
+        .parse::<IpAddr>()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| unbracketed_host.to_ascii_lowercase());
+    Ok((
+        url.scheme().to_ascii_lowercase(),
+        normalized_host,
+        url.port_or_known_default(),
+    ))
+}
+
+/// Reject a public/private collapse after semantic origin normalization.
+pub(crate) fn validate_distinct_rift_origins(
+    public_api_url: &str,
+    bridge_api_url: &str,
+) -> Result<(), BridgeError> {
+    let public_origin = parse_rift_origin(public_api_url, "rift.api_url")?;
+    let bridge_origin = parse_rift_origin(bridge_api_url, "rift.bridge_api_url")?;
+    if public_origin == bridge_origin {
+        return Err(BridgeError::Config(
+            "rift.api_url and rift.bridge_api_url must use distinct origins".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert one agent while excluding runtime-only credential mediation.
@@ -820,7 +1022,7 @@ fn default_exec_timeout() -> u64 {
 }
 
 /// Control HTTP server settings.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct ControlConfig {
     /// Address to bind the control server to (e.g., 127.0.0.1:3210).
     pub bind_addr: String,
@@ -829,6 +1031,19 @@ pub struct ControlConfig {
     /// Whether a non-loopback bind is explicitly acknowledged as externally protected.
     #[serde(default)]
     pub allow_insecure_remote: bool,
+}
+
+/// Keeps the local approval bearer out of diagnostics.
+impl fmt::Debug for ControlConfig {
+    /// Render listener policy while replacing the bearer with a fixed marker.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("auth_token", &"[REDACTED]")
+            .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .finish()
+    }
 }
 
 /// Implements fail-closed validation for the execution-approval boundary.
@@ -861,7 +1076,7 @@ impl ControlConfig {
         }
         if reserved_secrets.contains(&self.auth_token.as_str()) {
             return Err(BridgeError::Config(
-                "control.auth_token must differ from Rift JWT and bridge secrets".to_string(),
+                "control.auth_token must differ from Rift agent JWT and bridge secrets".to_string(),
             ));
         }
         Ok(bind_addr)
@@ -871,8 +1086,266 @@ impl ControlConfig {
 #[cfg(test)]
 /// Unit tests for bridge configuration parsing.
 mod tests {
-    use super::BridgeConfig;
+    use super::{
+        validate_bridge_api_url, validate_distinct_rift_origins, validate_rift_secret, BridgeConfig,
+    };
     use uuid::Uuid;
+
+    /// The bridge-only endpoint accepts only explicit loopback HTTP sockets.
+    #[test]
+    fn bridge_api_url_accepts_loopback_ip_literals() {
+        for url in ["http://127.0.0.1:3201", "http://[::1]:3201/"] {
+            validate_bridge_api_url(url).expect("loopback bridge URL");
+        }
+    }
+
+    /// Every URL feature that can escape or obscure the private boundary fails closed.
+    #[test]
+    fn bridge_api_url_rejects_ambiguous_or_remote_targets() {
+        for url in [
+            "",
+            "https://127.0.0.1:3201",
+            "http://localhost:3201",
+            "http://0.0.0.0:3201",
+            "http://192.0.2.10:3201",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://@127.0.0.1:3201",
+            "http://user@127.0.0.1:3201",
+            "http://user:password@127.0.0.1:3201",
+            "http://127.0.0.1:3201/api/bridge",
+            "http://127.0.0.1:3201/?target=public",
+            "http://127.0.0.1:3201/#fragment",
+        ] {
+            assert!(
+                validate_bridge_api_url(url).is_err(),
+                "bridge URL {url:?} must be rejected"
+            );
+        }
+    }
+
+    /// Equivalent textual spellings cannot collapse the public and private origins.
+    #[test]
+    fn distinct_rift_origins_reject_semantic_aliases() {
+        for (public_url, bridge_url) in [
+            ("HTTP://127.0.0.1:3201", "http://127.0.0.1:3201"),
+            ("http://127.0.0.1:3201/", "http://127.0.0.1:3201"),
+            ("http://127.0.0.1", "http://127.0.0.1:80"),
+            ("http://[0:0:0:0:0:0:0:1]:3201/api", "http://[::1]:3201"),
+        ] {
+            assert!(
+                validate_distinct_rift_origins(public_url, bridge_url).is_err(),
+                "equivalent origins {public_url:?} and {bridge_url:?} must be rejected"
+            );
+        }
+    }
+
+    /// Standalone Rift blocks cannot silently inherit the public API origin.
+    #[test]
+    fn standalone_rift_config_requires_bridge_api_url() {
+        let result = toml::from_str::<BridgeConfig>(
+            r#"
+                [rift]
+                api_url = "http://127.0.0.1:3200"
+                ws_url = "ws://127.0.0.1:3200/ws"
+                agent_jwt_secret = "agent-jwt-secret-that-is-at-least-32-bytes"
+                bridge_secret = "bridge-secret-that-is-at-least-32-bytes"
+                server_id = "00000000-0000-0000-0000-000000000001"
+                channel_id = "00000000-0000-0000-0000-000000000002"
+
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "Architect fixture."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        );
+
+        assert!(result
+            .expect_err("bridge_api_url must be mandatory")
+            .to_string()
+            .contains("bridge_api_url"));
+    }
+
+    /// Rift connection secrets use one bounded, transport-safe byte contract.
+    #[test]
+    fn rift_secrets_require_bounded_graphic_ascii() {
+        assert!(validate_rift_secret("rift.bridge_secret", &"b".repeat(32)).is_ok());
+        for secret in [
+            "b".repeat(31),
+            "b".repeat(257),
+            "bridge secret with whitespace".repeat(2),
+            "é".repeat(32),
+        ] {
+            assert!(validate_rift_secret("rift.bridge_secret", &secret).is_err());
+        }
+    }
+
+    /// Direct bridge construction cannot bypass the loader's security checks.
+    #[test]
+    fn direct_bridge_config_runtime_validation_rejects_weak_secrets() {
+        let config = toml::from_str::<BridgeConfig>(
+            r#"
+                [rift]
+                api_url = "http://127.0.0.1:3200"
+                bridge_api_url = "http://127.0.0.1:3201"
+                ws_url = "ws://127.0.0.1:3200/ws"
+                agent_jwt_secret = "short"
+                bridge_secret = "bridge-secret-that-is-at-least-32-bytes"
+                server_id = "00000000-0000-0000-0000-000000000001"
+                channel_id = "00000000-0000-0000-0000-000000000002"
+
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "Architect fixture."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        )
+        .expect("direct test config must parse");
+
+        assert!(config.validate_runtime().is_err());
+    }
+
+    /// Agent JWT WebSocket authentication stays on the exact public Rift origin.
+    #[test]
+    fn runtime_validation_rejects_cross_origin_or_ambiguous_websocket_targets() {
+        let base = toml::from_str::<BridgeConfig>(
+            r#"
+                [rift]
+                api_url = "https://rift.example:443"
+                bridge_api_url = "http://127.0.0.1:3201"
+                ws_url = "wss://rift.example/ws"
+                agent_jwt_secret = "agent-jwt-secret-that-is-at-least-32-bytes"
+                bridge_secret = "bridge-secret-that-is-at-least-32-bytes"
+                server_id = "00000000-0000-0000-0000-000000000001"
+                channel_id = "00000000-0000-0000-0000-000000000002"
+
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "Architect fixture."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        )
+        .expect("URL validation fixture must parse");
+        base.validate_runtime().expect("matched HTTPS/WSS origins");
+
+        for ws_url in [
+            "wss://attacker.invalid/ws",
+            "ws://rift.example:443/ws",
+            "wss://user@rift.example/ws",
+            "wss://rift.example/ws?redirect=attacker",
+            "wss://rift.example/ws#fragment",
+        ] {
+            let mut config = base.clone();
+            config.rift.ws_url = ws_url.to_string();
+            assert!(
+                config.validate_runtime().is_err(),
+                "unsafe WebSocket target {ws_url:?} must fail"
+            );
+        }
+
+        for api_url in [
+            "ftp://rift.example",
+            "https://user@rift.example",
+            "https://rift.example?redirect=attacker",
+            "https://rift.example#fragment",
+        ] {
+            let mut config = base.clone();
+            config.rift.api_url = api_url.to_string();
+            assert!(
+                config.validate_runtime().is_err(),
+                "ambiguous public API target {api_url:?} must fail"
+            );
+        }
+    }
+
+    /// Diagnostic formatting never exposes authority or executor credential values.
+    #[test]
+    fn secret_bearing_config_debug_output_is_redacted() {
+        let config = toml::from_str::<BridgeConfig>(
+            r#"
+                [rift]
+                api_url = "http://127.0.0.1:3200"
+                bridge_api_url = "http://127.0.0.1:3201"
+                ws_url = "ws://127.0.0.1:3200/ws"
+                agent_jwt_secret = "agent-jwt-secret-sentinel-123456789"
+                bridge_secret = "bridge-route-secret-sentinel-123456"
+                server_id = "00000000-0000-0000-0000-000000000001"
+                channel_id = "00000000-0000-0000-0000-000000000002"
+
+                [control]
+                bind_addr = "127.0.0.1:3210"
+                auth_token = "control-token-sentinel-123456789012"
+
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "system-prompt-sentinel"
+                executor = { type = "Command", binary = "/usr/bin/agent", discuss_args = ["discuss", "{prompt}"], execute_args = ["execute", "{prompt}"], env = { PROVIDER_TOKEN = "executor-token-sentinel" } }
+            "#,
+        )
+        .expect("redaction fixture must parse");
+        let debug = format!(
+            "{config:?} {:?} {:?} {:?} {:?}",
+            config.rift,
+            config.control.as_ref().expect("control fixture"),
+            config.agents[0],
+            config.agents[0].executor
+        );
+
+        for secret in [
+            "agent-jwt-secret-sentinel-123456789",
+            "bridge-route-secret-sentinel-123456",
+            "control-token-sentinel-123456789012",
+            "system-prompt-sentinel",
+            "executor-token-sentinel",
+        ] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+    }
+
+    /// Managed configuration rejects reuse between agent-signing and bridge-route authority.
+    #[test]
+    fn managed_room_rejects_reused_agent_and_bridge_secrets() {
+        let path = std::env::temp_dir().join(format!(
+            "henosis-managed-reused-secret-{}.toml",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "Architect fixture."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        )
+        .expect("write managed config");
+        let reused = "reused-secret-that-is-at-least-32-bytes".to_string();
+        let result = BridgeConfig::load_for_managed_room(
+            &path,
+            "http://127.0.0.1:3200".to_string(),
+            "http://127.0.0.1:3201".to_string(),
+            "ws://127.0.0.1:3200/ws".to_string(),
+            reused.clone(),
+            reused,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        std::fs::remove_file(&path).expect("remove managed config");
+
+        assert!(
+            matches!(result, Err(super::BridgeError::Config(message)) if message.contains("must differ"))
+        );
+    }
 
     /// Verifies the new execution-mode config blocks parse and are optional.
     #[test]
@@ -880,8 +1353,9 @@ mod tests {
         let toml = r#"
             [rift]
             api_url = "http://localhost:3200"
+            bridge_api_url = "http://127.0.0.1:3201"
             ws_url = "ws://localhost:3200/ws"
-            jwt_secret = "secret"
+            agent_jwt_secret = "secret"
             bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
@@ -970,8 +1444,9 @@ mod tests {
         let toml = r#"
             [rift]
             api_url = "http://localhost:3200"
+            bridge_api_url = "http://127.0.0.1:3201"
             ws_url = "ws://localhost:3200/ws"
-            jwt_secret = "secret"
+            agent_jwt_secret = "secret"
             bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
@@ -1015,8 +1490,9 @@ mod tests {
         let toml = r#"
             [rift]
             api_url = "http://localhost:3200"
+            bridge_api_url = "http://127.0.0.1:3201"
             ws_url = "ws://localhost:3200/ws"
-            jwt_secret = "secret"
+            agent_jwt_secret = "secret"
             bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
@@ -1073,8 +1549,9 @@ mod tests {
         let toml = r#"
             [rift]
             api_url = "http://localhost:3200"
+            bridge_api_url = "http://127.0.0.1:3201"
             ws_url = "ws://localhost:3200/ws"
-            jwt_secret = "secret"
+            agent_jwt_secret = "secret"
             bridge_secret = "bridge-secret"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"
@@ -1132,6 +1609,7 @@ mod tests {
         let config = BridgeConfig::load_for_managed_room(
             &path,
             "http://127.0.0.1:3200".to_string(),
+            "http://127.0.0.1:3201".to_string(),
             "ws://127.0.0.1:3200/ws".to_string(),
             "j".repeat(32),
             "b".repeat(32),
@@ -1142,7 +1620,44 @@ mod tests {
         std::fs::remove_file(&path).expect("remove temporary managed config");
         assert_eq!(config.rift.server_id, server_id);
         assert_eq!(config.rift.channel_id, channel_id);
+        assert_eq!(config.rift.bridge_api_url, "http://127.0.0.1:3201");
         assert_eq!(config.agents.len(), 1);
+    }
+
+    /// Managed loading rejects a remote bridge URL instead of falling back to public Rift.
+    #[test]
+    fn managed_room_config_rejects_remote_bridge_api_url() {
+        let path = std::env::temp_dir().join(format!(
+            "henosis-managed-remote-bridge-config-{}.toml",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [[agents]]
+                name = "Architect"
+                username = "architect"
+                base_chance = 0.5
+                system_prompt = "Architect fixture."
+                executor = { type = "ClaudeCode", binary = "/usr/bin/claude" }
+            "#,
+        )
+        .expect("write managed config");
+        let result = BridgeConfig::load_for_managed_room(
+            &path,
+            "http://127.0.0.1:3200".to_string(),
+            "http://192.0.2.10:3201".to_string(),
+            "ws://127.0.0.1:3200/ws".to_string(),
+            "j".repeat(32),
+            "b".repeat(32),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        std::fs::remove_file(&path).expect("remove managed config");
+
+        assert!(
+            matches!(result, Err(super::BridgeError::Config(message)) if message.contains("rift.bridge_api_url"))
+        );
     }
 
     /// A generated roster can omit bridge tuning and still defaults to an empty child environment.
@@ -1197,6 +1712,7 @@ mod tests {
         let result = BridgeConfig::load_for_managed_room(
             &path,
             "http://127.0.0.1:3200".to_string(),
+            "http://127.0.0.1:3201".to_string(),
             "ws://127.0.0.1:3200/ws".to_string(),
             "j".repeat(32),
             "b".repeat(32),
@@ -1247,6 +1763,7 @@ mod tests {
             let result = BridgeConfig::load_for_managed_room(
                 &path,
                 "http://127.0.0.1:3200".to_string(),
+                "http://127.0.0.1:3201".to_string(),
                 "ws://127.0.0.1:3200/ws".to_string(),
                 "j".repeat(32),
                 "b".repeat(32),
@@ -1268,7 +1785,8 @@ mod tests {
         let config: BridgeConfig = toml::from_str(
             r#"
                 [rift]
-                jwt_secret = "rift-jwt-secret-value"
+                bridge_api_url = "http://127.0.0.1:3201"
+                agent_jwt_secret = "rift-agent-jwt-secret-value"
                 bridge_secret = "rift-bridge-secret-value"
 
                 [[agents]]

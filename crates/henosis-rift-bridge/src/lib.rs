@@ -24,6 +24,8 @@ pub mod embedding;
 pub mod engagement;
 /// Bridge error types.
 pub mod error;
+/// Durable replay suppression for Rift gateway event identities.
+pub(crate) mod event_dedupe;
 /// Execution mode: proposals, approvals, sandboxes, supervision.
 pub mod execution;
 /// AgentExecutor trait and discussion types.
@@ -36,12 +38,16 @@ pub mod growth;
 pub mod identity;
 /// Kleos client seam (HTTP and in-process backends).
 pub mod kleos;
+/// Monotonic managed-room leadership verification and cancellation.
+pub mod leadership;
 /// Turn budgets, consensus signals, thread ceiling.
 pub mod loop_prevention;
 /// Managed revision validation and bridge configuration materialization.
 pub mod materialize;
 /// Frameshift persona allocation across the roster.
 pub mod persona_alloc;
+/// Child-process environment confinement shared by executors and helpers.
+pub(crate) mod process_security;
 /// Message-to-persona relevance scoring.
 pub mod relevance;
 /// Rift REST and WebSocket clients.

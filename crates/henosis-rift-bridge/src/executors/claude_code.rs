@@ -2,6 +2,7 @@
 //! and `claude` for execution mode.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,11 +15,15 @@ use crate::executor::{
     HealthStatus, ProgressUpdate, TaskContext,
 };
 use crate::materialize::{MediatedCommandOutput, ResolvedExecutionMode};
+use crate::process_security::{
+    host_session_tokio_command, secure_tokio_command, spawn_direct_executor,
+    wait_for_direct_executor_output,
+};
 
 /// Return the worktree's current HEAD commit hash, or `None` if `dir` is not a git
 /// repository or the command fails. Used to detect whether an execution committed work.
 async fn git_head(dir: &std::path::Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = secure_tokio_command("git")
         .arg("-C")
         .arg(dir)
         .arg("rev-parse")
@@ -110,12 +115,7 @@ impl ClaudeCodeExecutor {
 
     /// Build a command with common flags and an explicit tool-access mode.
     fn base_cmd(&self, tools_enabled: bool) -> Command {
-        let mut cmd = Command::new(&self.binary);
-        // Dropping the output future on timeout must terminate the CLI. Without
-        // this the process survives its deadline, keeps mutating the sandbox
-        // worktree after the bridge considers the session over, and races the
-        // retry attempt that reuses that same worktree.
-        cmd.kill_on_drop(true);
+        let mut cmd = host_session_tokio_command(&self.binary);
         cmd.arg("-p");
         cmd.arg("--output-format").arg("text");
         if !tools_enabled {
@@ -146,7 +146,9 @@ impl ClaudeCodeExecutor {
                 if let Some(cargo_target_dir) = cargo_target_dir {
                     command.env("CARGO_TARGET_DIR", cargo_target_dir);
                 }
-                let output = command.output().await?;
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                let (child, process_group_guard) = spawn_direct_executor(&mut command)?;
+                let output = wait_for_direct_executor_output(child, process_group_guard).await?;
                 Ok(ClaudeOutput {
                     success: output.status.success(),
                     status: output.status.to_string(),
@@ -247,9 +249,9 @@ impl AgentExecutor for ClaudeCodeExecutor {
         let head_before = git_head(&task.sandbox.working_dir).await;
 
         // Enforce the sandbox's wall-clock ceiling here rather than trusting the
-        // CLI to honour it. On expiry the run future is dropped: a host-session
-        // child dies through `kill_on_drop`, and a broker-mediated child stays
-        // bounded by the broker's own execution deadline.
+        // CLI to honour it. On expiry the run future is dropped: remaining members
+        // of a host-session process group receive SIGKILL through its scope guard,
+        // and a broker-mediated child stays bounded by the broker's own deadline.
         let deadline = std::time::Duration::from_secs(task.sandbox.max_runtime_secs);
         let run = self.run(
             &task.description,
@@ -316,6 +318,25 @@ impl AgentExecutor for ClaudeCodeExecutor {
 /// Command-assembly tests for tool-access modes and untrusted prompt text.
 mod tests {
     use super::*;
+
+    /// Direct host execution captures stdout after replacing `Command::output`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_session_run_captures_direct_output() {
+        let executor = ClaudeCodeExecutor::new(PathBuf::from("/bin/echo"), None, None);
+
+        let output = executor
+            .run("capture-me", None, None, true)
+            .await
+            .expect("run echo through the direct Claude path");
+
+        assert!(output.success);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "-p --output-format text -- capture-me\n"
+        );
+        assert!(output.stderr.is_empty());
+    }
 
     /// Prompt text beginning with a dash follows the explicit option terminator.
     #[test]

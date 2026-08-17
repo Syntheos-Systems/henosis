@@ -88,12 +88,16 @@ pub enum CredentialMode {
     RequiredBinding,
 }
 
-/// One desired seat enriched with ownership and credential readiness.
+/// One desired seat enriched with public identity, ownership, and credential readiness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSeatView {
     /// Submitted non-secret seat configuration.
     pub seat: AgentSeatInput,
+    /// Unique public username of the selected agent identity.
+    pub agent_username: String,
+    /// Optional human-readable name of the selected agent identity.
+    pub agent_display_name: Option<String>,
     /// Current human owner of the selected agent identity.
     pub owner_user_id: Option<Uuid>,
     /// Deployment-resolved readiness without credential contents.
@@ -530,6 +534,23 @@ mod tests {
             serde_json::to_string(&ApplyState::Failed).unwrap(),
             "\"failed\""
         );
+    }
+
+    /// Dashboard roster seats serialize enough public identity context for owned and unowned agents.
+    #[test]
+    fn dashboard_read_context_serializes_public_agent_identity() {
+        let view = AgentSeatView {
+            seat: seat(0),
+            agent_username: "cartographer".to_string(),
+            agent_display_name: Some("Cartographer".to_string()),
+            owner_user_id: None,
+            credential_readiness: CredentialReadiness::HostSession,
+        };
+
+        let encoded = serde_json::to_value(view).expect("agent seat view must serialize");
+        assert_eq!(encoded["agentUsername"], "cartographer");
+        assert_eq!(encoded["agentDisplayName"], "Cartographer");
+        assert!(encoded["ownerUserId"].is_null());
     }
 
     /// Whole-roster validation rejects excessive size and duplicate identities.

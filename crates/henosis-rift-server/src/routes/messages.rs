@@ -4,42 +4,121 @@ use axum::{
     http::StatusCode,
 };
 use sqlx::PgPool;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
-use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::models::attachment::Attachment;
 use crate::models::message::{
     EditMessageRequest, MessageQuery, MessageResponse, SendMessageRequest,
+    validated_message_page_limit,
 };
 use crate::models::permissions::perms;
-use crate::routes::upload::{PendingUploads, delete_pending_upload_file};
-use crate::ws::gateway::{Gateway, GatewayEvent};
+use crate::routes::upload::{PendingUpload, PendingUploads};
+
+/// Maximum number of staged attachments accepted by one message.
+const MAX_MESSAGE_ATTACHMENTS: usize = 10;
+
+/// Atomic, cancellation-safe ownership of staged uploads during message creation.
+#[derive(Debug)]
+struct PendingUploadClaims {
+    /// Shared registry to restore into until the database transaction commits.
+    pending: PendingUploads,
+    /// Upload identifiers and metadata removed atomically from the registry.
+    uploads: Vec<(Uuid, PendingUpload)>,
+    /// True only after the database transaction has durably linked every upload.
+    committed: bool,
+}
+
+/// Claim lifecycle that restores staged uploads whenever the request does not commit.
+impl PendingUploadClaims {
+    /// Iterate over claimed upload metadata while building database attachment rows.
+    fn uploads(&self) -> impl Iterator<Item = &PendingUpload> {
+        self.uploads.iter().map(|(_, upload)| upload)
+    }
+
+    /// Mark every claim consumed after the message and attachments commit together.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+/// Restore atomically claimed uploads on error, panic, or request cancellation.
+impl Drop for PendingUploadClaims {
+    /// Return every uncommitted claim to the shared pending-upload registry.
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (upload_id, upload) in self.uploads.drain(..) {
+            self.pending.insert(upload_id, upload);
+        }
+    }
+}
+
+/// Atomically claim a bounded, unique set of uploads owned by one authenticated user.
+fn claim_pending_uploads(
+    pending: &PendingUploads,
+    uploader_id: Uuid,
+    upload_ids: &[Uuid],
+) -> Result<PendingUploadClaims, AppError> {
+    if upload_ids.len() > MAX_MESSAGE_ATTACHMENTS {
+        return Err(AppError::BadRequest(format!(
+            "A message can include no more than {MAX_MESSAGE_ATTACHMENTS} attachments"
+        )));
+    }
+
+    let mut unique_ids = HashSet::with_capacity(upload_ids.len());
+    if upload_ids
+        .iter()
+        .any(|upload_id| !unique_ids.insert(*upload_id))
+    {
+        return Err(AppError::BadRequest(
+            "Attachment identifiers must be unique".to_string(),
+        ));
+    }
+
+    let mut claims = PendingUploadClaims {
+        pending: pending.clone(),
+        uploads: Vec::with_capacity(upload_ids.len()),
+        committed: false,
+    };
+    for upload_id in upload_ids {
+        let Some(claimed) =
+            pending.remove_if(upload_id, |_, upload| upload.uploader_id == uploader_id)
+        else {
+            return Err(AppError::BadRequest(
+                "One or more attachments are unavailable".to_string(),
+            ));
+        };
+        claims.uploads.push(claimed);
+    }
+    Ok(claims)
+}
 
 /// GET /api/channels/:channel_id/messages
 pub async fn list_messages(
     State(pool): State<PgPool>,
     auth: AuthUser,
     Path(channel_id): Path<Uuid>,
-    Query(query): Query<MessageQuery>,
+    Query(mut query): Query<MessageQuery>,
 ) -> Result<Json<Vec<MessageResponse>>, AppError> {
-    let channel = db::get_channel_by_id(&pool, channel_id)
-        .await?
-        .ok_or(AppError::NotFound("Channel not found".into()))?;
-
-    require_member(&pool, channel.server_id, auth.user_id).await?;
-    let cursor = select_list_message_cursor(&query)?;
-    let messages = db::get_messages(&pool, channel_id, &query).await?;
-    require_existing_message_cursor(cursor, channel_id, |cursor| {
-        db::message_cursor_exists_in_channel(&pool, channel_id, cursor)
-    })
-    .await?;
-
-    // Batch-load attachments for all messages
-    let msg_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
-    let all_attachments = db::get_attachments_for_messages(&pool, &msg_ids).await?;
+    query.limit = Some(
+        validated_message_page_limit(query.limit)
+            .map_err(|message| AppError::BadRequest(message.to_string()))?,
+    );
+    select_list_message_cursor(&query)?;
+    let (messages, all_attachments) = db::list_channel_messages_authorized(
+        &pool,
+        channel_id,
+        auth.user_id,
+        auth.managed_fence.as_ref(),
+        &query,
+    )
+    .await
+    .map_err(map_list_messages_error)?;
 
     // Group attachments by message_id
     let responses = messages
@@ -60,8 +139,6 @@ pub async fn list_messages(
 /// POST /api/channels/:channel_id/messages
 pub async fn send_message(
     State(pool): State<PgPool>,
-    State(config): State<Config>,
-    State(gateway): State<Gateway>,
     State(pending): State<PendingUploads>,
     auth: AuthUser,
     Path(channel_id): Path<Uuid>,
@@ -71,6 +148,8 @@ pub async fn send_message(
         .await?
         .ok_or(AppError::NotFound("Channel not found".into()))?;
 
+    auth.require_server_target_fence(&pool, channel.server_id)
+        .await?;
     require_permission(&pool, channel.server_id, auth.user_id, perms::SEND_MESSAGES).await?;
 
     let content = req.content.as_deref().unwrap_or("").trim();
@@ -102,61 +181,46 @@ pub async fn send_message(
         .ok_or(AppError::Unauthorized)?;
     let message_type = resolve_message_type(req.message_type.as_deref(), author.is_agent)?;
 
-    // Use empty string for content-less messages (attachment-only)
+    let upload_ids = req.attachment_ids.as_deref().unwrap_or_default();
+    let claims = claim_pending_uploads(&pending, auth.user_id, upload_ids)?;
+    let new_attachments = claims
+        .uploads()
+        .map(|upload| db::NewAttachment {
+            filename: upload.filename.clone(),
+            url: upload.url.clone(),
+            content_type: upload.content_type.clone(),
+            size_bytes: upload.size_bytes,
+        })
+        .collect::<Vec<_>>();
+
+    // Use empty string for content-less messages (attachment-only).
     let msg_content = if content.is_empty() { "" } else { content };
-    let msg =
-        db::create_message(&pool, channel_id, auth.user_id, msg_content, message_type).await?;
-
-    // Link pending uploads to this message
-    let mut attachments = Vec::new();
-    if let Some(upload_ids) = req.attachment_ids {
-        for upload_id in upload_ids {
-            let Some(pending_upload) = pending.get(&upload_id).map(|entry| entry.clone()) else {
-                continue;
-            };
-
-            // Verify the uploader owns this upload
-            if pending_upload.uploader_id != auth.user_id {
-                continue;
-            }
-
-            let attachment = db::create_attachment(
-                &pool,
-                msg.id,
-                &pending_upload.filename,
-                &pending_upload.url,
-                pending_upload.content_type.as_deref(),
-                Some(pending_upload.size_bytes),
-            )
-            .await?;
-
-            if let Some((_, stored_upload)) = pending.remove(&upload_id)
-                && stored_upload.uploader_id != auth.user_id
-            {
-                delete_pending_upload_file(&config, &stored_upload).await;
-                continue;
-            }
-
-            attachments.push(attachment);
+    let write_authorization = if author.is_agent {
+        db::MessageWriteAuthorization::Agent {
+            server_id: channel.server_id,
+            fence: auth.managed_fence.as_ref(),
+            required_permissions: perms::SEND_MESSAGES
+                | if has_attachments {
+                    perms::ATTACH_FILES
+                } else {
+                    0
+                },
         }
-    }
-
-    // Broadcast to channel subscribers
-    gateway.broadcast_to_channel(
+    } else {
+        db::MessageWriteAuthorization::Human
+    };
+    let (msg, attachments) = db::create_message_with_attachments(
+        &pool,
         channel_id,
-        GatewayEvent::MessageCreate {
-            id: msg.id,
-            channel_id: msg.channel_id,
-            author_id: msg.author_id,
-            author_username: msg.author_username.clone(),
-            author_display_name: msg.author_display_name.clone(),
-            author_avatar_url: msg.author_avatar_url.clone(),
-            content: msg.content.clone(),
-            attachments: attachments.clone(),
-            message_type: msg.message_type.clone(),
-            created_at: msg.created_at.to_rfc3339(),
-        },
-    );
+        auth.user_id,
+        msg_content,
+        message_type,
+        write_authorization,
+        &new_attachments,
+    )
+    .await
+    .map_err(map_message_create_error)?;
+    claims.commit();
 
     Ok(Json(MessageResponse::from_msg(msg, attachments)))
 }
@@ -164,7 +228,6 @@ pub async fn send_message(
 /// PATCH /api/channels/:channel_id/messages/:message_id
 pub async fn edit_message(
     State(pool): State<PgPool>,
-    State(gateway): State<Gateway>,
     auth: AuthUser,
     Path((channel_id, message_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<EditMessageRequest>,
@@ -172,6 +235,8 @@ pub async fn edit_message(
     let channel = db::get_channel_by_id(&pool, channel_id)
         .await?
         .ok_or(AppError::NotFound("Channel not found".into()))?;
+    auth.require_server_target_fence(&pool, channel.server_id)
+        .await?;
     require_member(&pool, channel.server_id, auth.user_id).await?;
 
     let existing = db::get_message_by_id(&pool, message_id)
@@ -193,18 +258,17 @@ pub async fn edit_message(
         ));
     }
 
-    let msg = db::update_message(&pool, message_id, content).await?;
-    let attachments = db::get_attachments_for_message(&pool, message_id).await?;
-
-    gateway.broadcast_to_channel(
+    let msg = db::update_message_with_fence(
+        &pool,
+        message_id,
         channel_id,
-        GatewayEvent::MessageUpdate {
-            id: msg.id,
-            channel_id,
-            content: msg.content.clone(),
-            edited_at: msg.edited_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-        },
-    );
+        auth.user_id,
+        auth.managed_fence.as_ref(),
+        content,
+    )
+    .await
+    .map_err(map_message_mutation_error)?;
+    let attachments = db::get_attachments_for_message(&pool, message_id).await?;
 
     Ok(Json(MessageResponse::from_msg(msg, attachments)))
 }
@@ -212,13 +276,14 @@ pub async fn edit_message(
 /// DELETE /api/channels/:channel_id/messages/:message_id
 pub async fn delete_message(
     State(pool): State<PgPool>,
-    State(gateway): State<Gateway>,
     auth: AuthUser,
     Path((channel_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let channel = db::get_channel_by_id(&pool, channel_id)
         .await?
         .ok_or(AppError::NotFound("Channel not found".into()))?;
+    auth.require_server_target_fence(&pool, channel.server_id)
+        .await?;
     require_member(&pool, channel.server_id, auth.user_id).await?;
 
     let existing = db::get_message_by_id(&pool, message_id)
@@ -238,15 +303,15 @@ pub async fn delete_message(
     }
 
     // Attachments cascade-deleted by DB foreign key
-    db::delete_message(&pool, message_id).await?;
-
-    gateway.broadcast_to_channel(
+    db::delete_message_with_fence(
+        &pool,
+        message_id,
         channel_id,
-        GatewayEvent::MessageDelete {
-            id: message_id,
-            channel_id,
-        },
-    );
+        auth.user_id,
+        auth.managed_fence.as_ref(),
+    )
+    .await
+    .map_err(map_message_mutation_error)?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -291,6 +356,37 @@ fn resolve_message_type(requested: Option<&str>, author_is_agent: bool) -> Resul
     }
 }
 
+/// Map a fenced message transaction failure to a stable, non-disclosing API response.
+fn map_message_create_error(error: db::CreateMessageError) -> AppError {
+    match error {
+        db::CreateMessageError::Forbidden => AppError::Forbidden,
+        db::CreateMessageError::StaleLeadership => AppError::stale_leadership_fence(),
+        db::CreateMessageError::Database(error) => error.into(),
+    }
+}
+
+/// Map one transaction-scoped message-list failure to its stable API contract.
+fn map_list_messages_error(error: db::ListMessagesError) -> AppError {
+    match error {
+        db::ListMessagesError::ChannelNotFound => {
+            AppError::NotFound("Channel not found".to_string())
+        }
+        db::ListMessagesError::Forbidden => AppError::Forbidden,
+        db::ListMessagesError::StaleLeadership => AppError::stale_leadership_fence(),
+        db::ListMessagesError::InvalidCursor => invalid_message_cursor(),
+        db::ListMessagesError::Database(error) => error.into(),
+    }
+}
+
+/// Map a fenced edit or delete failure to a stable, non-disclosing API response.
+fn map_message_mutation_error(error: db::MessageMutationError) -> AppError {
+    match error {
+        db::MessageMutationError::NotFound => AppError::NotFound("Message not found".to_string()),
+        db::MessageMutationError::StaleLeadership => AppError::stale_leadership_fence(),
+        db::MessageMutationError::Database(error) => error.into(),
+    }
+}
+
 /// Direction-bearing message boundary selected from one unambiguous page query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListMessageCursor {
@@ -301,6 +397,7 @@ enum ListMessageCursor {
 }
 
 /// Return the opaque identifier carried by one selected page boundary.
+#[cfg(test)]
 impl ListMessageCursor {
     /// Extract the identifier without discarding its pagination direction.
     fn id(self) -> Uuid {
@@ -323,6 +420,7 @@ fn select_list_message_cursor(query: &MessageQuery) -> Result<Option<ListMessage
 }
 
 /// Confirm after the page read that its boundary exists or is the reserved beginning cursor.
+#[cfg(test)]
 async fn require_existing_message_cursor<F, Fut>(
     cursor: Option<ListMessageCursor>,
     channel_id: Uuid,
@@ -386,14 +484,134 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     use super::{
-        list_messages, require_existing_message_cursor, require_message_channel,
-        resolve_message_type, select_list_message_cursor,
+        MAX_MESSAGE_ATTACHMENTS, claim_pending_uploads, list_messages, map_message_mutation_error,
+        require_existing_message_cursor, require_message_channel, resolve_message_type,
+        select_list_message_cursor,
     };
     use crate::auth::middleware::AuthUser;
     use crate::db;
     use crate::error::AppError;
     use crate::models::message::MessageQuery;
+    use crate::models::permissions::perms;
+    use crate::routes::upload::{PendingUpload, PendingUploads};
+    use chrono::Utc;
     use uuid::Uuid;
+
+    /// A stale transactional edit or delete uses the same stable revocation envelope as creation.
+    #[tokio::test]
+    async fn message_mutation_stale_fence_has_stable_conflict_code() {
+        use axum::response::IntoResponse;
+
+        let response =
+            map_message_mutation_error(db::MessageMutationError::StaleLeadership).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("coded mutation error body must be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("coded mutation error body must be JSON");
+        assert_eq!(body["code"], "stale_leadership_fence");
+    }
+
+    /// Build one pending upload owned by the requested user.
+    fn pending_upload(uploader_id: Uuid) -> PendingUpload {
+        PendingUpload {
+            uploader_id,
+            filename: "evidence.txt".to_string(),
+            stored_filename: Uuid::new_v4().to_string(),
+            url: "/uploads/evidence".to_string(),
+            content_type: Some("text/plain".to_string()),
+            size_bytes: 8,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Build an empty pending-upload registry for claim tests.
+    fn pending_uploads() -> PendingUploads {
+        std::sync::Arc::new(dashmap::DashMap::new())
+    }
+
+    /// Only one concurrent message may consume a staged upload identifier.
+    #[test]
+    fn pending_upload_claim_is_single_use_under_concurrency() {
+        let pending = pending_uploads();
+        let uploader_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        pending.insert(upload_id, pending_upload(uploader_id));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let claims = (0..2)
+            .map(|_| {
+                let pending = pending.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_pending_uploads(&pending, uploader_id, &[upload_id])
+                        .map(|claim| claim.commit())
+                        .is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let successes = claims
+            .into_iter()
+            .map(|claim| claim.join().expect("claim worker must not panic"))
+            .filter(|succeeded| *succeeded)
+            .count();
+        assert_eq!(successes, 1);
+        assert!(!pending.contains_key(&upload_id));
+    }
+
+    /// A failed partial claim restores earlier uploads and leaves foreign uploads untouched.
+    #[test]
+    fn pending_upload_claim_is_all_or_nothing() {
+        let pending = pending_uploads();
+        let uploader_id = Uuid::new_v4();
+        let owned_id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        pending.insert(owned_id, pending_upload(uploader_id));
+        pending.insert(foreign_id, pending_upload(Uuid::new_v4()));
+
+        let error = claim_pending_uploads(&pending, uploader_id, &[owned_id, foreign_id])
+            .expect_err("foreign upload must reject the entire claim");
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(pending.contains_key(&owned_id));
+        assert!(pending.contains_key(&foreign_id));
+    }
+
+    /// Dropping an uncommitted claim restores it so cancellation cannot orphan the file.
+    #[test]
+    fn uncommitted_pending_upload_claim_restores_on_drop() {
+        let pending = pending_uploads();
+        let uploader_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        pending.insert(upload_id, pending_upload(uploader_id));
+
+        let claim = claim_pending_uploads(&pending, uploader_id, &[upload_id])
+            .expect("owned upload must be claimable");
+        assert!(!pending.contains_key(&upload_id));
+        drop(claim);
+        assert!(pending.contains_key(&upload_id));
+    }
+
+    /// Duplicate or excessive identifiers are rejected before any upload is removed.
+    #[test]
+    fn pending_upload_claim_enforces_request_bounds() {
+        let pending = pending_uploads();
+        let uploader_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        pending.insert(upload_id, pending_upload(uploader_id));
+
+        assert!(claim_pending_uploads(&pending, uploader_id, &[upload_id, upload_id]).is_err());
+        assert!(pending.contains_key(&upload_id));
+
+        let excessive = (0..=MAX_MESSAGE_ATTACHMENTS)
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
+        assert!(claim_pending_uploads(&pending, uploader_id, &excessive).is_err());
+        assert!(pending.contains_key(&upload_id));
+    }
 
     /// Construct one list query around the requested before and after cursors.
     fn message_query(before: Option<Uuid>, after: Option<Uuid>) -> MessageQuery {
@@ -420,6 +638,397 @@ mod tests {
             .await
             .expect("test database migrations must apply");
         Some(pool)
+    }
+
+    /// Live PostgreSQL proves one fenced list boundary covers membership, cursor, page, and files.
+    #[tokio::test]
+    async fn live_managed_message_list_is_authorized_as_one_database_read() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("list_owner_{suffix}"),
+            &format!("list-owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("list owner must be created");
+        let agent = db::create_owned_agent_user(
+            &pool,
+            &format!("list_agent_{suffix}"),
+            &format!("list-agent-{suffix}@agent.local"),
+            "test-hash",
+            None,
+            owner.id,
+        )
+        .await
+        .expect("list agent must be created");
+        let server = db::create_server(&pool, &format!("list-{suffix}"), None, owner.id)
+            .await
+            .expect("list server must be created");
+        sqlx::query(
+            r#"INSERT INTO bridge_server_state (server_id, fencing_required)
+               VALUES ($1, TRUE)"#,
+        )
+        .bind(server.id)
+        .execute(&pool)
+        .await
+        .expect("managed list state must be created");
+        db::add_member(&pool, server.id, agent.id)
+            .await
+            .expect("list agent must join the room");
+        let channel = db::create_channel(&pool, server.id, "list", None, "text")
+            .await
+            .expect("list channel must be created");
+        let message = db::create_message(&pool, channel.id, agent.id, "listed", "agent")
+            .await
+            .expect("listed message must be created");
+        db::create_attachment(
+            &pool,
+            message.id,
+            "evidence.txt",
+            "/uploads/evidence",
+            Some("text/plain"),
+            Some(8),
+        )
+        .await
+        .expect("listed attachment must be created");
+        let stale = db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("first list fence must be acquired");
+
+        let (messages, attachments) = db::list_channel_messages_authorized(
+            &pool,
+            channel.id,
+            agent.id,
+            Some(&stale),
+            &message_query(None, None),
+        )
+        .await
+        .expect("current managed list must load");
+        assert_eq!(
+            messages.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [message.id]
+        );
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].message_id, message.id);
+
+        let current = db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("successor list fence must be acquired");
+        assert!(matches!(
+            db::list_channel_messages_authorized(
+                &pool,
+                channel.id,
+                agent.id,
+                Some(&stale),
+                &message_query(None, None),
+            )
+            .await,
+            Err(db::ListMessagesError::StaleLeadership)
+        ));
+        db::remove_member(&pool, server.id, agent.id)
+            .await
+            .expect("list membership must be removable");
+        assert!(matches!(
+            db::list_channel_messages_authorized(
+                &pool,
+                channel.id,
+                agent.id,
+                Some(&current),
+                &message_query(None, None),
+            )
+            .await,
+            Err(db::ListMessagesError::Forbidden)
+        ));
+    }
+
+    /// Live PostgreSQL rejects managed inserts after membership or permission revocation.
+    #[tokio::test]
+    async fn live_managed_send_revalidates_authority_inside_message_transaction() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("send_owner_{suffix}"),
+            &format!("send-owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("send owner must be created");
+        let agent = db::create_owned_agent_user(
+            &pool,
+            &format!("send_agent_{suffix}"),
+            &format!("send-agent-{suffix}@agent.local"),
+            "test-hash",
+            None,
+            owner.id,
+        )
+        .await
+        .expect("send agent must be created");
+        let server = db::create_server(&pool, &format!("send-{suffix}"), None, owner.id)
+            .await
+            .expect("send server must be created");
+        sqlx::query(
+            r#"INSERT INTO bridge_server_state (server_id, fencing_required)
+               VALUES ($1, TRUE)"#,
+        )
+        .bind(server.id)
+        .execute(&pool)
+        .await
+        .expect("managed send state must be created");
+        db::add_member(&pool, server.id, agent.id)
+            .await
+            .expect("send agent must join the room");
+        let role = db::create_role(&pool, server.id, "sender", 0, perms::SEND_MESSAGES)
+            .await
+            .expect("sender role must be created");
+        db::assign_role(&pool, server.id, agent.id, role.id)
+            .await
+            .expect("sender role must be assigned");
+        let channel = db::create_channel(&pool, server.id, "send", None, "text")
+            .await
+            .expect("send channel must be created");
+        let fence = db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("send fence must be acquired");
+
+        db::create_message_with_attachments(
+            &pool,
+            channel.id,
+            agent.id,
+            "authorized",
+            "agent",
+            db::MessageWriteAuthorization::Agent {
+                server_id: server.id,
+                fence: Some(&fence),
+                required_permissions: perms::SEND_MESSAGES,
+            },
+            &[],
+        )
+        .await
+        .expect("current membership and permission must authorize send");
+
+        assert!(matches!(
+            db::create_message_with_attachments(
+                &pool,
+                channel.id,
+                agent.id,
+                "missing attachment permission",
+                "agent",
+                db::MessageWriteAuthorization::Agent {
+                    server_id: server.id,
+                    fence: Some(&fence),
+                    required_permissions: perms::SEND_MESSAGES | perms::ATTACH_FILES,
+                },
+                &[],
+            )
+            .await,
+            Err(db::CreateMessageError::Forbidden)
+        ));
+        let current_fence = db::agent_control::acquire_room_fence(&pool, server.id)
+            .await
+            .expect("successor send fence must be acquired");
+        assert!(matches!(
+            db::create_message_with_attachments(
+                &pool,
+                channel.id,
+                agent.id,
+                "stale",
+                "agent",
+                db::MessageWriteAuthorization::Agent {
+                    server_id: server.id,
+                    fence: Some(&fence),
+                    required_permissions: perms::SEND_MESSAGES,
+                },
+                &[],
+            )
+            .await,
+            Err(db::CreateMessageError::StaleLeadership)
+        ));
+        db::remove_role_from_member(&pool, server.id, agent.id, role.id)
+            .await
+            .expect("sender role must be removable");
+        assert!(matches!(
+            db::create_message_with_attachments(
+                &pool,
+                channel.id,
+                agent.id,
+                "revoked",
+                "agent",
+                db::MessageWriteAuthorization::Agent {
+                    server_id: server.id,
+                    fence: Some(&current_fence),
+                    required_permissions: perms::SEND_MESSAGES,
+                },
+                &[],
+            )
+            .await,
+            Err(db::CreateMessageError::Forbidden)
+        ));
+        db::assign_role(&pool, server.id, agent.id, role.id)
+            .await
+            .expect("sender role must be restorable");
+        db::remove_member(&pool, server.id, agent.id)
+            .await
+            .expect("send membership must be removable");
+        assert!(matches!(
+            db::create_message_with_attachments(
+                &pool,
+                channel.id,
+                agent.id,
+                "nonmember",
+                "agent",
+                db::MessageWriteAuthorization::Agent {
+                    server_id: server.id,
+                    fence: Some(&current_fence),
+                    required_permissions: perms::SEND_MESSAGES,
+                },
+                &[],
+            )
+            .await,
+            Err(db::CreateMessageError::Forbidden)
+        ));
+    }
+
+    /// Live PostgreSQL proves edit/delete fences are target-scoped and held by each mutation.
+    #[tokio::test]
+    async fn live_message_mutations_reject_stale_and_cross_room_fences() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("mutation_owner_{suffix}"),
+            &format!("mutation-owner-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("mutation owner must be created");
+        let agent = db::create_owned_agent_user(
+            &pool,
+            &format!("mutation_agent_{suffix}"),
+            &format!("mutation-agent-{suffix}@agent.local"),
+            "test-hash",
+            None,
+            owner.id,
+        )
+        .await
+        .expect("mutation agent must be created");
+        let target_server =
+            db::create_server(&pool, &format!("mutation-target-{suffix}"), None, owner.id)
+                .await
+                .expect("target server must be created");
+        let other_server =
+            db::create_server(&pool, &format!("mutation-other-{suffix}"), None, owner.id)
+                .await
+                .expect("other server must be created");
+        for server_id in [target_server.id, other_server.id] {
+            sqlx::query(
+                r#"INSERT INTO bridge_server_state (server_id, fencing_required)
+                   VALUES ($1, TRUE)"#,
+            )
+            .bind(server_id)
+            .execute(&pool)
+            .await
+            .expect("managed room state must be created");
+        }
+        db::add_member(&pool, target_server.id, agent.id)
+            .await
+            .expect("agent must join target room");
+        let channel = db::create_channel(&pool, target_server.id, "target", None, "text")
+            .await
+            .expect("target channel must be created");
+        let message = db::create_message(&pool, channel.id, agent.id, "original", "agent")
+            .await
+            .expect("agent test message must be created");
+
+        let stale_fence = db::agent_control::acquire_room_fence(&pool, target_server.id)
+            .await
+            .expect("first target fence must be acquired");
+        let current_fence = db::agent_control::acquire_room_fence(&pool, target_server.id)
+            .await
+            .expect("second target fence must be acquired");
+        let other_fence = db::agent_control::acquire_room_fence(&pool, other_server.id)
+            .await
+            .expect("other room fence must be acquired");
+
+        let stale_edit = db::update_message_with_fence(
+            &pool,
+            message.id,
+            channel.id,
+            agent.id,
+            Some(&stale_fence),
+            "stale edit",
+        )
+        .await;
+        assert!(matches!(
+            stale_edit,
+            Err(db::MessageMutationError::StaleLeadership)
+        ));
+        let cross_room_edit = db::update_message_with_fence(
+            &pool,
+            message.id,
+            channel.id,
+            agent.id,
+            Some(&other_fence),
+            "cross room edit",
+        )
+        .await;
+        assert!(matches!(
+            cross_room_edit,
+            Err(db::MessageMutationError::StaleLeadership)
+        ));
+        let updated = db::update_message_with_fence(
+            &pool,
+            message.id,
+            channel.id,
+            agent.id,
+            Some(&current_fence),
+            "current edit",
+        )
+        .await
+        .expect("current target fence must edit");
+        assert_eq!(updated.content, "current edit");
+
+        let stale_delete = db::delete_message_with_fence(
+            &pool,
+            message.id,
+            channel.id,
+            agent.id,
+            Some(&stale_fence),
+        )
+        .await;
+        assert!(matches!(
+            stale_delete,
+            Err(db::MessageMutationError::StaleLeadership)
+        ));
+        db::delete_message_with_fence(
+            &pool,
+            message.id,
+            channel.id,
+            agent.id,
+            Some(&current_fence),
+        )
+        .await
+        .expect("current target fence must delete");
+        assert!(
+            db::get_message_by_id(&pool, message.id)
+                .await
+                .expect("deleted message lookup must succeed")
+                .is_none()
+        );
     }
 
     /// Assert the concrete HTTP envelope for one invalid cursor error.
@@ -505,6 +1114,29 @@ mod tests {
         assert!(matches!(error, AppError::BadRequest(_)));
     }
 
+    /// Invalid page sizes fail before an unavailable database can be queried.
+    #[tokio::test]
+    async fn list_messages_rejects_invalid_limit_before_database_access() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/rift_pagination_must_not_connect")
+            .expect("static database URL must parse");
+        let mut query = message_query(None, None);
+        query.limit = Some(-1);
+        let result = list_messages(
+            State(pool),
+            AuthUser {
+                user_id: Uuid::new_v4(),
+                username: "pagination-test".to_string(),
+                is_agent: false,
+                managed_fence: None,
+            },
+            Path(Uuid::new_v4()),
+            Query(query),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
     /// Live PostgreSQL proves cursor scope, stable ordering, and empty boundaries.
     #[tokio::test]
     async fn list_messages_enforce_live_channel_cursor_contracts() {
@@ -557,6 +1189,8 @@ mod tests {
         let auth = AuthUser {
             user_id: user.id,
             username,
+            is_agent: false,
+            managed_fence: None,
         };
         for query in [
             message_query(Some(Uuid::new_v4()), None),

@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::StimulusSettings;
 use crate::kleos::KleosClient;
+use crate::process_security::secure_tokio_command;
 
 /// Maximum characters a sanitized stimulus text may carry into the room.
 const MAX_STIMULUS_CHARS: usize = 600;
@@ -256,7 +257,7 @@ impl GitHeadSource {
     /// Any failure -- spawn error, non-zero exit, timeout, parse -- returns
     /// None; the caller's failure counter decides when to give up.
     async fn head_of(path: &Path) -> Option<(String, String)> {
-        let probe = tokio::process::Command::new("git")
+        let probe = secure_tokio_command("git")
             .arg("-C")
             .arg(path)
             .args(["log", "-1", "--format=%H\t%h %s"])

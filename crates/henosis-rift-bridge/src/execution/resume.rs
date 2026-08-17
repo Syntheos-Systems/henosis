@@ -11,9 +11,8 @@
 
 use std::path::Path;
 
-use tokio::process::Command;
-
 use crate::executor::ExecutionResult;
+use crate::process_security::secure_tokio_command;
 
 /// Decide whether a finished attempt should be retried.
 ///
@@ -60,7 +59,7 @@ pub fn format_resume_context(reason: &str, commits: &[String]) -> String {
 /// the commits a failed attempt added on top of it. Mirrors the thin git helper
 /// in the ClaudeCode executor; best-effort, never blocks execution.
 pub async fn git_head(dir: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = secure_tokio_command("git")
         .arg("-C")
         .arg(dir)
         .arg("rev-parse")
@@ -81,7 +80,7 @@ pub async fn git_head(dir: &Path) -> Option<String> {
 /// Best-effort: returns an empty vec on any git error or when `dir` is not a
 /// repository, so a missing or broken worktree never blocks the retry.
 pub async fn collect_partial_commits(dir: &Path, base: &str) -> Vec<String> {
-    let output = match Command::new("git")
+    let output = match secure_tokio_command("git")
         .arg("-C")
         .arg(dir)
         .arg("log")
@@ -101,6 +100,7 @@ pub async fn collect_partial_commits(dir: &Path, base: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+/// Covers retry selection and prior-attempt context formatting.
 mod tests {
     use super::{format_resume_context, should_retry};
     use crate::executor::ExecutionResult;

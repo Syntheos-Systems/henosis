@@ -21,11 +21,13 @@ use henosis_rift_server::models::agent_control::{
     AgentSeatInput, AgentSeatView, ApplyState, ApplyStatusUpdate, ExecutionCapabilityCatalog,
     RoomAgentRoster, UpdateRoomAgentRoster,
 };
+use henosis_rift_server::models::leadership::RoomFence;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::PgPool;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::credential_bindings::{FileCredentialBindingResolver, CREDENTIAL_BINDINGS_FILE_ENV};
 
@@ -54,6 +56,9 @@ struct RuntimeAgentIdentity {
 /// Opaque lifetime token proving and monitoring exclusive supervision of one room.
 #[async_trait]
 trait RoomLeadershipLease: Send {
+    /// Return the database-backed capability shared by this process generation.
+    fn fence(&self) -> RoomFence;
+
     /// Subscribe to the first observed loss of the lock-holding database session.
     fn subscribe_loss(&self) -> watch::Receiver<Option<String>>;
 
@@ -63,6 +68,8 @@ trait RoomLeadershipLease: Send {
 
 /// PostgreSQL advisory-lock monitor retained for one supervisor lifetime.
 struct PostgresRoomLeadershipLease {
+    /// Database-backed generation capability issued after lock acquisition.
+    fence: RoomFence,
     /// Latest sanitized database-session failure, initially absent.
     loss: watch::Receiver<Option<String>>,
     /// Task owning and probing the dedicated lock-holding connection.
@@ -107,6 +114,7 @@ trait RoomRevisionStore: Send + Sync {
     /// Persist one observable runtime transition.
     async fn set_status(
         &self,
+        fence: &RoomFence,
         expected_desired_revision: Option<i64>,
         status: ApplyStatusUpdate,
     ) -> Result<(), String>;
@@ -139,23 +147,29 @@ impl RoomRevisionStore for PostgresRoomRevisionStore {
         if !acquired {
             return Err("another Henosis process already supervises this room".to_string());
         }
+        let fence =
+            db::agent_control::acquire_room_fence_on_connection(&mut connection, self.server_id)
+                .await
+                .map_err(|error| sanitized_store_failure("room leadership fence", &error))?;
         let (loss_tx, loss) = watch::channel(None);
         let monitor = tokio::spawn(async move {
             let mut heartbeat = tokio::time::interval(ROOM_LEADERSHIP_HEARTBEAT_INTERVAL);
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 heartbeat.tick().await;
-                if let Err(error) = sqlx::query_scalar::<_, i32>("SELECT 1")
-                    .fetch_one(&mut connection)
-                    .await
+                if let Err(detail) = await_room_leadership_heartbeat(
+                    sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&mut connection),
+                    ROOM_LEADERSHIP_HEARTBEAT_TIMEOUT,
+                )
+                .await
                 {
-                    let detail = sanitized_store_failure("room leadership heartbeat", &error);
                     let _ = loss_tx.send(Some(detail));
                     return;
                 }
             }
         });
         Ok(Box::new(PostgresRoomLeadershipLease {
+            fence,
             loss,
             monitor: Some(monitor),
         }))
@@ -217,12 +231,14 @@ impl RoomRevisionStore for PostgresRoomRevisionStore {
     /// Write active, last-good, and failure state through Rift's repository.
     async fn set_status(
         &self,
+        fence: &RoomFence,
         expected_desired_revision: Option<i64>,
         status: ApplyStatusUpdate,
     ) -> Result<(), String> {
         db::agent_control::set_room_apply_status(
             &self.pool,
             self.server_id,
+            fence,
             expected_desired_revision,
             status,
         )
@@ -234,6 +250,11 @@ impl RoomRevisionStore for PostgresRoomRevisionStore {
 /// Exposes lock-session failure and deterministic release to the supervisor.
 #[async_trait]
 impl RoomLeadershipLease for PostgresRoomLeadershipLease {
+    /// Copy the immutable capability issued to this lock-holding generation.
+    fn fence(&self) -> RoomFence {
+        self.fence
+    }
+
     /// Clone the watch receiver without exposing the dedicated database connection.
     fn subscribe_loss(&self) -> watch::Receiver<Option<String>> {
         self.loss.clone()
@@ -253,6 +274,21 @@ const ROOM_RECONCILER_LOCK_DOMAIN: u64 = 0x4845_4e4f_5349_5352;
 
 /// Maximum interval before a dead leadership session is observed.
 const ROOM_LEADERSHIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum time one leadership-session probe may remain unanswered.
+const ROOM_LEADERSHIP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound one database heartbeat and reduce failure details before publication.
+async fn await_room_leadership_heartbeat<F>(heartbeat: F, timeout: Duration) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<i32, sqlx::Error>>,
+{
+    match tokio::time::timeout(timeout, heartbeat).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(sanitized_store_failure("room leadership heartbeat", &error)),
+        Err(_) => Err("room leadership heartbeat timed out".to_string()),
+    }
+}
 
 /// Fold one room UUID into a stable namespaced 64-bit PostgreSQL lock key.
 fn room_reconciler_lock_key(server_id: Uuid) -> i64 {
@@ -492,6 +528,8 @@ pub struct RoomReconciler {
     lifecycle_timeout: Duration,
     /// Revision author when managed control is enabled; none keeps TOML authoritative.
     initial_roster_author: Option<Uuid>,
+    /// Server-only root used to derive exact room-generation capabilities.
+    managed_authority_root: Option<Zeroizing<String>>,
     /// Controller withheld from Rift until initial durable-state selection commits.
     pending_control_activation: Option<PendingControlActivation>,
 }
@@ -521,6 +559,7 @@ pub fn build_room_reconciler(
     dependencies: RuntimeDependencies,
     bindings: Arc<dyn CredentialBindingResolver>,
     managed_control: Option<(Uuid, ManagedAgentControlRegistry)>,
+    managed_authority_root: Zeroizing<String>,
 ) -> RoomReconciler {
     let server_id = base.rift.server_id;
     let store: Arc<dyn RoomRevisionStore> = Arc::new(PostgresRoomRevisionStore { pool, server_id });
@@ -542,6 +581,7 @@ pub fn build_room_reconciler(
     if let Some((_, registry)) = managed_control {
         reconciler.defer_control_activation(registry, Arc::new(handle.clone()));
     }
+    reconciler.managed_authority_root = Some(managed_authority_root);
     reconciler
 }
 
@@ -575,9 +615,34 @@ fn build_room_reconciler_with_parts(
             poll_interval: options.poll_interval,
             lifecycle_timeout: options.lifecycle_timeout,
             initial_roster_author: options.initial_roster_author,
+            managed_authority_root: None,
             pending_control_activation: None,
         },
     )
+}
+
+/// Replace deployment-wide capabilities with exact acquired-room child keys.
+fn install_managed_room_authority(
+    config: &mut BridgeConfig,
+    root_secret: Option<&str>,
+    fence: Option<&RoomFence>,
+) -> Result<(), String> {
+    let Some(root_secret) = root_secret else {
+        return Ok(());
+    };
+    let fence = fence.ok_or_else(|| {
+        "managed room authority unavailable before leadership acquisition".to_string()
+    })?;
+    if fence.server_id != config.rift.server_id {
+        return Err("managed room authority targets a different Rift server".to_string());
+    }
+    config.rift.agent_jwt_secret =
+        henosis_rift_server::auth::jwt::derive_managed_agent_jwt_secret(root_secret, fence)
+            .map_err(|_| "managed agent signing key derivation failed".to_string())?;
+    config.rift.bridge_secret =
+        henosis_rift_server::auth::jwt::derive_managed_bridge_route_secret(root_secret, fence)
+            .map_err(|_| "managed bridge route key derivation failed".to_string())?;
+    Ok(())
 }
 
 /// Continue-or-stop signal returned by supervision passes.
@@ -928,13 +993,14 @@ impl RoomReconciler {
     /// it. Rift is never aborted from here: an initial startup failure returns
     /// an error for the parent to treat as fatal, while later bridge failures
     /// are absorbed by fallback and restart.
-    pub async fn run(self, stop: watch::Receiver<bool>) -> Result<(), String> {
+    pub async fn run(mut self, stop: watch::Receiver<bool>) -> Result<(), String> {
         let mut leadership_lease = self
             .core
             .store
             .acquire_leadership()
             .await
             .map_err(|detail| format!("room reconciler leadership unavailable: {detail}"))?;
+        self.dependencies.managed_fence = Some(leadership_lease.fence());
         let mut leadership_loss = leadership_lease.subscribe_loss();
         let result = self.run_with_leadership(stop, &mut leadership_loss).await;
         leadership_lease.release().await;
@@ -1383,10 +1449,17 @@ impl RoomReconciler {
     /// Spawn one bridge and drive it to its readiness boundary.
     async fn start_bridge(
         &self,
-        config: BridgeConfig,
+        mut config: BridgeConfig,
         stop: &mut watch::Receiver<bool>,
         leadership_loss: &mut watch::Receiver<Option<String>>,
     ) -> StartupOutcome {
+        if let Err(detail) = install_managed_room_authority(
+            &mut config,
+            self.managed_authority_root.as_deref().map(String::as_str),
+            self.dependencies.managed_fence.as_ref(),
+        ) {
+            return StartupOutcome::Failed(detail);
+        }
         let spawned = self.runner.spawn(config, self.dependencies.clone());
         spawned
             .wait_ready(stop, leadership_loss, self.lifecycle_timeout)
@@ -1430,10 +1503,14 @@ impl RoomReconciler {
         expected_desired_revision: Option<i64>,
         status: ApplyStatusUpdate,
     ) {
+        let Some(fence) = self.dependencies.managed_fence.as_ref() else {
+            tracing::error!("bridge status persistence rejected without a leadership fence");
+            return;
+        };
         if let Err(detail) = self
             .core
             .store
-            .set_status(expected_desired_revision, status)
+            .set_status(fence, expected_desired_revision, status)
             .await
         {
             tracing::warn!(%detail, "bridge status persistence failed; the poll loop will heal it");
@@ -1549,7 +1626,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Mutex,
     };
 
@@ -1618,6 +1695,18 @@ mod tests {
         );
     }
 
+    /// A silent database peer is classified as leadership loss within the supplied bound.
+    #[tokio::test]
+    async fn leadership_heartbeat_timeout_fails_closed() {
+        let result = await_room_leadership_heartbeat(
+            std::future::pending::<Result<i32, sqlx::Error>>(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "room leadership heartbeat timed out");
+    }
+
     /// Produce the deterministic provisioned user ID emitted by the fake runner.
     fn ready_user_id(position: usize) -> Uuid {
         Uuid::from_u128(100 + position as u128)
@@ -1628,8 +1717,9 @@ mod tests {
         BridgeConfig {
             rift: RiftConfig {
                 api_url: "http://127.0.0.1:3200".to_string(),
+                bridge_api_url: "http://127.0.0.1:3201".to_string(),
                 ws_url: "ws://127.0.0.1:3200/ws".to_string(),
-                jwt_secret: "jwt-secret-that-is-at-least-32-bytes".to_string(),
+                agent_jwt_secret: "agent-jwt-secret-that-is-at-least-32-bytes".to_string(),
                 bridge_secret: "bridge-secret-that-is-at-least-32-bytes".to_string(),
                 server_id: server_id(),
                 channel_id: Uuid::from_u128(2),
@@ -1674,6 +1764,41 @@ mod tests {
         }
     }
 
+    /// Managed launch replaces both base capabilities with lease-bound child keys.
+    #[test]
+    fn managed_launch_installs_fence_derived_authority() {
+        let claude = ExecutableFixture::new("claude-key-scope");
+        let codex = ExecutableFixture::new("codex-key-scope");
+        let mut config = test_base(&claude, &codex);
+        let deployment_agent_key = config.rift.agent_jwt_secret.clone();
+        let deployment_bridge_key = config.rift.bridge_secret.clone();
+        let root = "human-jwt-root-that-remains-inside-syntheos";
+        let fence = RoomFence {
+            server_id: config.rift.server_id,
+            epoch: 12,
+            lease_id: Uuid::new_v4(),
+        };
+
+        install_managed_room_authority(&mut config, Some(root), Some(&fence))
+            .expect("install derived key");
+
+        let expected =
+            henosis_rift_server::auth::jwt::derive_managed_agent_jwt_secret(root, &fence)
+                .expect("derive expected key");
+        let expected_bridge =
+            henosis_rift_server::auth::jwt::derive_managed_bridge_route_secret(root, &fence)
+                .expect("derive expected bridge key");
+        assert_eq!(config.rift.agent_jwt_secret, expected);
+        assert_eq!(config.rift.bridge_secret, expected_bridge);
+        assert_ne!(config.rift.agent_jwt_secret, deployment_agent_key);
+        assert_ne!(config.rift.bridge_secret, deployment_bridge_key);
+        assert_ne!(config.rift.agent_jwt_secret, config.rift.bridge_secret);
+        assert!(
+            install_managed_room_authority(&mut config, Some(root), None).is_err(),
+            "a configured derivation root must fail closed before lease acquisition"
+        );
+    }
+
     /// One recorded attempt to import the initial ready roster.
     #[derive(Clone)]
     struct InitialImportAttempt {
@@ -1705,6 +1830,8 @@ mod tests {
         revision_results: VecDeque<Result<(), String>>,
         /// Revisions whose seats the reconciler read.
         revision_reads: Vec<i64>,
+        /// Latest issued generation capability, retained after lease release.
+        current_fence: Option<RoomFence>,
     }
 
     /// In-memory revision store recording every reconciler interaction.
@@ -1715,10 +1842,14 @@ mod tests {
         leadership_held: Arc<AtomicBool>,
         /// Failure sender for the currently held fake leadership lease.
         leadership_loss: Mutex<Option<watch::Sender<Option<String>>>>,
+        /// Monotonic process-generation counter for deterministic fencing tests.
+        leadership_epoch: AtomicI64,
     }
 
     /// Fake lifetime token releasing room leadership when the supervisor exits.
     struct FakeLeadershipLease {
+        /// Capability issued to this fake process generation.
+        fence: RoomFence,
         /// Shared lock state reset when this lease is dropped.
         held: Arc<AtomicBool>,
         /// Receiver carrying a scripted leadership-session failure.
@@ -1730,6 +1861,11 @@ mod tests {
     /// Exposes scripted failure and deterministic release for fake leadership.
     #[async_trait]
     impl RoomLeadershipLease for FakeLeadershipLease {
+        /// Copy the fake generation capability.
+        fn fence(&self) -> RoomFence {
+            self.fence
+        }
+
         /// Clone the scripted loss receiver for one supervisor.
         fn subscribe_loss(&self) -> watch::Receiver<Option<String>> {
             self.loss.clone()
@@ -1779,9 +1915,11 @@ mod tests {
                     roster_results: VecDeque::new(),
                     revision_results: VecDeque::new(),
                     revision_reads: Vec::new(),
+                    current_fence: None,
                 }),
                 leadership_held: Arc::new(AtomicBool::new(false)),
                 leadership_loss: Mutex::new(None),
+                leadership_epoch: AtomicI64::new(0),
             })
         }
 
@@ -1823,6 +1961,8 @@ mod tests {
                 revision,
                 vec![AgentSeatView {
                     seat,
+                    agent_username: format!("agent-r{revision}"),
+                    agent_display_name: Some(format!("Agent R{revision}")),
                     owner_user_id: None,
                     credential_readiness: CredentialReadiness::HostSession,
                 }],
@@ -1952,7 +2092,15 @@ mod tests {
                 .leadership_loss
                 .lock()
                 .expect("fake leadership sender lock") = Some(loss_tx);
+            let epoch = self.leadership_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            let fence = RoomFence {
+                server_id: server_id(),
+                epoch,
+                lease_id: Uuid::new_v4(),
+            };
+            self.state.lock().expect("fake store lock").current_fence = Some(fence);
             Ok(Box::new(FakeLeadershipLease {
+                fence,
                 held: self.leadership_held.clone(),
                 loss,
                 released: false,
@@ -1977,6 +2125,8 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|seat| AgentSeatView {
+                    agent_username: seat.agent_user_id.to_string(),
+                    agent_display_name: None,
                     seat,
                     owner_user_id: None,
                     credential_readiness: CredentialReadiness::HostSession,
@@ -2034,14 +2184,18 @@ mod tests {
         /// Record one status write and reject it when its desired revision is stale.
         async fn set_status(
             &self,
+            fence: &RoomFence,
             expected_desired_revision: Option<i64>,
             status: ApplyStatusUpdate,
         ) -> Result<(), String> {
             let mut state = self.state.lock().expect("fake store lock");
-            state.status_updates.push(status.clone());
+            if state.current_fence.as_ref() != Some(fence) {
+                return Err("managed room leadership fence is stale".to_string());
+            }
             if state.roster.desired_revision != expected_desired_revision {
                 return Err("desired revision changed before status persistence".to_string());
             }
+            state.status_updates.push(status.clone());
             if let Some(result) = state.status_results.pop_front() {
                 result?;
             }
@@ -2407,9 +2561,34 @@ mod tests {
             .connect(&database_url.to_string_lossy())
             .await
             .expect("test database must be reachable");
+        sqlx::migrate!("../henosis-rift-server/migrations")
+            .run(&pool)
+            .await
+            .expect("test database migrations must apply");
+        let suffix = Uuid::new_v4().simple().to_string();
+        let owner = db::create_user(
+            &pool,
+            &format!("leader-owner-{}", &suffix[..12]),
+            &format!("leader-owner-{suffix}@example.invalid"),
+            "unusable-test-hash",
+            Some("Leadership Test Owner"),
+        )
+        .await
+        .expect("test owner must be created");
+        let server = db::create_server(&pool, "Leadership fencing test", None, owner.id)
+            .await
+            .expect("test server must be created");
+        sqlx::query(
+            r#"INSERT INTO bridge_server_state (server_id, fencing_required)
+               VALUES ($1, TRUE)"#,
+        )
+        .bind(server.id)
+        .execute(&pool)
+        .await
+        .expect("test room must require leadership fencing");
         let store = PostgresRoomRevisionStore {
             pool: pool.clone(),
-            server_id: Uuid::new_v4(),
+            server_id: server.id,
         };
 
         let mut first = store
@@ -2430,8 +2609,69 @@ mod tests {
             .acquire_leadership()
             .await
             .expect("replacement session must acquire released leadership");
+        assert_eq!(replacement.fence().epoch, first.fence().epoch + 1);
         replacement.release().await;
+        sqlx::query("DELETE FROM servers WHERE id = $1")
+            .bind(server.id)
+            .execute(&pool)
+            .await
+            .expect("test server cleanup must succeed");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("test owner cleanup must succeed");
         pool.close().await;
+    }
+
+    /// Reacquiring one fake room advances the capability that fences stale leaders.
+    #[tokio::test]
+    async fn fake_leadership_reacquisition_advances_fence() {
+        let store = FakeStore::new();
+        let mut first = store.acquire_leadership().await.expect("first fake leader");
+        let first_fence = first.fence();
+        first.release().await;
+
+        let mut second = store
+            .acquire_leadership()
+            .await
+            .expect("replacement fake leader");
+        let second_fence = second.fence();
+        assert_eq!(second_fence.server_id, first_fence.server_id);
+        assert_eq!(second_fence.epoch, first_fence.epoch + 1);
+        assert_ne!(second_fence.lease_id, first_fence.lease_id);
+        second.release().await;
+    }
+
+    /// A superseded fake leader cannot persist status after replacement acquisition.
+    #[tokio::test]
+    async fn stale_leadership_fence_cannot_persist_status() {
+        let store = FakeStore::new();
+        let mut first = store.acquire_leadership().await.expect("first fake leader");
+        let stale_fence = first.fence();
+        first.release().await;
+        let mut second = store
+            .acquire_leadership()
+            .await
+            .expect("replacement fake leader");
+        let current_fence = second.fence();
+
+        let status = ApplyStatusUpdate {
+            active_revision: None,
+            last_good_revision: None,
+            apply_state: ApplyState::Idle,
+            error_code: None,
+            error_message: None,
+        };
+        assert!(store
+            .set_status(&stale_fence, None, status.clone())
+            .await
+            .is_err());
+        store
+            .set_status(&current_fence, None, status)
+            .await
+            .expect("current leader may persist status");
+        second.release().await;
     }
 
     /// Stale runtime results cannot overwrite the status of a newer desired revision.
@@ -2439,9 +2679,15 @@ mod tests {
     async fn status_persistence_is_bound_to_the_desired_revision() {
         let store = FakeStore::new();
         store.install_revision(2);
+        let mut leadership = store
+            .acquire_leadership()
+            .await
+            .expect("fake leadership must be available");
+        let fence = leadership.fence();
 
         let stale_result = store
             .set_status(
+                &fence,
                 Some(1),
                 ApplyStatusUpdate {
                     active_revision: Some(1),
@@ -2460,6 +2706,7 @@ mod tests {
 
         store
             .set_status(
+                &fence,
                 Some(2),
                 ApplyStatusUpdate {
                     active_revision: Some(2),
@@ -2471,6 +2718,7 @@ mod tests {
             )
             .await
             .expect("current desired revision may persist status");
+        leadership.release().await;
         let applied = store.latest_roster();
         assert_eq!(applied.active_revision, Some(2));
         assert_eq!(applied.last_good_revision, Some(2));

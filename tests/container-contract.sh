@@ -40,6 +40,10 @@ require_line "$production_environment" 'HENOSIS_IMAGE_REPOSITORY=ghcr.io/syntheo
 require_line "$production_environment" 'HENOSIS_IMAGE_DIGEST=REPLACE_WITH_64_CHARACTER_LOWERCASE_HEX_DIGEST'
 require_line "$production_environment" 'HENOSIS_ROOM_MODE=required'
 require_line "$production_environment" 'HENOSIS_RIFT_BRIDGE_CONFIG=/run/secrets/henosis/agents.toml'
+require_line "$production_environment" 'HENOSIS_RIFT_AGENT_JWT_SECRET=REPLACE_WITH_DIFFERENT_AGENT_ONLY_AT_LEAST_64_RANDOM_HEX_CHARACTERS'
+require_line "$production_environment" 'HENOSIS_RIFT_ADDR=0.0.0.0:3200'
+require_line "$production_environment" 'HENOSIS_RIFT_BRIDGE_ADDR=127.0.0.1:3201'
+require_line "$production_environment" 'HENOSIS_RIFT_ALLOW_REMOTE_LISTEN=1'
 require_line "$production_environment" 'HENOSIS_AUDIT_ORIGIN_KEY_FILE=/run/secrets/henosis/audit-origin.key'
 require_line "$production_environment" 'HENOSIS_WITNESS_PUBLIC_KEY_FILE=/run/secrets/henosis/witness-public.key'
 # Require every authority and managed-room setting enforced by production startup.
@@ -47,9 +51,14 @@ for required_environment_key in \
     SYNTHEOS_PLUTUS_DB \
     SYNTHEOS_OPERATOR_JWT_SECRET \
     HENOSIS_RIFT_JWT_SECRET \
+    HENOSIS_RIFT_AGENT_JWT_SECRET \
     HENOSIS_RIFT_BRIDGE_SECRET \
     HENOSIS_RIFT_DATABASE_URL \
     HENOSIS_RIFT_BRIDGE_CONFIG \
+    HENOSIS_RIFT_ADDR \
+    HENOSIS_RIFT_BRIDGE_ADDR \
+    HENOSIS_RIFT_ALLOW_REMOTE_LISTEN \
+    HENOSIS_RIFT_CORS_ORIGINS \
     PHYLAXD_URL \
     HERMES_PHYLAXD_TOKEN \
     HENOSIS_WITNESS_URL \
@@ -59,6 +68,19 @@ for required_environment_key in \
     HENOSIS_WITNESS_KEY_ID; do
     require_line "$production_environment" "$required_environment_key="
 done
+# Example values must make the three independent Rift authorities visually unambiguous.
+human_jwt_placeholder=$(sed -n 's/^HENOSIS_RIFT_JWT_SECRET=//p' "$production_environment")
+agent_jwt_placeholder=$(sed -n 's/^HENOSIS_RIFT_AGENT_JWT_SECRET=//p' "$production_environment")
+bridge_placeholder=$(sed -n 's/^HENOSIS_RIFT_BRIDGE_SECRET=//p' "$production_environment")
+if [ "$human_jwt_placeholder" = "$agent_jwt_placeholder" ] \
+    || [ "$human_jwt_placeholder" = "$bridge_placeholder" ] \
+    || [ "$agent_jwt_placeholder" = "$bridge_placeholder" ]; then
+    fail 'production Rift human JWT, agent JWT, and bridge placeholders must differ pairwise'
+fi
+# The private bridge port must never appear in production publication metadata.
+if grep -E '(^|[^0-9])3201([^0-9]|$)' "$production_compose" >/dev/null; then
+    fail 'production compose must not publish or expose the Rift bridge port'
+fi
 require_line "$production_roster" '[[agents]]'
 require_line "$production_roster" 'type = "Synapse"'
 require_line "$production_roster" 'provider = "anthropic"'

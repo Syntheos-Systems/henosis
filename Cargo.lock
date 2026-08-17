@@ -2897,11 +2897,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3801,10 +3800,13 @@ dependencies = [
  "henosis-memory-client",
  "henosis-pistis",
  "henosis-rift-server",
+ "henosis-sqlite",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -3837,6 +3839,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures",
+ "hmac",
  "jsonwebtoken",
  "rand 0.9.4",
  "serde",
@@ -3845,6 +3848,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tower",
  "tower-http",
  "tracing",

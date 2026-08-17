@@ -16,6 +16,7 @@ use crate::models::server::{
     CreateInviteRequest, CreateServerRequest, Invite, Server, UpdateServerRequest,
 };
 use crate::models::user::PublicUser;
+use crate::ws::gateway::Gateway;
 
 /// Server response enriched with its visible channels and roles.
 #[derive(Serialize)]
@@ -68,12 +69,7 @@ pub async fn create_server(
     auth: AuthUser,
     Json(req): Json<CreateServerRequest>,
 ) -> Result<Json<ServerWithChannels>, AppError> {
-    let name = req.name.trim();
-    if name.is_empty() || name.len() > 100 {
-        return Err(AppError::BadRequest(
-            "Server name must be 1-100 characters".into(),
-        ));
-    }
+    let name = validate_server_name(&req.name)?;
 
     let server = db::create_server(&pool, name, req.description.as_deref(), auth.user_id).await?;
 
@@ -143,14 +139,9 @@ pub async fn update_server(
     Json(req): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
     require_permission(&pool, server_id, auth.user_id, perms::MANAGE_SERVER).await?;
+    let name = req.name.as_deref().map(validate_server_name).transpose()?;
 
-    let server = db::update_server(
-        &pool,
-        server_id,
-        req.name.as_deref(),
-        req.description.as_deref(),
-    )
-    .await?;
+    let server = db::update_server(&pool, server_id, name, req.description.as_deref()).await?;
 
     Ok(Json(server))
 }
@@ -197,18 +188,18 @@ pub async fn list_members(
 /// DELETE /api/servers/:server_id/members/:user_id (kick)
 pub async fn remove_member(
     State(pool): State<PgPool>,
+    State(gateway): State<Gateway>,
     auth: AuthUser,
     Path((server_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if user_id == auth.user_id {
-        // Leave server
-        db::remove_member(&pool, server_id, user_id).await?;
+        revoke_and_remove_member(&pool, &gateway, server_id, user_id).await?;
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
 
     require_permission(&pool, server_id, auth.user_id, perms::KICK_MEMBERS).await?;
 
-    db::remove_member(&pool, server_id, user_id).await?;
+    revoke_and_remove_member(&pool, &gateway, server_id, user_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -222,6 +213,7 @@ pub async fn create_invite(
     Json(req): Json<CreateInviteRequest>,
 ) -> Result<Json<Invite>, AppError> {
     require_permission(&pool, server_id, auth.user_id, perms::CREATE_INVITES).await?;
+    validate_invite_options(req.max_uses, req.expires_in_hours)?;
 
     let code = generate_invite_code();
     let expires_at = req
@@ -247,39 +239,9 @@ pub async fn join_via_invite(
     auth: AuthUser,
     Path(code): Path<String>,
 ) -> Result<Json<Server>, AppError> {
-    let invite = db::get_invite(&pool, &code)
-        .await?
-        .ok_or(AppError::NotFound("Invite not found".into()))?;
-
-    // Check expiry
-    if let Some(expires) = invite.expires_at
-        && expires < chrono::Utc::now()
-    {
-        return Err(AppError::BadRequest("Invite expired".into()));
-    }
-
-    // Check max uses
-    if let Some(max) = invite.max_uses
-        && invite.uses >= max
-    {
-        return Err(AppError::BadRequest("Invite has reached max uses".into()));
-    }
-
-    // Check if already a member
-    if db::is_member(&pool, invite.server_id, auth.user_id).await? {
-        let server = db::get_server_by_id(&pool, invite.server_id)
-            .await?
-            .ok_or(AppError::NotFound("Server not found".into()))?;
-        return Ok(Json(server));
-    }
-
-    db::add_member(&pool, invite.server_id, auth.user_id).await?;
-    db::use_invite(&pool, &code).await?;
-
-    let server = db::get_server_by_id(&pool, invite.server_id)
-        .await?
-        .ok_or(AppError::NotFound("Server not found".into()))?;
-
+    let server = db::join_server_via_invite(&pool, &code, auth.user_id)
+        .await
+        .map_err(map_join_invite_error)?;
     Ok(Json(server))
 }
 
@@ -313,6 +275,63 @@ pub async fn delete_invite(
 }
 
 // ─── Helpers ───
+
+/// Close subscribed local sockets around an authoritative membership deletion.
+async fn revoke_and_remove_member(
+    pool: &PgPool,
+    gateway: &Gateway,
+    server_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), AppError> {
+    // The first signal prevents an already subscribed socket from receiving
+    // during the database mutation. The second catches a reconnect or Subscribe
+    // command that raced between the first signal and the committed deletion.
+    gateway.revoke_membership(server_id, user_id);
+    let result = db::remove_member(pool, server_id, user_id).await;
+    gateway.revoke_membership(server_id, user_id);
+    result.map_err(AppError::Database)
+}
+
+/// Normalize and validate the server-name contract shared by create and update.
+fn validate_server_name(name: &str) -> Result<&str, AppError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 100 {
+        return Err(AppError::BadRequest(
+            "Server name must be 1-100 characters".into(),
+        ));
+    }
+    Ok(name)
+}
+
+/// Bound invite capacity and expiry inputs before duration arithmetic or persistence.
+fn validate_invite_options(
+    max_uses: Option<i32>,
+    expires_in_hours: Option<i64>,
+) -> Result<(), AppError> {
+    if max_uses.is_some_and(|value| !(1..=1_000_000).contains(&value)) {
+        return Err(AppError::BadRequest(
+            "Invite max uses must be 1-1000000".into(),
+        ));
+    }
+    if expires_in_hours.is_some_and(|value| !(1..=8_760).contains(&value)) {
+        return Err(AppError::BadRequest(
+            "Invite expiry must be 1-8760 hours".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Convert transactional invite outcomes into stable public API failures.
+fn map_join_invite_error(error: db::JoinInviteError) -> AppError {
+    match error {
+        db::JoinInviteError::NotFound => AppError::NotFound("Invite not found".into()),
+        db::JoinInviteError::Expired => AppError::BadRequest("Invite expired".into()),
+        db::JoinInviteError::Exhausted => {
+            AppError::BadRequest("Invite has reached max uses".into())
+        }
+        db::JoinInviteError::Database(error) => AppError::Database(error),
+    }
+}
 
 /// Reject callers that are not members of the requested server.
 async fn require_member(pool: &PgPool, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
@@ -374,6 +393,7 @@ mod tests {
 
     use super::{
         RoomPermissions, current_user_permissions, require_invite_server, require_membership,
+        validate_server_name,
     };
     use crate::auth::middleware::AuthUser;
     use crate::db;
@@ -500,6 +520,8 @@ mod tests {
             AuthUser {
                 user_id: member.id,
                 username: member.username,
+                is_agent: false,
+                managed_fence: None,
             },
             Path(server.id),
         )
@@ -520,6 +542,8 @@ mod tests {
             AuthUser {
                 user_id: outsider.id,
                 username: outsider.username,
+                is_agent: false,
+                managed_fence: None,
             },
             Path(server.id),
         )
@@ -534,5 +558,100 @@ mod tests {
         let server_id = Uuid::new_v4();
         assert!(require_invite_server(server_id, server_id).is_ok());
         assert!(require_invite_server(server_id, Uuid::new_v4()).is_err());
+    }
+
+    /// Server updates enforce the same trimmed nonempty length contract as creation.
+    #[test]
+    fn server_name_validation_is_shared_by_create_and_update() {
+        assert_eq!(
+            validate_server_name("  Secure Room  ").expect("valid"),
+            "Secure Room"
+        );
+        assert!(validate_server_name("").is_err());
+        assert!(validate_server_name("   ").is_err());
+        assert!(validate_server_name(&"x".repeat(101)).is_err());
+    }
+
+    /// Concurrent users cannot both consume a one-use invite.
+    #[tokio::test]
+    async fn invite_capacity_and_membership_are_consumed_atomically() {
+        let Some(pool) = live_test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..12];
+        let owner = db::create_user(
+            &pool,
+            &format!("io_{suffix}"),
+            &format!("io-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("owner");
+        let first = db::create_user(
+            &pool,
+            &format!("i1_{suffix}"),
+            &format!("i1-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("first invitee");
+        let second = db::create_user(
+            &pool,
+            &format!("i2_{suffix}"),
+            &format!("i2-{suffix}@example.invalid"),
+            "test-hash",
+            None,
+        )
+        .await
+        .expect("second invitee");
+        let server = db::create_server(&pool, &format!("invite-{suffix}"), None, owner.id)
+            .await
+            .expect("server");
+        db::add_member(&pool, server.id, owner.id)
+            .await
+            .expect("owner membership");
+        let code = format!("I{}", &suffix[..10]);
+        db::create_invite(
+            &pool,
+            server.id,
+            owner.id,
+            &code,
+            Some(1),
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .await
+        .expect("invite");
+
+        let (first_result, second_result) = tokio::join!(
+            db::join_server_via_invite(&pool, &code, first.id),
+            db::join_server_via_invite(&pool, &code, second.id)
+        );
+        assert_eq!(
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+            1
+        );
+        assert!(
+            matches!(first_result, Err(db::JoinInviteError::Exhausted))
+                || matches!(second_result, Err(db::JoinInviteError::Exhausted))
+        );
+        let joined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE server_id = $1 AND user_id IN ($2, $3)",
+        )
+        .bind(server.id)
+        .bind(first.id)
+        .bind(second.id)
+        .fetch_one(&pool)
+        .await
+        .expect("membership count");
+        let uses: i32 = sqlx::query_scalar("SELECT uses FROM invites WHERE code = $1")
+            .bind(&code)
+            .fetch_one(&pool)
+            .await
+            .expect("invite uses");
+        assert_eq!(joined, 1);
+        assert_eq!(uses, 1);
     }
 }

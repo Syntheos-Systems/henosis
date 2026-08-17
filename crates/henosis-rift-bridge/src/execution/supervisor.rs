@@ -11,6 +11,7 @@ use crate::execution::RoomNotifier;
 use crate::executor::{
     AgentExecutor, Capability, ExecutionResult, ExecutionSandbox, ProgressUpdate, TaskContext,
 };
+use crate::leadership::{wait_for_revocation, LeadershipGuard};
 
 /// Minimum interval between progress posts to the room.
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -43,13 +44,24 @@ pub struct SupervisedTask {
 pub struct ExecutionSupervisor {
     /// Room notifier for progress and result posts.
     notifier: Arc<dyn RoomNotifier>,
+    /// Monotonic gate shared with the managed room runtime.
+    leadership: Arc<LeadershipGuard>,
 }
 
 /// Supervision of execution sessions.
 impl ExecutionSupervisor {
     /// Build a supervisor that posts through the given notifier.
     pub fn new(notifier: Arc<dyn RoomNotifier>) -> Self {
-        Self { notifier }
+        Self {
+            notifier,
+            leadership: Arc::new(LeadershipGuard::unmanaged()),
+        }
+    }
+
+    /// Replace the standalone guard with the managed room's shared guard.
+    pub fn with_leadership_guard(mut self, leadership: Arc<LeadershipGuard>) -> Self {
+        self.leadership = leadership;
+        self
     }
 
     /// Run a supervised task to completion and return its result.
@@ -82,6 +94,9 @@ impl ExecutionSupervisor {
         let mut prior_context = prior_context;
         let mut attempt: u32 = 1;
         let result = loop {
+            if self.leadership.require_current().await.is_err() {
+                return leadership_revoked_result(false);
+            }
             let result = self
                 .run_attempt(
                     executor.clone(),
@@ -93,6 +108,9 @@ impl ExecutionSupervisor {
                 )
                 .await;
 
+            if self.leadership.is_revoked() {
+                return result;
+            }
             if !resume::should_retry(&result, attempt, MAX_ATTEMPTS) {
                 break result;
             }
@@ -108,17 +126,27 @@ impl ExecutionSupervisor {
                 None => Vec::new(),
             };
             prior_context = Some(resume::format_resume_context(&reason, &commits));
+            if self.leadership.require_current().await.is_err() {
+                return leadership_revoked_result(true);
+            }
             let next = attempt + 1;
-            let _ = self
-                .notifier
-                .notify(&format!(
+            let notified = self
+                .notify_if_current(&format!(
                     "[EXEC #{task_id}] attempt {attempt} left partial work; retrying ({next}/{MAX_ATTEMPTS})"
                 ))
                 .await;
+            if !notified && self.leadership.is_revoked() {
+                return leadership_revoked_result(true);
+            }
             attempt = next;
         };
 
-        self.post_result(&task_id, &result).await;
+        if self.leadership.require_current().await.is_err() {
+            return leadership_revoked_result(true);
+        }
+        if !self.post_result(&task_id, &result).await && self.leadership.is_revoked() {
+            return leadership_revoked_result(true);
+        }
         result
     }
 
@@ -137,6 +165,16 @@ impl ExecutionSupervisor {
         granted_capabilities: Vec<Capability>,
         prior_context: Option<String>,
     ) -> ExecutionResult {
+        let leadership_revoked = self.leadership.subscribe();
+        if *leadership_revoked.borrow() {
+            return leadership_revoked_result(false);
+        }
+        if self.leadership.require_current().await.is_err() {
+            return leadership_revoked_result(false);
+        }
+        if *leadership_revoked.borrow() {
+            return leadership_revoked_result(false);
+        }
         let max_runtime = sandbox.max_runtime_secs;
         let task_ctx = TaskContext {
             task_id: task_id.to_string(),
@@ -147,7 +185,9 @@ impl ExecutionSupervisor {
         };
 
         let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
-        let exec_handle = tokio::spawn(async move { executor.execute(task_ctx, tx).await });
+        let mut exec_handle = tokio::spawn(async move { executor.execute(task_ctx, tx).await });
+        let leadership_revoked = wait_for_revocation(leadership_revoked);
+        tokio::pin!(leadership_revoked);
 
         // Optional wall-clock deadline bounding the WHOLE attempt, including a
         // hung executor that never sends progress and never returns.
@@ -160,27 +200,53 @@ impl ExecutionSupervisor {
         // Pump progress with rate limiting; the channel closes when execute returns.
         let mut last_post: Option<Instant> = None;
         loop {
-            let received = match deadline {
-                Some(d) => match tokio::time::timeout_at(d, rx.recv()).await {
-                    Ok(value) => value,
-                    Err(_) => {
-                        // Deadline reached. Abort the executor (dropping the
-                        // receiver also signals abort via the closed channel),
-                        // report, and return a timeout failure that is eligible
-                        // for one retry (partial work may exist on the branch).
-                        exec_handle.abort();
-                        let _ = self
-                            .notifier
-                            .notify(&format!("[EXEC #{task_id}] timed out after {max_runtime}s"))
-                            .await;
-                        return ExecutionResult::Failed {
-                            reason: format!("timed out after {max_runtime}s"),
-                            partial_work: true,
-                        };
-                    }
-                },
-                None => rx.recv().await,
+            let receive_progress = async {
+                match deadline {
+                    Some(d) => tokio::time::timeout_at(d, rx.recv()).await,
+                    None => Ok(rx.recv().await),
+                }
             };
+            let received = tokio::select! {
+                biased;
+                _ = &mut leadership_revoked => {
+                    exec_handle.abort();
+                    let _ = (&mut exec_handle).await;
+                    return leadership_revoked_result(true);
+                }
+                value = receive_progress => value,
+            };
+            let received = match received {
+                Ok(value) => value,
+                Err(_) => {
+                    // Deadline reached. Abort and join the local executor task.
+                    // Arbitrary external child side effects that already began
+                    // are outside Tokio cancellation and may still persist.
+                    exec_handle.abort();
+                    let _ = (&mut exec_handle).await;
+                    if self.leadership.is_revoked() {
+                        return leadership_revoked_result(true);
+                    }
+                    if !self
+                        .notify_if_current(&format!(
+                            "[EXEC #{task_id}] timed out after {max_runtime}s"
+                        ))
+                        .await
+                        && self.leadership.is_revoked()
+                    {
+                        return leadership_revoked_result(true);
+                    }
+                    return ExecutionResult::Failed {
+                        reason: format!("timed out after {max_runtime}s"),
+                        partial_work: true,
+                    };
+                }
+            };
+
+            if self.leadership.is_revoked() {
+                exec_handle.abort();
+                let _ = (&mut exec_handle).await;
+                return leadership_revoked_result(true);
+            }
 
             match received {
                 Some(ProgressUpdate::Message(m)) => self.maybe_post(&mut last_post, &m).await,
@@ -198,15 +264,19 @@ impl ExecutionSupervisor {
                 }
                 Some(ProgressUpdate::Done) => {}
                 Some(ProgressUpdate::Failed(reason)) => {
-                    let _ = self
-                        .notifier
-                        .notify(&format!("[EXEC #{task_id}] failed: {reason}"))
+                    self.notify_if_current(&format!("[EXEC #{task_id}] failed: {reason}"))
                         .await;
                     failure_signal = Some(reason);
                 }
                 // Channel closed: execute() has returned, so the join is immediate.
                 None => break,
             }
+        }
+
+        if self.leadership.is_revoked() {
+            exec_handle.abort();
+            let _ = (&mut exec_handle).await;
+            return leadership_revoked_result(true);
         }
 
         let result = match exec_handle.await {
@@ -233,6 +303,9 @@ impl ExecutionSupervisor {
 
     /// Post a progress line if the rate-limit interval has elapsed.
     async fn maybe_post(&self, last_post: &mut Option<Instant>, line: &str) {
+        if self.leadership.is_revoked() {
+            return;
+        }
         let now = Instant::now();
         let due = match last_post {
             Some(prev) => now.duration_since(*prev) >= PROGRESS_MIN_INTERVAL,
@@ -240,12 +313,15 @@ impl ExecutionSupervisor {
         };
         if due {
             *last_post = Some(now);
-            let _ = self.notifier.notify(&format!("[EXEC] {line}")).await;
+            self.notify_if_current(&format!("[EXEC] {line}")).await;
         }
     }
 
     /// Post the terminal result to the room.
-    async fn post_result(&self, task_id: &str, result: &ExecutionResult) {
+    async fn post_result(&self, task_id: &str, result: &ExecutionResult) -> bool {
+        if self.leadership.is_revoked() {
+            return false;
+        }
         let msg = match result {
             ExecutionResult::Success {
                 summary,
@@ -262,11 +338,40 @@ impl ExecutionSupervisor {
                 format!("[EXEC #{task_id}] failed: {reason} (partial_work={partial_work})")
             }
         };
-        let _ = self.notifier.notify(&msg).await;
+        self.notify_if_current(&msg).await
+    }
+
+    /// Post one notice while racing the shared revocation signal.
+    async fn notify_if_current(&self, message: &str) -> bool {
+        let revoked = self.leadership.subscribe();
+        if *revoked.borrow() {
+            return false;
+        }
+        let revoked = wait_for_revocation(revoked);
+        tokio::pin!(revoked);
+        tokio::select! {
+            biased;
+            _ = &mut revoked => false,
+            result = self.notifier.notify(message) => {
+                if result.is_err() && self.leadership.is_managed() {
+                    self.leadership.revoke();
+                }
+                result.is_ok() && !self.leadership.is_revoked()
+            }
+        }
+    }
+}
+
+/// Build the terminal local result used when managed leadership is revoked.
+fn leadership_revoked_result(partial_work: bool) -> ExecutionResult {
+    ExecutionResult::Failed {
+        reason: "managed-room leadership revoked; local executor cancellation cannot roll back external side effects that already began".to_string(),
+        partial_work,
     }
 }
 
 #[cfg(test)]
+/// Covers successful, retrying, timed-out, and leadership-revoked supervision.
 mod tests {
     use super::{ExecutionSupervisor, SupervisedTask};
     use crate::execution::RoomNotifier;
@@ -277,9 +382,12 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Semaphore};
+
+    use crate::leadership::LeadershipGuard;
 
     /// Fake executor that emits two progress messages then succeeds. Records the
     /// `prior_context` it receives so tests can assert the supervisor threads it.
@@ -288,11 +396,14 @@ mod tests {
         seen_prior: Arc<Mutex<Option<String>>>,
     }
 
+    /// Supplies a successful executor while capturing resume context.
     #[async_trait]
     impl AgentExecutor for FakeExecutor {
+        /// Declares the fake's required shell capability.
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![Capability::new(Capability::BASH)]
         }
+        /// Returns the fake executor's inert sandbox policy.
         fn sandbox(&self) -> ExecutionSandbox {
             ExecutionSandbox {
                 branch: "agent/a/task-1".into(),
@@ -301,9 +412,11 @@ mod tests {
                 cargo_target_dir: None,
             }
         }
+        /// Produces no conversational response in supervisor tests.
         async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
             Ok(None)
         }
+        /// Records context, emits progress, and returns success.
         async fn execute(
             &self,
             task: TaskContext,
@@ -323,6 +436,7 @@ mod tests {
                 evidence: None,
             })
         }
+        /// Reports the fake executor ready for work.
         async fn health_check(&self) -> Result<HealthStatus> {
             Ok(HealthStatus::Ready)
         }
@@ -338,11 +452,14 @@ mod tests {
         priors: Arc<Mutex<Vec<Option<String>>>>,
     }
 
+    /// Fails once with partial work and then succeeds for retry coverage.
     #[async_trait]
     impl AgentExecutor for PartialThenSuccessExecutor {
+        /// Declares the fake's required shell capability.
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![Capability::new(Capability::BASH)]
         }
+        /// Returns the fake executor's inert sandbox policy.
         fn sandbox(&self) -> ExecutionSandbox {
             ExecutionSandbox {
                 branch: "agent/a/task-1".into(),
@@ -351,9 +468,11 @@ mod tests {
                 cargo_target_dir: None,
             }
         }
+        /// Produces no conversational response in supervisor tests.
         async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
             Ok(None)
         }
+        /// Records context and returns the attempt-specific result.
         async fn execute(
             &self,
             task: TaskContext,
@@ -375,6 +494,7 @@ mod tests {
                 })
             }
         }
+        /// Reports the fake executor ready for work.
         async fn health_check(&self) -> Result<HealthStatus> {
             Ok(HealthStatus::Ready)
         }
@@ -387,11 +507,14 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
 
+    /// Always returns a clean terminal failure for no-retry coverage.
     #[async_trait]
     impl AgentExecutor for CleanFailExecutor {
+        /// Declares the fake's required shell capability.
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![Capability::new(Capability::BASH)]
         }
+        /// Returns the fake executor's inert sandbox policy.
         fn sandbox(&self) -> ExecutionSandbox {
             ExecutionSandbox {
                 branch: "agent/a/task-1".into(),
@@ -400,9 +523,11 @@ mod tests {
                 cargo_target_dir: None,
             }
         }
+        /// Produces no conversational response in supervisor tests.
         async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
             Ok(None)
         }
+        /// Counts the attempt and returns a clean failure.
         async fn execute(
             &self,
             _task: TaskContext,
@@ -415,6 +540,7 @@ mod tests {
                 partial_work: false,
             })
         }
+        /// Reports the fake executor ready for work.
         async fn health_check(&self) -> Result<HealthStatus> {
             Ok(HealthStatus::Ready)
         }
@@ -432,11 +558,39 @@ mod tests {
         priors: Arc<Mutex<Vec<Option<String>>>>,
     }
 
+    /// Drop marker proving an aborted executor future was joined and destroyed.
+    struct AbortDropProbe {
+        /// Shared observation flipped when the executor future is dropped.
+        dropped: Arc<AtomicBool>,
+    }
+
+    /// Marks completion of local cancellation for the active executor future.
+    impl Drop for AbortDropProbe {
+        /// Records that the cancelled executor future was destroyed.
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Executor that enters one attempt and then waits forever until aborted.
+    struct CancellableExecutor {
+        /// Number of attempts that reached executor code.
+        attempts: Arc<AtomicUsize>,
+        /// Permit released once the executor future is active.
+        entered: Arc<Semaphore>,
+        /// Observation flipped only when the active future is dropped.
+        dropped: Arc<AtomicBool>,
+    }
+
+    /// Provides a cancellation-observable execution fake.
     #[async_trait]
-    impl AgentExecutor for TimeoutThenSuccessExecutor {
+    impl AgentExecutor for CancellableExecutor {
+        /// Declares the fake's required shell capability.
         fn required_capabilities(&self) -> Vec<Capability> {
             vec![Capability::new(Capability::BASH)]
         }
+
+        /// Returns the fake executor's inert sandbox policy.
         fn sandbox(&self) -> ExecutionSandbox {
             ExecutionSandbox {
                 branch: "agent/a/task-1".into(),
@@ -445,9 +599,53 @@ mod tests {
                 cargo_target_dir: None,
             }
         }
+
+        /// Produces no conversational response in supervisor tests.
         async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
             Ok(None)
         }
+
+        /// Signals entry and remains pending until supervision cancels it.
+        async fn execute(
+            &self,
+            _task: TaskContext,
+            _progress_tx: mpsc::Sender<ProgressUpdate>,
+        ) -> Result<ExecutionResult> {
+            let _drop_probe = AbortDropProbe {
+                dropped: self.dropped.clone(),
+            };
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.entered.add_permits(1);
+            std::future::pending::<Result<ExecutionResult>>().await
+        }
+
+        /// Reports the fake executor ready for work.
+        async fn health_check(&self) -> Result<HealthStatus> {
+            Ok(HealthStatus::Ready)
+        }
+    }
+
+    /// Times out once and then succeeds for timeout retry coverage.
+    #[async_trait]
+    impl AgentExecutor for TimeoutThenSuccessExecutor {
+        /// Declares the fake's required shell capability.
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![Capability::new(Capability::BASH)]
+        }
+        /// Returns the fake executor's inert sandbox policy.
+        fn sandbox(&self) -> ExecutionSandbox {
+            ExecutionSandbox {
+                branch: "agent/a/task-1".into(),
+                working_dir: PathBuf::from("/tmp"),
+                max_runtime_secs: 0,
+                cargo_target_dir: None,
+            }
+        }
+        /// Produces no conversational response in supervisor tests.
+        async fn discuss(&self, _c: DiscussionContext) -> Result<Option<AgentResponse>> {
+            Ok(None)
+        }
+        /// Hangs on attempt one and succeeds on attempt two.
         async fn execute(
             &self,
             task: TaskContext,
@@ -470,6 +668,7 @@ mod tests {
                 evidence: None,
             })
         }
+        /// Reports the fake executor ready for work.
         async fn health_check(&self) -> Result<HealthStatus> {
             Ok(HealthStatus::Ready)
         }
@@ -481,8 +680,10 @@ mod tests {
         posts: Arc<Mutex<Vec<String>>>,
     }
 
+    /// Captures every room notice in memory for assertions.
     #[async_trait]
     impl RoomNotifier for RecordingNotifier {
+        /// Appends one notice to the shared capture list.
         async fn notify(&self, content: &str) -> Result<(), crate::error::BridgeError> {
             self.posts.lock().unwrap().push(content.to_string());
             Ok(())
@@ -682,5 +883,108 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Revocation before attempt one prevents executor entry and all room notices.
+    #[tokio::test]
+    async fn revoked_before_start_never_enters_executor() {
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let notifier: Arc<dyn RoomNotifier> = Arc::new(RecordingNotifier {
+            posts: posts.clone(),
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn AgentExecutor> = Arc::new(CleanFailExecutor {
+            attempts: attempts.clone(),
+        });
+        let leadership = Arc::new(LeadershipGuard::unmanaged());
+        leadership.revoke();
+        let supervisor = ExecutionSupervisor::new(notifier).with_leadership_guard(leadership);
+        let task = SupervisedTask {
+            executor,
+            task_id: "10".into(),
+            description: "must not start".into(),
+            sandbox: ExecutionSandbox {
+                branch: "agent/a/task-10".into(),
+                working_dir: PathBuf::from("/tmp"),
+                max_runtime_secs: 0,
+                cargo_target_dir: None,
+            },
+            granted_capabilities: vec![Capability::new(Capability::BASH)],
+            prior_context: None,
+        };
+
+        let result = supervisor.run(task).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(posts.lock().unwrap().is_empty());
+        assert!(matches!(
+            result,
+            ExecutionResult::Failed {
+                partial_work: false,
+                ..
+            }
+        ));
+    }
+
+    /// Active revocation aborts and joins the local task without retry or notices.
+    #[tokio::test]
+    async fn active_revocation_aborts_joins_and_never_retries() {
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let notifier: Arc<dyn RoomNotifier> = Arc::new(RecordingNotifier {
+            posts: posts.clone(),
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Semaphore::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let executor: Arc<dyn AgentExecutor> = Arc::new(CancellableExecutor {
+            attempts: attempts.clone(),
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+        });
+        let leadership = Arc::new(LeadershipGuard::unmanaged());
+        let supervisor =
+            Arc::new(ExecutionSupervisor::new(notifier).with_leadership_guard(leadership.clone()));
+        let task = SupervisedTask {
+            executor,
+            task_id: "11".into(),
+            description: "cancel on takeover".into(),
+            sandbox: ExecutionSandbox {
+                branch: "agent/a/task-11".into(),
+                working_dir: PathBuf::from("/tmp"),
+                max_runtime_secs: 0,
+                cargo_target_dir: None,
+            },
+            granted_capabilities: vec![Capability::new(Capability::BASH)],
+            prior_context: None,
+        };
+        let run = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.run(task).await }
+        });
+        let entered_permit = tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+            .await
+            .expect("executor should enter")
+            .expect("entry semaphore open");
+        entered_permit.forget();
+
+        leadership.revoke();
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("revoked run should terminate")
+            .expect("supervisor task should join");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(posts.lock().unwrap().is_empty());
+        match result {
+            ExecutionResult::Failed {
+                reason,
+                partial_work,
+            } => {
+                assert!(partial_work);
+                assert!(reason.contains("cannot roll back external side effects"));
+            }
+            ExecutionResult::Success { .. } => panic!("revoked execution cannot succeed"),
+        }
     }
 }

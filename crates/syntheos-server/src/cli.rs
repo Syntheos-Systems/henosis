@@ -73,6 +73,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
     "SYNTHEOS_PLUTUS_DB",
     "SYNTHEOS_OPERATOR_JWT_SECRET",
     "HENOSIS_RIFT_JWT_SECRET",
+    "HENOSIS_RIFT_AGENT_JWT_SECRET",
     "HENOSIS_RIFT_BRIDGE_SECRET",
     "HENOSIS_RIFT_DATABASE_URL",
     "HENOSIS_RIFT_BRIDGE_CONFIG",
@@ -2365,6 +2366,7 @@ mod tests {
         let managed = henosis_rift_bridge::config::BridgeConfig::load_for_managed_room(
             &roster_path,
             "http://127.0.0.1:3200".to_string(),
+            "http://127.0.0.1:3201".to_string(),
             "ws://127.0.0.1:3200/ws".to_string(),
             "j".repeat(32),
             "b".repeat(32),
@@ -2722,6 +2724,9 @@ mod tests {
         assert!(missing.iter().any(|key| key == "PHYLAXD_URL"));
         assert!(missing.iter().any(|key| key == "HENOSIS_WITNESS_URL"));
         assert!(missing.iter().any(|key| key == "HENOSIS_RIFT_JWT_SECRET"));
+        assert!(missing
+            .iter()
+            .any(|key| key == "HENOSIS_RIFT_AGENT_JWT_SECRET"));
         assert!(missing
             .iter()
             .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));

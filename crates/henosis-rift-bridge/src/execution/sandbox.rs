@@ -2,11 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::process::Command;
-
 use crate::config::WorkspaceConfig;
 use crate::error::BridgeError;
 use crate::executor::ExecutionSandbox;
+use crate::process_security::secure_tokio_command;
 
 /// Build the git branch name for a task, honoring the executor convention
 /// `agent/{agent}/...`.
@@ -62,7 +61,7 @@ impl SandboxManager {
         let branch = branch_name(agent, task_id);
         let path = worktree_path(&self.worktrees_root, task_id);
 
-        let output = Command::new("git")
+        let output = secure_tokio_command("git")
             .arg("-C")
             .arg(&workspace.path)
             .arg("worktree")
@@ -94,6 +93,7 @@ impl SandboxManager {
 }
 
 #[cfg(test)]
+/// Covers pure sandbox naming and workspace resolution rules.
 mod tests {
     use super::{branch_name, resolve_workspace, worktree_path};
     use crate::config::WorkspaceConfig;

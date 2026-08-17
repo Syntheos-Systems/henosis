@@ -1,7 +1,7 @@
 //! Codex CLI executor with explicit read-only discussion and workspace-write execution modes.
 
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,6 +16,10 @@ use crate::executor::{
     HealthStatus, ProgressUpdate, TaskContext,
 };
 use crate::materialize::{MediatedCommandOutput, ResolvedExecutionMode};
+use crate::process_security::{
+    host_session_tokio_command, secure_tokio_command, spawn_direct_executor,
+    wait_for_direct_executor_output,
+};
 
 /// Codex sandbox selected for one CLI invocation.
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +116,7 @@ impl CodexExecutor {
 
     /// Build an ephemeral JSONL command with an explicit sandbox and optional working directory.
     fn command(&self, sandbox: CodexSandbox, working_dir: Option<&Path>) -> Command {
-        let mut command = Command::new(&self.binary);
+        let mut command = host_session_tokio_command(&self.binary);
         command.args(self.arguments(sandbox, working_dir, None));
         command
     }
@@ -131,16 +135,16 @@ impl CodexExecutor {
                 command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
+                    .stderr(Stdio::piped());
                 command.env_remove("CARGO_TARGET_DIR");
                 if let Some(cargo_target_dir) = cargo_target_dir {
                     command.env("CARGO_TARGET_DIR", cargo_target_dir);
                 }
 
-                let mut child = command.spawn().with_context(|| {
-                    format!("failed to start Codex CLI at {}", self.binary.display())
-                })?;
+                let (mut child, process_group_guard) = spawn_direct_executor(&mut command)
+                    .with_context(|| {
+                        format!("failed to start Codex CLI at {}", self.binary.display())
+                    })?;
                 let mut stdin = child
                     .stdin
                     .take()
@@ -150,8 +154,7 @@ impl CodexExecutor {
                     .await
                     .context("failed to write the Codex prompt")?;
                 drop(stdin);
-                let output: Output = child
-                    .wait_with_output()
+                let output = wait_for_direct_executor_output(child, process_group_guard)
                     .await
                     .context("failed while waiting for the Codex CLI")?;
                 Ok(CodexOutput {
@@ -220,7 +223,7 @@ fn final_agent_message(stdout: &[u8]) -> Result<Option<String>> {
 
 /// Return the worktree HEAD when execution created or advanced a commit.
 async fn git_head(working_dir: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = secure_tokio_command("git")
         .arg("-C")
         .arg(working_dir)
         .arg("rev-parse")

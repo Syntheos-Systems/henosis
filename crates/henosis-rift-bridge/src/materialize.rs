@@ -109,12 +109,14 @@ impl fmt::Debug for ResolvedExecutionMode {
 /// Managed connection coordinates that replace deployment-local TOML values.
 #[derive(Clone)]
 pub struct ManagedRoomConnection {
-    /// Rift HTTP API base URL.
+    /// Public Rift HTTP API base URL.
     pub api_url: String,
+    /// Private bridge-only Rift HTTP API base URL.
+    pub bridge_api_url: String,
     /// Rift WebSocket endpoint.
     pub ws_url: String,
-    /// Rift JWT signing secret used for agent identities.
-    pub jwt_secret: String,
+    /// Dedicated Rift JWT signing secret used only for agent identities.
+    pub agent_jwt_secret: String,
     /// Dedicated secret accepted only by bridge-internal routes.
     pub bridge_secret: String,
     /// Durable Rift server identifier.
@@ -130,8 +132,9 @@ impl fmt::Debug for ManagedRoomConnection {
         formatter
             .debug_struct("ManagedRoomConnection")
             .field("api_url", &self.api_url)
+            .field("bridge_api_url", &self.bridge_api_url)
             .field("ws_url", &self.ws_url)
-            .field("jwt_secret", &"[REDACTED]")
+            .field("agent_jwt_secret", &"[REDACTED]")
             .field("bridge_secret", &"[REDACTED]")
             .field("server_id", &self.server_id)
             .field("channel_id", &self.channel_id)
@@ -319,8 +322,9 @@ pub fn materialize_revision(
     let base = BridgeConfig::load_for_managed_room(
         base_path,
         managed.api_url,
+        managed.bridge_api_url,
         managed.ws_url,
-        managed.jwt_secret,
+        managed.agent_jwt_secret,
         managed.bridge_secret,
         managed.server_id,
         managed.channel_id,
@@ -690,8 +694,9 @@ mod tests {
             r#"
             [rift]
             api_url = "http://127.0.0.1:3200"
+            bridge_api_url = "http://127.0.0.1:3201"
             ws_url = "ws://127.0.0.1:3200/ws"
-            jwt_secret = "jwt-secret-that-is-at-least-32-bytes"
+            agent_jwt_secret = "agent-jwt-secret-that-is-at-least-32-bytes"
             bridge_secret = "bridge-secret-that-is-at-least-32-bytes"
             server_id = "00000000-0000-0000-0000-000000000001"
             channel_id = "00000000-0000-0000-0000-000000000002"

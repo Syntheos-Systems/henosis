@@ -199,9 +199,11 @@ pub async fn bootstrap_managed_room(
     };
 
     sqlx::query(
-        r#"INSERT INTO bridge_server_state (server_id, paused)
-           VALUES ($1, FALSE)
-           ON CONFLICT (server_id) DO NOTHING"#,
+        r#"INSERT INTO bridge_server_state (server_id, paused, fencing_required)
+           VALUES ($1, FALSE, TRUE)
+           ON CONFLICT (server_id) DO UPDATE
+           SET fencing_required = TRUE,
+               updated_at = NOW()"#,
     )
     .bind(server_id)
     .execute(&mut *transaction)
@@ -235,9 +237,11 @@ pub async fn import_initial_agent_roster(
 
     let mut transaction = pool.begin().await?;
     sqlx::query(
-        r#"INSERT INTO bridge_server_state (server_id, paused)
-           VALUES ($1, FALSE)
-           ON CONFLICT (server_id) DO NOTHING"#,
+        r#"INSERT INTO bridge_server_state (server_id, paused, fencing_required)
+           VALUES ($1, FALSE, TRUE)
+           ON CONFLICT (server_id) DO UPDATE
+           SET fencing_required = TRUE,
+               updated_at = NOW()"#,
     )
     .bind(server_id)
     .execute(&mut *transaction)
@@ -455,6 +459,8 @@ mod tests {
             crate::models::agent_control::ApplyState::Active
         );
         assert_eq!(roster.seats.len(), 1);
+        assert_eq!(roster.seats[0].agent_username, first_agent.username);
+        assert_eq!(roster.seats[0].agent_display_name, first_agent.display_name);
         assert_eq!(roster.seats[0].owner_user_id, None);
         assert_eq!(
             crate::db::agent_control::owner_for_agent(&pool, first_agent.id)

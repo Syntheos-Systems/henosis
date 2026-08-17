@@ -3,7 +3,7 @@
 use std::{
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -224,6 +224,14 @@ impl AuthenticatedIdentity {
         }
     }
 
+    /// Require a human owner or administrator for credential and approval mutation.
+    fn require_operator_administrator(&self) -> Result<(), AuthorityError> {
+        match self.role {
+            Some(Role::Owner | Role::Admin) => Ok(()),
+            Some(_) | None => Err(AuthorityError::Forbidden),
+        }
+    }
+
     /// Require tenant audit-read authority.
     fn require_audit_read(&self) -> Result<(), AuthorityError> {
         match self.role {
@@ -246,7 +254,7 @@ impl FromRequestParts<AuthorityState> for AuthenticatedIdentity {
         state: &AuthorityState,
     ) -> Result<Self, Self::Rejection> {
         let credential = bearer_credential(&parts.headers)?;
-        let now = unix_seconds();
+        let now = unix_seconds()?;
         if credential.starts_with("hen_v1_") {
             let token = state
                 .accounts
@@ -542,7 +550,7 @@ impl Gate for DurableHumanGate {
         let envelope = canonical_request_envelope(request);
         let request_hash =
             canonical_request_hash(&envelope).map_err(|error| GateError::new(error.to_string()))?;
-        let now = unix_seconds();
+        let now = unix_seconds().map_err(|_| GateError::new("authority clock unavailable"))?;
         let approval = self.approval_for_request(request, authority, request_hash, now)?;
         let supplied_approval = authority.approval_id.as_deref();
         let stored_approval = approval.id.to_string();
@@ -736,6 +744,8 @@ impl ExecutionGuard for AuditExecutionGuard {
             let id = Uuid::parse_str(id).map_err(|_| ExecutorError::new("invalid approval id"))?;
             let hash = canonical_request_hash(&canonical_request_envelope(request))
                 .map_err(|_| ExecutorError::new("request hash failed"))?;
+            let now =
+                unix_seconds().map_err(|_| ExecutorError::new("approval authority unavailable"))?;
             let consumed = self
                 .approvals
                 .consume_approved(ApprovalConsumption {
@@ -745,7 +755,7 @@ impl ExecutionGuard for AuditExecutionGuard {
                     token_identity: &authority.token_identity,
                     request_hash: &hash,
                     policy_version: APPROVAL_POLICY_VERSION,
-                    now: unix_seconds(),
+                    now,
                 })
                 .map_err(|error| {
                     tracing::error!(%error, "approval consumption failed");
@@ -915,15 +925,15 @@ async fn dispatch(
     }
 }
 
-/// Issue one least-privilege machine token for the authenticated tenant.
+/// Issue one least-privilege machine token for the authenticated operator's tenant.
 async fn create_token(
     State(state): State<AuthorityState>,
     identity: AuthenticatedIdentity,
     Json(body): Json<TokenCreateBody>,
 ) -> Result<Json<TokenIssuedResponse>, AuthorityError> {
-    identity.require_administrator()?;
+    identity.require_operator_administrator()?;
     validate_scopes(&body.scopes)?;
-    let now = unix_seconds();
+    let now = unix_seconds()?;
     let expires_at = body
         .expires_in_seconds
         .map(|ttl| {
@@ -974,18 +984,18 @@ async fn list_tokens(
     Ok(Json(tokens.into_iter().map(Into::into).collect()))
 }
 
-/// Revoke one tenant-scoped machine token.
+/// Revoke one tenant-scoped machine token as a human operator administrator.
 async fn revoke_token(
     State(state): State<AuthorityState>,
     identity: AuthenticatedIdentity,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AuthorityError> {
-    identity.require_administrator()?;
+    identity.require_operator_administrator()?;
     let id = Uuid::parse_str(&id)
         .map_err(|_| AuthorityError::InvalidRequest("invalid token id".to_string()))?;
     let revoked = state
         .accounts
-        .revoke_machine_token(identity.tenant, id, unix_seconds())
+        .revoke_machine_token(identity.tenant, id, unix_seconds()?)
         .map_err(|error| {
             tracing::error!(%error, "machine-token revocation failed");
             AuthorityError::Unavailable
@@ -1005,7 +1015,7 @@ async fn list_approvals(
     identity.require_administrator()?;
     state
         .approvals
-        .expire(identity.tenant, unix_seconds())
+        .expire(identity.tenant, unix_seconds()?)
         .map_err(|_| AuthorityError::Unavailable)?;
     let approvals = state
         .approvals
@@ -1050,7 +1060,7 @@ async fn deny(
     decide_approval(state, identity, id, body, ApprovalDecision::Deny).await
 }
 
-/// Apply one human decision through the tenant-scoped approval store.
+/// Apply one human operator's decision through the tenant-scoped approval store.
 async fn decide_approval(
     state: AuthorityState,
     identity: AuthenticatedIdentity,
@@ -1058,7 +1068,7 @@ async fn decide_approval(
     body: ApprovalDecisionBody,
     decision: ApprovalDecision,
 ) -> Result<Json<ApprovalResponse>, AuthorityError> {
-    identity.require_administrator()?;
+    identity.require_operator_administrator()?;
     let id = parse_public_id(&id)?;
     if decision == ApprovalDecision::Approve && state.audit.is_witnessed() {
         let approval = state
@@ -1078,7 +1088,7 @@ async fn decide_approval(
             decision,
             identity.principal.to_string(),
             body.reason,
-            unix_seconds(),
+            unix_seconds()?,
         )
         .map_err(|_| AuthorityError::Unavailable)?
         .ok_or(AuthorityError::Conflict)?;
@@ -1293,18 +1303,35 @@ fn audit_executor_error(error: henosis_audit::AuditError) -> ExecutorError {
     ExecutorError::new("audit execution boundary unavailable")
 }
 
-/// Return the current Unix timestamp in whole seconds.
-fn unix_seconds() -> i64 {
-    SystemTime::now()
+/// Convert one system time to a bounded Unix timestamp or fail closed.
+fn unix_seconds_from(now: SystemTime) -> Result<i64, AuthorityError> {
+    let seconds = now
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64
+        .map_err(|error| {
+            tracing::error!(%error, "system clock is before the Unix epoch");
+            AuthorityError::Unavailable
+        })?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| {
+        tracing::error!(
+            seconds,
+            "system clock exceeds supported authority timestamp range"
+        );
+        AuthorityError::Unavailable
+    })
+}
+
+/// Return the current Unix timestamp in whole seconds or fail closed.
+fn unix_seconds() -> Result<i64, AuthorityError> {
+    unix_seconds_from(SystemTime::now())
 }
 
 #[cfg(test)]
 /// Exercises authority validation and approval escalation policy.
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use ed25519_dalek::SigningKey;
     use henosis_audit::{OriginSigner, WitnessClient};
     use henosis_plutus::MockPolicyBackend;
@@ -1355,13 +1382,87 @@ mod tests {
         }
     }
 
+    /// Construct an administrator-scoped machine identity for privilege-boundary tests.
+    fn administrator_machine_identity(
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> AuthenticatedIdentity {
+        AuthenticatedIdentity {
+            tenant,
+            principal,
+            token_identity: Uuid::new_v4().to_string(),
+            role: None,
+            scopes: vec!["admin".to_string()],
+        }
+    }
+
+    /// Machine credentials cannot mint successors or stand in for human administrators.
+    #[test]
+    fn administrator_machine_identity_cannot_authorize_sensitive_mutations() {
+        let identity = administrator_machine_identity(TenantId::new(), PrincipalId::new());
+        assert!(identity.require_administrator().is_ok());
+        assert!(matches!(
+            identity.require_operator_administrator(),
+            Err(AuthorityError::Forbidden)
+        ));
+    }
+
+    /// Sensitive HTTP handlers bind credential and approval mutations to human operators.
+    #[tokio::test]
+    async fn sensitive_mutation_handlers_reject_administrator_machine_identity() {
+        let state = witnessed_state(Arc::new(
+            ApprovalStore::open_in_memory().expect("approval store"),
+        ));
+        let identity = administrator_machine_identity(TenantId::new(), PrincipalId::new());
+
+        let create = create_token(
+            State(state.clone()),
+            identity.clone(),
+            Json(TokenCreateBody {
+                label: "successor".to_string(),
+                scopes: vec!["dispatch".to_string()],
+                expires_in_seconds: None,
+            }),
+        )
+        .await;
+        assert!(matches!(create, Err(AuthorityError::Forbidden)));
+
+        let revoke = revoke_token(
+            State(state.clone()),
+            identity.clone(),
+            Path(Uuid::new_v4().to_string()),
+        )
+        .await;
+        assert!(matches!(revoke, Err(AuthorityError::Forbidden)));
+
+        let decision = decide_approval(
+            state,
+            identity,
+            Uuid::new_v4().to_string(),
+            ApprovalDecisionBody { reason: None },
+            ApprovalDecision::Approve,
+        )
+        .await;
+        assert!(matches!(decision, Err(AuthorityError::Forbidden)));
+    }
+
+    /// A clock before the Unix epoch fails closed instead of authenticating at timestamp zero.
+    #[test]
+    fn authority_clock_rejects_pre_epoch_time() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        assert!(matches!(
+            unix_seconds_from(pre_epoch),
+            Err(AuthorityError::Unavailable)
+        ));
+    }
+
     /// Insert one unexpired approval request for the supplied originating principal.
     fn pending_approval(
         approvals: &ApprovalStore,
         tenant: TenantId,
         principal: PrincipalId,
     ) -> Approval {
-        let now = unix_seconds();
+        let now = unix_seconds().expect("test clock must be valid");
         approvals
             .create_or_get_pending(
                 ApprovalRequest {
@@ -1755,7 +1856,7 @@ mod tests {
         };
         let request_hash =
             canonical_request_hash(&canonical_request_envelope(&request)).expect("request hash");
-        let now = unix_seconds();
+        let now = unix_seconds().expect("test clock must be valid");
         let approval = approvals
             .create_or_get_pending(
                 ApprovalRequest {
@@ -1841,7 +1942,7 @@ mod tests {
         };
         let request_hash =
             canonical_request_hash(&canonical_request_envelope(&request)).expect("request hash");
-        let now = unix_seconds();
+        let now = unix_seconds().expect("test clock must be valid");
         let approval = approvals
             .create_or_get_pending(
                 ApprovalRequest {

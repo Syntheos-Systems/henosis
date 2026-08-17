@@ -6,18 +6,44 @@
 pub mod agent_control;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::attachment::Attachment;
 use crate::models::channel::Channel;
+use crate::models::leadership::RoomFence;
 use crate::models::message::{MessageQuery, MessageWithAuthor};
+use crate::models::permissions::perms;
 use crate::models::role::Role;
 use crate::models::server::{Invite, Member, Server};
 use crate::models::user::User;
+use crate::outbox;
+use crate::ws::gateway::GatewayEvent;
 
-/// Email suffix proving an agent identity was created by the Rift bridge path.
+/// Canonical email suffix reserved for identities created by an agent-only path.
 pub(crate) const CLAIMABLE_AGENT_EMAIL_SUFFIX: &str = "@agent.local";
+
+/// Failure while converging one bridge-managed agent inside a fenced transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum ProvisionAgentError {
+    /// An existing human owns the requested username and cannot be promoted.
+    #[error("requested agent username belongs to a human account")]
+    HumanUsername,
+    /// The presented managed-room generation is no longer current.
+    #[error("managed room leadership fence is stale")]
+    StaleLeadership,
+    /// PostgreSQL could not complete or authorize the convergence transaction.
+    #[error("agent provisioning database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Return whether a public email attempts to use the reserved agent namespace.
+pub(crate) fn is_reserved_agent_email(email: &str) -> bool {
+    email
+        .trim()
+        .rsplit_once('@')
+        .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case("agent.local"))
+}
 
 // ───── Users ─────
 
@@ -108,24 +134,34 @@ pub async fn update_user_email(
     Ok(())
 }
 
-/// Replace a user's password hash and revoke every refresh token atomically.
+/// Conditionally replace a verified password hash and revoke every refresh token atomically.
 pub async fn update_user_password(
     pool: &PgPool,
     user_id: Uuid,
-    password_hash: &str,
-) -> Result<(), sqlx::Error> {
+    expected_password_hash: &str,
+    new_password_hash: &str,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
-        .bind(user_id)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await?;
+    let updated = sqlx::query(
+        r#"UPDATE users
+           SET password_hash = $3, updated_at = NOW()
+           WHERE id = $1 AND password_hash = $2"#,
+    )
+    .bind(user_id)
+    .bind(expected_password_hash)
+    .bind(new_password_hash)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Set a user's presence status string.
@@ -305,6 +341,77 @@ pub async fn add_member(
     .await
 }
 
+/// Converge one agent identity, membership, and message history under one room fence lock.
+pub async fn provision_agent_with_fence(
+    pool: &PgPool,
+    server_id: Uuid,
+    fence: Option<&RoomFence>,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    display_name: Option<&str>,
+) -> Result<(User, u64), ProvisionAgentError> {
+    let mut transaction = pool.begin().await?;
+    match agent_control::require_room_fence_locked(&mut transaction, server_id, fence).await {
+        Ok(()) => {}
+        Err(agent_control::RoomFenceError::Stale) => {
+            return Err(ProvisionAgentError::StaleLeadership);
+        }
+        Err(agent_control::RoomFenceError::Database(error)) => {
+            return Err(ProvisionAgentError::Database(error));
+        }
+    }
+
+    let existing = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1 FOR UPDATE")
+        .bind(username)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let user = match existing {
+        Some(user) if user.is_agent => user,
+        Some(_) => return Err(ProvisionAgentError::HumanUsername),
+        None => {
+            sqlx::query_as::<_, User>(
+                r#"INSERT INTO users (username, email, password_hash, display_name, is_agent)
+                   VALUES ($1, $2, $3, $4, TRUE)
+                   RETURNING *"#,
+            )
+            .bind(username)
+            .bind(email)
+            .bind(password_hash)
+            .bind(display_name)
+            .fetch_one(&mut *transaction)
+            .await?
+        }
+    };
+    sqlx::query(
+        r#"INSERT INTO members (server_id, user_id)
+           VALUES ($1, $2)
+           ON CONFLICT (server_id, user_id)
+           DO UPDATE SET server_id = EXCLUDED.server_id"#,
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .execute(&mut *transaction)
+    .await?;
+    let retyped = sqlx::query(
+        r#"UPDATE messages
+           SET message_type = CASE
+               WHEN content LIKE '[STIMULUS] %' THEN 'stimulus'
+               WHEN content LIKE '[SYSTEM] %' THEN 'system'
+               WHEN content LIKE '[EXEC] %' THEN 'system'
+               ELSE 'agent'
+           END
+           WHERE author_id = $1
+             AND message_type = 'user'"#,
+    )
+    .bind(user.id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    transaction.commit().await?;
+    Ok((user, retyped))
+}
+
 /// Create a user that is flagged as an agent from birth.
 ///
 /// Distinct from `create_user`, which always produces a human account
@@ -364,28 +471,12 @@ pub async fn create_owned_agent_user(
     Ok(user)
 }
 
-/// Flag an existing user as an agent.
-///
-/// Converges agent accounts provisioned before `is_agent` was set correctly:
-/// the bridge used to register agents through the public `/api/auth/register`
-/// route, which always leaves the flag FALSE.
-pub async fn mark_user_as_agent(pool: &PgPool, user_id: Uuid) -> Result<User, sqlx::Error> {
-    sqlx::query_as::<_, User>(
-        "UPDATE users SET is_agent = TRUE, updated_at = NOW() WHERE id = $1 RETURNING *",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-}
-
 /// Retype an agent's historic messages still carrying the 'user' column
 /// default, returning how many rows changed.
 ///
 /// Mirrors migration 004's classification exactly. The migration runs once
-/// at boot, strictly before provisioning can promote a legacy account
-/// (is_agent = FALSE) or a pre-stamping server build stops writing 'user'
-/// rows, so provisioning must converge each agent's history itself or those
-/// rows remain mislabeled.
+/// at boot before a pre-stamping server build necessarily stops writing
+/// 'user' rows, so provisioning must converge each agent's history itself.
 pub async fn retype_agent_messages(pool: &PgPool, user_id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         r#"UPDATE messages
@@ -664,6 +755,167 @@ pub async fn delete_channel(pool: &PgPool, channel_id: Uuid) -> Result<(), sqlx:
 /// Domain separator for per-channel message creation advisory locks.
 const MESSAGE_CREATE_LOCK_DOMAIN: u64 = 0x4845_4e4f_5349_534d;
 
+/// Server-truth authorization mode held through one message transaction.
+#[derive(Debug, Clone, Copy)]
+pub enum MessageWriteAuthorization<'a> {
+    /// A human account whose writes are independent of bridge leadership.
+    Human,
+    /// An agent account that must present the target room's current fence when managed.
+    Agent {
+        /// Server independently resolved from the message channel.
+        server_id: Uuid,
+        /// Optional capability retained for standalone, unfenced Rift rooms.
+        fence: Option<&'a RoomFence>,
+        /// Permission bits that must all remain granted when the insert executes.
+        required_permissions: i64,
+    },
+}
+
+/// Failure while reading one authorized channel message page under a stable room fence.
+#[derive(Debug, thiserror::Error)]
+pub enum ListMessagesError {
+    /// The requested channel did not exist in the transaction snapshot.
+    #[error("channel not found")]
+    ChannelNotFound,
+    /// The authenticated account was not a current member of the channel's room.
+    #[error("message history access is forbidden")]
+    Forbidden,
+    /// The managed agent's room generation is absent or no longer current.
+    #[error("managed room leadership fence is stale")]
+    StaleLeadership,
+    /// The requested cursor did not identify a message in the target channel.
+    #[error("message cursor does not exist in channel")]
+    InvalidCursor,
+    /// PostgreSQL could not complete the authorized read transaction.
+    #[error("message list database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Failure while inserting a message and its attachments atomically.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateMessageError {
+    /// The actor is no longer an agent member with every required permission.
+    #[error("message write is forbidden")]
+    Forbidden,
+    /// The agent's managed-room generation is absent or no longer current.
+    #[error("managed room leadership fence is stale")]
+    StaleLeadership,
+    /// PostgreSQL could not complete the message transaction.
+    #[error("message database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Failure while editing or deleting one channel message under its target room fence.
+#[derive(Debug, thiserror::Error)]
+pub enum MessageMutationError {
+    /// The route channel or message did not identify one current channel message.
+    #[error("message not found in channel")]
+    NotFound,
+    /// The managed agent's room generation is absent or no longer current.
+    #[error("managed room leadership fence is stale")]
+    StaleLeadership,
+    /// PostgreSQL could not complete the message mutation transaction.
+    #[error("message mutation database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Validated attachment metadata inserted with its owning message transaction.
+#[derive(Debug, Clone)]
+pub struct NewAttachment {
+    /// Original user-visible filename retained as inert metadata.
+    pub filename: String,
+    /// Opaque same-origin URL of the already staged object.
+    pub url: String,
+    /// Caller-declared media type retained as inert metadata.
+    pub content_type: Option<String>,
+    /// Stored object size in bytes.
+    pub size_bytes: i64,
+}
+
+/// Return whether one permission set contains every requested bit or administrator authority.
+fn permissions_contain_all(granted: i64, required: i64) -> bool {
+    (granted & perms::ADMINISTRATOR) != 0 || (granted & required) == required
+}
+
+/// Lock and revalidate one managed agent's room membership and permissions before insertion.
+async fn authorize_agent_message_write(
+    connection: &mut PgConnection,
+    channel_id: Uuid,
+    author_id: Uuid,
+    expected_server_id: Uuid,
+    fence: Option<&RoomFence>,
+    required_permissions: i64,
+) -> Result<(), CreateMessageError> {
+    let resolved_server_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT server_id FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+    if resolved_server_id != Some(expected_server_id) {
+        return Err(CreateMessageError::Forbidden);
+    }
+    match agent_control::require_room_fence_locked(connection, expected_server_id, fence).await {
+        Ok(()) => {}
+        Err(agent_control::RoomFenceError::Stale) => {
+            return Err(CreateMessageError::StaleLeadership);
+        }
+        Err(agent_control::RoomFenceError::Database(error)) => {
+            return Err(CreateMessageError::Database(error));
+        }
+    }
+    let scope: Option<(bool, bool)> = sqlx::query_as(
+        r#"SELECT actor.is_agent, server.owner_id = actor.id
+           FROM channels AS channel
+           INNER JOIN servers AS server ON server.id = channel.server_id
+           INNER JOIN users AS actor ON actor.id = $2
+           INNER JOIN members AS membership
+             ON membership.server_id = channel.server_id
+            AND membership.user_id = actor.id
+           WHERE channel.id = $1
+             AND channel.server_id = $3
+           FOR SHARE OF channel, server, actor, membership"#,
+    )
+    .bind(channel_id)
+    .bind(author_id)
+    .bind(expected_server_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((true, is_owner)) = scope else {
+        return Err(CreateMessageError::Forbidden);
+    };
+    if is_owner {
+        return Ok(());
+    }
+    let role_ids = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT role_id
+           FROM member_roles
+           WHERE server_id = $1 AND user_id = $2
+           FOR SHARE"#,
+    )
+    .bind(expected_server_id)
+    .bind(author_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let permission_rows = sqlx::query_scalar::<_, i64>(
+        r#"SELECT permissions
+           FROM roles
+           WHERE server_id = $1
+             AND (is_default = TRUE OR id = ANY($2))
+           FOR SHARE"#,
+    )
+    .bind(expected_server_id)
+    .bind(&role_ids)
+    .fetch_all(&mut *connection)
+    .await?;
+    let granted = permission_rows
+        .into_iter()
+        .fold(0_i64, |combined, permissions| combined | permissions);
+    if !permissions_contain_all(granted, required_permissions) {
+        return Err(CreateMessageError::Forbidden);
+    }
+    Ok(())
+}
+
 /// Insert a channel-ordered message with an explicit authorized type.
 ///
 /// A transaction-scoped advisory lock serializes creation per channel, and the
@@ -676,20 +928,83 @@ pub async fn create_message(
     author_id: Uuid,
     content: &str,
     message_type: &str,
-) -> Result<MessageWithAuthor, sqlx::Error> {
+) -> Result<MessageWithAuthor, CreateMessageError> {
+    let (message, _) = create_message_with_attachments(
+        pool,
+        channel_id,
+        author_id,
+        content,
+        message_type,
+        MessageWriteAuthorization::Human,
+        &[],
+    )
+    .await?;
+    Ok(message)
+}
+
+/// Insert one channel-ordered message and all attachments in a single transaction.
+pub async fn create_message_with_attachments(
+    pool: &PgPool,
+    channel_id: Uuid,
+    author_id: Uuid,
+    content: &str,
+    message_type: &str,
+    authorization: MessageWriteAuthorization<'_>,
+    attachments: &[NewAttachment],
+) -> Result<(MessageWithAuthor, Vec<Attachment>), CreateMessageError> {
+    let mut transaction = pool.begin().await?;
+    let result = create_message_with_attachments_in_transaction(
+        &mut transaction,
+        channel_id,
+        author_id,
+        content,
+        message_type,
+        authorization,
+        attachments,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(result)
+}
+
+/// Insert a message, attachments, and its stable gateway event in one caller-owned transaction.
+pub(crate) async fn create_message_with_attachments_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    channel_id: Uuid,
+    author_id: Uuid,
+    content: &str,
+    message_type: &str,
+    authorization: MessageWriteAuthorization<'_>,
+    attachments: &[NewAttachment],
+) -> Result<(MessageWithAuthor, Vec<Attachment>), CreateMessageError> {
     let raw_channel_id = channel_id.as_u128();
     let folded_channel_id =
         (raw_channel_id as u64) ^ ((raw_channel_id >> 64) as u64) ^ MESSAGE_CREATE_LOCK_DOMAIN;
     let lock_key = i64::from_be_bytes(folded_channel_id.to_be_bytes());
-    let mut transaction = pool.begin().await?;
     // Per-statement snapshots are required so a waiter observes the preceding
     // lock holder's committed message before choosing its own timestamp.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
+    if let MessageWriteAuthorization::Agent {
+        server_id,
+        fence,
+        required_permissions,
+    } = authorization
+    {
+        authorize_agent_message_write(
+            transaction,
+            channel_id,
+            author_id,
+            server_id,
+            fence,
+            required_permissions,
+        )
+        .await?;
+    }
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
     let message = sqlx::query_as::<_, MessageWithAuthor>(
         r#"WITH next_time AS (
@@ -721,10 +1036,39 @@ pub async fn create_message(
     .bind(author_id)
     .bind(content)
     .bind(message_type)
-    .fetch_one(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await?;
-    transaction.commit().await?;
-    Ok(message)
+    let mut created_attachments = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let created = sqlx::query_as::<_, Attachment>(
+            r#"INSERT INTO attachments (message_id, filename, url, content_type, size_bytes)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING *"#,
+        )
+        .bind(message.id)
+        .bind(&attachment.filename)
+        .bind(&attachment.url)
+        .bind(attachment.content_type.as_deref())
+        .bind(attachment.size_bytes)
+        .fetch_one(&mut **transaction)
+        .await?;
+        created_attachments.push(created);
+    }
+    let event = GatewayEvent::MessageCreate {
+        event_id: Uuid::new_v4(),
+        id: message.id,
+        channel_id: message.channel_id,
+        author_id: message.author_id,
+        author_username: message.author_username.clone(),
+        author_display_name: message.author_display_name.clone(),
+        author_avatar_url: message.author_avatar_url.clone(),
+        content: message.content.clone(),
+        attachments: created_attachments.clone(),
+        message_type: message.message_type.clone(),
+        created_at: message.created_at.to_rfc3339(),
+    };
+    outbox::enqueue_message_event(transaction, &event).await?;
+    Ok((message, created_attachments))
 }
 
 /// Report whether a message cursor belongs to the requested channel.
@@ -733,10 +1077,20 @@ pub async fn message_cursor_exists_in_channel(
     channel_id: Uuid,
     message_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    message_cursor_exists_on_connection(&mut connection, channel_id, message_id).await
+}
+
+/// Report whether a cursor belongs to the channel in the caller's stable transaction.
+async fn message_cursor_exists_on_connection(
+    connection: &mut PgConnection,
+    channel_id: Uuid,
+    message_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id = $1 AND id = $2)")
         .bind(channel_id)
         .bind(message_id)
-        .fetch_one(pool)
+        .fetch_one(connection)
         .await
 }
 
@@ -746,7 +1100,17 @@ pub async fn get_messages(
     channel_id: Uuid,
     query: &MessageQuery,
 ) -> Result<Vec<MessageWithAuthor>, sqlx::Error> {
-    let limit = query.limit.unwrap_or(50).min(100);
+    let mut connection = pool.acquire().await?;
+    get_messages_on_connection(&mut connection, channel_id, query).await
+}
+
+/// Page messages through the caller's stable transaction snapshot.
+async fn get_messages_on_connection(
+    connection: &mut PgConnection,
+    channel_id: Uuid,
+    query: &MessageQuery,
+) -> Result<Vec<MessageWithAuthor>, sqlx::Error> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
 
     if let Some(before) = query.before {
         sqlx::query_as::<_, MessageWithAuthor>(
@@ -771,7 +1135,7 @@ pub async fn get_messages(
         .bind(channel_id)
         .bind(before)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
     } else if let Some(after) = query.after {
         if after == channel_id {
@@ -789,7 +1153,7 @@ pub async fn get_messages(
             )
             .bind(channel_id)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await;
         }
         sqlx::query_as::<_, MessageWithAuthor>(
@@ -814,7 +1178,7 @@ pub async fn get_messages(
         .bind(channel_id)
         .bind(after)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
     } else {
         // Latest messages (most recent first)
@@ -832,9 +1196,86 @@ pub async fn get_messages(
         )
         .bind(channel_id)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
     }
+}
+
+/// Read one channel page, cursor, and attachments under one membership and fence snapshot.
+pub async fn list_channel_messages_authorized(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+    fence: Option<&RoomFence>,
+    query: &MessageQuery,
+) -> Result<(Vec<MessageWithAuthor>, Vec<Attachment>), ListMessagesError> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *transaction)
+        .await?;
+    let server_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT server_id FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    let Some(server_id) = server_id else {
+        return Err(ListMessagesError::ChannelNotFound);
+    };
+    let actor_is_agent: Option<bool> =
+        sqlx::query_scalar("SELECT is_agent FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    let Some(actor_is_agent) = actor_is_agent else {
+        return Err(ListMessagesError::Forbidden);
+    };
+    if actor_is_agent {
+        match agent_control::require_room_fence_locked(&mut transaction, server_id, fence).await {
+            Ok(()) => {}
+            Err(agent_control::RoomFenceError::Stale) => {
+                return Err(ListMessagesError::StaleLeadership);
+            }
+            Err(agent_control::RoomFenceError::Database(error)) => {
+                return Err(ListMessagesError::Database(error));
+            }
+        }
+    }
+    let locked_membership: Option<bool> = sqlx::query_scalar(
+        r#"SELECT actor.is_agent
+           FROM channels AS channel
+           INNER JOIN users AS actor ON actor.id = $2
+           INNER JOIN members AS membership
+             ON membership.user_id = actor.id
+            AND membership.server_id = channel.server_id
+           WHERE channel.id = $1
+             AND channel.server_id = $3
+           FOR SHARE OF channel, actor, membership"#,
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(server_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if locked_membership != Some(actor_is_agent) {
+        return Err(ListMessagesError::Forbidden);
+    }
+    let cursor = query.before.or(query.after);
+    let reserved_beginning = query.before.is_none() && query.after == Some(channel_id);
+    if let Some(cursor) = cursor
+        && !reserved_beginning
+        && !message_cursor_exists_on_connection(&mut transaction, channel_id, cursor).await?
+    {
+        return Err(ListMessagesError::InvalidCursor);
+    }
+    let messages = get_messages_on_connection(&mut transaction, channel_id, query).await?;
+    let message_ids = messages
+        .iter()
+        .map(|message| message.id)
+        .collect::<Vec<_>>();
+    let attachments =
+        get_attachments_for_messages_on_connection(&mut transaction, &message_ids).await?;
+    transaction.commit().await?;
+    Ok((messages, attachments))
 }
 
 /// Fetch one message joined with author info.
@@ -857,16 +1298,82 @@ pub async fn get_message_by_id(
     .await
 }
 
-/// Replace a message's content and stamp edited_at.
-pub async fn update_message(
+/// Lock one mutation target and authorize its agent actor against the target room fence.
+async fn authorize_message_mutation(
+    connection: &mut PgConnection,
+    message_id: Uuid,
+    channel_id: Uuid,
+    actor_id: Uuid,
+    fence: Option<&RoomFence>,
+) -> Result<(), MessageMutationError> {
+    let scope: Option<(Uuid, bool)> = sqlx::query_as(
+        r#"SELECT channels.server_id, users.is_agent
+           FROM messages
+           INNER JOIN channels ON channels.id = messages.channel_id
+           INNER JOIN users ON users.id = $3
+           WHERE messages.id = $1
+             AND messages.channel_id = $2
+           FOR UPDATE OF messages"#,
+    )
+    .bind(message_id)
+    .bind(channel_id)
+    .bind(actor_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((server_id, actor_is_agent)) = scope else {
+        return Err(MessageMutationError::NotFound);
+    };
+    if actor_is_agent {
+        match agent_control::require_room_fence_locked(connection, server_id, fence).await {
+            Ok(()) => {}
+            Err(agent_control::RoomFenceError::Stale) => {
+                return Err(MessageMutationError::StaleLeadership);
+            }
+            Err(agent_control::RoomFenceError::Database(error)) => {
+                return Err(MessageMutationError::Database(error));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace a channel message's content under its target room's current agent fence.
+pub async fn update_message_with_fence(
     pool: &PgPool,
     message_id: Uuid,
+    channel_id: Uuid,
+    actor_id: Uuid,
+    fence: Option<&RoomFence>,
     content: &str,
-) -> Result<MessageWithAuthor, sqlx::Error> {
-    sqlx::query_as::<_, MessageWithAuthor>(
+) -> Result<MessageWithAuthor, MessageMutationError> {
+    let mut transaction = pool.begin().await?;
+    let message = update_message_in_transaction(
+        &mut transaction,
+        message_id,
+        channel_id,
+        actor_id,
+        fence,
+        content,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(message)
+}
+
+/// Edit a message and enqueue its stable gateway event in one caller-owned transaction.
+pub(crate) async fn update_message_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    message_id: Uuid,
+    channel_id: Uuid,
+    actor_id: Uuid,
+    fence: Option<&RoomFence>,
+    content: &str,
+) -> Result<MessageWithAuthor, MessageMutationError> {
+    authorize_message_mutation(transaction, message_id, channel_id, actor_id, fence).await?;
+    let message = sqlx::query_as::<_, MessageWithAuthor>(
         r#"WITH updated AS (
                UPDATE messages SET content = $2, edited_at = NOW()
-               WHERE id = $1
+               WHERE id = $1 AND channel_id = $3
                RETURNING *
            )
            SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at,
@@ -879,16 +1386,61 @@ pub async fn update_message(
     )
     .bind(message_id)
     .bind(content)
-    .fetch_one(pool)
-    .await
+    .bind(channel_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let event = GatewayEvent::MessageUpdate {
+        event_id: Uuid::new_v4(),
+        id: message.id,
+        channel_id: message.channel_id,
+        content: message.content.clone(),
+        edited_at: message
+            .edited_at
+            .map(|edited_at| edited_at.to_rfc3339())
+            .unwrap_or_default(),
+    };
+    outbox::enqueue_message_event(transaction, &event).await?;
+    Ok(message)
 }
 
-/// Delete a message (attachments cascade via foreign keys).
-pub async fn delete_message(pool: &PgPool, message_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM messages WHERE id = $1")
-        .bind(message_id)
-        .execute(pool)
+/// Delete a channel message under its target room's current agent fence.
+pub async fn delete_message_with_fence(
+    pool: &PgPool,
+    message_id: Uuid,
+    channel_id: Uuid,
+    actor_id: Uuid,
+    fence: Option<&RoomFence>,
+) -> Result<(), MessageMutationError> {
+    let mut transaction = pool.begin().await?;
+    delete_message_in_transaction(&mut transaction, message_id, channel_id, actor_id, fence)
         .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Delete a message and enqueue its stable gateway event in one caller-owned transaction.
+pub(crate) async fn delete_message_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    message_id: Uuid,
+    channel_id: Uuid,
+    actor_id: Uuid,
+    fence: Option<&RoomFence>,
+) -> Result<(), MessageMutationError> {
+    authorize_message_mutation(transaction, message_id, channel_id, actor_id, fence).await?;
+    let deleted = sqlx::query("DELETE FROM messages WHERE id = $1 AND channel_id = $2")
+        .bind(message_id)
+        .bind(channel_id)
+        .execute(&mut **transaction)
+        .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(MessageMutationError::NotFound);
+    }
+    let event = GatewayEvent::MessageDelete {
+        event_id: Uuid::new_v4(),
+        id: message_id,
+        channel_id,
+    };
+    outbox::enqueue_message_event(transaction, &event).await?;
     Ok(())
 }
 
@@ -937,6 +1489,15 @@ pub async fn get_attachments_for_messages(
     pool: &PgPool,
     message_ids: &[Uuid],
 ) -> Result<Vec<Attachment>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    get_attachments_for_messages_on_connection(&mut connection, message_ids).await
+}
+
+/// Batch-load attachments through the caller's stable transaction snapshot.
+async fn get_attachments_for_messages_on_connection(
+    connection: &mut PgConnection,
+    message_ids: &[Uuid],
+) -> Result<Vec<Attachment>, sqlx::Error> {
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -944,7 +1505,7 @@ pub async fn get_attachments_for_messages(
         "SELECT * FROM attachments WHERE message_id = ANY($1) ORDER BY created_at",
     )
     .bind(message_ids)
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await
 }
 
@@ -1128,6 +1689,23 @@ pub async fn get_member_permissions(
 
 // ───── Invites ─────
 
+/// Failures returned while atomically consuming invite capacity and membership.
+#[derive(Debug, thiserror::Error)]
+pub enum JoinInviteError {
+    /// No invite exists for the supplied code.
+    #[error("invite not found")]
+    NotFound,
+    /// The invite expired before its row lock was acquired.
+    #[error("invite expired")]
+    Expired,
+    /// The invite has no remaining uses.
+    #[error("invite exhausted")]
+    Exhausted,
+    /// PostgreSQL could not complete the membership transaction.
+    #[error("invite database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
 /// Insert an invite code with optional use cap and expiry.
 pub async fn create_invite(
     pool: &PgPool,
@@ -1159,13 +1737,56 @@ pub async fn get_invite(pool: &PgPool, code: &str) -> Result<Option<Invite>, sql
         .await
 }
 
-/// Increment an invite's use counter.
-pub async fn use_invite(pool: &PgPool, code: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE invites SET uses = uses + 1 WHERE code = $1")
+/// Atomically validate an invite, add one member, and consume one use.
+pub async fn join_server_via_invite(
+    pool: &PgPool,
+    code: &str,
+    user_id: Uuid,
+) -> Result<Server, JoinInviteError> {
+    let mut transaction = pool.begin().await?;
+    let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1 FOR UPDATE")
         .bind(code)
-        .execute(pool)
-        .await?;
-    Ok(())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(JoinInviteError::NotFound)?;
+    if invite
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        return Err(JoinInviteError::Expired);
+    }
+    if invite
+        .max_uses
+        .is_some_and(|max_uses| invite.uses >= max_uses)
+    {
+        return Err(JoinInviteError::Exhausted);
+    }
+
+    let already_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)",
+    )
+    .bind(invite.server_id)
+    .bind(user_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !already_member {
+        sqlx::query("INSERT INTO members (server_id, user_id) VALUES ($1, $2)")
+            .bind(invite.server_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE invites SET uses = uses + 1 WHERE code = $1")
+            .bind(code)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let server = sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE id = $1")
+        .bind(invite.server_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(JoinInviteError::NotFound)?;
+    transaction.commit().await?;
+    Ok(server)
 }
 
 /// List a server's invites oldest-first.
@@ -1312,7 +1933,7 @@ pub async fn get_dm_messages(
     limit: i64,
     before: Option<Uuid>,
 ) -> Result<Vec<DmMessageWithAuthor>, sqlx::Error> {
-    let limit = limit.min(100);
+    let limit = limit.clamp(1, 100);
     if let Some(before_id) = before {
         sqlx::query_as::<_, DmMessageWithAuthor>(
             r#"SELECT m.id, m.dm_channel_id, m.author_id, m.content, m.edited_at, m.created_at,

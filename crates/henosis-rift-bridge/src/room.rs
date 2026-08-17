@@ -28,6 +28,7 @@ use crate::echo::EchoDetector;
 use crate::embedding::{cosine, Embedder};
 use crate::engagement::{EngagementEngine, EngagementInputs};
 use crate::error::BridgeError;
+use crate::event_dedupe::{DurableEventLedger, EventAdmission, EventGuard, EventStateError};
 use crate::execution::approval::ApprovalRegistry;
 use crate::execution::command::{parse_control_command, ControlCommand};
 use crate::execution::coordinator::ProposalCoordinator;
@@ -38,10 +39,11 @@ use crate::executor::{AgentExecutor, DiscussionContext};
 use crate::executors::build_executor;
 use crate::growth::GrowthStore;
 use crate::kleos::KleosClient;
+use crate::leadership::LeadershipGuard;
 use crate::loop_prevention::{LoopBudget, LoopGuard};
 use crate::persona_alloc::{PersonaAllocator, PersonaAssignment};
 use crate::relevance;
-use crate::rift_client::{RiftRestClient, RiftWsEvent};
+use crate::rift_client::{RiftMessageEvent, RiftRestClient, RiftWsEvent};
 use crate::roster::AgentRoster;
 use crate::stimulus::Stimulus;
 use crate::turn_manager::TurnManager;
@@ -62,6 +64,10 @@ pub struct Room {
     loop_guard: LoopGuard,
     /// Shared Rift REST client for posting messages.
     rift: Arc<RiftRestClient>,
+    /// Fail-closed managed-room generation guard shared with runtime dispatch.
+    leadership: Arc<LeadershipGuard>,
+    /// Durable payload-bound claims gating every inbound Rift message effect.
+    event_ledger: DurableEventLedger,
     /// Shared Kleos client for memory, task, and activity coordination.
     kleos: Arc<dyn KleosClient>,
     /// Daemon configuration.
@@ -131,7 +137,7 @@ enum SlotOutcome {
     /// The compose slot arrived; proceed with this agent.
     Proceed,
     /// A fresh non-agent message arrived: it becomes the new topic seed.
-    Interrupted(RoomMessage),
+    Interrupted(EventGuard),
     /// The bridge was paused; abort the cascade.
     Paused,
 }
@@ -144,7 +150,7 @@ impl Room {
     /// Create a new room from agent configs and daemon settings.
     /// Provisions all agent users in Rift during initialization.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub(crate) async fn new(
         agent_configs: &[AgentConfig],
         daemon_config: BridgeDaemonConfig,
         rift: Arc<RiftRestClient>,
@@ -160,6 +166,8 @@ impl Room {
         personas_config: Option<PersonaSettings>,
         embedder: Option<Arc<dyn Embedder>>,
         embedding_cfg: Option<EmbeddingConfig>,
+        leadership: Arc<LeadershipGuard>,
+        event_ledger: DurableEventLedger,
     ) -> Result<Self, BridgeError> {
         let roster = AgentRoster::provision(agent_configs, &rift, server_id).await?;
 
@@ -209,7 +217,9 @@ impl Room {
             project_name.clone(),
             workspaces.clone(),
         ));
-        let supervisor = Arc::new(ExecutionSupervisor::new(notifier.clone()));
+        let supervisor = Arc::new(
+            ExecutionSupervisor::new(notifier.clone()).with_leadership_guard(leadership.clone()),
+        );
         let exec_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
 
         // All execution machinery lives on the dispatcher so approvals never
@@ -223,7 +233,8 @@ impl Room {
             kleos.clone(),
             project_name.clone(),
             approval_registry.clone(),
-        );
+        )
+        .with_leadership_guard(leadership.clone());
 
         // Allocate thread-stable personas across the roster, if configured. The
         // channel id seeds the (stable) thread identity. Allocation failure
@@ -277,6 +288,8 @@ impl Room {
             ),
             loop_guard,
             rift,
+            leadership,
+            event_ledger,
             kleos,
             config: daemon_config,
             project_name,
@@ -309,23 +322,72 @@ impl Room {
     /// re-seed the topic) and on the operator pause state.
     pub async fn handle_message(
         &mut self,
-        msg: RoomMessage,
+        event: RiftMessageEvent,
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
     ) -> Result<(), BridgeError> {
+        self.leadership.require_current().await?;
+        let Some(guard) = self.admit_message_event(event).await? else {
+            return Ok(());
+        };
+        if *pause.borrow() {
+            tracing::debug!(event_id = %guard.event_id(), "bridge paused, completing ignored message disposition");
+            return guard.complete().await.map_err(event_state_error);
+        }
+
+        let msg = guard.message().clone();
+        if msg.channel_id != self.channel_id {
+            tracing::warn!(
+                event_id = %guard.event_id(),
+                message_channel_id = %msg.channel_id,
+                room_channel_id = %self.channel_id,
+                "ignoring Rift event delivered for a different channel"
+            );
+            return guard.complete().await.map_err(event_state_error);
+        }
         let own_agent = self.roster.by_rift_user_id(msg.author_id).is_some();
         if inbound_action(own_agent, &msg.message_type) == InboundAction::Ignore {
-            return Ok(());
+            return guard.complete().await.map_err(event_state_error);
         }
 
         // Handle approval control commands only from canonically typed humans.
         if let Some(cmd) = authorized_control_command(&msg) {
             self.apply_control_command(cmd);
-            return Ok(());
+            return guard.complete().await.map_err(event_state_error);
         }
 
+        let pending_events = vec![guard];
         self.seed_topic(&msg.content, &msg.author_username).await;
-        self.run_cascade(msg.content, events, pause).await
+        self.run_cascade(msg.content, events, pause, pending_events)
+            .await
+    }
+
+    /// Acquire a durable processing claim or suppress a matching replay without effects.
+    async fn admit_message_event(
+        &self,
+        event: RiftMessageEvent,
+    ) -> Result<Option<EventGuard>, BridgeError> {
+        let event_id = event.event_id;
+        match self
+            .event_ledger
+            .admit(event)
+            .await
+            .map_err(event_state_error)?
+        {
+            EventAdmission::Fresh(guard) => Ok(Some(guard)),
+            EventAdmission::CompletedDuplicate => {
+                tracing::debug!(%event_id, "suppressing completed Rift event replay");
+                Ok(None)
+            }
+            EventAdmission::ProcessingDuplicate { claimed_at } => {
+                tracing::warn!(
+                    %event_id,
+                    claimed_at,
+                    "suppressing quarantined Rift event replay"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Handle an injected stimulus: announce it in the room (humans must see
@@ -339,6 +401,7 @@ impl Room {
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
     ) -> Result<(), BridgeError> {
+        self.leadership.require_current().await?;
         let (announcement, announcement_type) = stimulus_announcement(&stimulus.text);
         // Deterministic announcer: slot 0. HashMap-order .all().next() used
         // to pick a different agent per boot.
@@ -364,7 +427,8 @@ impl Room {
 
         self.seed_topic(&stimulus.text, stimulus.kind.as_str())
             .await;
-        self.run_cascade(stimulus.text, events, pause).await
+        self.run_cascade(stimulus.text, events, pause, Vec::new())
+            .await
     }
 
     /// Start a topic from a non-agent trigger: reset interleaving and topic
@@ -416,6 +480,7 @@ impl Room {
         mut trigger_content: String,
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
+        mut pending_events: Vec<EventGuard>,
     ) -> Result<(), BridgeError> {
         // The seed of the CURRENT topic, kept for exhaustion recording. A
         // mid-cascade interruption replaces it along with the trigger.
@@ -424,8 +489,12 @@ impl Room {
         let mut rounds = 0u32;
 
         'cascade: while rounds < self.config.max_cascade_rounds {
+            self.leadership.require_current().await?;
             if *pause.borrow() {
                 tracing::info!("bridge paused, aborting cascade");
+                EventGuard::complete_all(pending_events)
+                    .await
+                    .map_err(event_state_error)?;
                 return Ok(());
             }
 
@@ -443,13 +512,15 @@ impl Room {
                 // window is derived from the agent's stable slot index, with
                 // jitter inside the window, never shared across agents.
                 let target = round_start + self.turn_manager.slot_delay(slot_index);
-                match self.wait_for_slot(target, events, pause).await {
+                match self.wait_for_slot(target, events, pause).await? {
                     SlotOutcome::Proceed => {}
-                    SlotOutcome::Interrupted(new_msg) => {
+                    SlotOutcome::Interrupted(new_event) => {
                         // Human priority: the fresh message
                         // becomes the topic. Reset energy and restart the
                         // cascade against it -- iteratively, never recursively.
                         tracing::info!("cascade interrupted by fresh message, re-seeding topic");
+                        let new_msg = new_event.message().clone();
+                        pending_events.push(new_event);
                         self.seed_topic(&new_msg.content, &new_msg.author_username)
                             .await;
                         trigger_content = new_msg.content;
@@ -460,6 +531,9 @@ impl Room {
                     }
                     SlotOutcome::Paused => {
                         tracing::info!("bridge paused during slot wait, aborting cascade");
+                        EventGuard::complete_all(pending_events)
+                            .await
+                            .map_err(event_state_error)?;
                         return Ok(());
                     }
                 }
@@ -484,6 +558,7 @@ impl Room {
                         last_post = Some((agent_id, text));
                     }
                     Ok(None) => {}
+                    Err(e @ BridgeError::StaleLeadership) => return Err(e),
                     Err(e) => {
                         tracing::error!("agent {:?} failed to respond: {e}", agent_id);
                     }
@@ -494,6 +569,9 @@ impl Room {
                 // trigger does not immediately re-litigate it.
                 if self.loop_guard.has_consensus() {
                     self.record_exhausted_topic(&topic_seed).await;
+                    EventGuard::complete_all(pending_events)
+                        .await
+                        .map_err(event_state_error)?;
                     return Ok(());
                 }
             }
@@ -517,7 +595,9 @@ impl Room {
             self.record_exhausted_topic(&topic_seed).await;
         }
 
-        Ok(())
+        EventGuard::complete_all(pending_events)
+            .await
+            .map_err(event_state_error)
     }
 
     /// Wait until `target`, staying responsive: control commands are applied
@@ -537,37 +617,51 @@ impl Room {
         target: tokio::time::Instant,
         events: &mut mpsc::Receiver<RiftWsEvent>,
         pause: &mut watch::Receiver<bool>,
-    ) -> SlotOutcome {
+    ) -> Result<SlotOutcome, BridgeError> {
         loop {
             if *pause.borrow() {
-                return SlotOutcome::Paused;
+                return Ok(SlotOutcome::Paused);
             }
             tokio::select! {
-                _ = tokio::time::sleep_until(target) => return SlotOutcome::Proceed,
+                _ = tokio::time::sleep_until(target) => return Ok(SlotOutcome::Proceed),
                 changed = pause.changed() => {
                     match changed {
                         Ok(()) => {
                             if *pause.borrow() {
-                                return SlotOutcome::Paused;
+                                return Ok(SlotOutcome::Paused);
                             }
                         }
                         Err(_) => {
                             // Pause sender gone (shutdown): finish the wait
                             // plainly instead of spinning on the dead arm.
                             tokio::time::sleep_until(target).await;
-                            return SlotOutcome::Proceed;
+                            return Ok(SlotOutcome::Proceed);
                         }
                     }
                 }
                 event = events.recv() => {
                     match event {
-                        Some(RiftWsEvent::MessageCreate(m)) => {
-                            // Level-check pause at the moment the event is
-                            // handled: the paused main loop would have
-                            // dropped this message, so the mid-cascade path
-                            // must too.
+                        Some(RiftWsEvent::MessageCreate(event)) => {
+                            self.leadership.require_current().await?;
+                            let Some(guard) = self.admit_message_event(event).await? else {
+                                continue;
+                            };
+                            // Admission commits before this pause disposition or
+                            // any message-driven room/control effect.
                             if *pause.borrow() {
-                                return SlotOutcome::Paused;
+                                guard.complete().await.map_err(event_state_error)?;
+                                return Ok(SlotOutcome::Paused);
+                            }
+                            let message = guard.message().clone();
+                            if message.channel_id != self.channel_id {
+                                tracing::warn!(
+                                    event_id = %guard.event_id(),
+                                    message_channel_id = %message.channel_id,
+                                    room_channel_id = %self.channel_id,
+                                    "ignoring mid-cascade Rift event for a different channel"
+                                );
+                                guard.complete().await.map_err(event_state_error)?;
+                                continue;
                             }
                             // Same gate as handle_message: own-agent echoes
                             // and foreign 'system' notices never interrupt.
@@ -576,21 +670,26 @@ impl Room {
                             // and apply a
                             // foreign control command mid-cascade that the
                             // idle path ignores.
-                            let own = self.roster.by_rift_user_id(m.author_id).is_some();
-                            if inbound_action(own, &m.message_type) == InboundAction::Ignore {
+                            let own = self
+                                .roster
+                                .by_rift_user_id(message.author_id)
+                                .is_some();
+                            if inbound_action(own, &message.message_type) == InboundAction::Ignore {
+                                guard.complete().await.map_err(event_state_error)?;
                                 continue;
                             }
-                            if let Some(cmd) = authorized_control_command(&m) {
+                            if let Some(cmd) = authorized_control_command(&message) {
                                 self.apply_control_command(cmd);
+                                guard.complete().await.map_err(event_state_error)?;
                                 continue;
                             }
-                            return SlotOutcome::Interrupted(m);
+                            return Ok(SlotOutcome::Interrupted(guard));
                         }
                         Some(RiftWsEvent::Ready) | Some(RiftWsEvent::Disconnected) => continue,
                         None => {
                             // Event channel gone (shutdown): finish the wait.
                             tokio::time::sleep_until(target).await;
-                            return SlotOutcome::Proceed;
+                            return Ok(SlotOutcome::Proceed);
                         }
                     }
                 }
@@ -873,6 +972,7 @@ impl Room {
         &mut self,
         agent_id: AgentId,
     ) -> Result<Option<String>, BridgeError> {
+        self.leadership.require_current().await?;
         // Hold the compose floor until this attempt ends (permit drops on
         // every return path).
         let _floor = self.turn_manager.acquire_floor().await;
@@ -908,6 +1008,10 @@ impl Room {
             }
         };
 
+        if let Err(error) = self.leadership.require_current().await {
+            self.set_agent_idle(agent_id);
+            return Err(error);
+        }
         let response = match executor.discuss(context).await {
             Ok(response) => response,
             Err(e) => {
@@ -964,6 +1068,13 @@ impl Room {
             }
         }
 
+        // Revalidate after generation so buffered work cannot post after a
+        // successor generation has taken over while the executor was active.
+        if let Err(error) = self.leadership.require_current().await {
+            self.set_agent_idle(agent_id);
+            return Err(error);
+        }
+
         // Post to room.
         if let Err(e) = self
             .rift
@@ -1003,6 +1114,7 @@ impl Room {
 
         tracing::info!("{display_name} posted ({} chars)", agent_resp.text.len());
 
+        self.leadership.require_current().await?;
         if let Err(e) = self
             .kleos
             .report_activity(
@@ -1022,6 +1134,7 @@ impl Room {
 
         // Route an execution proposal through the coordinator.
         if let Some(proposal) = &agent_resp.execution_proposal {
+            self.leadership.require_current().await?;
             tracing::info!(
                 "{display_name} proposed execution: {}",
                 proposal.scope_summary
@@ -1034,6 +1147,7 @@ impl Room {
 
         // Check for consensus.
         if self.loop_guard.has_consensus() {
+            self.leadership.require_current().await?;
             let consensus_tags = vec![
                 format!("project:{}", self.project_name),
                 format!("channel:{}", self.channel_name),
@@ -1051,6 +1165,7 @@ impl Room {
             }
 
             if should_create_draft_task(&agent_resp.text) {
+                self.leadership.require_current().await?;
                 if let Err(e) = self
                     .kleos
                     .create_draft_task(
@@ -1164,6 +1279,11 @@ impl Room {
     pub fn dispatcher(&self) -> ApprovalDispatcher {
         self.dispatcher.clone()
     }
+}
+
+/// Convert a fail-closed ledger error into the bridge's fatal dispatch error.
+fn event_state_error(error: EventStateError) -> BridgeError {
+    BridgeError::EventState(error.to_string())
 }
 
 /// True while an agent's per-agent pacing floor is active: the agent posted
@@ -1353,9 +1473,16 @@ mod tests {
         // Port 9 on localhost: nothing listens there, connections fail fast.
         let auth =
             AgentAuthManager::new("test-secret".to_string(), "test-bridge-secret".to_string());
-        let rift = Arc::new(RiftRestClient::new("http://127.0.0.1:9".to_string(), auth));
+        let rift = Arc::new(
+            RiftRestClient::new(
+                "http://127.0.0.1:9".to_string(),
+                "http://127.0.0.1:10".to_string(),
+                auth,
+            )
+            .expect("test Rift client"),
+        );
         let kleos: Arc<dyn KleosClient> = Arc::new(NullKleos);
-        let channel_id = Uuid::new_v4();
+        let channel_id = Uuid::nil();
         let notifier: Arc<dyn crate::execution::RoomNotifier> = Arc::new(RiftRoomNotifier::new(
             rift.clone(),
             Uuid::new_v4(),
@@ -1396,6 +1523,8 @@ mod tests {
             turn_manager: TurnManager::new(10, 5),
             loop_guard: LoopGuard::new(5, 30),
             rift,
+            leadership: Arc::new(LeadershipGuard::unmanaged()),
+            event_ledger: DurableEventLedger::open_in_memory().expect("test event ledger"),
             kleos,
             config: BridgeDaemonConfig::default(),
             project_name: "test".to_string(),
@@ -1466,13 +1595,41 @@ mod tests {
     fn human_msg(content: &str) -> RoomMessage {
         RoomMessage {
             id: Uuid::new_v4(),
-            channel_id: Uuid::new_v4(),
+            channel_id: Uuid::nil(),
             author_id: Uuid::new_v4(),
             author_username: "operator".to_string(),
             content: content.to_string(),
             message_type: "user".to_string(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    /// Wrap a test message in the stable identity carried by MessageCreate.
+    fn message_event(message: RoomMessage) -> RiftMessageEvent {
+        RiftMessageEvent {
+            event_id: Uuid::new_v4(),
+            message,
+        }
+    }
+
+    /// A revoked generation rejects a buffered message before any room mutation.
+    #[tokio::test]
+    async fn revoked_leadership_rejects_buffered_message() {
+        let (mut room, _agent) = offline_room();
+        room.leadership.revoke();
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+
+        let result = room
+            .handle_message(
+                message_event(human_msg("do not run")),
+                &mut rx,
+                &mut pause_rx,
+            )
+            .await;
+
+        assert!(matches!(result, Err(BridgeError::StaleLeadership)));
+        assert_eq!(room.room_turn, 0);
     }
 
     /// Verifies approve and reject authority belongs only to the canonical user type.
@@ -1509,14 +1666,89 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(8);
         let (_pause_tx, mut pause_rx) = watch::channel(false);
 
-        room.handle_message(human_msg("!approve 6"), &mut rx, &mut pause_rx)
-            .await
-            .expect("human approval must be handled");
+        room.handle_message(
+            message_event(human_msg("!approve 6")),
+            &mut rx,
+            &mut pause_rx,
+        )
+        .await
+        .expect("human approval must be handled");
 
         assert!(
             room.approval_registry.list().is_empty(),
             "a canonical human approval must consume the proposal"
         );
+    }
+
+    /// The idle consumer suppresses durable replays before controls, topic seeding, or cascades.
+    #[tokio::test]
+    async fn handle_message_claim_precedes_every_message_effect() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(66),
+            agent: "nobody".to_string(),
+            task_id: "t-66".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+        let command = message_event(human_msg("!approve 66"));
+        let topic = message_event(human_msg("do dangerous topic work"));
+        let _command_claim = room
+            .event_ledger
+            .admit(command.clone())
+            .await
+            .expect("preclaim command event");
+        let _topic_claim = room
+            .event_ledger
+            .admit(topic.clone())
+            .await
+            .expect("preclaim topic event");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+
+        room.handle_message(command, &mut rx, &mut pause_rx)
+            .await
+            .expect("suppress command replay");
+        room.handle_message(topic, &mut rx, &mut pause_rx)
+            .await
+            .expect("suppress topic replay");
+
+        assert_eq!(room.approval_registry.list().len(), 1);
+        assert_eq!(room.room_turn, 0);
+    }
+
+    /// A server-scoped delivery for another channel is claimed and completed without authority.
+    #[tokio::test]
+    async fn handle_message_rejects_foreign_channel_before_control_or_topic_effects() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(67),
+            agent: "nobody".to_string(),
+            task_id: "t-67".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+        let mut message = human_msg("!approve 67");
+        message.channel_id = Uuid::new_v4();
+        let event = message_event(message);
+        let (_tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+
+        room.handle_message(event.clone(), &mut rx, &mut pause_rx)
+            .await
+            .expect("ignore foreign channel");
+
+        assert_eq!(room.approval_registry.list().len(), 1);
+        assert_eq!(room.room_turn, 0);
+        assert!(matches!(
+            room.event_ledger
+                .admit(event)
+                .await
+                .expect("inspect foreign-channel disposition"),
+            EventAdmission::CompletedDuplicate
+        ));
     }
 
     /// Verifies foreign agent and stimulus commands cannot consume a proposal in the idle path.
@@ -1538,7 +1770,7 @@ mod tests {
             let mut message = human_msg("!approve 6");
             message.message_type = message_type.to_string();
 
-            room.handle_message(message, &mut rx, &mut pause_rx)
+            room.handle_message(message_event(message), &mut rx, &mut pause_rx)
                 .await
                 .expect("foreign message remains an ordinary conversation trigger");
 
@@ -1567,9 +1799,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         let (_pause_tx, mut pause_rx) = watch::channel(false);
-        tx.send(RiftWsEvent::MessageCreate(human_msg("!approve 7")))
-            .await
-            .unwrap();
+        tx.send(RiftWsEvent::MessageCreate(message_event(human_msg(
+            "!approve 7",
+        ))))
+        .await
+        .unwrap();
 
         let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
         let outcome = tokio::time::timeout(
@@ -1577,13 +1811,96 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("wait must complete");
+        .expect("wait must complete")
+        .expect("event admission must succeed");
 
         assert!(matches!(outcome, SlotOutcome::Proceed));
         assert!(
             room.approval_registry.list().is_empty(),
             "approval must be consumed during the slot wait, not after the cascade"
         );
+    }
+
+    /// The mid-cascade consumer suppresses durable replays before controls or interruption.
+    #[tokio::test]
+    async fn wait_for_slot_claim_precedes_every_message_effect() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(77),
+            agent: "nobody".to_string(),
+            task_id: "t-77".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+        let command = message_event(human_msg("!approve 77"));
+        let topic = message_event(human_msg("interrupt with dangerous work"));
+        let _command_claim = room
+            .event_ledger
+            .admit(command.clone())
+            .await
+            .expect("preclaim command event");
+        let _topic_claim = room
+            .event_ledger
+            .admit(topic.clone())
+            .await
+            .expect("preclaim topic event");
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        tx.send(RiftWsEvent::MessageCreate(command))
+            .await
+            .expect("queue command replay");
+        tx.send(RiftWsEvent::MessageCreate(topic))
+            .await
+            .expect("queue topic replay");
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = room
+            .wait_for_slot(target, &mut rx, &mut pause_rx)
+            .await
+            .expect("suppress replays");
+
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+        assert_eq!(room.approval_registry.list().len(), 1);
+        assert_eq!(room.room_turn, 0);
+    }
+
+    /// The mid-cascade consumer completes a foreign-channel claim without applying control.
+    #[tokio::test]
+    async fn wait_for_slot_rejects_foreign_channel_before_control_effects() {
+        let (mut room, _agent) = offline_room();
+        room.approval_registry.insert_for_test(PendingProposal {
+            id: ProposalId(78),
+            agent: "nobody".to_string(),
+            task_id: "t-78".to_string(),
+            scope_summary: "test scope".to_string(),
+            granted_capabilities: Vec::new(),
+            workspace: "w".to_string(),
+        });
+        let mut message = human_msg("!approve 78");
+        message.channel_id = Uuid::new_v4();
+        let event = message_event(message);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_pause_tx, mut pause_rx) = watch::channel(false);
+        tx.send(RiftWsEvent::MessageCreate(event.clone()))
+            .await
+            .expect("queue foreign-channel event");
+
+        let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let outcome = room
+            .wait_for_slot(target, &mut rx, &mut pause_rx)
+            .await
+            .expect("ignore foreign channel");
+
+        assert!(matches!(outcome, SlotOutcome::Proceed));
+        assert_eq!(room.approval_registry.list().len(), 1);
+        assert!(matches!(
+            room.event_ledger
+                .admit(event)
+                .await
+                .expect("inspect foreign-channel disposition"),
+            EventAdmission::CompletedDuplicate
+        ));
     }
 
     /// Verifies foreign agent and stimulus commands interrupt normally without approving.
@@ -1603,7 +1920,9 @@ mod tests {
             let (_pause_tx, mut pause_rx) = watch::channel(false);
             let mut message = human_msg("!approve 8");
             message.message_type = message_type.to_string();
-            tx.send(RiftWsEvent::MessageCreate(message)).await.unwrap();
+            tx.send(RiftWsEvent::MessageCreate(message_event(message)))
+                .await
+                .unwrap();
 
             let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let outcome = tokio::time::timeout(
@@ -1611,7 +1930,8 @@ mod tests {
                 room.wait_for_slot(target, &mut rx, &mut pause_rx),
             )
             .await
-            .expect("foreign conversation message must interrupt promptly");
+            .expect("foreign conversation message must interrupt promptly")
+            .expect("event admission must succeed");
 
             assert!(matches!(outcome, SlotOutcome::Interrupted(_)));
             assert_eq!(
@@ -1629,9 +1949,9 @@ mod tests {
         let (mut room, _agent) = offline_room();
         let (tx, mut rx) = mpsc::channel(8);
         let (_pause_tx, mut pause_rx) = watch::channel(false);
-        tx.send(RiftWsEvent::MessageCreate(human_msg(
+        tx.send(RiftWsEvent::MessageCreate(message_event(human_msg(
             "new topic, drop everything",
-        )))
+        ))))
         .await
         .unwrap();
 
@@ -1642,11 +1962,12 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("interruption must end the wait well before the slot");
+        .expect("interruption must end the wait well before the slot")
+        .expect("event admission must succeed");
 
         match outcome {
             SlotOutcome::Interrupted(m) => {
-                assert_eq!(m.content, "new topic, drop everything");
+                assert_eq!(m.message().content, "new topic, drop everything");
             }
             _ => panic!("expected Interrupted"),
         }
@@ -1667,7 +1988,9 @@ mod tests {
         let (_pause_tx, mut pause_rx) = watch::channel(false);
         let mut echo = human_msg("what an agent just said");
         echo.author_id = own_user;
-        tx.send(RiftWsEvent::MessageCreate(echo)).await.unwrap();
+        tx.send(RiftWsEvent::MessageCreate(message_event(echo)))
+            .await
+            .unwrap();
 
         let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
         let outcome = tokio::time::timeout(
@@ -1675,7 +1998,8 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("wait must complete");
+        .expect("wait must complete")
+        .expect("event admission must succeed");
         assert!(matches!(outcome, SlotOutcome::Proceed));
     }
 
@@ -1697,9 +2021,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         let (pause_tx, mut pause_rx) = watch::channel(false);
-        tx.send(RiftWsEvent::MessageCreate(human_msg("!approve 9")))
-            .await
-            .unwrap();
+        tx.send(RiftWsEvent::MessageCreate(message_event(human_msg(
+            "!approve 9",
+        ))))
+        .await
+        .unwrap();
         pause_tx.send(true).expect("receiver alive");
 
         let target = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1708,7 +2034,8 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("pause must end the wait");
+        .expect("pause must end the wait")
+        .expect("event admission must succeed");
         assert!(matches!(outcome, SlotOutcome::Paused));
         assert_eq!(
             room.approval_registry.list().len(),
@@ -1731,7 +2058,8 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("pause must end the wait well before the slot");
+        .expect("pause must end the wait well before the slot")
+        .expect("event admission must succeed");
         assert!(matches!(outcome, SlotOutcome::Paused));
     }
 
@@ -2054,7 +2382,9 @@ mod tests {
         let (_pause_tx, mut pause_rx) = watch::channel(false);
         let mut notice = human_msg("[SYSTEM] All agents have reached consensus on this topic.");
         notice.message_type = "system".to_string();
-        tx.send(RiftWsEvent::MessageCreate(notice)).await.unwrap();
+        tx.send(RiftWsEvent::MessageCreate(message_event(notice)))
+            .await
+            .unwrap();
 
         let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
         let outcome = tokio::time::timeout(
@@ -2062,7 +2392,8 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("wait must complete");
+        .expect("wait must complete")
+        .expect("event admission must succeed");
         assert!(matches!(outcome, SlotOutcome::Proceed));
     }
 
@@ -2086,7 +2417,9 @@ mod tests {
         let (_pause_tx, mut pause_rx) = watch::channel(false);
         let mut msg = human_msg("!approve 9");
         msg.message_type = "system".to_string();
-        tx.send(RiftWsEvent::MessageCreate(msg)).await.unwrap();
+        tx.send(RiftWsEvent::MessageCreate(message_event(msg)))
+            .await
+            .unwrap();
 
         let target = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
         let outcome = tokio::time::timeout(
@@ -2094,7 +2427,8 @@ mod tests {
             room.wait_for_slot(target, &mut rx, &mut pause_rx),
         )
         .await
-        .expect("wait must complete");
+        .expect("wait must complete")
+        .expect("event admission must succeed");
         assert!(matches!(outcome, SlotOutcome::Proceed));
         assert!(
             !room.approval_registry.list().is_empty(),
@@ -2117,7 +2451,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            room.handle_message(notice, &mut rx, &mut pause_rx),
+            room.handle_message(message_event(notice), &mut rx, &mut pause_rx),
         )
         .await
         .expect("a gated message must return immediately");

@@ -41,3 +41,7 @@ async-trait = "0.1"
 futures = "0.3"
 dashmap = "6"
 sha2 = "0.10"
+hmac.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
