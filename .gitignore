@@ -6,3 +6,17 @@ containers/.env.production
 containers/secrets/
 .DS_Store
 /data
+
+# Local agent and persona control files never belong in the public repository.
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+GROWTH.md
+**/AGENTS.md
+**/CLAUDE.md
+**/GEMINI.md
+**/GROWTH.md
+.claude/
+.codex/
+**/.claude/
+**/.codex/
