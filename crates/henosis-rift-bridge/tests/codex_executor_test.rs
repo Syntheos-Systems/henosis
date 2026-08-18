@@ -3,6 +3,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,7 @@ impl FakeCodex {
         fs::write(root.join("stdout"), stdout).expect("write fake stdout");
         fs::write(root.join("stderr"), stderr).expect("write fake stderr");
         let binary = root.join("codex");
+        let staged_binary = root.join(".codex-staged");
         let script = format!(
             "#!/bin/sh\n\
              : > '{root}/args'\n\
@@ -45,12 +47,19 @@ impl FakeCodex {
              exit {exit_code}\n",
             root = root.display(),
         );
-        fs::write(&binary, script).expect("write fake Codex executable");
-        let mut permissions = fs::metadata(&binary)
+        let mut staged_file =
+            fs::File::create(&staged_binary).expect("create staged Codex fixture");
+        staged_file
+            .write_all(script.as_bytes())
+            .expect("write staged Codex fixture");
+        staged_file.sync_all().expect("sync staged Codex fixture");
+        drop(staged_file);
+        let mut permissions = fs::metadata(&staged_binary)
             .expect("stat fake Codex")
             .permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&binary, permissions).expect("make fake Codex executable");
+        fs::set_permissions(&staged_binary, permissions).expect("make staged Codex executable");
+        fs::rename(&staged_binary, &binary).expect("publish fake Codex executable");
         Self { root, binary }
     }
 
