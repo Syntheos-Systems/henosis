@@ -33,6 +33,17 @@ PostgreSQL database.
 `v0.1.0-beta.1` is the first release with desktop installers. The guide lists
 the stable filenames and the current operating-system trust warnings.
 
+The installer accepts four experience profiles. The graphical profiles use one
+desktop application, one authenticated session, and the same room data. The
+initial selection can be changed from the application without reconnecting.
+
+| Experience | Installer value | Best fit |
+| --- | --- | --- |
+| CLI | `cli` | Servers, automation, and terminal-first operation. This is the default. |
+| Chat | `chat` | A familiar room list and conversation-focused workspace. |
+| Desktop | `desktop` | Complete room, agent, approval, and runtime controls. |
+| Spatial | `spatial` | An interactive room field with direct keyboard and touch navigation. |
+
 ### Headless runtime
 
 The installers select the host platform, verify `SHA256SUMS`, install into the current user account, run `henosis init --quick`, and restore the prior version if initialization fails.
@@ -41,8 +52,8 @@ On Linux or macOS, copy and run this command:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.sh \
-  | sh -s -- --version v0.1.0-beta.1
+  https://raw.githubusercontent.com/Syntheos-Systems/henosis/4f6ac581c39667b14cec013e25346d234d15433b/install.sh \
+  | sh -s -- --version v0.1.0-beta.1 --experience cli
 ```
 
 On Windows, open PowerShell, copy this command, and press Enter:
@@ -50,16 +61,22 @@ On Windows, open PowerShell, copy this command, and press Enter:
 ```powershell
 $installer = Join-Path ([IO.Path]::GetTempPath()) "henosis-install-$([guid]::NewGuid().ToString('N')).ps1"
 try {
-  irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1' -OutFile $installer
+  irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/4f6ac581c39667b14cec013e25346d234d15433b/install.ps1' -OutFile $installer
   $powerShell = (Get-Process -Id $PID).Path
-  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-beta.1'
+  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-beta.1' -Experience 'cli'
   if ($LASTEXITCODE -ne 0) { throw "Henosis installer exited with code $LASTEXITCODE" }
 } finally {
   Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
 }
 ```
 
-Both commands pin the installer to a reviewed commit and select the release version as a separate input. Start the loopback service:
+Both commands pin the installer to a reviewed commit and select the release
+version as a separate input. Replace `cli` with `chat`, `desktop`, or `spatial`
+to install the shared graphical application with that initial experience.
+Graphical installation requires a desktop package published for the current
+operating system and architecture.
+
+Start the loopback service after a CLI installation:
 
 ```sh
 $HOME/.local/bin/henosis serve
@@ -99,7 +116,13 @@ Repeating the same key and request returns the stored filtered result. Reusing t
 
 ## Desktop
 
-The Tauri application opens to the Rift room directory and pins the room with the newest activity. It keeps Rift tokens in the native process and stores sanitized connection and room-cache data. Build and development instructions live in [apps/desktop](apps/desktop/README.md).
+The Tauri application offers chat, complete desktop, and spatial room
+experiences over one native trust boundary. The spatial view projects current
+rooms, participants, agents, work, and approval signals into a deterministic
+field, with a direct room index for keyboard, touch, and reduced-motion use.
+Rift tokens remain in the native process; only sanitized connection,
+preference, and room-cache data are stored for the webview. Build and
+development instructions live in [apps/desktop](apps/desktop/README.md).
 
 ## Trust model
 
