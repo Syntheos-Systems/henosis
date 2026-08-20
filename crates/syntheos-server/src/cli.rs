@@ -34,11 +34,13 @@ const AGENTS_FILE: &str = "agents.toml";
 /// Environment variable selecting the agent harness during initialization.
 ///
 /// Exists because `install.sh` runs under `curl | sh`, where stdin is the script
-/// itself and an interactive prompt cannot read a reply.
-const HARNESS_ENV: &str = "HENOSIS_HARNESS";
+/// itself and an interactive prompt cannot read a reply. `SYNTHEOS_HARNESS` is
+/// canonical; the legacy brand alias is honored read-only.
+const HARNESS_ENV: &str = "SYNTHEOS_HARNESS";
 
-/// Local owner-token path key written by `henosis init --quick`.
-const LOCAL_TOKEN_KEY: &str = "HENOSIS_LOCAL_TOKEN_FILE";
+/// Local owner-token path key written by `henosis init --quick`. Canonical
+/// name; the legacy brand alias is honored read-only.
+const LOCAL_TOKEN_KEY: &str = "SYNTHEOS_LOCAL_TOKEN_FILE";
 
 /// Local owner-token filename created on the first server boot.
 const LOCAL_TOKEN_FILE: &str = "local-operator.token";
@@ -58,8 +60,8 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Local database environment keys and filenames written by `henosis init --quick`.
 const LOCAL_DATABASES: &[(&str, &str)] = &[
     ("SYNTHEOS_IDENTITY_DB", "identity.sqlite"),
-    ("HENOSIS_APPROVAL_DB", "approval.sqlite"),
-    ("HENOSIS_AUDIT_DB", "audit.sqlite"),
+    ("SYNTHEOS_APPROVAL_DB", "approval.sqlite"),
+    ("SYNTHEOS_AUDIT_DB", "audit.sqlite"),
     ("SYNTHEOS_CHIASM_DB", "chiasm.sqlite"),
     ("SYNTHEOS_SOMA_DB", "soma.sqlite"),
     ("SYNTHEOS_BROCA_DB", "broca.sqlite"),
@@ -72,18 +74,18 @@ const LOCAL_DATABASES: &[(&str, &str)] = &[
 const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
     "SYNTHEOS_PLUTUS_DB",
     "SYNTHEOS_OPERATOR_JWT_SECRET",
-    "HENOSIS_RIFT_JWT_SECRET",
-    "HENOSIS_RIFT_AGENT_JWT_SECRET",
-    "HENOSIS_RIFT_BRIDGE_SECRET",
-    "HENOSIS_RIFT_DATABASE_URL",
-    "HENOSIS_RIFT_BRIDGE_CONFIG",
+    "SYNTHEOS_RIFT_JWT_SECRET",
+    "SYNTHEOS_RIFT_AGENT_JWT_SECRET",
+    "SYNTHEOS_RIFT_BRIDGE_SECRET",
+    "SYNTHEOS_RIFT_DATABASE_URL",
+    "SYNTHEOS_RIFT_BRIDGE_CONFIG",
     "PHYLAXD_URL",
     "HERMES_PHYLAXD_TOKEN",
-    "HENOSIS_WITNESS_URL",
-    "HENOSIS_AUDIT_ORIGIN_KEY_FILE",
-    "HENOSIS_AUDIT_ORIGIN_KEY_ID",
-    "HENOSIS_WITNESS_PUBLIC_KEY_FILE",
-    "HENOSIS_WITNESS_KEY_ID",
+    "SYNTHEOS_WITNESS_URL",
+    "SYNTHEOS_AUDIT_ORIGIN_KEY_FILE",
+    "SYNTHEOS_AUDIT_ORIGIN_KEY_ID",
+    "SYNTHEOS_WITNESS_PUBLIC_KEY_FILE",
+    "SYNTHEOS_WITNESS_KEY_ID",
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
@@ -239,9 +241,7 @@ impl HttpControlApi {
     /// Loads a validated API endpoint and bearer credential after local configuration is available.
     pub fn from_environment() -> Result<Self, CliError> {
         let base_url = control_base_url(
-            env::var("HENOSIS_API_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
+            resolve_env("API_URL")?,
             env::var("SYNTHEOS_ADDR")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -251,12 +251,14 @@ impl HttpControlApi {
             .timeout(CONTROL_REQUEST_TIMEOUT)
             .build()
             .map_err(CliError::ControlClient)?;
-        let bearer_token = match env::var("HENOSIS_API_TOKEN") {
-            Ok(token) if !token.trim().is_empty() => validate_bearer_token(token)?,
+        let bearer_token = match resolve_env("API_TOKEN")? {
+            Some(token) if !token.trim().is_empty() => validate_bearer_token(token)?,
             _ => {
-                let path = env::var_os(LOCAL_TOKEN_KEY).ok_or(CliError::ControlConfiguration {
-                    message: "set HENOSIS_API_TOKEN or HENOSIS_LOCAL_TOKEN_FILE",
-                })?;
+                let path = resolve_env(LOCAL_TOKEN_KEY)?.map(PathBuf::from).ok_or(
+                    CliError::ControlConfiguration {
+                        message: "set SYNTHEOS_API_TOKEN or SYNTHEOS_LOCAL_TOKEN_FILE",
+                    },
+                )?;
                 load_local_bearer_token(Path::new(&path))?
             }
         };
@@ -489,6 +491,19 @@ struct IssuedTokenResponse {
     token: String,
 }
 
+/// Resolve one environment value through the rename boundary.
+///
+/// Canonical `SYNTHEOS_*` keys are resolved together with their read-only
+/// legacy brand aliases; blank values count as absent and conflicts fail
+/// closed with an actionable message.
+fn resolve_env(key: &str) -> Result<Option<String>, CliError> {
+    syntheos_env::resolve_name(key)
+        .map(|value| value.filter(|value| !value.trim().is_empty()))
+        .map_err(|error| CliError::EnvironmentBoundary {
+            message: error.to_string(),
+        })
+}
+
 /// Resolves the configured base URL from an explicit URL or the local listening address.
 fn control_base_url(
     explicit_url: Option<String>,
@@ -498,7 +513,7 @@ fn control_base_url(
         Some(url) => url,
         None => {
             let address = syntheos_address.ok_or(CliError::ControlConfiguration {
-                message: "set HENOSIS_API_URL or SYNTHEOS_ADDR",
+                message: "set SYNTHEOS_API_URL or SYNTHEOS_ADDR",
             })?;
             format!("http://{address}")
         }
@@ -509,16 +524,16 @@ fn control_base_url(
 /// Validates an HTTP base URL before a bearer credential can be sent to it.
 fn validate_control_url(value: &str) -> Result<Url, CliError> {
     let mut url = Url::parse(value).map_err(|_| CliError::ControlConfiguration {
-        message: "HENOSIS_API_URL must be an absolute HTTP URL",
+        message: "SYNTHEOS_API_URL must be an absolute HTTP URL",
     })?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(CliError::ControlConfiguration {
-            message: "HENOSIS_API_URL must not contain credentials",
+            message: "SYNTHEOS_API_URL must not contain credentials",
         });
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(CliError::ControlConfiguration {
-            message: "HENOSIS_API_URL must not contain a query or fragment",
+            message: "SYNTHEOS_API_URL must not contain a query or fragment",
         });
     }
     let loopback = url.host_str().is_some_and(is_loopback_host);
@@ -527,18 +542,18 @@ fn validate_control_url(value: &str) -> Result<Url, CliError> {
         "http" if loopback => {}
         "http" => {
             return Err(CliError::ControlConfiguration {
-                message: "remote HENOSIS_API_URL endpoints must use HTTPS",
+                message: "remote SYNTHEOS_API_URL endpoints must use HTTPS",
             });
         }
         _ => {
             return Err(CliError::ControlConfiguration {
-                message: "HENOSIS_API_URL must use HTTP or HTTPS",
+                message: "SYNTHEOS_API_URL must use HTTP or HTTPS",
             });
         }
     }
     if url.host_str().is_none() {
         return Err(CliError::ControlConfiguration {
-            message: "HENOSIS_API_URL must contain a host",
+            message: "SYNTHEOS_API_URL must contain a host",
         });
     }
     if !url.path().ends_with('/') {
@@ -574,7 +589,7 @@ fn control_url(base_url: &Url, segments: &[&str]) -> Result<Url, CliError> {
     let mut path = url
         .path_segments_mut()
         .map_err(|_| CliError::ControlConfiguration {
-            message: "HENOSIS_API_URL cannot be used as an HTTP base URL",
+            message: "SYNTHEOS_API_URL cannot be used as an HTTP base URL",
         })?;
     path.pop_if_empty();
     for segment in segments {
@@ -656,12 +671,11 @@ impl CliPaths {
         }
     }
 
-    /// Uses `HENOSIS_HOME`, then the current user's home directory, and finally an actionable error.
+    /// Uses `SYNTHEOS_HOME` (legacy brand alias honored), then the current
+    /// user's home directory, and finally an actionable error.
     pub fn from_environment() -> Result<Self, CliError> {
-        if let Some(home) = env::var_os("HENOSIS_HOME") {
-            if !home.is_empty() {
-                return Ok(Self::from_home(home));
-            }
+        if let Some(home) = resolve_env("HOME")? {
+            return Ok(Self::from_home(PathBuf::from(home)));
         }
         let home = env::var_os("HOME")
             .or_else(|| env::var_os("USERPROFILE"))
@@ -884,7 +898,7 @@ pub enum CliError {
     )]
     InitModeRequired,
     /// The execution environment supplied no usable user home directory.
-    #[error("cannot resolve a local Henosis home; set HENOSIS_HOME to an explicit directory")]
+    #[error("cannot resolve a local Henosis home; set SYNTHEOS_HOME to an explicit directory")]
     HomeDirectoryUnavailable,
     /// A filesystem operation for one explicit path failed.
     #[error("filesystem operation for {path} failed: {source}")]
@@ -986,6 +1000,12 @@ pub enum CliError {
         /// Non-secret corrective action for the operator.
         message: &'static str,
     },
+    /// Rename-boundary environment resolution failed closed.
+    #[error("environment configuration conflict: {message}")]
+    EnvironmentBoundary {
+        /// Non-secret corrective action naming the conflicting keys.
+        message: String,
+    },
     /// The synchronous HTTP client could not be initialized.
     #[error("cannot initialize the live-control HTTP client: {0}")]
     ControlClient(#[source] reqwest::Error),
@@ -1051,7 +1071,7 @@ pub enum Harness {
 
 /// Resolves harness names into generated roster configuration.
 impl Harness {
-    /// Parse a `--harness` value or `HENOSIS_HARNESS` setting.
+    /// Parse a `--harness` value or `SYNTHEOS_HARNESS` setting.
     ///
     /// An unrecognized value is treated as a binary name or path rather than an
     /// error, so a harness Henosis has never heard of still works on day one.
@@ -1147,11 +1167,14 @@ impl Harness {
 /// Resolve the harness selection from the environment.
 ///
 /// Used by both `henosis init --quick` and the automatic boot-time
-/// initialization path, so a `HENOSIS_HARNESS` set for a `curl | sh` install
-/// applies however initialization is reached.
+/// initialization path, so a `SYNTHEOS_HARNESS` set for a `curl | sh` install
+/// applies however initialization is reached. A conflict between the canonical
+/// key and its legacy alias degrades to the default harness instead of
+/// guessing.
 pub fn harness_from_env() -> Harness {
-    std::env::var(HARNESS_ENV)
+    syntheos_env::resolve_name(HARNESS_ENV)
         .ok()
+        .flatten()
         .as_deref()
         .map(Harness::parse)
         .unwrap_or_default()
@@ -1172,7 +1195,7 @@ fn quick_init_command(harness: Harness) -> Command {
 
 /// Parses the `init` subcommand and requires exactly one safe non-interactive flag.
 ///
-/// `--harness` may accompany `--quick`. When it is absent the `HENOSIS_HARNESS`
+/// `--harness` may accompany `--quick`. When it is absent the `SYNTHEOS_HARNESS`
 /// environment variable is consulted so `curl | sh` installs can select a
 /// harness without an interactive prompt.
 fn parse_init(arguments: &[String]) -> Result<Command, CliError> {
@@ -1363,21 +1386,21 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
     } else {
         BTreeMap::new()
     };
-    let mut missing_production_keys = missing_config_keys(&values, PRODUCTION_REQUIRED_KEYS);
-    if config_value_present(&values, "SYNTHEOS_LOCAL_POLICY") {
+    let mut missing_production_keys = missing_config_keys(&values, PRODUCTION_REQUIRED_KEYS)?;
+    if config_value_present(&values, "SYNTHEOS_LOCAL_POLICY")? {
         missing_production_keys.push(
             "SYNTHEOS_LOCAL_POLICY (remove this local-only setting for production)".to_string(),
         );
     }
-    let room_mode = effective_room_mode(&values);
+    let room_mode = effective_room_mode(&values)?;
     if room_mode != Some(RoomMode::Required) {
         missing_production_keys
-            .push("HENOSIS_ROOM_MODE (must be required for production)".to_string());
+            .push("SYNTHEOS_ROOM_MODE (must be required for production)".to_string());
     }
     let local_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
-        && local_configuration_ready(&values, room_mode);
+        && local_configuration_ready(&values, room_mode)?;
     let production_ready = home == LocalPathState::Directory
         && config == LocalPathState::File
         && data == LocalPathState::Directory
@@ -1394,7 +1417,7 @@ fn doctor(paths: &CliPaths) -> Result<DoctorReport, CliError> {
         )
     } else if !production_ready {
         format!(
-            "set the required PostgreSQL, managed-room, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, select HENOSIS_ROOM_MODE=required, then run `henosis init --production`",
+            "set the required PostgreSQL, managed-room, phylaxd, and witness values in {}, remove SYNTHEOS_LOCAL_POLICY, select SYNTHEOS_ROOM_MODE=required, then run `henosis init --production`",
             paths.config.display()
         )
     } else {
@@ -1558,18 +1581,18 @@ fn render_quick_config(paths: &CliPaths, harness: &Harness) -> Result<String, Cl
     let tenant = TenantId::new();
     let principal = PrincipalId::new();
     let jwt_secret = hex::encode(rand::random::<[u8; 32]>());
-    let roster_path = config_path_value("HENOSIS_RIFT_BRIDGE_CONFIG", &home.join(AGENTS_FILE))?;
+    let roster_path = config_path_value("SYNTHEOS_RIFT_BRIDGE_CONFIG", &home.join(AGENTS_FILE))?;
     let mut configuration = format!(
         "# Henosis private local operator configuration.\n\
          # This file contains local authority material. Do not share it.\n\
          SYNTHEOS_ADDR=127.0.0.1:8088\n\
          SYNTHEOS_LOCAL_POLICY=1\n\
-         HENOSIS_ROOM_MODE={DISABLED_MODE}\n\
+         SYNTHEOS_ROOM_MODE={DISABLED_MODE}\n\
          SYNTHEOS_PLUTUS_OPERATOR_TENANT={tenant}\n\
          SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL={principal}\n\
          SYNTHEOS_OPERATOR_JWT_SECRET={jwt_secret}\n\
-         HENOSIS_HARNESS={harness}\n\
-         HENOSIS_RIFT_BRIDGE_CONFIG={roster_path}\n",
+         SYNTHEOS_HARNESS={harness}\n\
+         SYNTHEOS_RIFT_BRIDGE_CONFIG={roster_path}\n",
         harness = harness.config_value()
     );
     for &(key, filename) in LOCAL_DATABASES {
@@ -1589,11 +1612,11 @@ fn render_quick_config(paths: &CliPaths, harness: &Harness) -> Result<String, Cl
          # SYNTHEOS_PLUTUS_DB=\n\
          # PHYLAXD_URL=\n\
          # HERMES_PHYLAXD_TOKEN=\n\
-         # HENOSIS_WITNESS_URL=\n\
-         # HENOSIS_AUDIT_ORIGIN_KEY_FILE=\n\
-         # HENOSIS_AUDIT_ORIGIN_KEY_ID=\n\
-         # HENOSIS_WITNESS_PUBLIC_KEY_FILE=\n\
-         # HENOSIS_WITNESS_KEY_ID=\n",
+         # SYNTHEOS_WITNESS_URL=\n\
+         # SYNTHEOS_AUDIT_ORIGIN_KEY_FILE=\n\
+         # SYNTHEOS_AUDIT_ORIGIN_KEY_ID=\n\
+         # SYNTHEOS_WITNESS_PUBLIC_KEY_FILE=\n\
+         # SYNTHEOS_WITNESS_KEY_ID=\n",
     );
     Ok(configuration)
 }
@@ -1818,69 +1841,83 @@ fn read_bounded_string(path: &Path, file: File, max_bytes: usize) -> Result<Stri
     Ok(contents)
 }
 
-/// Returns required key names whose values are absent or blank without returning their contents.
-fn missing_config_keys(values: &BTreeMap<String, String>, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .filter(|key| !config_value_present(values, key))
-        .map(|key| (*key).to_string())
-        .collect()
+/// Resolve one canonical key from parsed configuration values, honoring the
+/// legacy brand alias for the same suffix. Keys outside the canonical
+/// `SYNTHEOS_` namespace are looked up verbatim. Conflicting values fail
+/// closed.
+fn resolve_config_value(
+    values: &BTreeMap<String, String>,
+    canonical_key: &str,
+) -> Result<Option<String>, CliError> {
+    let Some(suffix) = canonical_key.strip_prefix(syntheos_env::CANONICAL_PREFIX) else {
+        return Ok(values.get(canonical_key).cloned());
+    };
+    syntheos_env::resolve_with(suffix, |key| Ok(values.get(key).cloned())).map_err(|error| {
+        CliError::EnvironmentBoundary {
+            message: error.to_string(),
+        }
+    })
 }
 
-/// Determines whether one configuration key is present with a non-blank value.
-fn config_value_present(values: &BTreeMap<String, String>, key: &str) -> bool {
-    values
-        .get(key)
-        .is_some_and(|value| !value.trim().is_empty())
+/// Returns required key names whose values are absent or blank without returning their contents.
+fn missing_config_keys(
+    values: &BTreeMap<String, String>,
+    keys: &[&str],
+) -> Result<Vec<String>, CliError> {
+    let mut missing = Vec::new();
+    for key in keys {
+        if !config_value_present(values, key)? {
+            missing.push((*key).to_string());
+        }
+    }
+    Ok(missing)
+}
+
+/// Determines whether one configuration key is present with a non-blank value,
+/// honoring the legacy brand alias for canonical keys.
+fn config_value_present(values: &BTreeMap<String, String>, key: &str) -> Result<bool, CliError> {
+    Ok(resolve_config_value(values, key)?.is_some_and(|value| !value.trim().is_empty()))
 }
 
 /// Resolves room mode with the same process-environment precedence used by server startup.
-fn effective_room_mode(values: &BTreeMap<String, String>) -> Option<RoomMode> {
-    let mode = match env::var("HENOSIS_ROOM_MODE") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => values
-            .get("HENOSIS_ROOM_MODE")
-            .cloned()
+fn effective_room_mode(values: &BTreeMap<String, String>) -> Result<Option<RoomMode>, CliError> {
+    let mode = match resolve_env("ROOM_MODE")? {
+        Some(mode) => mode,
+        None => resolve_config_value(values, "SYNTHEOS_ROOM_MODE")?
             .unwrap_or_else(|| REQUIRED_MODE.to_string()),
-        Err(env::VarError::NotUnicode(_)) => return None,
     };
-    parse_room_mode(&mode).ok()
+    Ok(parse_room_mode(&mode).ok())
 }
 
-/// Validates every generated local value needed for the private runtime to boot.
+/// Validates every generated local value needed for the private runtime to boot,
+/// honoring legacy brand aliases in parsed configuration.
 fn local_configuration_ready(
     values: &BTreeMap<String, String>,
     room_mode: Option<RoomMode>,
-) -> bool {
-    if values
-        .get("SYNTHEOS_LOCAL_POLICY")
-        .is_none_or(|value| value != "1")
-    {
-        return false;
+) -> Result<bool, CliError> {
+    let local_policy = resolve_config_value(values, "SYNTHEOS_LOCAL_POLICY")?;
+    if local_policy.as_deref() != Some("1") {
+        return Ok(false);
     }
-    if values
-        .get("SYNTHEOS_PLUTUS_OPERATOR_TENANT")
-        .is_none_or(|value| value.parse::<TenantId>().is_err())
-        || values
-            .get("SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL")
-            .is_none_or(|value| value.parse::<PrincipalId>().is_err())
+    let tenant = resolve_config_value(values, "SYNTHEOS_PLUTUS_OPERATOR_TENANT")?;
+    let principal = resolve_config_value(values, "SYNTHEOS_PLUTUS_OPERATOR_PRINCIPAL")?;
+    if tenant.is_none_or(|value| value.parse::<TenantId>().is_err())
+        || principal.is_none_or(|value| value.parse::<PrincipalId>().is_err())
     {
-        return false;
+        return Ok(false);
     }
-    let jwt_ready = values
-        .get("SYNTHEOS_OPERATOR_JWT_SECRET")
+    let jwt_ready = resolve_config_value(values, "SYNTHEOS_OPERATOR_JWT_SECRET")?
         .and_then(|value| hex::decode(value).ok())
         .is_some_and(|secret| secret.len() >= 32);
-    let local_token_ready = values
-        .get(LOCAL_TOKEN_KEY)
-        .is_some_and(|value| Path::new(value).is_absolute());
-    room_mode == Some(RoomMode::Disabled)
-        && jwt_ready
-        && local_token_ready
-        && LOCAL_DATABASES.iter().all(|(key, _)| {
-            values
-                .get(*key)
-                .is_some_and(|value| Path::new(value).is_absolute())
-        })
+    let local_token_ready = resolve_config_value(values, LOCAL_TOKEN_KEY)?
+        .is_some_and(|value| Path::new(&value).is_absolute());
+    let mut databases_ready = true;
+    for (key, _) in LOCAL_DATABASES {
+        let absolute =
+            resolve_config_value(values, key)?.is_some_and(|value| Path::new(&value).is_absolute());
+        databases_ready = databases_ready && absolute;
+    }
+    Ok(room_mode == Some(RoomMode::Disabled) && jwt_ready && local_token_ready && databases_ready)
 }
 
 /// Inspects a filesystem entry without following a potentially unsafe symbolic link.
@@ -2357,10 +2394,10 @@ mod tests {
         assert!(roster.contains("--henosis-execute"));
 
         let values = read_config_values(&paths.config).expect("read generated configuration");
-        assert_eq!(values["HENOSIS_HARNESS"], "codex");
+        assert_eq!(values["SYNTHEOS_HARNESS"], "codex");
         let roster_path = fs::canonicalize(home.join(AGENTS_FILE)).expect("canonical roster");
         assert_eq!(
-            PathBuf::from(&values["HENOSIS_RIFT_BRIDGE_CONFIG"]),
+            PathBuf::from(&values["SYNTHEOS_RIFT_BRIDGE_CONFIG"]),
             roster_path
         );
         let managed = henosis_rift_bridge::config::BridgeConfig::load_for_managed_room(
@@ -2384,7 +2421,7 @@ mod tests {
         let paths = CliPaths::from_home(&home);
         let error = initialize_quick(
             &paths,
-            &Harness::External("adapter\nHENOSIS_ROOM_MODE=required".to_string()),
+            &Harness::External("adapter\nSYNTHEOS_ROOM_MODE=required".to_string()),
         )
         .expect_err("multiline harness must be rejected");
 
@@ -2446,7 +2483,7 @@ mod tests {
             .expect("generated JWT secret is hex");
         assert!(jwt.len() >= 32);
         assert!(!values.contains_key("SYNTHEOS_OPERATOR_PASSWORD"));
-        assert_eq!(values["HENOSIS_ROOM_MODE"], DISABLED_MODE);
+        assert_eq!(values["SYNTHEOS_ROOM_MODE"], DISABLED_MODE);
 
         let canonical_data = fs::canonicalize(&paths.data).expect("canonical data path");
         assert_eq!(
@@ -2521,7 +2558,7 @@ mod tests {
         let legacy = fs::read_to_string(&paths.config)
             .expect("read generated configuration")
             .lines()
-            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .filter(|line| *line != "SYNTHEOS_ROOM_MODE=disabled")
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         fs::write(&paths.config, &legacy).expect("write legacy configuration");
@@ -2722,14 +2759,14 @@ mod tests {
         };
         assert!(missing.iter().any(|key| key == "SYNTHEOS_PLUTUS_DB"));
         assert!(missing.iter().any(|key| key == "PHYLAXD_URL"));
-        assert!(missing.iter().any(|key| key == "HENOSIS_WITNESS_URL"));
-        assert!(missing.iter().any(|key| key == "HENOSIS_RIFT_JWT_SECRET"));
+        assert!(missing.iter().any(|key| key == "SYNTHEOS_WITNESS_URL"));
+        assert!(missing.iter().any(|key| key == "SYNTHEOS_RIFT_JWT_SECRET"));
         assert!(missing
             .iter()
-            .any(|key| key == "HENOSIS_RIFT_AGENT_JWT_SECRET"));
+            .any(|key| key == "SYNTHEOS_RIFT_AGENT_JWT_SECRET"));
         assert!(missing
             .iter()
-            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
+            .any(|key| key.starts_with("SYNTHEOS_ROOM_MODE")));
         assert!(missing
             .iter()
             .any(|key| key.starts_with("SYNTHEOS_LOCAL_POLICY")));
@@ -2749,11 +2786,11 @@ mod tests {
         let mut production = generated
             .lines()
             .filter(|line| {
-                *line != "SYNTHEOS_LOCAL_POLICY=1" && *line != "HENOSIS_ROOM_MODE=disabled"
+                *line != "SYNTHEOS_LOCAL_POLICY=1" && *line != "SYNTHEOS_ROOM_MODE=disabled"
             })
             .map(|line| format!("{line}\n"))
             .collect::<String>();
-        production.push_str("HENOSIS_ROOM_MODE=required\n");
+        production.push_str("SYNTHEOS_ROOM_MODE=required\n");
         for key in PRODUCTION_REQUIRED_KEYS {
             if !production
                 .lines()
@@ -2780,7 +2817,7 @@ mod tests {
 
         let without_room_mode = generated
             .lines()
-            .filter(|line| *line != "HENOSIS_ROOM_MODE=disabled")
+            .filter(|line| *line != "SYNTHEOS_ROOM_MODE=disabled")
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         fs::write(&paths.config, without_room_mode).expect("remove room mode");
@@ -2792,7 +2829,7 @@ mod tests {
 
         fs::write(
             &paths.config,
-            generated.replace("HENOSIS_ROOM_MODE=disabled", "HENOSIS_ROOM_MODE=invalid"),
+            generated.replace("SYNTHEOS_ROOM_MODE=disabled", "SYNTHEOS_ROOM_MODE=invalid"),
         )
         .expect("write invalid room mode");
         let report = doctor(&paths).expect("doctor with invalid room mode");
@@ -2800,7 +2837,7 @@ mod tests {
         assert!(report
             .missing_production_keys
             .iter()
-            .any(|key| key.starts_with("HENOSIS_ROOM_MODE")));
+            .any(|key| key.starts_with("SYNTHEOS_ROOM_MODE")));
         remove_temporary_home(&home);
     }
 
@@ -2842,7 +2879,7 @@ mod tests {
             .expect("run doctor")
             .render()
             .expect("render doctor JSON");
-        assert!(output.contains("HENOSIS_WITNESS_URL"));
+        assert!(output.contains("SYNTHEOS_WITNESS_URL"));
         assert!(!output.contains("secret-value"));
         remove_temporary_home(&home);
     }

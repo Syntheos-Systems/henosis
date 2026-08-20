@@ -2,8 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = $(if ($env:HENOSIS_VERSION) { $env:HENOSIS_VERSION } else { 'v0.1.0-alpha.6' }),
-    [string]$InstallDirectory = $(if ($env:HENOSIS_INSTALL_DIR) { $env:HENOSIS_INSTALL_DIR } else { Join-Path $HOME '.local\\bin' }),
+    [string]$Version = $(if ($env:SYNTHEOS_VERSION) { $env:SYNTHEOS_VERSION } else { 'v0.1.0-alpha.6' }),
+    [string]$InstallDirectory = $(if ($env:SYNTHEOS_INSTALL_DIR) { $env:SYNTHEOS_INSTALL_DIR } else { Join-Path $HOME '.local\\bin' }),
     [switch]$Headless
 )
 
@@ -23,30 +23,57 @@ function Stop-Install {
     exit 1
 }
 
+# Resolve one rename-boundary override: SYNTHEOS_<Name> is canonical and
+# HENOSIS_<Name> is a read-only compatibility alias. Both set with different
+# values fails closed instead of silently choosing one.
+function Resolve-EnvironmentOverride {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Current
+    )
+    $canonical = [Environment]::GetEnvironmentVariable("SYNTHEOS_$Name")
+    $legacy = [Environment]::GetEnvironmentVariable("HENOSIS_$Name")
+    if ($canonical -and $legacy -and $canonical -ne $legacy) {
+        Stop-Install "SYNTHEOS_$Name and HENOSIS_$Name are both set with different values; unset one (SYNTHEOS_$Name is canonical)"
+    }
+    if ($canonical) { return $canonical }
+    if ($legacy) { return $legacy }
+    return $Current
+}
+
+# Explicit parameters outrank environment overrides; environment resolution
+# only fills values the caller did not supply on the command line.
+if (-not $PSBoundParameters.ContainsKey('Version')) {
+    $Version = Resolve-EnvironmentOverride -Name 'VERSION' -Current $Version
+}
+if (-not $PSBoundParameters.ContainsKey('InstallDirectory')) {
+    $InstallDirectory = Resolve-EnvironmentOverride -Name 'INSTALL_DIR' -Current $InstallDirectory
+}
+
 # Return an absolute HTTPS release base without credentials, query, or fragment.
 function Get-ReleaseBase {
-    $candidate = if ($env:HENOSIS_RELEASE_BASE) { $env:HENOSIS_RELEASE_BASE.TrimEnd('/') } else { 'https://github.com/Syntheos-Systems/henosis/releases/download' }
+    $candidate = (Resolve-EnvironmentOverride -Name 'RELEASE_BASE' -Current 'https://github.com/Syntheos-Systems/henosis/releases/download').TrimEnd('/')
     $uri = $null
     if (-not [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -or
         $uri.Scheme -ne [Uri]::UriSchemeHttps -or
         -not [string]::IsNullOrEmpty($uri.UserInfo) -or
         -not [string]::IsNullOrEmpty($uri.Query) -or
         -not [string]::IsNullOrEmpty($uri.Fragment)) {
-        Stop-Install 'HENOSIS_RELEASE_BASE must be an absolute HTTPS URL without credentials, query, or fragment'
+        Stop-Install 'SYNTHEOS_RELEASE_BASE must be an absolute HTTPS URL without credentials, query, or fragment'
     }
     return $uri.AbsoluteUri.TrimEnd('/')
 }
 
 # Return an absolute HTTPS release metadata API without credentials, query, or fragment.
 function Get-ReleaseApi {
-    $candidate = if ($env:HENOSIS_RELEASE_API) { $env:HENOSIS_RELEASE_API.TrimEnd('/') } else { 'https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags' }
+    $candidate = (Resolve-EnvironmentOverride -Name 'RELEASE_API' -Current 'https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags').TrimEnd('/')
     $uri = $null
     if (-not [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -or
         $uri.Scheme -ne [Uri]::UriSchemeHttps -or
         -not [string]::IsNullOrEmpty($uri.UserInfo) -or
         -not [string]::IsNullOrEmpty($uri.Query) -or
         -not [string]::IsNullOrEmpty($uri.Fragment)) {
-        Stop-Install 'HENOSIS_RELEASE_API must be an absolute HTTPS URL without credentials, query, or fragment'
+        Stop-Install 'SYNTHEOS_RELEASE_API must be an absolute HTTPS URL without credentials, query, or fragment'
     }
     return $uri.AbsoluteUri.TrimEnd('/')
 }

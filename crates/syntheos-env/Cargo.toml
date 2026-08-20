@@ -1,0 +1,11 @@
+[package]
+name = "syntheos-env"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rename-boundary environment resolution: canonical SYNTHEOS_* keys with read-only legacy brand aliases."
+
+[dependencies]
+tracing.workspace = true

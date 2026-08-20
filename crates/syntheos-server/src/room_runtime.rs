@@ -1,6 +1,5 @@
 //! Managed Rift room and Synapse bridge lifecycle.
 
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,14 +88,9 @@ pub struct PreparedRoomRuntime {
 /// Failures emitted while configuring or supervising the room stack.
 #[derive(Debug, thiserror::Error)]
 pub enum RoomRuntimeError {
-    /// A required environment variable was missing or invalid Unicode.
-    #[error("{name}: {source}")]
-    Environment {
-        /// Name of the rejected environment variable.
-        name: &'static str,
-        /// Environment lookup failure.
-        source: env::VarError,
-    },
+    /// A required environment variable was missing, conflicted, or not Unicode.
+    #[error("{0}")]
+    Environment(String),
     /// A room environment setting violated its contract.
     #[error("invalid room configuration: {0}")]
     InvalidConfig(String),
@@ -142,7 +136,7 @@ pub enum RoomRuntimeError {
 
 /// Load the room mode and all settings required by the selected mode.
 pub fn room_runtime_from_environment() -> Result<RoomRuntimeSelection, RoomRuntimeError> {
-    let mode = env_or_default("HENOSIS_ROOM_MODE", REQUIRED_MODE)?;
+    let mode = env_or_default("SYNTHEOS_ROOM_MODE", REQUIRED_MODE)?;
     match parse_room_mode(&mode)? {
         RoomMode::Disabled => Ok(RoomRuntimeSelection::Disabled),
         RoomMode::Required => Ok(RoomRuntimeSelection::Required(Box::new(
@@ -445,7 +439,7 @@ pub(crate) fn parse_room_mode(value: &str) -> Result<RoomMode, RoomRuntimeError>
         REQUIRED_MODE => Ok(RoomMode::Required),
         DISABLED_MODE => Ok(RoomMode::Disabled),
         other => Err(RoomRuntimeError::InvalidConfig(format!(
-            "HENOSIS_ROOM_MODE must be {REQUIRED_MODE:?} or {DISABLED_MODE:?}, got {other:?}"
+            "SYNTHEOS_ROOM_MODE must be {REQUIRED_MODE:?} or {DISABLED_MODE:?}, got {other:?}"
         ))),
     }
 }
@@ -456,7 +450,7 @@ pub(crate) fn parse_agent_control(value: &str) -> Result<bool, RoomRuntimeError>
         "0" => Ok(false),
         "1" => Ok(true),
         other => Err(RoomRuntimeError::InvalidConfig(format!(
-            "HENOSIS_ROOM_AGENT_CONTROL must be \"0\" or \"1\", got {other:?}"
+            "SYNTHEOS_ROOM_AGENT_CONTROL must be \"0\" or \"1\", got {other:?}"
         ))),
     }
 }
@@ -467,7 +461,7 @@ fn parse_remote_listen_ack(value: &str) -> Result<bool, RoomRuntimeError> {
         "0" => Ok(false),
         "1" => Ok(true),
         other => Err(RoomRuntimeError::InvalidConfig(format!(
-            "HENOSIS_RIFT_ALLOW_REMOTE_LISTEN must be \"0\" or \"1\", got {other:?}"
+            "SYNTHEOS_RIFT_ALLOW_REMOTE_LISTEN must be \"0\" or \"1\", got {other:?}"
         ))),
     }
 }
@@ -476,29 +470,29 @@ fn parse_remote_listen_ack(value: &str) -> Result<bool, RoomRuntimeError> {
 impl RoomRuntimeConfig {
     /// Build the server and managed room configuration.
     fn from_environment() -> Result<Self, RoomRuntimeError> {
-        let jwt_secret = required_env("HENOSIS_RIFT_JWT_SECRET")?;
-        let agent_jwt_secret = required_env("HENOSIS_RIFT_AGENT_JWT_SECRET")?;
-        let bridge_secret = required_env("HENOSIS_RIFT_BRIDGE_SECRET")?;
+        let jwt_secret = required_env("SYNTHEOS_RIFT_JWT_SECRET")?;
+        let agent_jwt_secret = required_env("SYNTHEOS_RIFT_AGENT_JWT_SECRET")?;
+        let bridge_secret = required_env("SYNTHEOS_RIFT_BRIDGE_SECRET")?;
         validate_managed_rift_secrets(&jwt_secret, &agent_jwt_secret, &bridge_secret)?;
-        let listen_addr = env_or_default("HENOSIS_RIFT_ADDR", "127.0.0.1:3200")?;
-        let bridge_listen_addr = env_or_default("HENOSIS_RIFT_BRIDGE_ADDR", "127.0.0.1:3201")?;
+        let listen_addr = env_or_default("SYNTHEOS_RIFT_ADDR", "127.0.0.1:3200")?;
+        let bridge_listen_addr = env_or_default("SYNTHEOS_RIFT_BRIDGE_ADDR", "127.0.0.1:3201")?;
         let allow_remote_listen =
-            parse_remote_listen_ack(&env_or_default("HENOSIS_RIFT_ALLOW_REMOTE_LISTEN", "0")?)?;
+            parse_remote_listen_ack(&env_or_default("SYNTHEOS_RIFT_ALLOW_REMOTE_LISTEN", "0")?)?;
         validate_listener_topology(&listen_addr, &bridge_listen_addr, allow_remote_listen)
             .map_err(RoomRuntimeError::InvalidConfig)?;
         internal_urls(&listen_addr)?;
-        let cors = env_or_default("HENOSIS_RIFT_CORS_ORIGINS", DEFAULT_CORS_ORIGINS)?;
+        let cors = env_or_default("SYNTHEOS_RIFT_CORS_ORIGINS", DEFAULT_CORS_ORIGINS)?;
         let cors_origins = parse_cors_origins(&cors).map_err(RoomRuntimeError::InvalidConfig)?;
-        let max_upload = optional_env("HENOSIS_RIFT_MAX_UPLOAD_BYTES")?;
+        let max_upload = optional_env("SYNTHEOS_RIFT_MAX_UPLOAD_BYTES")?;
         let max_upload_bytes =
             parse_upload_limit(max_upload.as_deref()).map_err(RoomRuntimeError::InvalidConfig)?;
         let agent_control_enabled = parse_agent_control(&env_or_default(
-            "HENOSIS_ROOM_AGENT_CONTROL",
+            "SYNTHEOS_ROOM_AGENT_CONTROL",
             DEFAULT_AGENT_CONTROL,
         )?)?;
         Ok(Self {
             rift: RiftConfig {
-                database_url: required_env("HENOSIS_RIFT_DATABASE_URL")?,
+                database_url: required_env("SYNTHEOS_RIFT_DATABASE_URL")?,
                 jwt_secret,
                 agent_jwt_secret,
                 bridge_secret,
@@ -506,15 +500,15 @@ impl RoomRuntimeConfig {
                 bridge_listen_addr,
                 allow_remote_listen,
                 cors_origins,
-                upload_dir: env_or_default("HENOSIS_RIFT_UPLOAD_DIR", "data/rift-uploads")?,
+                upload_dir: env_or_default("SYNTHEOS_RIFT_UPLOAD_DIR", "data/rift-uploads")?,
                 max_upload_bytes,
             },
-            bridge_config_path: PathBuf::from(required_env("HENOSIS_RIFT_BRIDGE_CONFIG")?),
+            bridge_config_path: PathBuf::from(required_env("SYNTHEOS_RIFT_BRIDGE_CONFIG")?),
             room: ManagedRoomConfig {
-                server_name: env_or_default("HENOSIS_RIFT_SERVER_NAME", "Henosis")?,
-                channel_name: env_or_default("HENOSIS_RIFT_CHANNEL_NAME", "general")?,
+                server_name: env_or_default("SYNTHEOS_RIFT_SERVER_NAME", "Henosis")?,
+                channel_name: env_or_default("SYNTHEOS_RIFT_CHANNEL_NAME", "general")?,
             },
-            cron_dir: PathBuf::from(env_or_default("HENOSIS_CRON_DIR", DEFAULT_CRON_DIR)?),
+            cron_dir: PathBuf::from(env_or_default("SYNTHEOS_CRON_DIR", DEFAULT_CRON_DIR)?),
             agent_control_enabled,
         })
     }
@@ -535,25 +529,23 @@ fn env_or_default(name: &'static str, default: &str) -> Result<String, RoomRunti
     Ok(optional_env(name)?.unwrap_or_else(|| default.to_string()))
 }
 
-/// Read one optional Unicode environment setting without hiding invalid Unicode.
+/// Read one optional Unicode environment setting through the rename boundary,
+/// where canonical `SYNTHEOS_*` keys honor their read-only legacy aliases.
 fn optional_env(name: &'static str) -> Result<Option<String>, RoomRuntimeError> {
-    match env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(source) => Err(RoomRuntimeError::Environment { name, source }),
-    }
+    syntheos_env::resolve_name(name)
+        .map_err(|error| RoomRuntimeError::Environment(error.to_string()))
 }
 
-/// Read one mandatory Unicode environment setting.
+/// Read one mandatory Unicode environment setting through the rename boundary.
 fn required_env(name: &'static str) -> Result<String, RoomRuntimeError> {
-    env::var(name).map_err(|source| RoomRuntimeError::Environment { name, source })
+    optional_env(name)?.ok_or_else(|| RoomRuntimeError::Environment(format!("{name} is required")))
 }
 
 /// Derive loopback-safe internal HTTP and WebSocket endpoints from a listener.
 fn internal_urls(listen_addr: &str) -> Result<(String, String), RoomRuntimeError> {
     let parsed = listen_addr.parse::<SocketAddr>().map_err(|error| {
         RoomRuntimeError::InvalidConfig(format!(
-            "HENOSIS_RIFT_ADDR {listen_addr:?} is not a socket address: {error}"
+            "SYNTHEOS_RIFT_ADDR {listen_addr:?} is not a socket address: {error}"
         ))
     })?;
     let internal_ip = match parsed.ip() {

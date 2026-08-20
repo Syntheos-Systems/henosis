@@ -1535,17 +1535,18 @@ impl CredentialBindingResolver for EmptyCredentialBindingResolver {
 
 /// Select the deployment credential resolver from process environment.
 ///
-/// An absent or empty `HENOSIS_AGENT_CREDENTIAL_BINDINGS_FILE` keeps
+/// An absent or empty `SYNTHEOS_AGENT_CREDENTIAL_BINDINGS_FILE` keeps
 /// host-session execution working through the empty resolver. A configured
 /// but unusable file must fail room preparation instead of silently
 /// downgrading credential-bound seats.
 pub fn credential_binding_resolver_from_environment(
 ) -> Result<Arc<dyn CredentialBindingResolver>, MaterializeError> {
-    match std::env::var_os(CREDENTIAL_BINDINGS_FILE_ENV) {
-        Some(value) if !value.is_empty() => {
+    match syntheos_env::resolve_name(CREDENTIAL_BINDINGS_FILE_ENV) {
+        Ok(Some(value)) if !value.is_empty() => {
             Ok(Arc::new(FileCredentialBindingResolver::from_env()?))
         }
-        _ => Ok(Arc::new(EmptyCredentialBindingResolver)),
+        Ok(_) => Ok(Arc::new(EmptyCredentialBindingResolver)),
+        Err(error) => Err(materialize_error("credential_conflict", error.to_string())),
     }
 }
 

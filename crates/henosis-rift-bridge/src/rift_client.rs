@@ -803,9 +803,9 @@ mod tests {
     /// Process proxy settings cannot receive an agent JWT from the public client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn public_client_ignores_proxy_environment() {
-        if std::env::var_os("HENOSIS_RIFT_PROXY_CHILD").is_some() {
+        if std::env::var_os("SYNTHEOS_RIFT_PROXY_CHILD").is_some() {
             let bridge_url =
-                std::env::var("HENOSIS_RIFT_PROXY_URL").expect("child process receives proxy URL");
+                std::env::var("SYNTHEOS_RIFT_PROXY_URL").expect("child process receives proxy URL");
             let client = RiftRestClient::new(
                 "http://rift-public.invalid:3200".to_string(),
                 bridge_url,
@@ -831,8 +831,8 @@ mod tests {
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new(executable)
                 .env_clear()
-                .env("HENOSIS_RIFT_PROXY_CHILD", "1")
-                .env("HENOSIS_RIFT_PROXY_URL", &child_proxy_url)
+                .env("SYNTHEOS_RIFT_PROXY_CHILD", "1")
+                .env("SYNTHEOS_RIFT_PROXY_URL", &child_proxy_url)
                 .env("HTTP_PROXY", &child_proxy_url)
                 .env("HTTPS_PROXY", &child_proxy_url)
                 .env("ALL_PROXY", &child_proxy_url)

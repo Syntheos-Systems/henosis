@@ -59,7 +59,7 @@ fn isolated_server() -> Command {
         .arg("serve")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("HENOSIS_HOME", isolated_home)
+        .env("SYNTHEOS_HOME", isolated_home)
         .env(
             "HERMES_PHYLAXD_TOKEN",
             "boot-test-broker-token-32-bytes-minimum",
@@ -84,7 +84,7 @@ fn quick_initialization_boots_local_server() {
         .env_clear()
         .env("HOME", "/tmp")
         .env("PATH", "/usr/bin:/bin")
-        .env("HENOSIS_HOME", &home)
+        .env("SYNTHEOS_HOME", &home)
         .output()
         .expect("run quick initialization");
     assert!(
@@ -96,7 +96,7 @@ fn quick_initialization_boots_local_server() {
         .expect("read generated local configuration");
     assert!(config
         .lines()
-        .any(|line| line == "HENOSIS_ROOM_MODE=disabled"));
+        .any(|line| line == "SYNTHEOS_ROOM_MODE=disabled"));
 
     let addr = available_loopback_addr();
     let mut child = Command::new(env!("CARGO_BIN_EXE_henosis"))
@@ -104,7 +104,7 @@ fn quick_initialization_boots_local_server() {
         .env_clear()
         .env("HOME", "/tmp")
         .env("PATH", "/usr/bin:/bin")
-        .env("HENOSIS_HOME", &home)
+        .env("SYNTHEOS_HOME", &home)
         .env("RUST_LOG", "off")
         .env("SYNTHEOS_ADDR", addr.to_string())
         .stdout(Stdio::null())

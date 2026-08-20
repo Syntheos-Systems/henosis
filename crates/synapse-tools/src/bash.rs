@@ -248,7 +248,15 @@ const INHERITABLE_ENV: &[&str] = &[
 /// Comma-separated. Exists so a deployment that genuinely needs a specific
 /// variable (a proxy setting, a private registry host) can opt it back in
 /// without patching the binary. Its own name is never forwarded.
-const ENV_PASSTHROUGH_VAR: &str = "HENOSIS_AGENT_ENV_PASSTHROUGH";
+/// `SYNTHEOS_AGENT_ENV_PASSTHROUGH` is canonical; the legacy brand alias is
+/// honored read-only by the rename boundary.
+const ENV_PASSTHROUGH_VAR: &str = "SYNTHEOS_AGENT_ENV_PASSTHROUGH";
+
+/// Legacy brand alias of [`ENV_PASSTHROUGH_VAR`], never forwarded either.
+const ENV_PASSTHROUGH_LEGACY_VAR: &str = "HENOSIS_AGENT_ENV_PASSTHROUGH";
+
+/// Suffix shared by the canonical and legacy passthrough variable names.
+const ENV_PASSTHROUGH_SUFFIX: &str = "AGENT_ENV_PASSTHROUGH";
 
 /// Replaces the child environment with an allowlist before the agent runs.
 ///
@@ -270,11 +278,18 @@ fn apply_agent_environment<F>(command: &mut Command, lookup: F)
 where
     F: Fn(&str) -> Option<String>,
 {
-    let passthrough = lookup(ENV_PASSTHROUGH_VAR).unwrap_or_default();
+    // A conflict between the canonical and legacy passthrough names fails
+    // closed to the restrictive side: no extra variables are forwarded.
+    let passthrough = syntheos_env::resolve_with(ENV_PASSTHROUGH_SUFFIX, |name| Ok(lookup(name)))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let extra: Vec<&str> = passthrough
         .split(',')
         .map(str::trim)
-        .filter(|name| !name.is_empty() && *name != ENV_PASSTHROUGH_VAR)
+        .filter(|name| {
+            !name.is_empty() && *name != ENV_PASSTHROUGH_VAR && *name != ENV_PASSTHROUGH_LEGACY_VAR
+        })
         .collect();
 
     command.env_clear();
@@ -381,6 +396,34 @@ mod tests {
             !names.iter().any(|got| got == ENV_PASSTHROUGH_VAR),
             "the passthrough list itself must not be forwarded"
         );
+    }
+
+    /// The legacy brand alias of the passthrough variable is honored read-only.
+    #[test]
+    fn passthrough_legacy_alias_is_honored() {
+        let names = child_env_names(&fixture(&[
+            (ENV_PASSTHROUGH_LEGACY_VAR, "NEEDED_HOST"),
+            ("NEEDED_HOST", "registry.internal"),
+        ]));
+        assert!(names.iter().any(|got| got == "NEEDED_HOST"));
+        assert!(
+            !names.iter().any(|got| got == ENV_PASSTHROUGH_LEGACY_VAR),
+            "the legacy passthrough alias itself must not be forwarded"
+        );
+    }
+
+    /// Conflicting canonical and legacy passthrough values fail closed to the
+    /// restrictive side: no extra variables are forwarded.
+    #[test]
+    fn passthrough_conflict_fails_closed() {
+        let names = child_env_names(&fixture(&[
+            (ENV_PASSTHROUGH_VAR, "NEEDED_HOST"),
+            (ENV_PASSTHROUGH_LEGACY_VAR, "OTHER_HOST"),
+            ("NEEDED_HOST", "registry.internal"),
+            ("OTHER_HOST", "other.internal"),
+        ]));
+        assert!(!names.iter().any(|got| got == "NEEDED_HOST"));
+        assert!(!names.iter().any(|got| got == "OTHER_HOST"));
     }
 
     /// A model-supplied timeout cannot exceed the documented ceiling.

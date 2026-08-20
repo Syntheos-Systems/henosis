@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/syntheos-memory-gateway",
     "crates/syntheos-contracts",
+    "crates/syntheos-env",
     "crates/syntheos-axon",
     "crates/syntheos-axon-durable",
     "crates/syntheos-dispatch",

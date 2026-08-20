@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Core contracts, event transport, dispatch, identity, approvals, and audit.
 syntheos-contracts = { path = "../syntheos-contracts" }
+syntheos-env = { path = "../syntheos-env" }
 syntheos-axon = { path = "../syntheos-axon" }
 syntheos-dispatch = { path = "../syntheos-dispatch" }
 syntheos-identity = { path = "../syntheos-identity" }

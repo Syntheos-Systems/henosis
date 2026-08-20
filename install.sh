@@ -5,12 +5,6 @@ set -eu
 
 PROGRAM=henosis-installer
 DEFAULT_RELEASE_BASE=https://github.com/Syntheos-Systems/henosis/releases/download
-RELEASE_BASE=${HENOSIS_RELEASE_BASE:-$DEFAULT_RELEASE_BASE}
-RELEASE_API=${HENOSIS_RELEASE_API:-https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags}
-VERSION=${HENOSIS_VERSION:-v0.1.0-alpha.6}
-INSTALL_DIR=${HENOSIS_INSTALL_DIR:-"${HOME}/.local/bin"}
-ATTESTATION_REPO=${HENOSIS_ATTESTATION_REPO:-Syntheos-Systems/henosis}
-ATTESTATION_SIGNER_WORKFLOW=Syntheos-Systems/henosis/.github/workflows/ci.yml
 HEADLESS=0
 
 # Print an installer message to standard error.
@@ -28,6 +22,39 @@ die() {
     exit 1
 }
 
+# Resolve one rename-boundary override: SYNTHEOS_<NAME> is canonical and
+# HENOSIS_<NAME> is a read-only compatibility alias. Both set with different
+# values fails closed. The NAME argument is always a literal chosen below.
+resolve_override() {
+    eval "canonical_value=\${SYNTHEOS_$1:-}"
+    eval "legacy_value=\${HENOSIS_$1:-}"
+    if [ -n "$canonical_value" ] && [ -n "$legacy_value" ] &&
+        [ "$canonical_value" != "$legacy_value" ]; then
+        die "SYNTHEOS_$1 and HENOSIS_$1 are both set with different values; unset one (SYNTHEOS_$1 is canonical)"
+    fi
+    if [ -n "$canonical_value" ]; then
+        printf '%s' "$canonical_value"
+    else
+        printf '%s' "$legacy_value"
+    fi
+}
+
+RELEASE_BASE=$(resolve_override RELEASE_BASE)
+RELEASE_BASE=${RELEASE_BASE:-$DEFAULT_RELEASE_BASE}
+RELEASE_API=$(resolve_override RELEASE_API)
+RELEASE_API=${RELEASE_API:-https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags}
+VERSION=$(resolve_override VERSION)
+VERSION=${VERSION:-v0.1.0-alpha.6}
+INSTALL_DIR=$(resolve_override INSTALL_DIR)
+INSTALL_DIR=${INSTALL_DIR:-"${HOME}/.local/bin"}
+ATTESTATION_REPO=$(resolve_override ATTESTATION_REPO)
+ATTESTATION_REPO=${ATTESTATION_REPO:-Syntheos-Systems/henosis}
+SKIP_ATTESTATION=$(resolve_override SKIP_ATTESTATION)
+SKIP_ATTESTATION=${SKIP_ATTESTATION:-0}
+REQUIRE_ATTESTATION=$(resolve_override REQUIRE_ATTESTATION)
+REQUIRE_ATTESTATION=${REQUIRE_ATTESTATION:-0}
+ATTESTATION_SIGNER_WORKFLOW=Syntheos-Systems/henosis/.github/workflows/ci.yml
+
 # Display the supported installer interface.
 usage() {
     cat <<'EOF'
@@ -37,22 +64,22 @@ Downloads the native Henosis release for this operating system and CPU,
 verifies its mandatory SHA-256 checksum, installs it per-user, and runs:
   henosis init --quick
 
-Environment:
-  HENOSIS_VERSION       Release tag, default v0.1.0-alpha.6
-  HENOSIS_RELEASE_BASE  Release download base URL
-  HENOSIS_RELEASE_API   Release metadata API base URL
-  HENOSIS_INSTALL_DIR   Destination directory, default ~/.local/bin
-  HENOSIS_REQUIRE_ATTESTATION
+Environment (SYNTHEOS_* canonical; legacy HENOSIS_* aliases honored read-only):
+  SYNTHEOS_VERSION       Release tag, default v0.1.0-alpha.6
+  SYNTHEOS_RELEASE_BASE  Release download base URL
+  SYNTHEOS_RELEASE_API   Release metadata API base URL
+  SYNTHEOS_INSTALL_DIR   Destination directory, default ~/.local/bin
+  SYNTHEOS_REQUIRE_ATTESTATION
                         Set to 1 to require sigstore build-provenance verification
                         via the GitHub CLI and refuse to install without it.
                         Default is opportunistic: verified when gh is present.
-  HENOSIS_HARNESS       Agent harness for the generated roster, default synapse.
+  SYNTHEOS_HARNESS       Agent harness for the generated roster, default synapse.
                         Presets: synapse, claude-code, aider. Any other binary
                         must implement distinct --henosis-discuss and
                         --henosis-execute adapter modes.
 
 Examples:
-  curl -fsSL <url>/install.sh | HENOSIS_HARNESS=aider sh
+  curl -fsSL <url>/install.sh | SYNTHEOS_HARNESS=aider sh
   henosis init --quick --harness /opt/bin/my-agent
 EOF
 }
@@ -130,28 +157,28 @@ verify_archive() {
 # that chain against the signing identity, which same-origin checksums cannot.
 #
 # Verification runs when the GitHub CLI is available. Set
-# HENOSIS_REQUIRE_ATTESTATION=1 to refuse to install without it.
+# SYNTHEOS_REQUIRE_ATTESTATION=1 to refuse to install without it.
 verify_attestation() {
     archive=$1
     name=$2
-    # HENOSIS_SKIP_ATTESTATION exists for the contract test, which serves a
+    # SYNTHEOS_SKIP_ATTESTATION exists for the contract test, which serves a
     # synthetic release through stubbed download tooling; that fixture has no
     # attestation and must not reach the network to discover it.
     #
     # A non-default release base is a mirror or a fork, which likewise does not
     # carry this repo's attestations.
-    if [ "${HENOSIS_SKIP_ATTESTATION:-0}" = 1 ] || [ "$RELEASE_BASE" != "$DEFAULT_RELEASE_BASE" ]; then
-        if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
-            die 'HENOSIS_REQUIRE_ATTESTATION=1 requires the default release base and no skip override'
+    if [ "$SKIP_ATTESTATION" = 1 ] || [ "$RELEASE_BASE" != "$DEFAULT_RELEASE_BASE" ]; then
+        if [ "$REQUIRE_ATTESTATION" = 1 ]; then
+            die 'SYNTHEOS_REQUIRE_ATTESTATION=1 requires the default release base and no skip override'
         fi
         info "skipping provenance verification for $name (non-canonical release source)"
         return 0
     fi
     if ! command -v gh >/dev/null 2>&1; then
-        if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
-            die 'HENOSIS_REQUIRE_ATTESTATION=1 but the GitHub CLI (gh) is not installed'
+        if [ "$REQUIRE_ATTESTATION" = 1 ]; then
+            die 'SYNTHEOS_REQUIRE_ATTESTATION=1 but the GitHub CLI (gh) is not installed'
         fi
-        info "skipping provenance verification for $name (gh not installed; set HENOSIS_REQUIRE_ATTESTATION=1 to require it)"
+        info "skipping provenance verification for $name (gh not installed; set SYNTHEOS_REQUIRE_ATTESTATION=1 to require it)"
         return 0
     fi
     info "verifying build provenance for $name"
@@ -160,7 +187,7 @@ verify_attestation() {
         info "provenance verified for $name"
         return 0
     fi
-    if [ "${HENOSIS_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+    if [ "$REQUIRE_ATTESTATION" = 1 ]; then
         die "provenance verification failed for $name"
     fi
     info "WARNING: provenance verification failed for $name; continuing on checksum alone"

@@ -1,6 +1,8 @@
 services:
   henosis:
-    image: ${HENOSIS_IMAGE_REPOSITORY:?Set HENOSIS_IMAGE_REPOSITORY}@sha256:${HENOSIS_IMAGE_DIGEST:?Set HENOSIS_IMAGE_DIGEST to the 64-character image digest}
+    # Canonical SYNTHEOS_* interpolation with a read-only legacy brand alias
+    # fallback; the canonical value wins when both are set.
+    image: ${SYNTHEOS_IMAGE_REPOSITORY:-${HENOSIS_IMAGE_REPOSITORY:?Set SYNTHEOS_IMAGE_REPOSITORY}}@sha256:${SYNTHEOS_IMAGE_DIGEST:-${HENOSIS_IMAGE_DIGEST:?Set SYNTHEOS_IMAGE_DIGEST to the 64-character image digest}}
     init: true
     user: "10001:10001"
     read_only: true
@@ -8,7 +10,7 @@ services:
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp]
     # The environment file supplies distinct human-JWT, agent-JWT, and bridge-route secrets.
-    env_file: ["${HENOSIS_ENV_FILE:-.env.production}"]
+    env_file: ["${SYNTHEOS_ENV_FILE:-${HENOSIS_ENV_FILE:-.env.production}}"]
     # Rift bridge ingress remains loopback-only inside the container and is never published.
     volumes:
       - henosis-state:/var/lib/henosis

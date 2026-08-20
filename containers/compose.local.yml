@@ -10,8 +10,8 @@ services:
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp]
     environment:
-      HENOSIS_HOME: /var/lib/henosis/.henosis
-      HENOSIS_AUTO_INIT: quick
+      SYNTHEOS_HOME: /var/lib/henosis/.henosis
+      SYNTHEOS_AUTO_INIT: quick
     ports: ["127.0.0.1:8088:8088"]
     volumes: ["henosis-state:/var/lib/henosis"]
 

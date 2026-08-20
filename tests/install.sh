@@ -10,6 +10,10 @@ ORIGINAL_PATH=$PATH
 # These fixtures are synthetic releases served through stubbed download tooling,
 # so they carry no sigstore attestation. Without this the installer would reach
 # out to GitHub on every case and this suite would depend on the network.
+#
+# The legacy brand alias is exported deliberately (canonical is
+# SYNTHEOS_SKIP_ATTESTATION) so the whole suite also proves the read-only
+# compatibility alias still resolves.
 HENOSIS_SKIP_ATTESTATION=1
 export HENOSIS_SKIP_ATTESTATION
 
@@ -130,7 +134,7 @@ test_required_attestation_success() {
     make_release "$version" "$target" 'exit 0' "$release"
     make_curl "$case_root/tools"; make_gh "$case_root/tools"; mkdir -p "$case_root/remote/$version"
     cp "$release/$version"/* "$case_root/remote/$version/"
-    HENOSIS_SKIP_ATTESTATION=0 HENOSIS_REQUIRE_ATTESTATION=1 \
+    HENOSIS_SKIP_ATTESTATION=0 SYNTHEOS_REQUIRE_ATTESTATION=1 \
         HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" \
         HENOSIS_GH_LOG="$case_root/gh.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
         "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" \
@@ -145,7 +149,7 @@ test_required_attestation_failure() {
     make_release "$version" "$target" 'exit 0' "$release"
     make_curl "$case_root/tools"; make_gh "$case_root/tools"; mkdir -p "$case_root/remote/$version"
     cp "$release/$version"/* "$case_root/remote/$version/"
-    if HENOSIS_SKIP_ATTESTATION=0 HENOSIS_REQUIRE_ATTESTATION=1 HENOSIS_FIXTURE_GH_EXIT=1 \
+    if HENOSIS_SKIP_ATTESTATION=0 SYNTHEOS_REQUIRE_ATTESTATION=1 HENOSIS_FIXTURE_GH_EXIT=1 \
         HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" \
         HENOSIS_GH_LOG="$case_root/gh.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
         "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" \

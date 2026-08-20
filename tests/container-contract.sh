@@ -29,49 +29,49 @@ require_line "$dockerfile" 'ENTRYPOINT ["/usr/local/bin/henosis"]'
 require_line "$local_compose" 'read_only: true'
 require_line "$local_compose" 'cap_drop: [ALL]'
 require_line "$local_compose" '127.0.0.1:8088:8088'
-require_line "$local_compose" 'HENOSIS_AUTO_INIT: quick'
+require_line "$local_compose" 'SYNTHEOS_AUTO_INIT: quick'
 require_line "$production_compose" 'read_only: true'
-require_line "$production_compose" 'image: ${HENOSIS_IMAGE_REPOSITORY:?Set HENOSIS_IMAGE_REPOSITORY}@sha256:${HENOSIS_IMAGE_DIGEST:?Set HENOSIS_IMAGE_DIGEST to the 64-character image digest}'
+require_line "$production_compose" 'image: ${SYNTHEOS_IMAGE_REPOSITORY:-${HENOSIS_IMAGE_REPOSITORY:?Set SYNTHEOS_IMAGE_REPOSITORY}}@sha256:${SYNTHEOS_IMAGE_DIGEST:-${HENOSIS_IMAGE_DIGEST:?Set SYNTHEOS_IMAGE_DIGEST to the 64-character image digest}}'
 require_line "$production_compose" 'cap_drop: [ALL]'
 require_line "$production_compose" 'no-new-privileges:true'
-require_line "$production_compose" 'env_file: ["${HENOSIS_ENV_FILE:-.env.production}"]'
+require_line "$production_compose" 'env_file: ["${SYNTHEOS_ENV_FILE:-${HENOSIS_ENV_FILE:-.env.production}}"]'
 require_line "$production_compose" './secrets:/run/secrets/henosis:ro'
-require_line "$production_environment" 'HENOSIS_IMAGE_REPOSITORY=ghcr.io/syntheos-systems/henosis'
-require_line "$production_environment" 'HENOSIS_IMAGE_DIGEST=REPLACE_WITH_64_CHARACTER_LOWERCASE_HEX_DIGEST'
-require_line "$production_environment" 'HENOSIS_ROOM_MODE=required'
-require_line "$production_environment" 'HENOSIS_RIFT_BRIDGE_CONFIG=/run/secrets/henosis/agents.toml'
-require_line "$production_environment" 'HENOSIS_RIFT_AGENT_JWT_SECRET=REPLACE_WITH_DIFFERENT_AGENT_ONLY_AT_LEAST_64_RANDOM_HEX_CHARACTERS'
-require_line "$production_environment" 'HENOSIS_RIFT_ADDR=0.0.0.0:3200'
-require_line "$production_environment" 'HENOSIS_RIFT_BRIDGE_ADDR=127.0.0.1:3201'
-require_line "$production_environment" 'HENOSIS_RIFT_ALLOW_REMOTE_LISTEN=1'
-require_line "$production_environment" 'HENOSIS_AUDIT_ORIGIN_KEY_FILE=/run/secrets/henosis/audit-origin.key'
-require_line "$production_environment" 'HENOSIS_WITNESS_PUBLIC_KEY_FILE=/run/secrets/henosis/witness-public.key'
+require_line "$production_environment" 'SYNTHEOS_IMAGE_REPOSITORY=ghcr.io/syntheos-systems/henosis'
+require_line "$production_environment" 'SYNTHEOS_IMAGE_DIGEST=REPLACE_WITH_64_CHARACTER_LOWERCASE_HEX_DIGEST'
+require_line "$production_environment" 'SYNTHEOS_ROOM_MODE=required'
+require_line "$production_environment" 'SYNTHEOS_RIFT_BRIDGE_CONFIG=/run/secrets/henosis/agents.toml'
+require_line "$production_environment" 'SYNTHEOS_RIFT_AGENT_JWT_SECRET=REPLACE_WITH_DIFFERENT_AGENT_ONLY_AT_LEAST_64_RANDOM_HEX_CHARACTERS'
+require_line "$production_environment" 'SYNTHEOS_RIFT_ADDR=0.0.0.0:3200'
+require_line "$production_environment" 'SYNTHEOS_RIFT_BRIDGE_ADDR=127.0.0.1:3201'
+require_line "$production_environment" 'SYNTHEOS_RIFT_ALLOW_REMOTE_LISTEN=1'
+require_line "$production_environment" 'SYNTHEOS_AUDIT_ORIGIN_KEY_FILE=/run/secrets/henosis/audit-origin.key'
+require_line "$production_environment" 'SYNTHEOS_WITNESS_PUBLIC_KEY_FILE=/run/secrets/henosis/witness-public.key'
 # Require every authority and managed-room setting enforced by production startup.
 for required_environment_key in \
     SYNTHEOS_PLUTUS_DB \
     SYNTHEOS_OPERATOR_JWT_SECRET \
-    HENOSIS_RIFT_JWT_SECRET \
-    HENOSIS_RIFT_AGENT_JWT_SECRET \
-    HENOSIS_RIFT_BRIDGE_SECRET \
-    HENOSIS_RIFT_DATABASE_URL \
-    HENOSIS_RIFT_BRIDGE_CONFIG \
-    HENOSIS_RIFT_ADDR \
-    HENOSIS_RIFT_BRIDGE_ADDR \
-    HENOSIS_RIFT_ALLOW_REMOTE_LISTEN \
-    HENOSIS_RIFT_CORS_ORIGINS \
+    SYNTHEOS_RIFT_JWT_SECRET \
+    SYNTHEOS_RIFT_AGENT_JWT_SECRET \
+    SYNTHEOS_RIFT_BRIDGE_SECRET \
+    SYNTHEOS_RIFT_DATABASE_URL \
+    SYNTHEOS_RIFT_BRIDGE_CONFIG \
+    SYNTHEOS_RIFT_ADDR \
+    SYNTHEOS_RIFT_BRIDGE_ADDR \
+    SYNTHEOS_RIFT_ALLOW_REMOTE_LISTEN \
+    SYNTHEOS_RIFT_CORS_ORIGINS \
     PHYLAXD_URL \
     HERMES_PHYLAXD_TOKEN \
-    HENOSIS_WITNESS_URL \
-    HENOSIS_AUDIT_ORIGIN_KEY_FILE \
-    HENOSIS_AUDIT_ORIGIN_KEY_ID \
-    HENOSIS_WITNESS_PUBLIC_KEY_FILE \
-    HENOSIS_WITNESS_KEY_ID; do
+    SYNTHEOS_WITNESS_URL \
+    SYNTHEOS_AUDIT_ORIGIN_KEY_FILE \
+    SYNTHEOS_AUDIT_ORIGIN_KEY_ID \
+    SYNTHEOS_WITNESS_PUBLIC_KEY_FILE \
+    SYNTHEOS_WITNESS_KEY_ID; do
     require_line "$production_environment" "$required_environment_key="
 done
 # Example values must make the three independent Rift authorities visually unambiguous.
-human_jwt_placeholder=$(sed -n 's/^HENOSIS_RIFT_JWT_SECRET=//p' "$production_environment")
-agent_jwt_placeholder=$(sed -n 's/^HENOSIS_RIFT_AGENT_JWT_SECRET=//p' "$production_environment")
-bridge_placeholder=$(sed -n 's/^HENOSIS_RIFT_BRIDGE_SECRET=//p' "$production_environment")
+human_jwt_placeholder=$(sed -n 's/^SYNTHEOS_RIFT_JWT_SECRET=//p' "$production_environment")
+agent_jwt_placeholder=$(sed -n 's/^SYNTHEOS_RIFT_AGENT_JWT_SECRET=//p' "$production_environment")
+bridge_placeholder=$(sed -n 's/^SYNTHEOS_RIFT_BRIDGE_SECRET=//p' "$production_environment")
 if [ "$human_jwt_placeholder" = "$agent_jwt_placeholder" ] \
     || [ "$human_jwt_placeholder" = "$bridge_placeholder" ] \
     || [ "$agent_jwt_placeholder" = "$bridge_placeholder" ]; then

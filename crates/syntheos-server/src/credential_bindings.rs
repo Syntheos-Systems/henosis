@@ -17,7 +17,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 /// Environment variable pointing to the deployment-owned binding metadata file.
-pub const CREDENTIAL_BINDINGS_FILE_ENV: &str = "HENOSIS_AGENT_CREDENTIAL_BINDINGS_FILE";
+/// `SYNTHEOS_AGENT_CREDENTIAL_BINDINGS_FILE` is canonical; the legacy brand
+/// alias is honored read-only by the rename boundary.
+pub const CREDENTIAL_BINDINGS_FILE_ENV: &str = "SYNTHEOS_AGENT_CREDENTIAL_BINDINGS_FILE";
 
 /// Maximum accepted binding metadata file size.
 const MAX_BINDINGS_FILE_BYTES: u64 = 1024 * 1024;
@@ -60,7 +62,8 @@ pub struct FileCredentialBindingResolver {
 impl FileCredentialBindingResolver {
     /// Load the configured binding file and construct a Phylax client from process environment.
     pub fn from_env() -> Result<Self, MaterializeError> {
-        let path = std::env::var_os(CREDENTIAL_BINDINGS_FILE_ENV)
+        let path = syntheos_env::resolve_name(CREDENTIAL_BINDINGS_FILE_ENV)
+            .map_err(|error| materialize_error("credential_conflict", error.to_string()))?
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| {

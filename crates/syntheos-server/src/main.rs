@@ -392,11 +392,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    if auto_init_requested(optional_env("HENOSIS_AUTO_INIT")?.as_deref())? {
+    if auto_init_requested(optional_env("SYNTHEOS_AUTO_INIT")?.as_deref())? {
         CliRunner::local(cli_paths.clone())
             .run(syntheos_server::cli::quick_init_command_from_env())?;
     }
     syntheos_server::cli::load_local_environment_if_present(&cli_paths)?;
+    // Report legacy brand environment keys used by the pre-serve boundary once.
+    syntheos_env::emit_deprecations();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -421,7 +423,7 @@ fn auto_init_requested(value: Option<&str>) -> Result<bool, String> {
     match value {
         None => Ok(false),
         Some("quick") => Ok(true),
-        Some(_) => Err("HENOSIS_AUTO_INIT must be exactly quick when enabled".to_string()),
+        Some(_) => Err("SYNTHEOS_AUTO_INIT must be exactly quick when enabled".to_string()),
     }
 }
 
@@ -496,7 +498,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let directory_store = Arc::new(SqliteDirectory::open(&identity_db)?);
     let directory: Arc<dyn PrincipalDirectory> = directory_store.clone();
     tracing::info!(path = %identity_db, "principal directory open");
-    let approval_db = db_path("HENOSIS_APPROVAL_DB", "data/approval.sqlite")?;
+    let approval_db = db_path("SYNTHEOS_APPROVAL_DB", "data/approval.sqlite")?;
     let approvals = Arc::new(ApprovalStore::open(&approval_db)?);
     tracing::info!(path = %approval_db, "durable approval store open");
     let audit = audit_boundary_from_env(local_mode)?;
@@ -635,7 +637,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         syntheos_server::room_runtime::RoomRuntimeSelection::Disabled => {
             return Err(
-                "HENOSIS_ROOM_MODE=disabled is allowed only with SYNTHEOS_LOCAL_POLICY=1".into(),
+                "SYNTHEOS_ROOM_MODE=disabled is allowed only with SYNTHEOS_LOCAL_POLICY=1".into(),
             );
         }
         syntheos_server::room_runtime::RoomRuntimeSelection::Required(config) => Some(
@@ -718,6 +720,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     });
+
+    // Configuration load is complete; report any legacy brand environment keys
+    // in one structured event before the server begins accepting requests.
+    syntheos_env::emit_deprecations();
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "henosis listening with authenticated authority, phylaxd broker, and durable audit");
@@ -825,13 +831,12 @@ fn validated_bind_addr(raw: &str) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-/// Read an optional Unicode environment value without treating malformed data as absent.
+/// Read an optional Unicode environment value through the rename boundary.
+///
+/// Canonical `SYNTHEOS_*` keys are resolved together with their read-only
+/// legacy brand aliases; conflicting values fail closed.
 fn optional_env(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(format!("{name}: {error}")),
-    }
+    syntheos_env::resolve_name(name).map_err(|error| error.to_string())
 }
 
 /// Validate the explicit local policy selection and its single-operator identity.
@@ -953,19 +958,21 @@ fn is_loopback_url_host(host: &str) -> bool {
 
 /// Open local audit storage and require an independent witness outside explicit local mode.
 fn audit_boundary_from_env(local_mode: bool) -> Result<AuditBoundary, Box<dyn std::error::Error>> {
-    let audit_path = db_path("HENOSIS_AUDIT_DB", "data/audit.sqlite")?;
+    let audit_path = db_path("SYNTHEOS_AUDIT_DB", "data/audit.sqlite")?;
     let store = AuditStore::open(&audit_path)?;
     let witness_names = [
-        "HENOSIS_WITNESS_URL",
-        "HENOSIS_AUDIT_ORIGIN_KEY_FILE",
-        "HENOSIS_AUDIT_ORIGIN_KEY_ID",
-        "HENOSIS_WITNESS_PUBLIC_KEY_FILE",
-        "HENOSIS_WITNESS_KEY_ID",
+        "SYNTHEOS_WITNESS_URL",
+        "SYNTHEOS_AUDIT_ORIGIN_KEY_FILE",
+        "SYNTHEOS_AUDIT_ORIGIN_KEY_ID",
+        "SYNTHEOS_WITNESS_PUBLIC_KEY_FILE",
+        "SYNTHEOS_WITNESS_KEY_ID",
     ];
-    let configured = witness_names
-        .iter()
-        .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-        .count();
+    let mut configured = 0;
+    for name in witness_names {
+        if optional_env(name)?.is_some_and(|value| !value.trim().is_empty()) {
+            configured += 1;
+        }
+    }
     if configured == 0 && local_mode {
         return Ok(AuditBoundary::Local(store));
     }
@@ -978,11 +985,11 @@ fn audit_boundary_from_env(local_mode: bool) -> Result<AuditBoundary, Box<dyn st
     }
     require_witness_file_security()?;
 
-    let witness_url = required_nonempty_env("HENOSIS_WITNESS_URL")?;
-    let origin_key_path = required_nonempty_env("HENOSIS_AUDIT_ORIGIN_KEY_FILE")?;
-    let origin_key_id = required_nonempty_env("HENOSIS_AUDIT_ORIGIN_KEY_ID")?;
-    let witness_key_path = required_nonempty_env("HENOSIS_WITNESS_PUBLIC_KEY_FILE")?;
-    let witness_key_id = required_nonempty_env("HENOSIS_WITNESS_KEY_ID")?;
+    let witness_url = required_nonempty_env("SYNTHEOS_WITNESS_URL")?;
+    let origin_key_path = required_nonempty_env("SYNTHEOS_AUDIT_ORIGIN_KEY_FILE")?;
+    let origin_key_id = required_nonempty_env("SYNTHEOS_AUDIT_ORIGIN_KEY_ID")?;
+    let witness_key_path = required_nonempty_env("SYNTHEOS_WITNESS_PUBLIC_KEY_FILE")?;
+    let witness_key_id = required_nonempty_env("SYNTHEOS_WITNESS_KEY_ID")?;
     let origin = OriginSigner::new(
         origin_key_id,
         load_signing_key(Path::new(&origin_key_path))?,
@@ -998,10 +1005,11 @@ fn audit_boundary_from_env(local_mode: bool) -> Result<AuditBoundary, Box<dyn st
     ))))
 }
 
-/// Read one mandatory non-blank environment value without logging its contents.
+/// Read one mandatory non-blank environment value through the rename boundary
+/// without logging its contents.
 fn required_nonempty_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
+    match syntheos_env::resolve_name(name)? {
+        Some(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(format!("{name} is required").into()),
     }
 }
@@ -1199,8 +1207,7 @@ fn bootstrap_local_machine_token(
     directory: &SqliteDirectory,
     config: &LocalPolicyConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token_path = std::env::var("HENOSIS_LOCAL_TOKEN_FILE")
-        .unwrap_or_else(|_| "data/local-operator.token".to_string());
+    let token_path = syntheos_env::resolve_or("LOCAL_TOKEN_FILE", "data/local-operator.token")?;
     let path = Path::new(&token_path);
     let now = chrono::Utc::now().timestamp();
     match std::fs::symlink_metadata(path) {
@@ -1559,9 +1566,10 @@ async fn bootstrap_operator_if_configured(
     Ok(())
 }
 
-/// Resolve a service database path from `var`, falling back to `default`.
-fn db_path(var: &str, default: &str) -> Result<String, std::io::Error> {
-    Ok(std::env::var(var).unwrap_or_else(|_| default.to_string()))
+/// Resolve a service database path from the canonical `SYNTHEOS_*` key `var`,
+/// honoring the legacy brand alias, falling back to `default`.
+fn db_path(var: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(syntheos_env::resolve_name(var)?.unwrap_or_else(|| default.to_string()))
 }
 
 /// Read and validate the Plutus pool acquisition deadline from the process environment.

@@ -3912,6 +3912,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "syntheos-env",
  "thiserror 1.0.69",
  "tokio",
  "tower",
@@ -8316,6 +8317,7 @@ dependencies = [
  "synapse-provider",
  "synapse-session",
  "syntheos-contracts",
+ "syntheos-env",
  "tempfile",
  "time",
  "tokio",
@@ -8414,6 +8416,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntheos-env"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "syntheos-identity"
 version = "0.1.0"
 dependencies = [
@@ -8501,6 +8510,7 @@ dependencies = [
  "syntheos-axon",
  "syntheos-contracts",
  "syntheos-dispatch",
+ "syntheos-env",
  "syntheos-identity",
  "thiserror 1.0.69",
  "tokio",

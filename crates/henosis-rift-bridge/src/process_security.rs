@@ -145,6 +145,10 @@ pub(crate) fn scrub_sensitive_environment(command: &mut StdCommand) {
         "HENOSIS_RIFT_JWT_SECRET",
         "HENOSIS_RIFT_AGENT_JWT_SECRET",
         "HENOSIS_RIFT_BRIDGE_SECRET",
+        "SYNTHEOS_RIFT_DATABASE_URL",
+        "SYNTHEOS_RIFT_JWT_SECRET",
+        "SYNTHEOS_RIFT_AGENT_JWT_SECRET",
+        "SYNTHEOS_RIFT_BRIDGE_SECRET",
         "JWT_SECRET",
         "AGENT_JWT_SECRET",
         "RIFT_BRIDGE_SECRET",
@@ -153,6 +157,7 @@ pub(crate) fn scrub_sensitive_environment(command: &mut StdCommand) {
         "SYNTHEOS_OPERATOR_PASSWORD",
         "SYNTHEOS_STRIPE_WEBHOOK_SECRET",
         "HENOSIS_API_TOKEN",
+        "SYNTHEOS_API_TOKEN",
         "KLEOS_API_KEY",
         "HERMES_PHYLAXD_TOKEN",
         "OPENAI_API_KEY",
@@ -664,9 +669,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn nondumpable_parent_blocks_proc_environment_access() {
-        let mode = std::env::var_os("HENOSIS_PROCESS_SECURITY_TEST_MODE");
+        let mode = std::env::var_os("SYNTHEOS_PROCESS_SECURITY_TEST_MODE");
         if mode.as_deref() == Some(OsStr::new("reader")) {
-            let parent_pid = std::env::var("HENOSIS_PROCESS_SECURITY_PARENT_PID")
+            let parent_pid = std::env::var("SYNTHEOS_PROCESS_SECURITY_PARENT_PID")
                 .expect("reader receives the authority parent PID");
             let error = std::fs::read(format!("/proc/{parent_pid}/environ"))
                 .expect_err("same-UID reader must not read a non-dumpable parent environment");
@@ -676,16 +681,16 @@ mod tests {
 
         if mode.as_deref() == Some(OsStr::new("authority")) {
             assert_eq!(
-                std::env::var("HENOSIS_PROCESS_SECURITY_MARKER").as_deref(),
+                std::env::var("SYNTHEOS_PROCESS_SECURITY_MARKER").as_deref(),
                 Ok("authority-root-marker")
             );
             protect_authority_process().expect("authority process becomes non-dumpable");
             let executable = std::env::current_exe().expect("current test executable");
             let output = StdCommand::new(executable)
                 .env_clear()
-                .env("HENOSIS_PROCESS_SECURITY_TEST_MODE", "reader")
+                .env("SYNTHEOS_PROCESS_SECURITY_TEST_MODE", "reader")
                 .env(
-                    "HENOSIS_PROCESS_SECURITY_PARENT_PID",
+                    "SYNTHEOS_PROCESS_SECURITY_PARENT_PID",
                     std::process::id().to_string(),
                 )
                 .arg("--exact")
@@ -704,8 +709,8 @@ mod tests {
         let executable = std::env::current_exe().expect("current test executable");
         let output = StdCommand::new(executable)
             .env_clear()
-            .env("HENOSIS_PROCESS_SECURITY_TEST_MODE", "authority")
-            .env("HENOSIS_PROCESS_SECURITY_MARKER", "authority-root-marker")
+            .env("SYNTHEOS_PROCESS_SECURITY_TEST_MODE", "authority")
+            .env("SYNTHEOS_PROCESS_SECURITY_MARKER", "authority-root-marker")
             .arg("--exact")
             .arg("process_security::tests::nondumpable_parent_blocks_proc_environment_access")
             .arg("--nocapture")
@@ -875,7 +880,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn direct_executor_dies_when_authority_parent_is_killed() {
-        let mode = std::env::var_os("HENOSIS_PROCESS_SECURITY_TEST_MODE");
+        let mode = std::env::var_os("SYNTHEOS_PROCESS_SECURITY_TEST_MODE");
         if mode.as_deref() == Some(OsStr::new("pdeath-authority")) {
             let mut command = Command::new("/bin/sleep");
             command.arg("60");
@@ -890,7 +895,7 @@ mod tests {
         let mut authority_command = Command::new(executable);
         authority_command
             .env_clear()
-            .env("HENOSIS_PROCESS_SECURITY_TEST_MODE", "pdeath-authority")
+            .env("SYNTHEOS_PROCESS_SECURITY_TEST_MODE", "pdeath-authority")
             .arg("--exact")
             .arg("process_security::tests::direct_executor_dies_when_authority_parent_is_killed")
             .arg("--nocapture")
@@ -928,7 +933,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn direct_executor_parent_death_setup_closes_the_fork_race() {
-        let mode = std::env::var_os("HENOSIS_PROCESS_SECURITY_TEST_MODE");
+        let mode = std::env::var_os("SYNTHEOS_PROCESS_SECURITY_TEST_MODE");
         if mode.as_deref() == Some(OsStr::new("pdeath-race-authority")) {
             let mut command = Command::new("/bin/sleep");
             command.arg("60");
@@ -955,7 +960,7 @@ mod tests {
         authority_command
             .env_clear()
             .env(
-                "HENOSIS_PROCESS_SECURITY_TEST_MODE",
+                "SYNTHEOS_PROCESS_SECURITY_TEST_MODE",
                 "pdeath-race-authority",
             )
             .arg("--exact")

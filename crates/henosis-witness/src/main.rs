@@ -82,13 +82,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let database_path = required_env("HENOSIS_WITNESS_DATABASE")?;
-    let signing_key_path = required_env("HENOSIS_WITNESS_SIGNING_KEY_FILE")?;
-    let witness_key_id = required_env("HENOSIS_WITNESS_KEY_ID")?;
-    let origins_path = required_env("HENOSIS_WITNESS_ORIGIN_KEYS_FILE")?;
-    let bind: SocketAddr = std::env::var("HENOSIS_WITNESS_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:9877".into())
-        .parse()?;
+    let database_path = required_env("SYNTHEOS_WITNESS_DATABASE")?;
+    let signing_key_path = required_env("SYNTHEOS_WITNESS_SIGNING_KEY_FILE")?;
+    let witness_key_id = required_env("SYNTHEOS_WITNESS_KEY_ID")?;
+    let origins_path = required_env("SYNTHEOS_WITNESS_ORIGIN_KEYS_FILE")?;
+    let bind: SocketAddr = syntheos_env::resolve_or("WITNESS_BIND", "127.0.0.1:9877")?.parse()?;
+    // Configuration load is complete; report any legacy brand environment keys.
+    syntheos_env::emit_deprecations();
 
     let signing_key = load_signing_key(Path::new(&signing_key_path))?;
     let trusted_origins = load_origin_keys(Path::new(&origins_path))?;
@@ -100,11 +100,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Reads a required environment variable without printing its value.
+/// Reads a required environment variable through the rename boundary without
+/// printing its value. Canonical `SYNTHEOS_*` keys honor their legacy alias.
 fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    std::env::var(name).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, format!("{name} is required")).into()
-    })
+    syntheos_env::resolve_name(name)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("{name} is required")).into()
+        })
 }
 
 /// Loads a base64-encoded 32-byte Ed25519 signing key from a protected file.
