@@ -35,6 +35,9 @@ require_line "$production_compose" 'image: ${SYNTHEOS_IMAGE_REPOSITORY:-${HENOSI
 require_line "$production_compose" 'cap_drop: [ALL]'
 require_line "$production_compose" 'no-new-privileges:true'
 require_line "$production_compose" 'env_file: ["${SYNTHEOS_ENV_FILE:-${HENOSIS_ENV_FILE:-.env.production}}"]'
+require_line "$production_compose" 'SYNTHEOS_IMAGE_REPOSITORY and HENOSIS_IMAGE_REPOSITORY cannot both be set; unset one'
+require_line "$production_compose" 'SYNTHEOS_IMAGE_DIGEST and HENOSIS_IMAGE_DIGEST cannot both be set; unset one'
+require_line "$production_compose" 'SYNTHEOS_ENV_FILE and HENOSIS_ENV_FILE cannot both be set; unset one'
 require_line "$production_compose" './secrets:/run/secrets/henosis:ro'
 require_line "$production_environment" 'SYNTHEOS_IMAGE_REPOSITORY=ghcr.io/syntheos-systems/henosis'
 require_line "$production_environment" 'SYNTHEOS_IMAGE_DIGEST=REPLACE_WITH_64_CHARACTER_LOWERCASE_HEX_DIGEST'
@@ -93,6 +96,36 @@ retired_prefix='SYNTHEOS_''PHYLAX_'
 if grep -F "$retired_prefix" "$local_compose" "$production_compose" "$production_environment" "$production_roster" >/dev/null; then
     fail 'container assets must not configure the retired in-process credential authority'
 fi
+
+# Prove Compose itself rejects dual-prefix production inputs before selecting
+# an image or loading an environment file. Compose cannot compare equality, so
+# this boundary conservatively rejects both-present values even when identical.
+assert_compose_conflict() {
+    expected=$1
+    shift
+    if output=$(env "$@" docker compose -f "$production_compose" config --images 2>&1); then
+        fail "conflicting Compose values unexpectedly succeeded: $expected"
+    fi
+    printf '%s' "$output" | grep -F "$expected" >/dev/null ||
+        fail "Compose conflict omitted actionable keys: $expected"
+}
+if ! docker compose version >/dev/null 2>&1; then
+    fail 'docker compose is required to verify production interpolation conflicts'
+fi
+digest_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+digest_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+assert_compose_conflict 'SYNTHEOS_IMAGE_REPOSITORY and HENOSIS_IMAGE_REPOSITORY' \
+    SYNTHEOS_IMAGE_REPOSITORY=canonical.example/henosis \
+    HENOSIS_IMAGE_REPOSITORY=legacy.example/henosis \
+    SYNTHEOS_IMAGE_DIGEST="$digest_a" SYNTHEOS_ENV_FILE=production.env.example
+assert_compose_conflict 'SYNTHEOS_IMAGE_DIGEST and HENOSIS_IMAGE_DIGEST' \
+    SYNTHEOS_IMAGE_REPOSITORY=canonical.example/henosis \
+    SYNTHEOS_IMAGE_DIGEST="$digest_a" HENOSIS_IMAGE_DIGEST="$digest_b" \
+    SYNTHEOS_ENV_FILE=production.env.example
+assert_compose_conflict 'SYNTHEOS_ENV_FILE and HENOSIS_ENV_FILE' \
+    SYNTHEOS_IMAGE_REPOSITORY=canonical.example/henosis \
+    SYNTHEOS_IMAGE_DIGEST="$digest_a" SYNTHEOS_ENV_FILE=production.env.example \
+    HENOSIS_ENV_FILE=legacy.env
 for excluded in /data '**/.env' '**/secrets' '*.pem' '*.key' '*.p12' '*.pfx'; do
     require_line "$REPOSITORY_DIR/.dockerignore" "$excluded"
 done

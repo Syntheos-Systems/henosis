@@ -75,6 +75,27 @@ fn isolated_server() -> Command {
     command
 }
 
+/// A short-lived CLI command reports legacy configuration after tracing is
+/// installed instead of draining the deprecation before it is observable.
+#[test]
+fn legacy_cli_configuration_emits_deprecation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_henosis"))
+        .arg("--version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HENOSIS_HOME", temporary_home())
+        .output()
+        .expect("run version command with a legacy home alias");
+
+    assert!(output.status.success(), "version command must succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("legacy HENOSIS_* environment keys in use")
+            && stderr.contains("HENOSIS_HOME"),
+        "legacy CLI configuration must emit one actionable warning: {stderr}"
+    );
+}
+
 /// Quick initialization produces configuration that reaches the real local health endpoint.
 #[test]
 fn quick_initialization_boots_local_server() {

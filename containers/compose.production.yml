@@ -1,7 +1,16 @@
+x-syntheos-rename-boundary:
+  # Compose interpolation cannot compare equality, so this boundary is
+  # deliberately stricter than the Rust resolver: defining both forms is an
+  # actionable error even when their values happen to match. The internal
+  # conflict variables are sentinels and must never be set.
+  image-repository-conflict: ${SYNTHEOS_IMAGE_REPOSITORY:+${HENOSIS_IMAGE_REPOSITORY:+${SYNTHEOS_INTERNAL_IMAGE_REPOSITORY_CONFLICT:?SYNTHEOS_IMAGE_REPOSITORY and HENOSIS_IMAGE_REPOSITORY cannot both be set; unset one}}}
+  image-digest-conflict: ${SYNTHEOS_IMAGE_DIGEST:+${HENOSIS_IMAGE_DIGEST:+${SYNTHEOS_INTERNAL_IMAGE_DIGEST_CONFLICT:?SYNTHEOS_IMAGE_DIGEST and HENOSIS_IMAGE_DIGEST cannot both be set; unset one}}}
+  env-file-conflict: ${SYNTHEOS_ENV_FILE:+${HENOSIS_ENV_FILE:+${SYNTHEOS_INTERNAL_ENV_FILE_CONFLICT:?SYNTHEOS_ENV_FILE and HENOSIS_ENV_FILE cannot both be set; unset one}}}
+
 services:
   henosis:
     # Canonical SYNTHEOS_* interpolation with a read-only legacy brand alias
-    # fallback; the canonical value wins when both are set.
+    # fallback; the guard above rejects ambiguous dual definitions.
     image: ${SYNTHEOS_IMAGE_REPOSITORY:-${HENOSIS_IMAGE_REPOSITORY:?Set SYNTHEOS_IMAGE_REPOSITORY}}@sha256:${SYNTHEOS_IMAGE_DIGEST:-${HENOSIS_IMAGE_DIGEST:?Set SYNTHEOS_IMAGE_DIGEST to the 64-character image digest}}
     init: true
     user: "10001:10001"

@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -113,7 +114,12 @@ impl AgentTool for BashTool {
 
         let mut cmd = build_command(&command);
         cmd.current_dir(cwd);
-        restrict_agent_environment(&mut cmd);
+        if let Err(error) = restrict_agent_environment(&mut cmd) {
+            return Ok(ToolResult {
+                content: format!("Agent environment configuration failed: {error}"),
+                is_error: true,
+            });
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
@@ -258,6 +264,48 @@ const ENV_PASSTHROUGH_LEGACY_VAR: &str = "HENOSIS_AGENT_ENV_PASSTHROUGH";
 /// Suffix shared by the canonical and legacy passthrough variable names.
 const ENV_PASSTHROUGH_SUFFIX: &str = "AGENT_ENV_PASSTHROUGH";
 
+/// Process-wide result of the single agent-environment configuration load.
+static AGENT_ENVIRONMENT_PASSTHROUGH: OnceLock<
+    std::result::Result<Vec<String>, syntheos_env::EnvError>,
+> = OnceLock::new();
+
+/// Parse one resolved comma-separated passthrough list into safe variable names.
+fn parse_environment_passthrough(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| {
+            !name.is_empty() && *name != ENV_PASSTHROUGH_VAR && *name != ENV_PASSTHROUGH_LEGACY_VAR
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Resolve the production passthrough setting once and emit its deprecation
+/// report at that configuration-load boundary rather than for every command.
+fn configured_environment_passthrough(
+) -> &'static std::result::Result<Vec<String>, syntheos_env::EnvError> {
+    AGENT_ENVIRONMENT_PASSTHROUGH.get_or_init(|| {
+        let resolved =
+            syntheos_env::resolve(ENV_PASSTHROUGH_SUFFIX).map(parse_environment_passthrough);
+        syntheos_env::emit_deprecations();
+        resolved
+    })
+}
+
+/// Resolve an injectable passthrough setting for deterministic policy tests.
+#[cfg(test)]
+fn resolve_environment_passthrough_with<F>(
+    mut lookup: F,
+) -> std::result::Result<Vec<String>, syntheos_env::EnvError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    syntheos_env::resolve_with(ENV_PASSTHROUGH_SUFFIX, |name| Ok(lookup(name)))
+        .map(parse_environment_passthrough)
+}
+
 /// Replaces the child environment with an allowlist before the agent runs.
 ///
 /// The shell command is model-generated and therefore untrusted, while this
@@ -266,34 +314,28 @@ const ENV_PASSTHROUGH_SUFFIX: &str = "AGENT_ENV_PASSTHROUGH";
 /// exfiltrate all of them with a single `env`. A denylist cannot be made
 /// complete -- every new secret would have to be remembered here -- so the child
 /// starts empty and receives only variables known not to carry authority.
-fn restrict_agent_environment(command: &mut Command) {
-    apply_agent_environment(command, |name| std::env::var(name).ok());
+fn restrict_agent_environment(
+    command: &mut Command,
+) -> std::result::Result<(), &'static syntheos_env::EnvError> {
+    let extra = configured_environment_passthrough().as_ref()?;
+    apply_agent_environment(command, extra, |name| std::env::var(name).ok());
+    Ok(())
 }
 
 /// Applies the allowlist against an injectable lookup.
 ///
 /// Split out so tests can exercise the policy against a fixture instead of
 /// mutating the real process environment, which races the parallel test harness.
-fn apply_agent_environment<F>(command: &mut Command, lookup: F)
+fn apply_agent_environment<F>(command: &mut Command, extra: &[String], lookup: F)
 where
     F: Fn(&str) -> Option<String>,
 {
-    // A conflict between the canonical and legacy passthrough names fails
-    // closed to the restrictive side: no extra variables are forwarded.
-    let passthrough = syntheos_env::resolve_with(ENV_PASSTHROUGH_SUFFIX, |name| Ok(lookup(name)))
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let extra: Vec<&str> = passthrough
-        .split(',')
-        .map(str::trim)
-        .filter(|name| {
-            !name.is_empty() && *name != ENV_PASSTHROUGH_VAR && *name != ENV_PASSTHROUGH_LEGACY_VAR
-        })
-        .collect();
-
     command.env_clear();
-    for name in INHERITABLE_ENV.iter().copied().chain(extra) {
+    for name in INHERITABLE_ENV
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+    {
         if let Some(value) = lookup(name) {
             command.env(name, value);
         }
@@ -324,15 +366,18 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     /// Names the child would actually receive, given a fixture environment.
-    fn child_env_names(fixture: &HashMap<String, String>) -> Vec<String> {
+    fn child_env_names(
+        fixture: &HashMap<String, String>,
+    ) -> std::result::Result<Vec<String>, syntheos_env::EnvError> {
         let mut command = build_command("true");
-        apply_agent_environment(&mut command, |name| fixture.get(name).cloned());
-        command
+        let extra = resolve_environment_passthrough_with(|name| fixture.get(name).cloned())?;
+        apply_agent_environment(&mut command, &extra, |name| fixture.get(name).cloned());
+        Ok(command
             .as_std()
             .get_envs()
             .filter(|(_, value)| value.is_some())
             .map(|(name, _)| name.to_string_lossy().into_owned())
-            .collect()
+            .collect())
     }
 
     /// Build a fixture environment from name/value pairs.
@@ -361,7 +406,7 @@ mod tests {
         let mut pairs: Vec<(&str, &str)> = secrets.iter().map(|n| (*n, "leaked")).collect();
         pairs.push(("PATH", "/usr/bin"));
 
-        let names = child_env_names(&fixture(&pairs));
+        let names = child_env_names(&fixture(&pairs)).expect("resolve empty passthrough policy");
 
         for name in secrets {
             assert!(
@@ -374,7 +419,8 @@ mod tests {
     /// PATH still reaches the child, or every build and test command breaks.
     #[test]
     fn agent_shell_keeps_the_toolchain_baseline() {
-        let names = child_env_names(&fixture(&[("PATH", "/usr/bin"), ("SECRET", "x")]));
+        let names = child_env_names(&fixture(&[("PATH", "/usr/bin"), ("SECRET", "x")]))
+            .expect("resolve baseline passthrough policy");
         assert!(names.iter().any(|got| got == "PATH"));
         assert!(!names.iter().any(|got| got == "SECRET"));
     }
@@ -387,7 +433,8 @@ mod tests {
             ("HTTPS_PROXY", "http://proxy.internal:3128"),
             ("NEEDED_HOST", "registry.internal"),
             ("ANTHROPIC_API_KEY", "leaked"),
-        ]));
+        ]))
+        .expect("resolve canonical passthrough policy");
 
         assert!(names.iter().any(|got| got == "HTTPS_PROXY"));
         assert!(names.iter().any(|got| got == "NEEDED_HOST"));
@@ -404,7 +451,8 @@ mod tests {
         let names = child_env_names(&fixture(&[
             (ENV_PASSTHROUGH_LEGACY_VAR, "NEEDED_HOST"),
             ("NEEDED_HOST", "registry.internal"),
-        ]));
+        ]))
+        .expect("resolve legacy passthrough policy");
         assert!(names.iter().any(|got| got == "NEEDED_HOST"));
         assert!(
             !names.iter().any(|got| got == ENV_PASSTHROUGH_LEGACY_VAR),
@@ -412,18 +460,35 @@ mod tests {
         );
     }
 
-    /// Conflicting canonical and legacy passthrough values fail closed to the
-    /// restrictive side: no extra variables are forwarded.
+    /// A legacy passthrough alias is available to the one load-boundary
+    /// deprecation emission used by the production cache initializer.
+    #[test]
+    fn passthrough_legacy_alias_records_deprecation() {
+        let fixture = fixture(&[(ENV_PASSTHROUGH_LEGACY_VAR, "NEEDED_HOST")]);
+        resolve_environment_passthrough_with(|name| fixture.get(name).cloned())
+            .expect("resolve legacy passthrough policy");
+        let emitted = syntheos_env::emit_deprecations();
+        assert!(emitted
+            .iter()
+            .any(|name| name == ENV_PASSTHROUGH_LEGACY_VAR));
+    }
+
+    /// Conflicting canonical and legacy passthrough values reject the command
+    /// with key names and without inspecting either requested child variable.
     #[test]
     fn passthrough_conflict_fails_closed() {
-        let names = child_env_names(&fixture(&[
+        let error = child_env_names(&fixture(&[
             (ENV_PASSTHROUGH_VAR, "NEEDED_HOST"),
             (ENV_PASSTHROUGH_LEGACY_VAR, "OTHER_HOST"),
             ("NEEDED_HOST", "registry.internal"),
             ("OTHER_HOST", "other.internal"),
-        ]));
-        assert!(!names.iter().any(|got| got == "NEEDED_HOST"));
-        assert!(!names.iter().any(|got| got == "OTHER_HOST"));
+        ]))
+        .expect_err("conflicting passthrough settings must reject the command");
+        let message = error.to_string();
+        assert!(message.contains(ENV_PASSTHROUGH_VAR));
+        assert!(message.contains(ENV_PASSTHROUGH_LEGACY_VAR));
+        assert!(!message.contains("NEEDED_HOST"));
+        assert!(!message.contains("OTHER_HOST"));
     }
 
     /// A model-supplied timeout cannot exceed the documented ceiling.

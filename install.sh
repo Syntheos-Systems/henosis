@@ -24,35 +24,38 @@ die() {
 
 # Resolve one rename-boundary override: SYNTHEOS_<NAME> is canonical and
 # HENOSIS_<NAME> is a read-only compatibility alias. Both set with different
-# values fails closed. The NAME argument is always a literal chosen below.
+# values fails closed. The NAME argument is always a literal chosen below and
+# the second argument is the value used only when neither form is present.
 resolve_override() {
-    eval "canonical_value=\${SYNTHEOS_$1:-}"
-    eval "legacy_value=\${HENOSIS_$1:-}"
-    if [ -n "$canonical_value" ] && [ -n "$legacy_value" ] &&
+    if canonical_value=$(printenv "SYNTHEOS_$1"); then canonical_is_set=1; else canonical_is_set=; fi
+    if legacy_value=$(printenv "HENOSIS_$1"); then legacy_is_set=1; else legacy_is_set=; fi
+    if [ -n "$canonical_is_set" ] && [ -n "$legacy_is_set" ] &&
         [ "$canonical_value" != "$legacy_value" ]; then
         die "SYNTHEOS_$1 and HENOSIS_$1 are both set with different values; unset one (SYNTHEOS_$1 is canonical)"
     fi
-    if [ -n "$canonical_value" ]; then
-        printf '%s' "$canonical_value"
+    if [ -n "$canonical_is_set" ]; then
+        RESOLVED_OVERRIDE=$canonical_value
+    elif [ -n "$legacy_is_set" ]; then
+        RESOLVED_OVERRIDE=$legacy_value
     else
-        printf '%s' "$legacy_value"
+        RESOLVED_OVERRIDE=$2
     fi
 }
 
-RELEASE_BASE=$(resolve_override RELEASE_BASE)
-RELEASE_BASE=${RELEASE_BASE:-$DEFAULT_RELEASE_BASE}
-RELEASE_API=$(resolve_override RELEASE_API)
-RELEASE_API=${RELEASE_API:-https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags}
-VERSION=$(resolve_override VERSION)
-VERSION=${VERSION:-v0.1.0-alpha.6}
-INSTALL_DIR=$(resolve_override INSTALL_DIR)
-INSTALL_DIR=${INSTALL_DIR:-"${HOME}/.local/bin"}
-ATTESTATION_REPO=$(resolve_override ATTESTATION_REPO)
-ATTESTATION_REPO=${ATTESTATION_REPO:-Syntheos-Systems/henosis}
-SKIP_ATTESTATION=$(resolve_override SKIP_ATTESTATION)
-SKIP_ATTESTATION=${SKIP_ATTESTATION:-0}
-REQUIRE_ATTESTATION=$(resolve_override REQUIRE_ATTESTATION)
-REQUIRE_ATTESTATION=${REQUIRE_ATTESTATION:-0}
+resolve_override RELEASE_BASE "$DEFAULT_RELEASE_BASE"
+RELEASE_BASE=$RESOLVED_OVERRIDE
+resolve_override RELEASE_API https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags
+RELEASE_API=$RESOLVED_OVERRIDE
+resolve_override VERSION v0.1.0-alpha.6
+VERSION=$RESOLVED_OVERRIDE
+resolve_override INSTALL_DIR "${HOME}/.local/bin"
+INSTALL_DIR=$RESOLVED_OVERRIDE
+resolve_override ATTESTATION_REPO Syntheos-Systems/henosis
+ATTESTATION_REPO=$RESOLVED_OVERRIDE
+resolve_override SKIP_ATTESTATION 0
+SKIP_ATTESTATION=$RESOLVED_OVERRIDE
+resolve_override REQUIRE_ATTESTATION 0
+REQUIRE_ATTESTATION=$RESOLVED_OVERRIDE
 ATTESTATION_SIGNER_WORKFLOW=Syntheos-Systems/henosis/.github/workflows/ci.yml
 
 # Display the supported installer interface.

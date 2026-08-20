@@ -210,8 +210,21 @@ impl Collector {
 }
 
 #[cfg(test)]
+/// Exercises the canonical/legacy compatibility contract without concurrent
+/// access to process-global environment and deprecation state.
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process environment or drain the
+    /// process-global deprecation collector.
+    static TEST_ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    /// Holds the shared test-state lock for one complete resolver assertion.
+    fn lock_test_environment() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENVIRONMENT
+            .lock()
+            .expect("syntheos-env test state poisoned")
+    }
 
     /// Remove both prefixed forms of one suffix from the test environment.
     fn clear(suffix: &str) {
@@ -222,6 +235,7 @@ mod tests {
     /// Canonical-only values resolve without recording legacy usage.
     #[test]
     fn canonical_only_resolves() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_CANONICAL_ONLY";
         clear(suffix);
         std::env::set_var(format!("{CANONICAL_PREFIX}{suffix}"), "canonical");
@@ -232,6 +246,7 @@ mod tests {
     /// Legacy-only values resolve and are recorded for deprecation reporting.
     #[test]
     fn legacy_only_resolves_and_records() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_LEGACY_ONLY";
         clear(suffix);
         std::env::set_var(format!("{LEGACY_PREFIX}{suffix}"), "legacy");
@@ -246,6 +261,7 @@ mod tests {
     /// Identical values on both prefixes resolve and record legacy usage.
     #[test]
     fn identical_values_resolve() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_IDENTICAL";
         clear(suffix);
         std::env::set_var(format!("{CANONICAL_PREFIX}{suffix}"), "same");
@@ -257,6 +273,7 @@ mod tests {
     /// Differing values on both prefixes fail closed and name both keys.
     #[test]
     fn conflicting_values_fail_closed() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_CONFLICT";
         clear(suffix);
         std::env::set_var(format!("{CANONICAL_PREFIX}{suffix}"), "one");
@@ -281,6 +298,7 @@ mod tests {
     /// Absent keys resolve to None and resolve_or applies the default.
     #[test]
     fn absent_keys_resolve_to_default() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_ABSENT";
         clear(suffix);
         assert_eq!(resolve(suffix).unwrap(), None);
@@ -290,6 +308,7 @@ mod tests {
     /// Empty strings are treated as set values and participate in conflicts.
     #[test]
     fn empty_values_are_set_values() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_EMPTY";
         clear(suffix);
         std::env::set_var(format!("{CANONICAL_PREFIX}{suffix}"), "");
@@ -308,6 +327,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_unicode_values_fail_closed() {
+        let _guard = lock_test_environment();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let suffix = "ENV_TEST_NON_UNICODE";
@@ -322,6 +342,7 @@ mod tests {
     /// usage reports nothing.
     #[test]
     fn emission_drains_recorded_keys() {
+        let _guard = lock_test_environment();
         let suffix = "ENV_TEST_EMISSION";
         clear(suffix);
         std::env::set_var(format!("{LEGACY_PREFIX}{suffix}"), "legacy");

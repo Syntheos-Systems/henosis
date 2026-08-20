@@ -1164,25 +1164,30 @@ impl Harness {
     }
 }
 
+/// Convert one rename-boundary harness resolution into a CLI result.
+fn harness_from_resolution(
+    resolved: Result<Option<String>, syntheos_env::EnvError>,
+) -> Result<Harness, CliError> {
+    resolved
+        .map(|value| value.as_deref().map(Harness::parse).unwrap_or_default())
+        .map_err(|error| CliError::EnvironmentBoundary {
+            message: error.to_string(),
+        })
+}
+
 /// Resolve the harness selection from the environment.
 ///
 /// Used by both `henosis init --quick` and the automatic boot-time
 /// initialization path, so a `SYNTHEOS_HARNESS` set for a `curl | sh` install
 /// applies however initialization is reached. A conflict between the canonical
-/// key and its legacy alias degrades to the default harness instead of
-/// guessing.
-pub fn harness_from_env() -> Harness {
-    syntheos_env::resolve_name(HARNESS_ENV)
-        .ok()
-        .flatten()
-        .as_deref()
-        .map(Harness::parse)
-        .unwrap_or_default()
+/// key and its legacy alias fails closed before initialization writes state.
+pub fn harness_from_env() -> Result<Harness, CliError> {
+    harness_from_resolution(syntheos_env::resolve_name(HARNESS_ENV))
 }
 
 /// Build the source-compatible quick-init command selected by the environment.
-pub fn quick_init_command_from_env() -> Command {
-    quick_init_command(harness_from_env())
+pub fn quick_init_command_from_env() -> Result<Command, CliError> {
+    Ok(quick_init_command(harness_from_env()?))
 }
 
 /// Keep the established unit-style quick command for the built-in harness.
@@ -1199,7 +1204,7 @@ fn quick_init_command(harness: Harness) -> Command {
 /// environment variable is consulted so `curl | sh` installs can select a
 /// harness without an interactive prompt.
 fn parse_init(arguments: &[String]) -> Result<Command, CliError> {
-    let default_harness = harness_from_env();
+    let default_harness = harness_from_env()?;
     match arguments {
         [] => Err(CliError::InitModeRequired),
         [flag] if flag == "--quick" => Ok(quick_init_command(default_harness)),
@@ -2342,6 +2347,21 @@ mod tests {
             .expect("parse harness init"),
             Command::InitWithHarness(Harness::External("aider".to_string()))
         );
+    }
+
+    /// A conflicting harness alias reaches the caller as an actionable
+    /// environment-boundary failure instead of selecting the default harness.
+    #[test]
+    fn harness_conflict_fails_before_initialization() {
+        let error = harness_from_resolution(Err(syntheos_env::EnvError::Conflict {
+            canonical_key: "SYNTHEOS_HARNESS".to_string(),
+            legacy_key: "HENOSIS_HARNESS".to_string(),
+        }))
+        .expect_err("conflicting harness values must fail closed");
+
+        let message = error.to_string();
+        assert!(message.contains("SYNTHEOS_HARNESS"));
+        assert!(message.contains("HENOSIS_HARNESS"));
     }
 
     /// An unknown harness name is accepted as a binary rather than rejected.

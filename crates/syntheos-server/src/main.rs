@@ -372,8 +372,23 @@ struct LocalPolicyConfig {
     principal: syntheos_contracts::PrincipalId,
 }
 
-/// Parse local commands and load private configuration before creating worker threads.
+/// Install process-wide diagnostics, run the selected command, and flush any
+/// legacy-key report even when configuration loading returns early.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let result = run();
+    syntheos_env::emit_deprecations();
+    result
+}
+
+/// Parse local commands and load private configuration before creating worker threads.
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli_paths = CliPaths::from_environment()?;
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if !arguments.is_empty() {
@@ -394,7 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if auto_init_requested(optional_env("SYNTHEOS_AUTO_INIT")?.as_deref())? {
         CliRunner::local(cli_paths.clone())
-            .run(syntheos_server::cli::quick_init_command_from_env())?;
+            .run(syntheos_server::cli::quick_init_command_from_env()?)?;
     }
     syntheos_server::cli::load_local_environment_if_present(&cli_paths)?;
     // Report legacy brand environment keys used by the pre-serve boundary once.
@@ -429,12 +444,6 @@ fn auto_init_requested(value: Option<&str>) -> Result<bool, String> {
 
 /// Initialize every kernel authority and serve the unified Syntheos API.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     // Resolve the explicit policy authority before selecting security boundaries. Listen topology
     // never decides whether production witness and broker authentication requirements apply.
     let raw_addr = std::env::var("SYNTHEOS_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());

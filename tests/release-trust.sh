@@ -57,10 +57,12 @@ if grep -F 'repos/$GITHUB_REPOSITORY/immutable-releases' "$WORKFLOW" >/dev/null;
     fail 'workflow token cannot read the immutable release administration endpoint'
 fi
 require_line "$REPOSITORY_DIR/install.sh" 'release_metadata_fields'
-require_line "$REPOSITORY_DIR/install.sh" 'VERSION=${VERSION:-v0.1.0-alpha.6}'
+require_line "$REPOSITORY_DIR/install.sh" 'resolve_override VERSION v0.1.0-alpha.6'
 require_line "$REPOSITORY_DIR/install.sh" 'resolve_override'
 require_line "$REPOSITORY_DIR/install.ps1" '$metadata.immutable -ne $true'
 require_line "$REPOSITORY_DIR/install.ps1" "else { 'v0.1.0-alpha.6' }"
+require_line "$REPOSITORY_DIR/install.ps1" '$canonicalIsSet = $null -ne $canonical'
+require_line "$REPOSITORY_DIR/install.ps1" '$legacyIsSet = $null -ne $legacy'
 require_line "$REPOSITORY_DIR/crates/syntheos-server/Cargo.toml" 'version = "0.1.0-alpha.6"'
 require_line "$REPOSITORY_DIR/Cargo.lock" 'version = "0.1.0-alpha.6"'
 require_line "$README" "https://raw.githubusercontent.com/Syntheos-Systems/henosis/$BOOTSTRAP_COMMIT/install.sh"

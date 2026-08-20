@@ -33,11 +33,13 @@ function Resolve-EnvironmentOverride {
     )
     $canonical = [Environment]::GetEnvironmentVariable("SYNTHEOS_$Name")
     $legacy = [Environment]::GetEnvironmentVariable("HENOSIS_$Name")
-    if ($canonical -and $legacy -and $canonical -ne $legacy) {
+    $canonicalIsSet = $null -ne $canonical
+    $legacyIsSet = $null -ne $legacy
+    if ($canonicalIsSet -and $legacyIsSet -and $canonical -ne $legacy) {
         Stop-Install "SYNTHEOS_$Name and HENOSIS_$Name are both set with different values; unset one (SYNTHEOS_$Name is canonical)"
     }
-    if ($canonical) { return $canonical }
-    if ($legacy) { return $legacy }
+    if ($canonicalIsSet) { return $canonical }
+    if ($legacyIsSet) { return $legacy }
     return $Current
 }
 

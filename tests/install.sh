@@ -257,6 +257,34 @@ test_archive_marker_mismatch() {
     [ ! -e "$case_root/bin/henosis" ] || fail 'mismatched archive marker installed a binary'
 }
 
+# Verify an explicitly empty canonical value still participates in conflict
+# detection instead of silently selecting a populated legacy alias.
+test_empty_canonical_override_conflict() {
+    case_root="$TEST_ROOT/empty-canonical-conflict"
+    mkdir -p "$case_root"
+    if SYNTHEOS_VERSION= HENOSIS_VERSION=v9.9.9 \
+        "$REPOSITORY_DIR/install.sh" --headless > "$case_root/result.log" 2>&1; then
+        fail 'empty canonical installer override conflict succeeded'
+    fi
+    grep -F 'SYNTHEOS_VERSION and HENOSIS_VERSION are both set with different values' \
+        "$case_root/result.log" >/dev/null ||
+        fail 'empty canonical installer conflict omitted the actionable key names'
+}
+
+# Verify an explicitly empty canonical value is preserved for validation rather
+# than replaced by the installer's default release version.
+test_empty_canonical_override_is_not_defaulted() {
+    case_root="$TEST_ROOT/empty-canonical-only"
+    mkdir -p "$case_root"
+    if SYNTHEOS_VERSION= "$REPOSITORY_DIR/install.sh" --headless \
+        > "$case_root/result.log" 2>&1; then
+        fail 'empty canonical installer override unexpectedly selected the default'
+    fi
+    grep -F 'release version must begin with v and contain a numeric version' \
+        "$case_root/result.log" >/dev/null ||
+        fail 'empty canonical installer override did not reach version validation'
+}
+
 trap cleanup EXIT HUP INT TERM
 test_verified_install
 test_required_attestation_success
@@ -267,4 +295,6 @@ test_mutable_release_failure
 test_release_metadata_structure
 test_archive_local_install
 test_archive_marker_mismatch
+test_empty_canonical_override_conflict
+test_empty_canonical_override_is_not_defaulted
 printf '%s\n' 'installer contract passed'
