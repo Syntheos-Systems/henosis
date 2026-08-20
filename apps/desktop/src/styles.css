@@ -2134,23 +2134,46 @@ h3 {
     0 0 0 4px var(--mineral-300);
 }
 
-.dashboard-overview {
+.room-people-panel,
+.room-settings-panel {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-6);
 }
 
-.dashboard-overview h3 {
-  margin-bottom: 0;
+.dashboard-overview-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.dashboard-overview-heading h3 {
+  margin-bottom: var(--space-1);
   color: var(--bone-100);
   font-size: 1rem;
 }
 
-.dashboard-overview > p,
+.dashboard-overview-heading p:last-child,
 .dashboard-state > p {
   margin: 0;
   color: var(--bone-300);
   font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.dashboard-overview-heading > span,
+.human-owner-card__presence,
+.runtime-state {
+  flex: 0 0 auto;
+  padding: 0.24rem 0.42rem;
+  border: 1px solid var(--border-quiet);
+  border-radius: 999px;
+  color: var(--bone-400);
+  font-size: 0.55rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .dashboard-empty {
@@ -2161,16 +2184,115 @@ h3 {
   text-align: center;
 }
 
-.dashboard-facts {
+.room-people-panel__owners {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.human-owner-card,
+.unowned-identities-card,
+.bridge-control-card,
+.dashboard-future-state {
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: rgb(12 17 14 / 42%);
+}
+
+.human-owner-card > header,
+.bridge-control-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.human-owner-card h4,
+.unowned-identities-card h4,
+.bridge-control-card h4,
+.dashboard-future-state h4 {
+  margin: 0;
+  color: var(--bone-100);
+  font-size: 0.78rem;
+}
+
+.human-owner-card header p,
+.human-owner-card__empty,
+.dashboard-future-state p:last-child,
+.dashboard-note {
+  margin: var(--space-1) 0 0;
+  color: var(--bone-400);
+  font-size: 0.62rem;
+  line-height: 1.5;
+}
+
+.human-owner-card__presence {
+  border-color: rgb(155 195 173 / 25%);
+  color: var(--mineral-300);
+}
+
+.human-owner-card ul,
+.unowned-identities-card ul {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.human-owner-card li,
+.unowned-identities-card li {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--bone-200);
+  font-size: 0.66rem;
+}
+
+.human-owner-card li span,
+.unowned-identities-card li span {
+  overflow: hidden;
+  color: var(--bone-400);
+  font-size: 0.58rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unowned-identities-card {
+  border-color: rgb(207 138 109 / 24%);
+  background: rgb(184 111 88 / 6%);
+}
+
+.unowned-identities-card > p {
+  margin: var(--space-3) 0 0;
+  color: var(--bone-400);
+  font-size: 0.62rem;
+  line-height: 1.5;
+}
+
+.room-settings-panel__facts,
+.bridge-control-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
   margin: 0;
 }
 
-.dashboard-facts > div {
-  padding: var(--space-4) 0;
-  border-top: 1px solid var(--border-subtle);
+.room-settings-panel__facts > div,
+.bridge-control-card dl > div {
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: rgb(12 17 14 / 32%);
 }
 
-.dashboard-facts dt {
+.room-settings-panel__facts dt,
+.bridge-control-card dt {
   margin-bottom: var(--space-1);
   color: var(--bone-400);
   font-size: 0.58rem;
@@ -2179,10 +2301,52 @@ h3 {
   text-transform: uppercase;
 }
 
-.dashboard-facts dd {
+.room-settings-panel__facts dd,
+.bridge-control-card dd {
   margin: 0;
   color: var(--bone-200);
-  font-size: 0.7rem;
+  font-size: 0.66rem;
+  overflow-wrap: anywhere;
+}
+
+.bridge-control-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  border-color: rgb(155 195 173 / 19%);
+  background: rgb(155 195 173 / 5%);
+}
+
+.bridge-control-card dl {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.runtime-state--active {
+  border-color: rgb(155 195 173 / 29%);
+  color: var(--mineral-300);
+}
+
+.runtime-state--failed,
+.bridge-control-card__runtime-error,
+.room-settings-panel .dashboard-error {
+  color: var(--rust-400);
+}
+
+.bridge-control-card__runtime-error,
+.room-settings-panel .dashboard-error {
+  margin: 0;
+  font-size: 0.64rem;
+  line-height: 1.5;
+}
+
+.bridge-control-card .button {
+  width: 100%;
+  min-height: 44px;
+}
+
+.dashboard-future-state {
+  border-style: dashed;
+  background: transparent;
 }
 
 .agent-roster-map {

@@ -1,5 +1,5 @@
 /** Sanitized room-control loading and navigation shell. */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type {
   AgentControlAction,
@@ -7,6 +7,7 @@ import type {
   AgentIdentity,
   AgentRosterSnapshot,
   OwnedAgentIdentity,
+  RoomBridgeStatus,
 } from "../domain/agentControl";
 import {
   applyAgentControlAction,
@@ -25,6 +26,8 @@ import {
 } from "./DashboardTabs";
 import type { DashboardTabId } from "./DashboardTabs";
 import { AgentRosterMap } from "./AgentRosterMap";
+import { RoomPeoplePanel } from "./RoomPeoplePanel";
+import { RoomSettingsPanel } from "./RoomSettingsPanel";
 
 /** Inputs required to load one room's control context. */
 export interface RoomDashboardProps {
@@ -106,9 +109,18 @@ export function RoomDashboard({
 }: RoomDashboardProps) {
   const [activeTab, setActiveTab] = useState<DashboardTabId>("agents");
   const [retryGeneration, setRetryGeneration] = useState(0);
+  const bridgeMutationGeneration = useRef(0);
   const [loadState, setLoadState] = useState<DashboardLoadState>(() =>
     currentUserId ? { status: "loading" } : { status: "disconnected" },
   );
+
+  /** Invalidate every in-flight bridge mutation when the room context changes. */
+  useEffect(() => {
+    bridgeMutationGeneration.current += 1;
+    return () => {
+      bridgeMutationGeneration.current += 1;
+    };
+  }, [room.serverId]);
 
   useEffect(() => {
     if (!currentUserId) {
@@ -230,6 +242,46 @@ export function RoomDashboard({
     });
   }
 
+  /** Apply one authoritative bridge result without overwriting a changed room. */
+  function applyBridgeStatus(
+    serverId: string,
+    generation: number,
+    status: RoomBridgeStatus,
+  ): void {
+    setLoadState((current) => {
+      if (
+        bridgeMutationGeneration.current !== generation ||
+        current.status !== "ready" ||
+        current.control.serverSnapshot.serverId !== serverId
+      ) {
+        return current;
+      }
+      return {
+        status: "ready",
+        control: applyAgentControlAction(current.control, {
+          type: "runtimeUpdated",
+          status,
+        }),
+      };
+    });
+  }
+
+  /** Pause the selected room bridge and retain the server's returned truth. */
+  async function pauseBridge(): Promise<void> {
+    const serverId = room.serverId;
+    const generation = ++bridgeMutationGeneration.current;
+    const status = await client.pauseRoomBridge(serverId);
+    applyBridgeStatus(serverId, generation, status);
+  }
+
+  /** Resume the selected room bridge and retain the server's returned truth. */
+  async function resumeBridge(): Promise<void> {
+    const serverId = room.serverId;
+    const generation = ++bridgeMutationGeneration.current;
+    const status = await client.resumeRoomBridge(serverId);
+    applyBridgeStatus(serverId, generation, status);
+  }
+
   /** Guard leaving Agents when roster controls contain a local draft. */
   function canSelectTab(nextTab: DashboardTabId): boolean {
     if (
@@ -318,6 +370,8 @@ export function RoomDashboard({
         onCreateIdentity={createIdentity}
         onClaimIdentity={claimIdentity}
         onIdentityMutated={refreshIdentityContext}
+        onPauseBridge={pauseBridge}
+        onResumeBridge={resumeBridge}
       />
     </div>
   );
@@ -370,6 +424,10 @@ interface DashboardPanelProps {
     identity: OwnedAgentIdentity,
     addToRoom: boolean,
   ) => Promise<void>;
+  /** Pause the authoritative bridge for the selected room. */
+  readonly onPauseBridge: () => Promise<void>;
+  /** Resume the authoritative bridge for the selected room. */
+  readonly onResumeBridge: () => Promise<void>;
 }
 
 /** Render the selected room-control panel. */
@@ -381,6 +439,8 @@ function DashboardPanel({
   onCreateIdentity,
   onClaimIdentity,
   onIdentityMutated,
+  onPauseBridge,
+  onResumeBridge,
 }: DashboardPanelProps) {
   return (
     <section
@@ -399,57 +459,23 @@ function DashboardPanel({
           onIdentityMutated={onIdentityMutated}
         />
       ) : null}
-      {tab === "people" ? <PeopleOverview room={room} /> : null}
-      {tab === "room" ? <RoomOverview room={room} /> : null}
+      {tab === "people" ? (
+        <RoomPeoplePanel
+          room={room}
+          currentUserId={control.currentHumanId}
+          identities={control.identities}
+        />
+      ) : null}
+      {tab === "room" ? (
+        <RoomSettingsPanel
+          key={room.serverId}
+          room={room}
+          status={control.bridgeStatus}
+          canManageRoom={control.canManageRoom}
+          onPause={onPauseBridge}
+          onResume={onResumeBridge}
+        />
+      ) : null}
     </section>
-  );
-}
-
-/** Inputs for the initial people overview. */
-interface PeopleOverviewProps {
-  /** Selected room summary. */
-  readonly room: RoomSummary;
-}
-
-/** Render the current participant summary. */
-function PeopleOverview({ room }: PeopleOverviewProps) {
-  return (
-    <div className="dashboard-overview">
-      <div>
-        <p className="eyebrow">People</p>
-        <h3>Room participants</h3>
-      </div>
-      <p>{`${room.participants.length} visible ${
-        room.participants.length === 1 ? "participant" : "participants"
-      }`}</p>
-    </div>
-  );
-}
-
-/** Inputs for the initial room overview. */
-interface RoomOverviewProps {
-  /** Selected room summary. */
-  readonly room: RoomSummary;
-}
-
-/** Render sanitized room context and conversation state. */
-function RoomOverview({ room }: RoomOverviewProps) {
-  return (
-    <div className="dashboard-overview">
-      <div>
-        <p className="eyebrow">Room</p>
-        <h3>{room.topic ?? "Persistent conversation"}</h3>
-      </div>
-      <dl className="dashboard-facts">
-        <div>
-          <dt>Current thread</dt>
-          <dd>{room.activeWork ?? "Open conversation"}</dd>
-        </div>
-        <div>
-          <dt>Unread</dt>
-          <dd>{room.unreadCount} messages</dd>
-        </div>
-      </dl>
-    </div>
   );
 }

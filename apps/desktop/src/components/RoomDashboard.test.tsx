@@ -225,6 +225,112 @@ describe("RoomDashboard", () => {
     expect(screen.getByText("Member access")).toBeInTheDocument();
   });
 
+  it("updates bridge state from authoritative manager pause and resume results", async () => {
+    const client = new FixtureHenosisClient();
+    const pauseSpy = vi.spyOn(client, "pauseRoomBridge");
+    const resumeSpy = vi.spyOn(client, "resumeRoomBridge");
+    await renderDashboard(client);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Room" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pause bridge" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Bridge paused" }),
+    ).toBeInTheDocument();
+    expect(pauseSpy).toHaveBeenCalledWith("server-henosis");
+    fireEvent.click(screen.getByRole("button", { name: "Resume bridge" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Bridge running" }),
+    ).toBeInTheDocument();
+    expect(resumeSpy).toHaveBeenCalledWith("server-henosis");
+  });
+
+  it("ignores a bridge mutation result after leaving and returning to its room", async () => {
+    const client = new FixtureHenosisClient();
+    const stalePause = deferred<RoomBridgeStatus>();
+    vi.spyOn(client, "pauseRoomBridge").mockImplementation(
+      () => stalePause.promise,
+    );
+    const firstRoom = primaryRoom();
+    const secondRoom = createFixtureRooms().find(
+      (candidate) => candidate.serverId === "server-trust",
+    );
+    if (!secondRoom) {
+      throw new Error("The stale bridge test requires the Trust Lab fixture room.");
+    }
+    const { rerender } = render(
+      <RoomDashboard
+        client={client}
+        room={firstRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "Room" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pause bridge" }));
+
+    rerender(
+      <RoomDashboard
+        client={client}
+        room={secondRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    expect(
+      await screen.findByRole("heading", { name: secondRoom.name }),
+    ).toBeInTheDocument();
+    rerender(
+      <RoomDashboard
+        client={client}
+        room={firstRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    expect(
+      await screen.findByRole("heading", { name: firstRoom.name }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      stalePause.resolve({
+        paused: true,
+        desiredRevision: 7,
+        activeRevision: 7,
+        lastGoodRevision: 7,
+        runtimeActivation: "active",
+        runtimeErrorCode: null,
+        runtimeErrorMessage: null,
+      });
+      await stalePause.promise;
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Bridge running" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps room bridge mutations unavailable without manager permission", async () => {
+    const client = new FixtureHenosisClient();
+    const room = createFixtureRooms().find(
+      (candidate) => candidate.serverId === "server-trust",
+    );
+    if (!room) {
+      throw new Error("The permission test requires the Trust Lab fixture room.");
+    }
+    await renderDashboard(client, room);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Room" }));
+
+    expect(
+      screen.getByText("Bridge controls require room-manager access."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /bridge/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("does not query dashboard data when cached room context has no current user", () => {
     const client = new FixtureHenosisClient();
     const ownedSpy = vi.spyOn(client, "getMyAgents");
