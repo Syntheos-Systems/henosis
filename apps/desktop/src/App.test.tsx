@@ -29,6 +29,33 @@ function fixtureDirectory(): RoomDirectorySnapshot {
   };
 }
 
+/** Force RoomDetail into its modal dashboard presentation and return a restorer. */
+function installNarrowDashboardViewport(): () => void {
+  const originalMatchMedia = window.matchMedia;
+  const mediaQueryList: MediaQueryList = {
+    matches: false,
+    media: "(min-width: 1180px)",
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(() => false),
+  };
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(() => mediaQueryList),
+  });
+  return () => {
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: originalMatchMedia,
+    });
+  };
+}
+
 /** Minimal injected client that records App requests without native IPC. */
 class TestClient extends FixtureHenosisClient implements HenosisClient {
   /** Bootstrap response supplied by each test. */
@@ -210,6 +237,90 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "governance" }),
     ).toBeInTheDocument();
+  });
+
+  it("applies one complete owned-agent roster and reopens the sheet with saved state", async () => {
+    const restoreViewport = installNarrowDashboardViewport();
+    try {
+      const client = new FixtureHenosisClient();
+      const applySpy = vi.spyOn(client, "applyRoomAgentRoster");
+      render(<App client={client} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Continue room" }));
+      fireEvent.click(screen.getByRole("button", { name: "Open room dashboard" }));
+      await screen.findByRole("heading", { name: "Agent topology" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Add agent identity" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add Lumen to room" }));
+      fireEvent.change(screen.getByRole("combobox", { name: "Execution harness for Lumen" }), {
+        target: { value: "codex-cli" },
+      });
+      fireEvent.change(screen.getByRole("combobox", { name: "Model for Lumen" }), {
+        target: { value: "gpt-5.6-sol" },
+      });
+      fireEvent.change(screen.getByRole("combobox", { name: "Reasoning effort for Lumen" }), {
+        target: { value: "high" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+
+      await waitFor(() => expect(applySpy).toHaveBeenCalledOnce());
+      expect(applySpy).toHaveBeenCalledWith(
+        "server-henosis",
+        expect.objectContaining({
+          expectedRevision: 2,
+          seats: expect.arrayContaining([
+            expect.objectContaining({
+              agentIdentityId: "agent-lumen",
+              harnessKey: "codex-cli",
+              modelKey: "gpt-5.6-sol",
+              settings: { effort: "high" },
+            }),
+          ]),
+        }),
+      );
+      expect(applySpy.mock.calls[0][1].seats).toHaveLength(4);
+      expect(screen.getByText("Activating revision 3")).toBeInTheDocument();
+      expect(
+        await screen.findAllByText("Active · revision 3", {}, { timeout: 2_500 }),
+      ).toHaveLength(4);
+
+      fireEvent.click(screen.getByRole("button", { name: "Close room controls" }));
+      expect(screen.getByRole("region", { name: "Room conversation" })).toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: "Room dashboard" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Open room dashboard" }));
+
+      expect(await screen.findByRole("heading", { name: "Lumen" })).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Execution harness for Lumen" })).toHaveValue(
+        "codex-cli",
+      );
+      expect(screen.getByRole("combobox", { name: "Model for Lumen" })).toHaveValue(
+        "gpt-5.6-sol",
+      );
+      expect(screen.getByRole("combobox", { name: "Reasoning effort for Lumen" })).toHaveValue(
+        "high",
+      );
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  it("keeps the desired roster and last-good revision visible after activation fails", async () => {
+    const client = new FixtureHenosisClient();
+    client.injectNextAgentActivationFailure("server-henosis", "fixture_activation_failed");
+    const applySpy = vi.spyOn(client, "applyRoomAgentRoster");
+    render(<App client={client} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Continue room" }));
+    const effort = await screen.findByRole("combobox", { name: "Reasoning effort for Mira" });
+    fireEvent.change(effort, { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+
+    await waitFor(() => expect(applySpy).toHaveBeenCalledOnce());
+    expect(screen.getByText("Activating revision 3")).toBeInTheDocument();
+    expect(await screen.findByText("Activation failed", {}, { timeout: 2_500 })).toBeInTheDocument();
+    expect(screen.getAllByText("Failed · fixture_activation_failed")).toHaveLength(3);
+    expect(screen.getAllByText("Last good revision 2").length).toBeGreaterThan(0);
+    expect(effort).toHaveValue("high");
   });
 
   it("uses the first-run form when no directory exists", async () => {

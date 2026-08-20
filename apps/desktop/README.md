@@ -39,6 +39,43 @@ The browser surface is explicitly fixture-backed. A production build uses the
 Tauri adapter, retains Rift tokens in the native process, and saves only
 sanitized connection and room-cache data.
 
+## Room dashboard
+
+Conversation remains the primary room surface. Room controls open beside it on
+wide screens and as a keyboard-contained sheet on narrower screens. The
+dashboard has three tabs:
+
+- **Agents** shows the ordered room roster. Execution harness and model are
+  separate controls populated from the deployment capability catalog, including
+  availability and supported non-secret settings.
+- **People** groups human members and persistent agent identities by ownership.
+  An operator may configure an identity they own. A room manager may explicitly
+  claim a visible unowned import, but seeing an identity in a roster does not
+  grant ownership.
+- **Room** shows read-only server and bridge context. Operators with
+  `manageServer` permission may pause or resume the bridge; room rename and
+  policy mutation are outside this dashboard.
+
+Agent edits stay local until **Apply roster** sends one normalized whole-roster
+desired state with the current expected revision. **Discard changes** restores
+the last server snapshot. A concurrent revision never silently overwrites the
+local or remote version: the dashboard preserves the draft, loads current
+server truth, and offers field-level review or an explicit discard.
+
+After an accepted write, the desired revision is distinct from runtime state.
+The dashboard reports pending, active, or failed activation and identifies the
+last good revision when activation fails. Status checks use capped intervals
+and stop after 60 seconds; a timeout leaves the desired state pending and offers
+manual Refresh. Retry reconciles the same desired revision instead of creating
+another roster revision. Lost Rift authentication preserves safe visible state
+and routes recovery through an explicit Reconnect action.
+
+The React layer receives capability metadata, ownership identifiers, stable
+error codes, credential readiness, and at most an opaque credential-binding
+UUID. Rift tokens, Phylax credential values, and binding locator metadata remain
+inside native or server boundaries. Direct messages and human invitation
+mutations are intentionally absent from the alpha interface.
+
 ## Verification
 
 ```sh
