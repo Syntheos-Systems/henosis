@@ -284,8 +284,8 @@ fn parse_environment_passthrough(value: Option<String>) -> Vec<String> {
 
 /// Resolve the production passthrough setting once and emit its deprecation
 /// report at that configuration-load boundary rather than for every command.
-fn configured_environment_passthrough(
-) -> &'static std::result::Result<Vec<String>, syntheos_env::EnvError> {
+fn configured_environment_passthrough()
+-> &'static std::result::Result<Vec<String>, syntheos_env::EnvError> {
     AGENT_ENVIRONMENT_PASSTHROUGH.get_or_init(|| {
         let resolved =
             syntheos_env::resolve(ENV_PASSTHROUGH_SUFFIX).map(parse_environment_passthrough);
@@ -468,9 +468,11 @@ mod tests {
         resolve_environment_passthrough_with(|name| fixture.get(name).cloned())
             .expect("resolve legacy passthrough policy");
         let emitted = syntheos_env::emit_deprecations();
-        assert!(emitted
-            .iter()
-            .any(|name| name == ENV_PASSTHROUGH_LEGACY_VAR));
+        assert!(
+            emitted
+                .iter()
+                .any(|name| name == ENV_PASSTHROUGH_LEGACY_VAR)
+        );
     }
 
     /// Conflicting canonical and legacy passthrough values reject the command

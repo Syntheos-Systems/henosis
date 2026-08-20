@@ -145,7 +145,7 @@ Compose uses `henosis init --quick` and stores state in the `henosis-state` volu
 
 ## Build from source
 
-The headless workspace requires Rust 1.88 or newer:
+The headless workspace requires Rust 1.94 or newer:
 
 ```sh
 cargo build --locked --workspace

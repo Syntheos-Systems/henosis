@@ -463,7 +463,7 @@ impl RequestSigner {
             .ok()
             .or_else(dirs::cache_dir)
             .unwrap_or_else(std::env::temp_dir);
-        Some(base.join(format!("kleos-session-{}", &self.identity_hash)))
+        Some(base.join(format!("kleos-session-{}", self.identity_hash)))
     }
 
     /// Returns the cached session token: the in-process copy if present,
