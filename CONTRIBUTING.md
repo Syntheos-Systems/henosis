@@ -1,6 +1,6 @@
 # Contributing to Henosis
 
-Henosis is source-available active public-alpha software. Focus contributions on reproducible bugs, tests, documentation, and narrowly scoped integrations.
+Henosis is source-available active public-beta software. Focus contributions on reproducible bugs, tests, documentation, and narrowly scoped integrations.
 
 ## Before opening a change
 
@@ -8,7 +8,7 @@ Henosis is source-available active public-alpha software. Focus contributions on
 - Preserve loopback-by-default behavior and fail-closed policy boundaries.
 - Add tests for behavior and failure paths.
 - Comment every declaration in source files.
-- Keep public documentation truthful about alpha and production limits.
+- Keep public documentation truthful about beta and production limits.
 
 ## Validation
 

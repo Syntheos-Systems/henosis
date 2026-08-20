@@ -8470,7 +8470,7 @@ dependencies = [
 
 [[package]]
 name = "syntheos-server"
-version = "0.1.0-alpha.6"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -12,10 +12,7 @@ Henosis desktop does not start or install Rift, PostgreSQL, or a managed cloud
 service. If you do not have a Rift address and account, contact the operator of
 the Rift service you intend to use.
 
-> **Current alpha availability:** `v0.1.0-alpha.6` contains headless archives
-> only. It does not contain desktop installers. The filenames below are the
-> enforced contract for the next desktop-enabled release, not a claim about the
-> assets attached to `v0.1.0-alpha.6`.
+> **Beta availability:** `v0.1.0-beta.1` is the first release with desktop installers. The filenames below are the stable desktop release contract.
 
 ## Choose one installer
 
@@ -37,7 +34,7 @@ Mac showing an Apple chip uses `aarch64`; a Mac showing an Intel processor uses
 
 ## Current trust warnings
 
-Alpha packages are built by the public release workflow and receive checksums
+Beta packages are built by the public release workflow and receive checksums
 and GitHub provenance attestations, but they are not yet store-trusted:
 
 - the macOS application is ad hoc signed and is not Apple-notarized;

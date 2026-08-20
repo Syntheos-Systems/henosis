@@ -7,7 +7,7 @@ REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 TEST_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/henosis-desktop-release-test.XXXXXX")
 RELEASE_DIRECTORY="$TEST_DIRECTORY/release"
 DESKTOP_INSTALL_GUIDE="$REPOSITORY_DIR/docs/desktop-install.md"
-VERSION=0.1.0-alpha.6
+VERSION=0.1.0-beta.1
 
 # Remove only the isolated desktop release test workspace.
 cleanup() { rm -rf "$TEST_DIRECTORY"; }
@@ -58,8 +58,8 @@ do
     grep -F "$installer_name" "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
         fail "desktop install guide omits $installer_name"
 done
-grep -F '`v0.1.0-alpha.6` contains headless archives' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
-    fail 'desktop install guide misstates the current release'
+grep -F '`v0.1.0-beta.1` is the first release with desktop installers' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
+    fail 'desktop install guide misstates the beta release'
 grep -F 'does not start or install Rift' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||
     fail 'desktop install guide implies local Rift provisioning'
 grep -F 'not Apple-notarized' "$DESKTOP_INSTALL_GUIDE" >/dev/null ||

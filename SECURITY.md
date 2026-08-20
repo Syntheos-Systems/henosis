@@ -1,6 +1,6 @@
 # Security policy
 
-Henosis is source-available public alpha software. Do not use it as the sole security boundary for an exposed production system.
+Henosis is source-available public beta software. Do not use it as the sole security boundary for an exposed production system.
 
 ## Reporting a vulnerability
 

@@ -1,6 +1,6 @@
 [package]
 name = "henosis"
-version = "0.1.0-alpha.6"
+version = "0.1.0-beta.1"
 description = "Henosis graphical operating environment for persistent agents"
 edition = "2024"
 rust-version = "1.88"

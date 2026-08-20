@@ -23,9 +23,9 @@ test("collects required installers under stable release names", async (context) 
   const outputDirectory = join(testDirectory, "release");
 
   await mkdir(sourceDirectory, { recursive: true });
-  await writeFile(join(sourceDirectory, "Henosis_0.1.0-alpha.6_amd64.deb"), "deb");
+  await writeFile(join(sourceDirectory, "Henosis_0.1.0-beta.1_amd64.deb"), "deb");
   await writeFile(
-    join(sourceDirectory, "Henosis_0.1.0-alpha.6_amd64.AppImage"),
+    join(sourceDirectory, "Henosis_0.1.0-beta.1_amd64.AppImage"),
     "appimage",
   );
 
@@ -33,7 +33,7 @@ test("collects required installers under stable release names", async (context) 
   const collectedFiles = await collectReleaseAssets({
     sourceDirectory: join(testDirectory, "bundle"),
     outputDirectory,
-    version: "0.1.0-alpha.6",
+    version: "0.1.0-beta.1",
     target: "linux-x86_64",
     expectedSuffixes: ".deb,.AppImage",
   });
@@ -41,8 +41,8 @@ test("collects required installers under stable release names", async (context) 
   assert.deepEqual(
     collectedFiles.map((file) => file.slice(outputDirectory.length + 1)),
     [
-      "henosis-desktop-0.1.0-alpha.6-linux-x86_64.deb",
-      "henosis-desktop-0.1.0-alpha.6-linux-x86_64.AppImage",
+      "henosis-desktop-0.1.0-beta.1-linux-x86_64.deb",
+      "henosis-desktop-0.1.0-beta.1-linux-x86_64.AppImage",
     ],
   );
   assert.equal(await readFile(collectedFiles[0], "utf8"), "deb");
@@ -64,7 +64,7 @@ test("rejects ambiguous bundle output", async (context) => {
     collectReleaseAssets({
       sourceDirectory,
       outputDirectory: join(testDirectory, "release"),
-      version: "0.1.0-alpha.6",
+      version: "0.1.0-beta.1",
       target: "macos-aarch64",
       expectedSuffixes: ".dmg",
     }),

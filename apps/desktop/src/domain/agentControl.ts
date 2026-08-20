@@ -286,7 +286,7 @@ export interface AgentControlInitialization {
   readonly snapshot: AgentRosterSnapshot;
 }
 
-/** Primitive setting value accepted by every alpha catalog control. */
+/** Primitive setting value accepted by every catalog control. */
 export type AgentSettingValue = string | number | boolean;
 
 /** Every pure state transition accepted by the room agent reducer. */

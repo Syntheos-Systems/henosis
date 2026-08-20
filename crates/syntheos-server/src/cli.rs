@@ -89,7 +89,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (unavailable in alpha)\n  henosis uninstall (unavailable in alpha)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (not implemented)\n  henosis uninstall (not implemented)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -1047,8 +1047,8 @@ pub enum CliError {
         /// Stable command name that received the malformed success response.
         operation: &'static str,
     },
-    /// The selected command is intentionally not implemented by the alpha control surface.
-    #[error("{operation} is unavailable in the alpha control plane")]
+    /// The selected command is intentionally not implemented by the control surface.
+    #[error("{operation} is not implemented")]
     UnsupportedControlOperation {
         /// Stable command name that is deliberately unavailable.
         operation: &'static str,
@@ -2177,9 +2177,9 @@ mod tests {
         assert_eq!(output.message, "ok");
     }
 
-    /// Rejects alpha-only maintenance commands before issuing a network request.
+    /// Rejects unimplemented maintenance commands before issuing a network request.
     #[test]
-    fn alpha_maintenance_commands_are_explicitly_unsupported() {
+    fn maintenance_commands_are_explicitly_unsupported() {
         let client = test_http_client(
             validate_control_url("http://127.0.0.1:8088").expect("validate loopback URL"),
         );

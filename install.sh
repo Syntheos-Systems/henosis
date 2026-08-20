@@ -46,7 +46,7 @@ resolve_override RELEASE_BASE "$DEFAULT_RELEASE_BASE"
 RELEASE_BASE=$RESOLVED_OVERRIDE
 resolve_override RELEASE_API https://api.github.com/repos/Syntheos-Systems/henosis/releases/tags
 RELEASE_API=$RESOLVED_OVERRIDE
-resolve_override VERSION v0.1.0-alpha.6
+resolve_override VERSION v0.1.0-beta.1
 VERSION=$RESOLVED_OVERRIDE
 resolve_override INSTALL_DIR "${HOME}/.local/bin"
 INSTALL_DIR=$RESOLVED_OVERRIDE
@@ -68,7 +68,7 @@ verifies its mandatory SHA-256 checksum, installs it per-user, and runs:
   henosis init --quick
 
 Environment (SYNTHEOS_* canonical; legacy HENOSIS_* aliases honored read-only):
-  SYNTHEOS_VERSION       Release tag, default v0.1.0-alpha.6
+  SYNTHEOS_VERSION       Release tag, default v0.1.0-beta.1
   SYNTHEOS_RELEASE_BASE  Release download base URL
   SYNTHEOS_RELEASE_API   Release metadata API base URL
   SYNTHEOS_INSTALL_DIR   Destination directory, default ~/.local/bin

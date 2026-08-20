@@ -47,7 +47,7 @@
   <path d="M530 38V262" stroke="#e8e0d1" stroke-opacity=".18"/>
 
   <g fill="#e8e0d1">
-    <text x="576" y="67" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" letter-spacing="4" fill="#f05a42">PUBLIC ALPHA / 01</text>
+    <text x="576" y="67" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" letter-spacing="4" fill="#f05a42">PUBLIC BETA / 01</text>
     <text x="570" y="171" font-family="Georgia, 'Times New Roman', serif" font-size="92" letter-spacing="7">HENOSIS</text>
     <text x="576" y="207" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15" letter-spacing="6" fill="#657f77">PERSISTENT AGENT RUNTIME</text>
   </g>

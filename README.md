@@ -15,7 +15,7 @@ Governed infrastructure for persistent AI agents.
 
 Henosis gives agents a durable place to work across sessions while operators retain control of identity, policy, approvals, credentials, execution, and audit. Rift rooms provide the human coordination surface. A headless Rust control plane owns the trust boundary.
 
-> **Public alpha:** v0.1.0-alpha.6 contains headless archives. Desktop source and release packaging live in this source tree, but that tagged release has no desktop installers. Local mode binds to loopback and supports one operator. Review the [limitations ledger](scripts/known-incomplete.md) before any network exposure.
+> **Public beta:** v0.1.0-beta.1 includes headless archives and desktop installers. Local mode binds to loopback and supports one operator. Review the [limitations ledger](scripts/known-incomplete.md) before any network exposure.
 
 Henosis authenticates each request, checks current membership and policy, binds any approval to the exact action, limits execution, filters the result, and commits the audit record before returning control.
 
@@ -30,9 +30,8 @@ connection. You need a Rift service address and account from the person or team
 operating that service. The desktop installer does not provision Rift or its
 PostgreSQL database.
 
-The current `v0.1.0-alpha.6` release is headless-only. The guide records the
-stable desktop filenames and current operating-system trust warnings without
-claiming those installers already exist in that release.
+`v0.1.0-beta.1` is the first release with desktop installers. The guide lists
+the stable filenames and the current operating-system trust warnings.
 
 ### Headless runtime
 
@@ -43,7 +42,7 @@ On Linux or macOS, copy and run this command:
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.sh \
-  | sh -s -- --version v0.1.0-alpha.6
+  | sh -s -- --version v0.1.0-beta.1
 ```
 
 On Windows, open PowerShell, copy this command, and press Enter:
@@ -53,7 +52,7 @@ $installer = Join-Path ([IO.Path]::GetTempPath()) "henosis-install-$([guid]::New
 try {
   irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/1a9ff0730f36e9a3af537e09177d36e3be204229/install.ps1' -OutFile $installer
   $powerShell = (Get-Process -Id $PID).Path
-  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-alpha.6'
+  & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-beta.1'
   if ($LASTEXITCODE -ne 0) { throw "Henosis installer exited with code $LASTEXITCODE" }
 } finally {
   Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
@@ -108,7 +107,7 @@ The Tauri application opens to the Rift room directory and pins the room with th
 | --- | --- |
 | Identity | Human and machine credentials are tenant-bound, scoped, revocable, and checked against live membership. |
 | Approval | Durable, one-use approvals bind to the request, principal, tenant, policy revision, and expiry. Production requires a different administrator from the requester. |
-| Execution | The Wasmtime Component Model host enforces fuel, memory, time, output, and network limits. Third-party extension loading remains disconnected in the alpha. |
+| Execution | The Wasmtime Component Model host enforces fuel, memory, time, output, and network limits. Third-party extension loading remains disconnected. |
 | Filesystem | Built-in file tools accept task-root-relative paths and reject traversal and symlink escapes. `bash` is a separate capability with the operating-system access of the Henosis process. |
 | Credentials | Tools request named broker operations without receiving raw secrets. Production uses the external `phylaxd` broker. |
 | Audit | Henosis writes synchronous hash-chained records and supports an independent witness. Production requires off-host intent and outcome receipts. |
@@ -166,10 +165,10 @@ pnpm build
 Each release includes checksums, SPDX SBOMs, and GitHub OIDC provenance. Verify the Linux x86-64 archive after downloading it with `SHA256SUMS`:
 
 ```sh
-grep -F '  henosis-0.1.0-alpha.6-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
+grep -F '  henosis-0.1.0-beta.1-x86_64-unknown-linux-musl.tar.gz' SHA256SUMS \
   | sha256sum --check
 
-gh attestation verify henosis-0.1.0-alpha.6-x86_64-unknown-linux-musl.tar.gz \
+gh attestation verify henosis-0.1.0-beta.1-x86_64-unknown-linux-musl.tar.gz \
   --repo Syntheos-Systems/henosis \
   --signer-workflow Syntheos-Systems/henosis/.github/workflows/ci.yml
 ```

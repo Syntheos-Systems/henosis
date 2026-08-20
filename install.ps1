@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = $(if ($env:SYNTHEOS_VERSION) { $env:SYNTHEOS_VERSION } else { 'v0.1.0-alpha.6' }),
+    [string]$Version = $(if ($env:SYNTHEOS_VERSION) { $env:SYNTHEOS_VERSION } else { 'v0.1.0-beta.1' }),
     [string]$InstallDirectory = $(if ($env:SYNTHEOS_INSTALL_DIR) { $env:SYNTHEOS_INSTALL_DIR } else { Join-Path $HOME '.local\\bin' }),
     [switch]$Headless
 )

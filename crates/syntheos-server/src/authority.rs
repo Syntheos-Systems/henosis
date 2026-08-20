@@ -40,7 +40,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::operator::auth;
 
 /// Current server-owned approval policy version.
-pub const APPROVAL_POLICY_VERSION: &str = "henosis-public-alpha-v1";
+pub const APPROVAL_POLICY_VERSION: &str = "henosis-public-beta-v1";
 
 /// Default lifetime of a pending high-risk approval.
 const APPROVAL_TTL_SECONDS: i64 = 15 * 60;

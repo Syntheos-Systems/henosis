@@ -74,7 +74,7 @@ The React layer receives capability metadata, ownership identifiers, stable
 error codes, credential readiness, and at most an opaque credential-binding
 UUID. Rift tokens, Phylax credential values, and binding locator metadata remain
 inside native or server boundaries. Direct messages and human invitation
-mutations are intentionally absent from the alpha interface.
+mutations are intentionally absent from the current interface.
 
 ## Verification
 
