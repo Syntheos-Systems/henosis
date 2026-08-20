@@ -21,6 +21,7 @@ import type {
   RoomUnreadBoundary,
 } from "../domain/conversation";
 import type { RoomSummary } from "../domain/rooms";
+import type { DesktopExperienceProfile } from "../domain/experience";
 import {
   createFixtureAgentCatalog,
   createFixtureAgentIdentities,
@@ -169,6 +170,9 @@ export class FixtureHenosisClient implements HenosisClient {
   /** Whether the browser fixture currently owns an authenticated preview session. */
   private connected = true;
 
+  /** Non-secret graphical profile retained for browser-preview switching. */
+  private experience: DesktopExperienceProfile = "desktop";
+
   /** Persistent oldest-first fixture histories keyed by room identifier. */
   private readonly histories = new Map<string, RoomMessage[]>();
 
@@ -226,7 +230,16 @@ export class FixtureHenosisClient implements HenosisClient {
     return {
       directory: this.snapshot(),
       requiresAuthentication: false,
+      experience: this.experience,
     };
+  }
+
+  /** Retain one graphical profile for the lifetime of this fixture client. */
+  async setExperience(
+    experience: DesktopExperienceProfile,
+  ): Promise<DesktopExperienceProfile> {
+    this.experience = experience;
+    return this.experience;
   }
 
   /** Accept GUI credentials without retaining the password and return fixture data. */

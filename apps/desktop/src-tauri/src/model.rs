@@ -24,6 +24,31 @@ pub struct ConnectionProfile {
     pub username: String,
 }
 
+/// Non-secret graphical renderer selected by the installer or desktop user.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExperienceProfile {
+    /// Conversation-first room renderer.
+    Chat,
+    /// Complete operator dashboard and room controls.
+    #[default]
+    Desktop,
+    /// Deterministic spatial room and agent renderer.
+    Spatial,
+}
+
+/// Persisted graphical experience normalization rules.
+impl ExperienceProfile {
+    /// Normalize persisted text while treating future values as the safe desktop view.
+    pub fn from_persisted(value: &str) -> Self {
+        match value {
+            "chat" => Self::Chat,
+            "spatial" => Self::Spatial,
+            _ => Self::Desktop,
+        }
+    }
+}
+
 /// Authenticated Rift identity safe to expose to the webview.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -382,6 +407,8 @@ pub struct BootstrapResult {
     pub directory: Option<RoomDirectorySnapshot>,
     /// True when a person must authenticate before live refreshes.
     pub requires_authentication: bool,
+    /// Non-secret renderer preference selected by installer or desktop user.
+    pub experience: ExperienceProfile,
 }
 
 /// Persistent agent identity owned by the signed-in Rift human.

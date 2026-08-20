@@ -40,6 +40,16 @@ EOF
     (CDPATH= cd -- "$release_dir/$version" && sha256sum "$root.tar.gz" > SHA256SUMS)
 }
 
+# Create one executable desktop fixture and append it to the release checksum manifest.
+make_desktop_release() {
+    version=$1; release_dir=$2
+    asset="henosis-desktop-${version#v}-linux-x86_64.AppImage"
+    mkdir -p "$release_dir/$version"
+    printf '#!/bin/sh\nprintf desktop\n' > "$release_dir/$version/$asset"
+    chmod 755 "$release_dir/$version/$asset"
+    (CDPATH= cd -- "$release_dir/$version" && sha256sum "$asset" > SHA256SUMS)
+}
+
 # Create a curl double that serves only fixture release files.
 make_curl() {
     tools=$1
@@ -126,6 +136,43 @@ test_verified_install() {
     [ -x "$case_root/bin/henosis" ] || fail 'henosis was not installed'
     [ -x "$case_root/bin/crucible" ] || fail 'Crucible was not installed'
     [ "$(cat "$case_root/init.log")" = 'init --quick' ] || fail 'installer did not run henosis init --quick'
+}
+
+# Verify every graphical selection installs the shared desktop and persists its renderer.
+test_graphical_experience_install() {
+    version=v0.1.0-beta.1; release="$TEST_ROOT/desktop-release"
+    for experience in chat desktop spatial; do
+        case_root="$TEST_ROOT/desktop-$experience"
+        make_desktop_release "$version" "$release"
+        make_curl "$case_root/tools"; mkdir -p "$case_root/remote/$version"
+        cp "$release/$version"/* "$case_root/remote/$version/"
+        HOME="$case_root/home" XDG_DATA_HOME="$case_root/data" \
+            HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" \
+            PATH="$case_root/tools:$ORIGINAL_PATH" \
+            "$REPOSITORY_DIR/install.sh" --version "$version" \
+                --install-dir "$case_root/bin" --experience "$experience" \
+                --headless > "$case_root/result.json"
+        [ -x "$case_root/bin/henosis-desktop" ] || fail "$experience did not install the desktop application"
+        [ ! -e "$case_root/bin/henosis" ] || fail "$experience silently installed the CLI distribution"
+        [ "$(cat "$case_root/data/systems.syntheos.henosis/experience.json")" = "\"$experience\"" ] ||
+            fail "$experience preference was not persisted"
+        grep -F "\"experience\":\"$experience\"" "$case_root/result.json" >/dev/null ||
+            fail "$experience result omitted the selected renderer"
+    done
+}
+
+# Verify an unknown experience fails before a downloader or destination is touched.
+test_unknown_experience_failure() {
+    case_root="$TEST_ROOT/unknown-experience"
+    mkdir -p "$case_root/tools"
+    if HOME="$case_root/home" PATH="$case_root/tools:$ORIGINAL_PATH" \
+        "$REPOSITORY_DIR/install.sh" --install-dir "$case_root/bin" \
+            --experience unsupported --headless > "$case_root/result.json" 2>&1; then
+        fail 'unknown experience succeeded'
+    fi
+    [ ! -e "$case_root/bin" ] || fail 'unknown experience mutated the install destination'
+    grep -F 'unknown experience: unsupported' "$case_root/result.json" >/dev/null ||
+        fail 'unknown experience omitted the accepted values'
 }
 
 # Verify required provenance pins both the repository and release workflow identities.
@@ -287,6 +334,8 @@ test_empty_canonical_override_is_not_defaulted() {
 
 trap cleanup EXIT HUP INT TERM
 test_verified_install
+test_graphical_experience_install
+test_unknown_experience_failure
 test_required_attestation_success
 test_required_attestation_failure
 test_rollback

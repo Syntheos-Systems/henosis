@@ -150,6 +150,7 @@ function createHarness(options: { holdOpen?: boolean } = {}): ConversationHarnes
     connect: vi.fn(),
     refresh: vi.fn(),
     disconnect: vi.fn(),
+    setExperience: vi.fn(async (experience) => experience),
     getMyAgents: vi.fn(),
     createMyAgent: vi.fn(),
     claimAgent: vi.fn(),

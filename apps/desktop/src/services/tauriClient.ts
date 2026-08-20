@@ -17,6 +17,7 @@ import type {
   RoomMessage,
   RoomPermissions,
 } from "../domain/conversation";
+import type { DesktopExperienceProfile } from "../domain/experience";
 import type {
   BootstrapResult,
   HenosisClient,
@@ -34,6 +35,15 @@ export class TauriHenosisClient implements HenosisClient {
   /** Load saved profile, cache, and any active native session. */
   async bootstrap(): Promise<BootstrapResult> {
     return this.invokeCommand<BootstrapResult>("bootstrap");
+  }
+
+  /** Persist one non-secret graphical renderer preference in native app data. */
+  async setExperience(
+    experience: DesktopExperienceProfile,
+  ): Promise<DesktopExperienceProfile> {
+    return this.invokeCommand<DesktopExperienceProfile>("set_experience", {
+      experience,
+    });
   }
 
   /** Pass credentials once to Rust and receive only sanitized room data. */

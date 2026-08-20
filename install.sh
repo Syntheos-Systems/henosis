@@ -50,6 +50,8 @@ resolve_override VERSION v0.1.0-beta.1
 VERSION=$RESOLVED_OVERRIDE
 resolve_override INSTALL_DIR "${HOME}/.local/bin"
 INSTALL_DIR=$RESOLVED_OVERRIDE
+resolve_override EXPERIENCE cli
+EXPERIENCE=$RESOLVED_OVERRIDE
 resolve_override ATTESTATION_REPO Syntheos-Systems/henosis
 ATTESTATION_REPO=$RESOLVED_OVERRIDE
 resolve_override SKIP_ATTESTATION 0
@@ -61,17 +63,20 @@ ATTESTATION_SIGNER_WORKFLOW=Syntheos-Systems/henosis/.github/workflows/ci.yml
 # Display the supported installer interface.
 usage() {
     cat <<'EOF'
-Usage: install.sh [--version TAG] [--install-dir DIRECTORY] [--headless]
+Usage: install.sh [--version TAG] [--install-dir DIRECTORY]
+                  [--experience cli|chat|desktop|spatial] [--headless]
 
-Downloads the native Henosis release for this operating system and CPU,
-verifies its mandatory SHA-256 checksum, installs it per-user, and runs:
-  henosis init --quick
+Downloads and verifies the selected native Henosis experience. CLI installs
+Henosis and Crucible per-user and runs `henosis init --quick`. Chat, desktop,
+and spatial install the same signed desktop application with a different
+initial renderer preference.
 
 Environment (SYNTHEOS_* canonical; legacy HENOSIS_* aliases honored read-only):
   SYNTHEOS_VERSION       Release tag, default v0.1.0-beta.1
   SYNTHEOS_RELEASE_BASE  Release download base URL
   SYNTHEOS_RELEASE_API   Release metadata API base URL
   SYNTHEOS_INSTALL_DIR   Destination directory, default ~/.local/bin
+  SYNTHEOS_EXPERIENCE    Initial experience: cli, chat, desktop, or spatial
   SYNTHEOS_REQUIRE_ATTESTATION
                         Set to 1 to require sigstore build-provenance verification
                         via the GitHub CLI and refuse to install without it.
@@ -82,7 +87,9 @@ Environment (SYNTHEOS_* canonical; legacy HENOSIS_* aliases honored read-only):
                         --henosis-execute adapter modes.
 
 Examples:
-  curl -fsSL <url>/install.sh | SYNTHEOS_HARNESS=aider sh
+  ./install.sh --experience desktop
+  ./install.sh --experience spatial --headless
+  curl -fsSL <url>/install.sh | SYNTHEOS_EXPERIENCE=cli sh
   henosis init --quick --harness /opt/bin/my-agent
 EOF
 }
@@ -93,11 +100,66 @@ parse_args() {
         case "$1" in
             --version) [ "$#" -ge 2 ] || die '--version requires a value'; VERSION=$2; shift 2 ;;
             --install-dir) [ "$#" -ge 2 ] || die '--install-dir requires a value'; INSTALL_DIR=$2; shift 2 ;;
+            --experience) [ "$#" -ge 2 ] || die '--experience requires a value'; EXPERIENCE=$2; shift 2 ;;
             --headless) HEADLESS=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
     done
+}
+
+# Reject unknown experience values before downloads or filesystem mutation.
+validate_experience() {
+    case "$EXPERIENCE" in
+        cli|chat|desktop|spatial) ;;
+        *) die "unknown experience: $EXPERIENCE (choose cli, chat, desktop, or spatial)" ;;
+    esac
+}
+
+# Test whether the selected experience uses the shared desktop application.
+is_desktop_experience() {
+    [ "$EXPERIENCE" != cli ]
+}
+
+# Map this Unix host to one stable public desktop release asset.
+desktop_release_asset() {
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "$os:$arch" in
+        Linux:x86_64|Linux:amd64)
+            DESKTOP_ASSET="henosis-desktop-${VERSION#v}-linux-x86_64.AppImage"
+            DESKTOP_KIND=appimage
+            ;;
+        Darwin:x86_64)
+            DESKTOP_ASSET="henosis-desktop-${VERSION#v}-macos-x86_64.dmg"
+            DESKTOP_KIND=dmg
+            ;;
+        Darwin:arm64|Darwin:aarch64)
+            DESKTOP_ASSET="henosis-desktop-${VERSION#v}-macos-aarch64.dmg"
+            DESKTOP_KIND=dmg
+            ;;
+        *) die "the $EXPERIENCE desktop experience is not packaged for $os/$arch" ;;
+    esac
+}
+
+# Resolve the Tauri application-data directory used by the current Unix host.
+desktop_preference_dir() {
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "${HOME}/Library/Application Support/systems.syntheos.henosis" ;;
+        *) printf '%s\n' "${XDG_DATA_HOME:-${HOME}/.local/share}/systems.syntheos.henosis" ;;
+    esac
+}
+
+# Atomically persist the selected non-secret graphical renderer preference.
+write_desktop_preference() {
+    preference_dir=$(desktop_preference_dir)
+    mkdir -p "$preference_dir" || die 'could not create the Henosis application-data directory'
+    preference_new="$preference_dir/.experience.json.new.$$"
+    printf '"%s"\n' "$EXPERIENCE" > "$preference_new" ||
+        die 'could not write the Henosis experience preference'
+    chmod 600 "$preference_new" || die 'could not protect the Henosis experience preference'
+    mv -f "$preference_new" "$preference_dir/experience.json" ||
+        die 'could not activate the Henosis experience preference'
 }
 
 # Map the current Unix platform to the release target triple.
@@ -533,6 +595,76 @@ rollback() {
             rm -f "$CRUCIBLE_DESTINATION"
         fi
     fi
+    if [ "${DESKTOP_ACTIVATED:-0}" -eq 1 ]; then
+        if [ -n "${DESKTOP_BACKUP:-}" ] && [ -f "$DESKTOP_BACKUP" ]; then
+            mv -f "$DESKTOP_BACKUP" "$DESKTOP_DESTINATION"
+        else
+            rm -f "$DESKTOP_DESTINATION"
+        fi
+    fi
+}
+
+# Activate one verified desktop asset and persist its initial renderer.
+install_desktop_candidate() {
+    candidate=$1
+    asset_name=$2
+    if [ "$DESKTOP_KIND" = appimage ]; then
+        DESKTOP_DESTINATION="$INSTALL_DIR/henosis-desktop"
+        DESKTOP_BACKUP="$WORK_DIR/henosis-desktop.previous"
+        DESKTOP_ACTIVATED=0
+        mkdir -p "$INSTALL_DIR"
+        [ -d "$INSTALL_DIR" ] || die "install directory is not a directory: $INSTALL_DIR"
+        if [ -f "$DESKTOP_DESTINATION" ]; then cp -p "$DESKTOP_DESTINATION" "$DESKTOP_BACKUP"; fi
+        install -m 755 "$candidate" "$WORK_DIR/henosis-desktop.new"
+        mv -f "$WORK_DIR/henosis-desktop.new" "$DESKTOP_DESTINATION"
+        DESKTOP_ACTIVATED=1
+        write_desktop_preference
+        DESKTOP_ACTIVATED=0
+        rm -f "$DESKTOP_BACKUP"
+        if [ "$HEADLESS" -eq 1 ]; then
+            printf '{"ok":true,"experience":"%s","desktop":"%s","version":"%s"}\n' \
+                "$EXPERIENCE" "$DESKTOP_DESTINATION" "$VERSION"
+        else
+            info "installed $DESKTOP_DESTINATION with the $EXPERIENCE experience"
+        fi
+        return 0
+    fi
+
+    downloads_dir="${HOME}/Downloads"
+    mkdir -p "$downloads_dir" || die 'could not create the Downloads directory'
+    DESKTOP_DESTINATION="$downloads_dir/$asset_name"
+    install -m 644 "$candidate" "$DESKTOP_DESTINATION"
+    write_desktop_preference
+    if [ "$HEADLESS" -eq 1 ]; then
+        printf '{"ok":true,"experience":"%s","installer":"%s","action":"open-dmg","version":"%s"}\n' \
+            "$EXPERIENCE" "$DESKTOP_DESTINATION" "$VERSION"
+    else
+        info "verified $DESKTOP_DESTINATION with the $EXPERIENCE experience selected"
+        if command -v open >/dev/null 2>&1; then
+            open "$DESKTOP_DESTINATION" || die 'could not open the verified Henosis disk image'
+        else
+            info "open the disk image and drag Henosis to Applications"
+        fi
+    fi
+}
+
+# Download, verify, and activate the desktop distribution for one graphical profile.
+install_desktop() {
+    desktop_release_asset
+    manifest="$WORK_DIR/SHA256SUMS"
+    metadata="$WORK_DIR/release.json"
+    candidate="$WORK_DIR/$DESKTOP_ASSET"
+    url_base="${RELEASE_BASE%/}/$VERSION"
+    metadata_url="${RELEASE_API%/}/$VERSION"
+    info "verifying immutable release $VERSION"
+    download "$metadata_url" "$metadata" || die 'could not download release metadata'
+    verify_release_metadata "$metadata"
+    info "downloading $DESKTOP_ASSET"
+    download "$url_base/SHA256SUMS" "$manifest" || die 'could not download checksum manifest'
+    download "$url_base/$DESKTOP_ASSET" "$candidate" || die "could not download $DESKTOP_ASSET"
+    verify_archive "$manifest" "$candidate" "$DESKTOP_ASSET"
+    verify_attestation "$candidate" "$DESKTOP_ASSET"
+    install_desktop_candidate "$candidate" "$DESKTOP_ASSET"
 }
 
 # Remove only the private temporary workspace created by this installer.
@@ -567,7 +699,7 @@ install_candidate() {
     CRUCIBLE_ACTIVATED=0
     rm -f "$HENOSIS_BACKUP" "$CRUCIBLE_BACKUP"
     if [ "$HEADLESS" -eq 1 ]; then
-        printf '{"ok":true,"binary":"%s","crucible":"%s","version":"%s","target":"%s"}\n' "$HENOSIS_DESTINATION" "$CRUCIBLE_DESTINATION" "$VERSION" "$target"
+        printf '{"ok":true,"experience":"cli","binary":"%s","crucible":"%s","version":"%s","target":"%s"}\n' "$HENOSIS_DESTINATION" "$CRUCIBLE_DESTINATION" "$VERSION" "$target"
     else
         info "installed $HENOSIS_DESTINATION and $CRUCIBLE_DESTINATION"
     fi
@@ -576,6 +708,7 @@ install_candidate() {
 # Download or resolve, verify, activate, and initialize the native release.
 main() {
     parse_args "$@"
+    validate_experience
     case "$VERSION" in
         v[0-9]*)
             case "$VERSION" in *[!A-Za-z0-9._-]*) die 'release version contains unsupported characters' ;; esac
@@ -585,6 +718,10 @@ main() {
     target=$(release_target)
     WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/henosis-install.XXXXXX") || die 'could not create temporary directory'
     trap cleanup EXIT HUP INT TERM
+    if is_desktop_experience; then
+        install_desktop
+        return 0
+    fi
     mkdir -p "$INSTALL_DIR"
     [ -d "$INSTALL_DIR" ] || die "install directory is not a directory: $INSTALL_DIR"
     ARCHIVE_BINARY=

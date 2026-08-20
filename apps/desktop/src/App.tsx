@@ -1,10 +1,18 @@
 /** Henosis application state machine for setup, room selection, and room entry. */
 import { useEffect, useState } from "react";
 import type { RoomSummary } from "./domain/rooms";
+import {
+  DEFAULT_DESKTOP_EXPERIENCE,
+  normalizeDesktopExperience,
+} from "./domain/experience";
+import type { DesktopExperienceProfile } from "./domain/experience";
 import { AppShell } from "./components/AppShell";
+import { ChatWorkspace } from "./components/ChatWorkspace";
 import { ConnectionSetup } from "./components/ConnectionSetup";
+import { ExperienceSelector } from "./components/ExperienceSelector";
 import { RoomDetail } from "./components/RoomDetail";
 import { RoomDirectory } from "./components/RoomDirectory";
+import { SpatialWorkspace } from "./components/SpatialWorkspace";
 import { createHenosisClient } from "./services/client";
 import type {
   ConnectionProfile,
@@ -35,6 +43,10 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
   const [selectedRoom, setSelectedRoom] = useState<RoomSummary>();
   const [error, setError] = useState<HenosisClientError>();
   const [notice, setNotice] = useState<string>();
+  const [experience, setExperience] = useState<DesktopExperienceProfile>(
+    DEFAULT_DESKTOP_EXPERIENCE,
+  );
+  const [savingExperience, setSavingExperience] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -48,6 +60,7 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
         }
         setProfile(result.savedProfile);
         setDirectory(result.directory);
+        setExperience(normalizeDesktopExperience(result.experience));
         setShowSetup(!result.directory);
       } catch (bootstrapError) {
         if (active) {
@@ -128,6 +141,22 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
     setNotice(`${action} is not available in this build.`);
   }
 
+  /** Persist and activate one renderer without reconnecting or clearing room state. */
+  async function handleExperienceChange(next: DesktopExperienceProfile) {
+    if (next === experience || savingExperience) {
+      return;
+    }
+    setSavingExperience(true);
+    setNotice(undefined);
+    try {
+      setExperience(normalizeDesktopExperience(await client.setExperience(next)));
+    } catch (preferenceError) {
+      setNotice(normalizeClientError(preferenceError).message);
+    } finally {
+      setSavingExperience(false);
+    }
+  }
+
   if (loading) {
     return <LoadingScreen />;
   }
@@ -143,21 +172,55 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
     );
   }
 
+  const experienceSelector = (
+    <ExperienceSelector
+      value={experience}
+      busy={savingExperience}
+      onChange={handleExperienceChange}
+    />
+  );
+  const featureNotice = notice ? (
+    <FeatureNotice message={notice} onDismiss={() => setNotice(undefined)} />
+  ) : null;
+
+  if (experience === "chat") {
+    return (
+      <>
+        {featureNotice}
+        <ChatWorkspace
+          client={client}
+          directory={directory}
+          selectedRoom={selectedRoom}
+          onOpenRoom={handleOpenRoom}
+          onOpenDesktop={() => void handleExperienceChange("desktop")}
+          experienceSelector={experienceSelector}
+        />
+      </>
+    );
+  }
+
+  if (experience === "spatial" && !selectedRoom) {
+    return (
+      <>
+        {featureNotice}
+        <SpatialWorkspace
+          directory={directory}
+          onOpenRoom={handleOpenRoom}
+          experienceSelector={experienceSelector}
+        />
+      </>
+    );
+  }
+
   return (
     <AppShell
       directory={directory}
       connection={directory.connection}
       onRooms={handleRooms}
       onUnavailableWorkspace={handleUnavailableAction}
+      experienceSelector={experienceSelector}
     >
-      {notice ? (
-        <div className="feature-notice" role="status">
-          <p>{notice}</p>
-          <button type="button" onClick={() => setNotice(undefined)}>
-            Dismiss
-          </button>
-        </div>
-      ) : null}
+      {featureNotice}
 
       {selectedRoom ? (
         <RoomDetail
@@ -179,6 +242,26 @@ export function App({ client = DEFAULT_CLIENT }: AppProps) {
         />
       )}
     </AppShell>
+  );
+}
+
+/** Render a dismissible status message above every graphical experience. */
+function FeatureNotice({
+  message,
+  onDismiss,
+}: {
+  /** Human-readable status or failure detail. */
+  message: string;
+  /** Clear the current notice. */
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="feature-notice" role="status">
+      <p>{message}</p>
+      <button type="button" onClick={onDismiss}>
+        Dismiss
+      </button>
+    </div>
   );
 }
 

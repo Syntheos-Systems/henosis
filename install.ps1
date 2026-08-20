@@ -4,6 +4,7 @@
 param(
     [string]$Version = $(if ($env:SYNTHEOS_VERSION) { $env:SYNTHEOS_VERSION } else { 'v0.1.0-beta.1' }),
     [string]$InstallDirectory = $(if ($env:SYNTHEOS_INSTALL_DIR) { $env:SYNTHEOS_INSTALL_DIR } else { Join-Path $HOME '.local\\bin' }),
+    [string]$Experience = 'cli',
     [switch]$Headless
 )
 
@@ -51,6 +52,13 @@ if (-not $PSBoundParameters.ContainsKey('Version')) {
 if (-not $PSBoundParameters.ContainsKey('InstallDirectory')) {
     $InstallDirectory = Resolve-EnvironmentOverride -Name 'INSTALL_DIR' -Current $InstallDirectory
 }
+if (-not $PSBoundParameters.ContainsKey('Experience')) {
+    $Experience = Resolve-EnvironmentOverride -Name 'EXPERIENCE' -Current $Experience
+}
+if (@('cli', 'chat', 'desktop', 'spatial') -notcontains $Experience) {
+    Stop-Install "unknown experience: $Experience (choose cli, chat, desktop, or spatial)"
+}
+$Experience = $Experience.ToLowerInvariant()
 
 # Return an absolute HTTPS release base without credentials, query, or fragment.
 function Get-ReleaseBase {
@@ -199,7 +207,7 @@ function Install-Release {
         $activated = $false
         $crucibleActivated = $false
         if ($Headless) {
-            [pscustomobject]@{ ok = $true; binary = $destination; crucible = $crucibleDestination; version = $Version; target = $target } | ConvertTo-Json -Compress
+            [pscustomobject]@{ ok = $true; experience = 'cli'; binary = $destination; crucible = $crucibleDestination; version = $Version; target = $target } | ConvertTo-Json -Compress
         }
         else { Write-Host "henosis-installer: installed $destination" }
     }
@@ -216,4 +224,65 @@ function Install-Release {
     }
 }
 
-Install-Release
+# Atomically persist one non-secret graphical renderer in Tauri application data.
+function Write-ExperiencePreference {
+    $preferenceDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)) 'systems.syntheos.henosis'
+    $preferencePath = Join-Path $preferenceDirectory 'experience.json'
+    $temporaryPath = Join-Path $preferenceDirectory ('.experience.json.new.' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $preferenceDirectory | Out-Null
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, ('"' + $Experience + '"' + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporaryPath -Destination $preferencePath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Download, verify, and run the shared desktop installer for one graphical profile.
+function Install-DesktopExperience {
+    if ($Version -notmatch '^v[0-9][0-9A-Za-z.-]*$') { Stop-Install 'release version must be a valid v-prefixed tag' }
+    $target = Get-ReleaseTarget
+    $assetName = "henosis-desktop-$($Version.TrimStart('v'))-windows-x86_64.exe"
+    $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("henosis-desktop-install-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Force -Path $workDirectory | Out-Null
+        $releaseBase = Get-ReleaseBase
+        $releaseApi = Get-ReleaseApi
+        $metadataPath = Join-Path $workDirectory 'release.json'
+        $manifestPath = Join-Path $workDirectory 'SHA256SUMS'
+        $installerPath = Join-Path $workDirectory $assetName
+        Get-ReleaseFile -Uri "$releaseApi/$Version" -OutFile $metadataPath
+        Assert-ImmutableRelease -Path $metadataPath
+        Get-ReleaseFile -Uri "$releaseBase/$Version/SHA256SUMS" -OutFile $manifestPath
+        Get-ReleaseFile -Uri "$releaseBase/$Version/$assetName" -OutFile $installerPath
+        Assert-ArchiveChecksum -ManifestPath $manifestPath -ArchivePath $installerPath -ArchiveName $assetName
+        if ($Headless) {
+            $process = Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
+        }
+        else {
+            $process = Start-Process -FilePath $installerPath -Wait -PassThru
+        }
+        if ($process.ExitCode -ne 0) { Stop-Install "desktop installer exited with code $($process.ExitCode)" }
+        Write-ExperiencePreference
+        if ($Headless) {
+            [pscustomobject]@{ ok = $true; experience = $Experience; desktopInstaller = $assetName; version = $Version; target = $target } | ConvertTo-Json -Compress
+        }
+        else { Write-Host "henosis-installer: installed the $Experience experience" }
+    }
+    finally {
+        Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Dispatch the validated experience to its matching signed distribution.
+function Install-SelectedExperience {
+    if ($Experience -eq 'cli') {
+        Install-Release
+    }
+    else {
+        Install-DesktopExperience
+    }
+}
+
+Install-SelectedExperience

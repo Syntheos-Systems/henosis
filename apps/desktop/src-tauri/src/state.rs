@@ -15,14 +15,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::gateway::RiftGateway;
 use crate::model::{
-    CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, MessagePage,
-    RoomConnectionStatus, RoomConversationCommandResult, RoomConversationEvent,
+    CommandError, CommandErrorKind, ConnectionProfile, DirectorySource, ExperienceProfile,
+    MessagePage, RoomConnectionStatus, RoomConversationCommandResult, RoomConversationEvent,
     RoomConversationEventEnvelope, RoomDirectorySnapshot, RoomMessage, RoomStatus,
 };
 use crate::rift::AuthenticatedRiftClient;
 
 /// Fixed application-data filename for non-secret per-room read cursors.
 const ROOM_READ_MARKERS_FILENAME: &str = "rift-room-read-markers.json";
+
+/// Fixed application-data filename for the non-secret renderer preference.
+const EXPERIENCE_FILENAME: &str = "experience.json";
 
 /// Maximum number of recently updated room cursors retained on disk.
 const MAX_ROOM_READ_MARKERS: usize = 500;
@@ -1507,6 +1510,22 @@ pub fn read_profile(app: &AppHandle) -> Result<Option<ConnectionProfile>, Comman
 /// Save only non-secret Rift profile fields.
 pub fn write_profile(app: &AppHandle, profile: &ConnectionProfile) -> Result<(), CommandError> {
     write_json(app, "rift-profile.json", profile)
+}
+
+/// Load the renderer preference with a desktop fallback for absent or future values.
+pub fn read_experience(app: &AppHandle) -> Result<ExperienceProfile, CommandError> {
+    Ok(read_json::<String>(app, EXPERIENCE_FILENAME)?
+        .as_deref()
+        .map(ExperienceProfile::from_persisted)
+        .unwrap_or_default())
+}
+
+/// Atomically save one non-secret renderer preference.
+pub fn write_experience(
+    app: &AppHandle,
+    experience: ExperienceProfile,
+) -> Result<(), CommandError> {
+    write_json(app, EXPERIENCE_FILENAME, &experience)
 }
 
 /// Load cached rooms and force their provenance and connectivity flags offline.

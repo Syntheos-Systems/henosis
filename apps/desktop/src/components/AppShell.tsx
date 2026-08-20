@@ -50,6 +50,8 @@ export interface AppShellProps {
   connection?: SanitizedConnection;
   /** Primary workspace view. */
   children: ReactNode;
+  /** Graphical renderer selector displayed with global controls. */
+  experienceSelector?: ReactNode;
   /** Return to Rooms from an internal workspace. */
   onRooms(): void;
   /** Explain a workspace unavailable in the current build. */
@@ -61,6 +63,7 @@ export function AppShell({
   directory,
   connection,
   children,
+  experienceSelector,
   onRooms,
   onUnavailableWorkspace,
 }: AppShellProps) {
@@ -159,6 +162,7 @@ export function AppShell({
           </button>
 
           <div className="global-actions">
+            {experienceSelector}
             {approvalCount > 0 ? (
               <button
                 className="approval-indicator"

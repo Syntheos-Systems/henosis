@@ -22,6 +22,7 @@ pub fn run() {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::set_experience,
             commands::connect_rift,
             commands::get_room_directory,
             commands::get_my_agents,

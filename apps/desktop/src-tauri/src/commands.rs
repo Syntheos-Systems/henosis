@@ -14,17 +14,19 @@ use crate::gateway::{ROOM_CONVERSATION_EVENT, RiftGateway, RiftGatewayError, spa
 use crate::model::{
     AgentCapabilityCatalog, AgentRosterSnapshot, ApplyAgentRosterRequest, BootstrapResult,
     CommandError, CommandErrorKind, ConnectionProfile, DashboardCommandError, DashboardErrorKind,
-    MessagePage, OwnedAgentIdentity, PendingRoomAttachment, RiftConnectionInput, RoomBridgeStatus,
-    RoomConversationCommandResult, RoomConversationEvent, RoomConversationEventEnvelope,
-    RoomConversationSnapshot, RoomDirectorySnapshot, RoomMessage, RoomPermissions, RoomSummary,
+    ExperienceProfile, MessagePage, OwnedAgentIdentity, PendingRoomAttachment, RiftConnectionInput,
+    RoomBridgeStatus, RoomConversationCommandResult, RoomConversationEvent,
+    RoomConversationEventEnvelope, RoomConversationSnapshot, RoomDirectorySnapshot, RoomMessage,
+    RoomPermissions, RoomSummary,
 };
 use crate::reconcile::{
     MessagePageSource, RECONCILE_PAGE_SIZE, ReconcileError, reconcile_open_room, unread_boundary,
 };
 use crate::rift::{self, RiftError};
 use crate::state::{
-    AppState, RoomLease, RoomReadMarker, read_profile, read_room_cache, read_room_read_markers,
-    write_profile, write_room_cache, write_room_read_markers,
+    AppState, RoomLease, RoomReadMarker, read_experience, read_profile, read_room_cache,
+    read_room_read_markers, write_experience, write_profile, write_room_cache,
+    write_room_read_markers,
 };
 
 /// Serializes read-marker comparisons and atomic file replacements inside this process.
@@ -504,6 +506,7 @@ fn bootstrap_from_saved_state(
     saved_profile: Option<ConnectionProfile>,
     directory: Option<RoomDirectorySnapshot>,
     requires_authentication: bool,
+    experience: ExperienceProfile,
 ) -> BootstrapResult {
     let directory = directory.filter(|snapshot| {
         let Some(profile) = saved_profile.as_ref() else {
@@ -518,6 +521,7 @@ fn bootstrap_from_saved_state(
         saved_profile,
         directory,
         requires_authentication,
+        experience,
     }
 }
 
@@ -527,6 +531,7 @@ fn setup_bootstrap(app: &AppHandle) -> Result<BootstrapResult, CommandError> {
         read_profile(app)?,
         read_room_cache(app)?,
         true,
+        read_experience(app)?,
     ))
 }
 
@@ -547,6 +552,7 @@ pub async fn bootstrap(
                 saved_profile: Some(rift::profile_for(&session)),
                 directory: Some(directory),
                 requires_authentication: false,
+                experience: read_experience(&app)?,
             })
         }
         Err(RiftError::Authentication) => {
@@ -557,9 +563,20 @@ pub async fn bootstrap(
             read_profile(&app)?,
             read_room_cache(&app)?,
             false,
+            read_experience(&app)?,
         )),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Persist and return one non-secret graphical renderer preference.
+#[tauri::command]
+pub fn set_experience(
+    app: AppHandle,
+    experience: ExperienceProfile,
+) -> Result<ExperienceProfile, CommandError> {
+    write_experience(&app, experience)?;
+    Ok(experience)
 }
 
 /// Authenticate to Rift, cache sanitized room data, and retain tokens natively.
@@ -1249,22 +1266,27 @@ mod tests {
             Some(profile.clone()),
             Some(bootstrap_cache("https://rift.example", "operator")),
             true,
+            ExperienceProfile::Chat,
         );
         let mismatched = bootstrap_from_saved_state(
             Some(profile.clone()),
             Some(bootstrap_cache("https://other.example", "other-user")),
             false,
+            ExperienceProfile::Spatial,
         );
         let orphaned = bootstrap_from_saved_state(
             None,
             Some(bootstrap_cache("https://rift.example", "operator")),
             true,
+            ExperienceProfile::Desktop,
         );
 
         assert!(matching.directory.is_some());
         assert!(matching.requires_authentication);
+        assert_eq!(matching.experience, ExperienceProfile::Chat);
         assert!(mismatched.directory.is_none());
         assert!(!mismatched.requires_authentication);
+        assert_eq!(mismatched.experience, ExperienceProfile::Spatial);
         assert_eq!(
             mismatched
                 .saved_profile

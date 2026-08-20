@@ -22,6 +22,7 @@ import type {
   RoomPermissions,
 } from "../domain/conversation";
 import type { DirectorySource, RoomSummary } from "../domain/rooms";
+import type { DesktopExperienceProfile } from "../domain/experience";
 
 /** Credentials collected by the first-run connection form. */
 export interface RiftConnectionInput {
@@ -71,6 +72,8 @@ export interface BootstrapResult {
   directory?: RoomDirectorySnapshot;
   /** True when a person must authenticate before live refreshes. */
   requiresAuthentication: boolean;
+  /** Non-secret graphical renderer selected by installer or in-app preference. */
+  experience: DesktopExperienceProfile;
 }
 
 /** Callback receiving one sanitized, generation-scoped native room event. */
@@ -112,6 +115,10 @@ export class HenosisClientError extends Error {
 export interface HenosisClient {
   /** Inspect saved profile and cached/native session state. */
   bootstrap(): Promise<BootstrapResult>;
+  /** Persist one non-secret graphical renderer preference. */
+  setExperience(
+    experience: DesktopExperienceProfile,
+  ): Promise<DesktopExperienceProfile>;
   /** Authenticate and return the first live room snapshot. */
   connect(input: RiftConnectionInput): Promise<RoomDirectorySnapshot>;
   /** Refresh rooms through the already authenticated native session. */

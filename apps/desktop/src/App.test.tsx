@@ -139,6 +139,7 @@ describe("App", () => {
     const client = new TestClient({
       directory: fixtureDirectory(),
       requiresAuthentication: false,
+      experience: "desktop",
     });
 
     render(<App client={client} />);
@@ -151,10 +152,72 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Athena" })).not.toBeInTheDocument();
   });
 
+  it("boots into the installer-selected spatial profile with direct navigation parity", async () => {
+    const client = new TestClient({
+      directory: fixtureDirectory(),
+      requiresAuthentication: false,
+      experience: "spatial",
+    });
+
+    render(<App client={client} />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Rooms are places. Agents have a seat.",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("group", { name: "Interactive spatial room field" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Spatial room index" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Enter room orchard" }),
+    ).toHaveLength(1);
+  });
+
+  it("switches renderers without reconnecting or losing the selected room", async () => {
+    const client = new TestClient({
+      directory: fixtureDirectory(),
+      requiresAuthentication: false,
+      experience: "desktop",
+    });
+    const experienceSpy = vi.spyOn(client, "setExperience");
+    render(<App client={client} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Chat: Rooms and conversation stay in focus.",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", {
+        name: "Conversation without the control room.",
+      }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /orchard/i }));
+    await screen.findByRole("region", { name: "Room conversation" });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Desktop: Complete room, agent, and runtime controls.",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "orchard" }),
+    ).toBeInTheDocument();
+    expect(experienceSpy).toHaveBeenNthCalledWith(1, "chat");
+    expect(experienceSpy).toHaveBeenNthCalledWith(2, "desktop");
+    expect(client.connectSpy).not.toHaveBeenCalled();
+  });
+
   it("opens the primary room conversation beside its dashboard and closes it on return", async () => {
     const client = new TestClient({
       directory: fixtureDirectory(),
       requiresAuthentication: false,
+      experience: "desktop",
     });
     render(<App client={client} />);
 
@@ -202,6 +265,7 @@ describe("App", () => {
     const client = new TestClient({
       directory: fixtureDirectory(),
       requiresAuthentication: false,
+      experience: "desktop",
     });
     render(<App client={client} />);
 
@@ -324,7 +388,10 @@ describe("App", () => {
   });
 
   it("uses the first-run form when no directory exists", async () => {
-    const client = new TestClient({ requiresAuthentication: true });
+    const client = new TestClient({
+      requiresAuthentication: true,
+      experience: "desktop",
+    });
     render(<App client={client} />);
 
     expect(await screen.findByLabelText("Rift endpoint")).toBeInTheDocument();
@@ -353,7 +420,7 @@ describe("App", () => {
 
   it("preserves non-secret fields and clears the password after App rejects a connection", async () => {
     const client = new TestClient(
-      { requiresAuthentication: true },
+      { requiresAuthentication: true, experience: "desktop" },
       new HenosisClientError("authentication", "Rift rejected that account."),
     );
     render(<App client={client} />);
