@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import type {
+  AgentControlAction,
   AgentControlState,
   AgentIdentity,
   AgentRosterSnapshot,
@@ -23,6 +24,7 @@ import {
   dashboardTabId,
 } from "./DashboardTabs";
 import type { DashboardTabId } from "./DashboardTabs";
+import { AgentRosterMap } from "./AgentRosterMap";
 
 /** Inputs required to load one room's control context. */
 export interface RoomDashboardProps {
@@ -169,6 +171,18 @@ export function RoomDashboard({
     setRetryGeneration((generation) => generation + 1);
   }
 
+  /** Apply one UI intent through the immutable agent-control reducer. */
+  function dispatchControl(action: AgentControlAction): void {
+    setLoadState((current) =>
+      current.status === "ready"
+        ? {
+            status: "ready",
+            control: applyAgentControlAction(current.control, action),
+          }
+        : current,
+    );
+  }
+
   /** Guard leaving Agents when roster controls contain a local draft. */
   function canSelectTab(nextTab: DashboardTabId): boolean {
     if (
@@ -249,7 +263,12 @@ export function RoomDashboard({
         onSelect={setActiveTab}
         canSelect={canSelectTab}
       />
-      <DashboardPanel tab={activeTab} control={loadState.control} room={room} />
+      <DashboardPanel
+        tab={activeTab}
+        control={loadState.control}
+        room={room}
+        onControlAction={dispatchControl}
+      />
     </div>
   );
 }
@@ -285,10 +304,17 @@ interface DashboardPanelProps {
   readonly control: AgentControlState;
   /** Selected room context. */
   readonly room: RoomSummary;
+  /** Send one roster intent through the room-level reducer state. */
+  readonly onControlAction: (action: AgentControlAction) => void;
 }
 
 /** Render the selected room-control panel. */
-function DashboardPanel({ tab, control, room }: DashboardPanelProps) {
+function DashboardPanel({
+  tab,
+  control,
+  room,
+  onControlAction,
+}: DashboardPanelProps) {
   return (
     <section
       className="dashboard-panel"
@@ -297,47 +323,12 @@ function DashboardPanel({ tab, control, room }: DashboardPanelProps) {
       aria-labelledby={dashboardTabId(tab)}
       tabIndex={0}
     >
-      {tab === "agents" ? <AgentsOverview control={control} /> : null}
+      {tab === "agents" ? (
+        <AgentRosterMap control={control} onAction={onControlAction} />
+      ) : null}
       {tab === "people" ? <PeopleOverview room={room} /> : null}
       {tab === "room" ? <RoomOverview room={room} /> : null}
     </section>
-  );
-}
-
-/** Inputs for the initial agents overview. */
-interface AgentsOverviewProps {
-  /** Loaded agent-control reducer state. */
-  readonly control: AgentControlState;
-}
-
-/** Render the current roster and bridge summary. */
-function AgentsOverview({ control }: AgentsOverviewProps) {
-  const seatCount = control.serverSnapshot.seats.length;
-  const bridgeLabel = control.bridgeStatus.paused
-    ? "Bridge paused"
-    : `Bridge ${control.bridgeStatus.runtimeActivation}`;
-  return (
-    <div className="dashboard-overview">
-      <div>
-        <p className="eyebrow">Agents</p>
-        <h3>Roster context</h3>
-      </div>
-      {seatCount === 0 ? (
-        <p className="dashboard-empty">No agents in this room yet.</p>
-      ) : (
-        <p>{`${seatCount} ${seatCount === 1 ? "agent" : "agents"} in this room`}</p>
-      )}
-      <dl className="dashboard-facts">
-        <div>
-          <dt>Available</dt>
-          <dd>{control.identities.length} identities available</dd>
-        </div>
-        <div>
-          <dt>Runtime</dt>
-          <dd>{bridgeLabel}</dd>
-        </div>
-      </dl>
-    </div>
   );
 }
 

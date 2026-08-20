@@ -397,7 +397,7 @@ describe("RoomDetail dashboard presentation", () => {
     const close = within(dialog).getByRole("button", { name: "Close room controls" });
     expect(close).toHaveFocus();
 
-    const last = within(dialog).getByRole("tabpanel", { name: "Agents" });
+    const last = within(dialog).getByRole("button", { name: "Add Lumen to room" });
     last.focus();
     fireEvent.keyDown(last, { key: "Tab" });
     expect(close).toHaveFocus();
