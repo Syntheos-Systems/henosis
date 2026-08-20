@@ -324,6 +324,56 @@ describe("RoomDashboard", () => {
     expect(screen.getByText("No agents in this room yet.")).toBeInTheDocument();
     expect(screen.queryByText("3 agents in this room")).not.toBeInTheDocument();
   });
+
+  it("creates an owned identity, refreshes context, and adds one local room draft", async () => {
+    const client = new FixtureHenosisClient();
+    const createSpy = vi.spyOn(client, "createMyAgent");
+    const ownedSpy = vi.spyOn(client, "getMyAgents");
+    const rosterSpy = vi.spyOn(client, "getRoomAgentRoster");
+    await renderDashboard(client);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add agent identity" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Handle" }), {
+      target: { value: "builder" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Display name (optional)" }), {
+      target: { value: "Builder" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create and add" }));
+
+    expect(await screen.findByRole("heading", { name: "Builder" })).toBeInTheDocument();
+    expect(screen.getByText("4 agents in this room")).toBeInTheDocument();
+    expect(screen.getByText("Not yet applied")).toBeInTheDocument();
+    expect(createSpy).toHaveBeenCalledWith("builder", "Builder");
+    expect(ownedSpy).toHaveBeenCalledTimes(2);
+    expect(rosterSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("claims a roster-visible identity only after confirmation and refreshes its owner", async () => {
+    const client = new FixtureHenosisClient();
+    const claimSpy = vi.spyOn(client, "claimAgent");
+    const ownedSpy = vi.spyOn(client, "getMyAgents");
+    const rosterSpy = vi.spyOn(client, "getRoomAgentRoster");
+    await renderDashboard(client);
+
+    expect(
+      screen.getByRole("combobox", { name: "Execution harness for Imported scout" }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Add agent identity" }));
+    fireEvent.click(screen.getByRole("button", { name: "Claim Imported scout" }));
+    expect(claimSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm claim" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("combobox", { name: "Execution harness for Imported scout" }),
+      ).toBeEnabled();
+    });
+    expect(screen.getByText("3 agents in this room")).toBeInTheDocument();
+    expect(claimSpy).toHaveBeenCalledWith("agent-imported");
+    expect(ownedSpy).toHaveBeenCalledTimes(2);
+    expect(rosterSpy).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("DashboardTabs", () => {
@@ -397,7 +447,7 @@ describe("RoomDetail dashboard presentation", () => {
     const close = within(dialog).getByRole("button", { name: "Close room controls" });
     expect(close).toHaveFocus();
 
-    const last = within(dialog).getByRole("button", { name: "Add Lumen to room" });
+    const last = within(dialog).getByRole("button", { name: "Add agent identity" });
     last.focus();
     fireEvent.keyDown(last, { key: "Tab" });
     expect(close).toHaveFocus();

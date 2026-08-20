@@ -43,7 +43,19 @@ function StatefulRoster({ initialState = createControlState() }: { readonly init
     setState((current) => applyAgentControlAction(current, action));
   }
 
-  return <AgentRosterMap control={state} onAction={onAction} />;
+  return (
+    <AgentRosterMap
+      control={state}
+      onAction={onAction}
+      onCreateIdentity={async () => {
+        throw new Error("Identity creation is outside this roster reducer test.");
+      }}
+      onClaimIdentity={async () => {
+        throw new Error("Identity claim is outside this roster reducer test.");
+      }}
+      onIdentityMutated={async () => undefined}
+    />
+  );
 }
 
 describe("AgentRosterMap", () => {
@@ -158,6 +170,7 @@ describe("AgentRosterMap", () => {
   it("adds and removes owned identities without deleting the persistent identity", () => {
     render(<StatefulRoster />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Add agent identity" }));
     fireEvent.click(screen.getByRole("button", { name: "Add Lumen to room" }));
     expect(screen.getByRole("heading", { name: "Lumen" })).toBeInTheDocument();
     expect(screen.getByText("4 agents in this room")).toBeInTheDocument();
@@ -165,6 +178,7 @@ describe("AgentRosterMap", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remove Lumen from room" }));
     expect(screen.queryByRole("heading", { name: "Lumen" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add agent identity" }));
     expect(screen.getByRole("button", { name: "Add Lumen to room" })).toBeInTheDocument();
   });
 

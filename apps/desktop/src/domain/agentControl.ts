@@ -376,6 +376,14 @@ export type AgentControlAction =
       readonly type: "catalogUpdated";
       /** Latest generation-stamped deployment catalog. */
       readonly catalog: AgentCapabilityCatalog;
+    }
+  | {
+      /** Refresh owned and roster-visible identity context after identity mutation. */
+      readonly type: "identityContextUpdated";
+      /** Latest identities composed from owned and roster-visible server data. */
+      readonly identities: readonly AgentIdentity[];
+      /** Latest authoritative room roster fetched with the identity context. */
+      readonly snapshot: AgentRosterSnapshot;
     };
 
 /** Stable validation codes rendered without parsing human-readable messages. */
@@ -963,6 +971,51 @@ function updateRuntime(
   };
 }
 
+/** Refresh identity ownership and roster truth without discarding local edits. */
+function updateIdentityContext(
+  state: AgentControlState,
+  identities: readonly AgentIdentity[],
+  snapshot: AgentRosterSnapshot,
+): AgentControlState {
+  if (snapshot.serverId !== state.serverSnapshot.serverId) {
+    return state;
+  }
+  const attemptedRevision = state.serverSnapshot.desiredRevision;
+  const nextIdentities = identities.map((identity) => ({ ...identity }));
+  const serverSnapshot = cloneSnapshot(snapshot);
+  const bridgeStatus = bridgeStatusFromSnapshot(
+    serverSnapshot,
+    state.bridgeStatus.paused,
+  );
+  if (!state.dirty) {
+    return {
+      ...state,
+      identities: nextIdentities,
+      serverSnapshot,
+      bridgeStatus,
+      draft: orderDraft(serverSnapshot.seats.map(draftFromSnapshot), nextIdentities),
+      dirty: false,
+      revisionConflict: null,
+    };
+  }
+  const draft = state.draft.map(cloneDraftSeat);
+  const dirty = draftIsDirty(draft, serverSnapshot, nextIdentities);
+  const revisionChanged = attemptedRevision !== serverSnapshot.desiredRevision;
+  return {
+    ...state,
+    identities: nextIdentities,
+    serverSnapshot,
+    bridgeStatus,
+    draft,
+    dirty,
+    revisionConflict: dirty
+      ? revisionChanged
+        ? { attemptedRevision, serverRevision: serverSnapshot.desiredRevision }
+        : state.revisionConflict
+      : null,
+  };
+}
+
 /** Apply one pure room agent configuration transition. */
 export function applyAgentControlAction(
   state: AgentControlState,
@@ -997,6 +1050,8 @@ export function applyAgentControlAction(
       return updateRuntime(state, action.status);
     case "catalogUpdated":
       return { ...state, catalog: cloneCatalog(action.catalog) };
+    case "identityContextUpdated":
+      return updateIdentityContext(state, action.identities, action.snapshot);
   }
 }
 

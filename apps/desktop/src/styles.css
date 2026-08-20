@@ -2492,6 +2492,194 @@ h3 {
   min-height: 44px;
 }
 
+.agent-identity-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  overflow-y: auto;
+  background: rgb(5 8 6 / 82%);
+  backdrop-filter: blur(8px);
+}
+
+.agent-identity-dialog {
+  width: min(100%, 650px);
+  max-height: calc(100vh - 2 * var(--space-4));
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(circle at 100% 0%, rgb(155 195 173 / 9%), transparent 24rem),
+    var(--ink-900);
+  box-shadow: var(--shadow-panel);
+}
+
+.agent-identity-dialog__header,
+.agent-identity-dialog__section,
+.agent-identity-dialog__confirm,
+.agent-identity-dialog__recovery {
+  padding: var(--space-5);
+}
+
+.agent-identity-dialog__header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgb(15 21 17 / 96%);
+  backdrop-filter: blur(14px);
+}
+
+.agent-identity-dialog__header h3,
+.agent-identity-dialog__section h4 {
+  margin: 0;
+  color: var(--bone-100);
+}
+
+.agent-identity-dialog__header h3 {
+  font-size: 1.15rem;
+}
+
+.agent-identity-dialog__header p:last-child,
+.agent-identity-dialog__section p,
+.agent-identity-dialog__recovery p {
+  margin: var(--space-2) 0 0;
+  color: var(--bone-300);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.agent-identity-dialog__section + .agent-identity-dialog__section {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.agent-identity-dialog__identity-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.agent-identity-dialog__identity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: 58px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: rgb(12 17 14 / 36%);
+}
+
+.agent-identity-dialog__identity strong,
+.agent-identity-dialog__identity span {
+  display: block;
+}
+
+.agent-identity-dialog__identity strong {
+  color: var(--bone-100);
+  font-size: 0.72rem;
+}
+
+.agent-identity-dialog__identity span {
+  margin-top: 2px;
+  color: var(--bone-400);
+  font-size: 0.6rem;
+}
+
+.agent-identity-dialog__form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.agent-identity-dialog__field,
+.agent-identity-dialog__form label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.agent-identity-dialog__form label {
+  color: var(--bone-300);
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.agent-identity-dialog__form input {
+  min-height: 44px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-quiet);
+  border-radius: 9px;
+  background: var(--ink-950);
+  color: var(--bone-100);
+  font-size: 0.72rem;
+}
+
+.agent-identity-dialog__form input[aria-invalid="true"] {
+  border-color: var(--rust-400);
+}
+
+.agent-identity-dialog__form .field-error {
+  margin: 0;
+  color: var(--rust-400);
+  font-size: 0.61rem;
+}
+
+.agent-identity-dialog__form .button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.agent-identity-dialog__confirm,
+.agent-identity-dialog__recovery {
+  border-top: 1px solid rgb(207 138 109 / 28%);
+  background: rgb(184 111 88 / 8%);
+}
+
+.agent-identity-dialog__confirm {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  backdrop-filter: blur(14px);
+}
+
+.agent-identity-dialog__confirm p {
+  margin: 0;
+  color: var(--bone-200);
+  font-size: 0.68rem;
+}
+
+.agent-identity-dialog__confirm > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-2);
+}
+
+.agent-identity-dialog__recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.agent-identity-dialog .dashboard-error {
+  margin: var(--space-4) var(--space-5) 0;
+  color: var(--rust-400);
+  font-size: 0.68rem;
+}
+
 .dashboard-state {
   min-height: 100%;
   display: flex;
@@ -3335,5 +3523,43 @@ h3 {
 @media (max-width: 639px) {
   .room-dashboard-surface {
     width: 100vw;
+  }
+
+  .agent-identity-dialog-backdrop {
+    align-items: end;
+    padding: 0;
+  }
+
+  .agent-identity-dialog {
+    width: 100vw;
+    max-height: 94vh;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+
+  .agent-identity-dialog__header,
+  .agent-identity-dialog__section,
+  .agent-identity-dialog__confirm,
+  .agent-identity-dialog__recovery {
+    padding: var(--space-4);
+  }
+
+  .agent-identity-dialog__form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-identity-dialog__identity,
+  .agent-identity-dialog__confirm,
+  .agent-identity-dialog__recovery {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .agent-identity-dialog__confirm > div,
+  .agent-identity-dialog__confirm .button,
+  .agent-identity-dialog__recovery .button {
+    width: 100%;
   }
 }

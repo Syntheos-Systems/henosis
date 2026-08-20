@@ -183,6 +183,53 @@ export function RoomDashboard({
     );
   }
 
+  /** Create one persistent identity through the authenticated client boundary. */
+  async function createIdentity(
+    username: string,
+    displayName: string | null,
+  ): Promise<OwnedAgentIdentity> {
+    return client.createMyAgent(username, displayName);
+  }
+
+  /** Claim one roster-visible imported identity through the client boundary. */
+  async function claimIdentity(agentIdentityId: string): Promise<OwnedAgentIdentity> {
+    return client.claimAgent(agentIdentityId);
+  }
+
+  /** Refresh mutation-dependent identity truth and preserve any unsaved room draft. */
+  async function refreshIdentityContext(
+    identity: OwnedAgentIdentity,
+    addToRoom: boolean,
+  ): Promise<void> {
+    const serverId = room.serverId;
+    const [owned, roster] = await Promise.all([
+      client.getMyAgents(),
+      client.getRoomAgentRoster(serverId),
+    ]);
+    const identities = composeDashboardIdentities(owned, roster);
+    setLoadState((current) => {
+      if (
+        current.status !== "ready" ||
+        current.control.serverSnapshot.serverId !== serverId
+      ) {
+        return current;
+      }
+      let control = applyAgentControlAction(current.control, {
+        type: "identityContextUpdated",
+        identities,
+        snapshot: roster,
+      });
+      if (addToRoom) {
+        control = applyAgentControlAction(control, {
+          type: "addSeat",
+          seatId: `draft-${identity.id}-${Date.now().toString(36)}`,
+          agentIdentityId: identity.id,
+        });
+      }
+      return { status: "ready", control };
+    });
+  }
+
   /** Guard leaving Agents when roster controls contain a local draft. */
   function canSelectTab(nextTab: DashboardTabId): boolean {
     if (
@@ -268,6 +315,9 @@ export function RoomDashboard({
         control={loadState.control}
         room={room}
         onControlAction={dispatchControl}
+        onCreateIdentity={createIdentity}
+        onClaimIdentity={claimIdentity}
+        onIdentityMutated={refreshIdentityContext}
       />
     </div>
   );
@@ -306,6 +356,20 @@ interface DashboardPanelProps {
   readonly room: RoomSummary;
   /** Send one roster intent through the room-level reducer state. */
   readonly onControlAction: (action: AgentControlAction) => void;
+  /** Create one persistent identity for the current human. */
+  readonly onCreateIdentity: (
+    username: string,
+    displayName: string | null,
+  ) => Promise<OwnedAgentIdentity>;
+  /** Claim one roster-visible imported identity. */
+  readonly onClaimIdentity: (
+    agentIdentityId: string,
+  ) => Promise<OwnedAgentIdentity>;
+  /** Refresh identity and roster truth after a successful mutation. */
+  readonly onIdentityMutated: (
+    identity: OwnedAgentIdentity,
+    addToRoom: boolean,
+  ) => Promise<void>;
 }
 
 /** Render the selected room-control panel. */
@@ -314,6 +378,9 @@ function DashboardPanel({
   control,
   room,
   onControlAction,
+  onCreateIdentity,
+  onClaimIdentity,
+  onIdentityMutated,
 }: DashboardPanelProps) {
   return (
     <section
@@ -324,7 +391,13 @@ function DashboardPanel({
       tabIndex={0}
     >
       {tab === "agents" ? (
-        <AgentRosterMap control={control} onAction={onControlAction} />
+        <AgentRosterMap
+          control={control}
+          onAction={onControlAction}
+          onCreateIdentity={onCreateIdentity}
+          onClaimIdentity={onClaimIdentity}
+          onIdentityMutated={onIdentityMutated}
+        />
       ) : null}
       {tab === "people" ? <PeopleOverview room={room} /> : null}
       {tab === "room" ? <RoomOverview room={room} /> : null}

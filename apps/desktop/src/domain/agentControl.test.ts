@@ -489,6 +489,79 @@ describe("applyAgentControlAction", () => {
     });
   });
 
+  it("refreshes ownership at the same revision without replacing a dirty draft", () => {
+    const edited = applyAgentControlAction(state(), {
+      type: "setModel",
+      seatId: "seat-alpha",
+      modelKey: "gpt-5.6-terra",
+    });
+    const claimedIdentities = IDENTITIES.map((identity) =>
+      identity.id === "agent-imported"
+        ? { ...identity, ownerUserId: OWNER_ID }
+        : identity,
+    ) as readonly AgentIdentity[];
+    const refreshed = applyAgentControlAction(edited, {
+      type: "identityContextUpdated",
+      identities: claimedIdentities,
+      snapshot: snapshot(),
+    });
+
+    expect(refreshed.draft).toEqual(edited.draft);
+    expect(refreshed.identities).toContainEqual(
+      expect.objectContaining({ id: "agent-imported", ownerUserId: OWNER_ID }),
+    );
+    expect(refreshed.dirty).toBe(true);
+    expect(refreshed.revisionConflict).toBeNull();
+  });
+
+  it("adopts a changed authoritative revision when no local draft exists", () => {
+    const remoteSnapshot = snapshot({
+      desiredRevision: 8,
+      activeRevision: 8,
+      lastGoodRevision: 8,
+      seats: [
+        seat("seat-zulu", "agent-zulu", 0, { configurationRevision: 8 }),
+      ],
+    });
+    const refreshed = applyAgentControlAction(state(), {
+      type: "identityContextUpdated",
+      identities: IDENTITIES,
+      snapshot: remoteSnapshot,
+    });
+
+    expect(refreshed.serverSnapshot.desiredRevision).toBe(8);
+    expect(refreshed.draft.map((entry) => entry.seatId)).toEqual(["seat-zulu"]);
+    expect(refreshed.dirty).toBe(false);
+    expect(refreshed.revisionConflict).toBeNull();
+  });
+
+  it("preserves a dirty draft and records conflict when identity refresh sees a new revision", () => {
+    const edited = applyAgentControlAction(state(), {
+      type: "setModel",
+      seatId: "seat-alpha",
+      modelKey: "gpt-5.6-terra",
+    });
+    const remoteSnapshot = snapshot({
+      desiredRevision: 9,
+      seats: snapshot().seats.map((entry) => ({
+        ...entry,
+        configurationRevision: 9,
+      })),
+    });
+    const refreshed = applyAgentControlAction(edited, {
+      type: "identityContextUpdated",
+      identities: IDENTITIES,
+      snapshot: remoteSnapshot,
+    });
+
+    expect(refreshed.draft).toEqual(edited.draft);
+    expect(refreshed.dirty).toBe(true);
+    expect(refreshed.revisionConflict).toEqual({
+      attemptedRevision: 7,
+      serverRevision: 9,
+    });
+  });
+
   it("projects pending, active, and failed runtime status without replacing the draft", () => {
     const edited = applyAgentControlAction(state(), {
       type: "setModel",

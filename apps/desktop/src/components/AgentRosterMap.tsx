@@ -1,9 +1,12 @@
 /** Vertical room topology for persistent agent identities and seats. */
+import { useRef, useState } from "react";
 import type {
   AgentControlAction,
   AgentControlState,
-  AgentIdentity,
+  OwnedAgentIdentity,
+  UnownedAgentIdentity,
 } from "../domain/agentControl";
+import { AgentIdentityDialog } from "./AgentIdentityDialog";
 import { AgentSeatCard } from "./AgentSeatCard";
 
 /** Inputs for the room's complete agent roster editor. */
@@ -12,6 +15,20 @@ export interface AgentRosterMapProps {
   readonly control: AgentControlState;
   /** Send one user intent through the authoritative reducer. */
   readonly onAction: (action: AgentControlAction) => void;
+  /** Create one server-owned identity for the signed-in human. */
+  readonly onCreateIdentity: (
+    username: string,
+    displayName: string | null,
+  ) => Promise<OwnedAgentIdentity>;
+  /** Claim one roster-visible imported identity under manager authority. */
+  readonly onClaimIdentity: (
+    agentIdentityId: string,
+  ) => Promise<OwnedAgentIdentity>;
+  /** Refresh dashboard identity context after one successful mutation. */
+  readonly onIdentityMutated: (
+    identity: OwnedAgentIdentity,
+    addToRoom: boolean,
+  ) => Promise<void>;
 }
 
 /** Return a collision-resistant local seat identifier without server authority. */
@@ -31,18 +48,47 @@ function bridgeLabel(control: AgentControlState): string {
 }
 
 /** Resolve identities owned by the current human but absent from this room. */
-function availableOwnedIdentities(control: AgentControlState): AgentIdentity[] {
+function availableOwnedIdentities(control: AgentControlState): OwnedAgentIdentity[] {
   const seated = new Set(control.draft.map((seat) => seat.agentIdentityId));
   return control.identities.filter(
-    (identity) =>
+    (identity): identity is OwnedAgentIdentity =>
       identity.ownerUserId === control.currentHumanId && !seated.has(identity.id),
   );
 }
 
+/** Resolve unowned identities exposed by the selected room roster only. */
+function visibleUnownedIdentities(control: AgentControlState): UnownedAgentIdentity[] {
+  const rosterIdentityIds = new Set(
+    control.serverSnapshot.seats.map((seat) => seat.agentIdentityId),
+  );
+  return control.identities.filter(
+    (identity): identity is UnownedAgentIdentity =>
+      identity.ownerUserId === null && rosterIdentityIds.has(identity.id),
+  );
+}
+
 /** Render the room roster as an ordered topology with explicit add affordances. */
-export function AgentRosterMap({ control, onAction }: AgentRosterMapProps) {
+export function AgentRosterMap({
+  control,
+  onAction,
+  onCreateIdentity,
+  onClaimIdentity,
+  onIdentityMutated,
+}: AgentRosterMapProps) {
+  const [identityDialogOpen, setIdentityDialogOpen] = useState(false);
+  const identityTriggerRef = useRef<HTMLButtonElement>(null);
   const available = availableOwnedIdentities(control);
+  const unowned = visibleUnownedIdentities(control);
   const seatCount = control.draft.length;
+
+  /** Add one existing owned identity to the local room draft. */
+  function selectIdentity(identityId: string): void {
+    onAction({
+      type: "addSeat",
+      seatId: createDraftSeatId(identityId),
+      agentIdentityId: identityId,
+    });
+  }
 
   return (
     <div className="agent-roster-map">
@@ -78,36 +124,33 @@ export function AgentRosterMap({ control, onAction }: AgentRosterMapProps) {
 
       <section className="agent-roster-map__add" aria-labelledby="available-agent-title">
         <div>
-          <p className="eyebrow">Owned identities</p>
+          <p className="eyebrow">Persistent identities</p>
           <h4 id="available-agent-title">Add to this room</h4>
+          <p>Create an identity, choose one you own, or claim a visible import.</p>
         </div>
-        {available.length === 0 ? (
-          <p>Every identity you own is already in this room.</p>
-        ) : (
-          <div className="agent-roster-map__add-actions">
-            {available.map((identity) => {
-              const name = identity.displayName?.trim() || identity.username;
-              return (
-                <button
-                  key={identity.id}
-                  className="button button-secondary"
-                  type="button"
-                  aria-label={`Add ${name} to room`}
-                  onClick={() =>
-                    onAction({
-                      type: "addSeat",
-                      seatId: createDraftSeatId(identity.id),
-                      agentIdentityId: identity.id,
-                    })
-                  }
-                >
-                  Add {name}
-                </button>
-              );
-            })}
-          </div>
-        )}
+        <button
+          ref={identityTriggerRef}
+          className="button button-secondary"
+          type="button"
+          onClick={() => setIdentityDialogOpen(true)}
+        >
+          Add agent identity
+        </button>
       </section>
+
+      {identityDialogOpen ? (
+        <AgentIdentityDialog
+          ownedIdentities={available}
+          unownedIdentities={unowned}
+          canClaim={control.canManageRoom}
+          onSelectIdentity={selectIdentity}
+          onCreateIdentity={onCreateIdentity}
+          onClaimIdentity={onClaimIdentity}
+          onIdentityMutated={onIdentityMutated}
+          onClose={() => setIdentityDialogOpen(false)}
+          returnFocusRef={identityTriggerRef}
+        />
+      ) : null}
     </div>
   );
 }
