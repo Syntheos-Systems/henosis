@@ -113,6 +113,7 @@ async function renderDashboard(
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -479,6 +480,394 @@ describe("RoomDashboard", () => {
     expect(claimSpy).toHaveBeenCalledWith("agent-imported");
     expect(ownedSpy).toHaveBeenCalledTimes(2);
     expect(rosterSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies one complete normalized roster and polls the accepted revision active", async () => {
+    const client = new FixtureHenosisClient();
+    const applySpy = vi.spyOn(client, "applyRoomAgentRoster");
+    const statusSpy = vi.spyOn(client, "getRoomBridgeStatus");
+    await renderDashboard(client);
+    vi.useFakeTimers();
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applySpy).toHaveBeenCalledWith(
+      "server-henosis",
+      expect.objectContaining({
+        expectedRevision: 2,
+        seats: [
+          expect.objectContaining({
+            seatId: "seat-mira",
+            settings: expect.objectContaining({ effort: "high" }),
+            position: 0,
+          }),
+          expect.objectContaining({ seatId: "seat-cinder", position: 1 }),
+          expect.objectContaining({ seatId: "seat-imported", position: 2 }),
+        ],
+      }),
+    );
+    expect(screen.getByText("Activating revision 3")).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(statusSpy).toHaveBeenCalledTimes(2);
+    expect(screen.queryByLabelText("Agent roster changes")).not.toBeInTheDocument();
+    expect(screen.getByText("Bridge active")).toBeInTheDocument();
+  });
+
+  it("blocks invalid combinations locally, attaches issues to the seat, and discards", async () => {
+    const client = new FixtureHenosisClient();
+    const applySpy = vi.spyOn(client, "applyRoomAgentRoster");
+    await renderDashboard(client);
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Execution harness for Mira" }),
+      { target: { value: "claude-code" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+    const card = screen.getByRole("heading", { name: "Mira" }).closest("article");
+    if (!card) {
+      throw new Error("Mira must remain inside an agent seat card.");
+    }
+
+    expect(within(card).getByRole("alert")).toHaveTextContent(
+      "Choose a model.",
+    );
+    expect(applySpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(
+      screen.getByRole("combobox", { name: "Execution harness for Mira" }),
+    ).toHaveValue("codex-cli");
+    expect(screen.queryByLabelText("Agent roster changes")).not.toBeInTheDocument();
+  });
+
+  it("preserves a stale draft for conflict review and restores fetched server truth", async () => {
+    const client = new FixtureHenosisClient();
+    const originalGetRoster = client.getRoomAgentRoster.bind(client);
+    const initial = await originalGetRoster("server-henosis");
+    const remote: AgentRosterSnapshot = {
+      ...initial,
+      desiredRevision: 3,
+      seats: initial.seats.map((seat) =>
+        seat.seatId === "seat-mira"
+          ? { ...seat, enabled: false, configurationRevision: 3 }
+          : { ...seat, configurationRevision: 3 },
+      ),
+    };
+    let conflictRaised = false;
+    vi.spyOn(client, "applyRoomAgentRoster").mockImplementation(async () => {
+      conflictRaised = true;
+      throw new HenosisClientError(
+        "conflict",
+        "The room roster changed.",
+        "revision_conflict",
+      );
+    });
+    vi.spyOn(client, "getRoomAgentRoster").mockImplementation(async (serverId) =>
+      conflictRaised ? remote : originalGetRoster(serverId),
+    );
+    await renderDashboard(client);
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+    expect(
+      await screen.findByText("Room changes arrived before your draft was applied."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+    ).toHaveValue(
+      "high",
+    );
+    expect(screen.queryByRole("button", { name: "Apply roster" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
+    expect(screen.getByText("Mine: Setting: effort")).toBeInTheDocument();
+    expect(screen.getByText("Server: Participation")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Discard mine" }));
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+    ).toHaveValue(
+      "medium",
+    );
+    expect(screen.getByRole("switch", { name: "Enable Mira in this room" })).not.toBeChecked();
+  });
+
+  it("keeps desired configuration after activation failure and retries without apply", async () => {
+    const client = new FixtureHenosisClient();
+    client.injectNextAgentActivationFailure(
+      "server-henosis",
+      "bridge_start_failed",
+    );
+    const applySpy = vi.spyOn(client, "applyRoomAgentRoster");
+    const reconcileSpy = vi.spyOn(client, "reconcileRoomBridge");
+    await renderDashboard(client);
+    vi.useFakeTimers();
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+
+    expect(screen.getByText("Activation failed")).toBeInTheDocument();
+    expect(screen.getAllByText("Last good revision 2")).not.toHaveLength(0);
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+    ).toHaveValue(
+      "high",
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry activation" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(reconcileSpy).toHaveBeenCalledWith("server-henosis");
+    expect(applySpy).toHaveBeenCalledOnce();
+    expect(screen.getByText("Activating revision 3")).toBeInTheDocument();
+  });
+
+  it("stops bounded pending polling at sixty seconds and offers a manual refresh", async () => {
+    const client = new FixtureHenosisClient();
+    const originalApply = client.applyRoomAgentRoster.bind(client);
+    const originalStatus = client.getRoomBridgeStatus.bind(client);
+    let holdPending = false;
+    vi.spyOn(client, "applyRoomAgentRoster").mockImplementation(
+      async (serverId, request) => {
+        const snapshot = await originalApply(serverId, request);
+        holdPending = true;
+        return snapshot;
+      },
+    );
+    const statusSpy = vi
+      .spyOn(client, "getRoomBridgeStatus")
+      .mockImplementation(async (serverId) => {
+        if (!holdPending) {
+          return originalStatus(serverId);
+        }
+        const roster = await client.getRoomAgentRoster(serverId);
+        return {
+          paused: false,
+          desiredRevision: roster.desiredRevision,
+          activeRevision: roster.activeRevision,
+          lastGoodRevision: roster.lastGoodRevision,
+          runtimeActivation: "pending",
+          runtimeErrorCode: null,
+          runtimeErrorMessage: null,
+        };
+      });
+    await renderDashboard(client);
+    vi.useFakeTimers();
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+
+    expect(
+      screen.getByText(
+        "Activation is taking longer than expected. The desired roster remains pending.",
+      ),
+    ).toBeInTheDocument();
+    const callsAtTimeout = statusSpy.mock.calls.length;
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(statusSpy).toHaveBeenCalledTimes(callsAtTimeout);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await act(async () => Promise.resolve());
+    expect(statusSpy).toHaveBeenCalledTimes(callsAtTimeout + 1);
+  });
+
+  it("keeps Discard available after a failed save without losing the draft", async () => {
+    const client = new FixtureHenosisClient();
+    vi.spyOn(client, "applyRoomAgentRoster").mockRejectedValue(
+      new HenosisClientError(
+        "unavailable",
+        "The room agent controls are temporarily unavailable.",
+        "room_agent_unavailable",
+      ),
+    );
+    await renderDashboard(client);
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+
+    expect(
+      await screen.findByText("Roster changes were not saved."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+    ).toHaveValue("high");
+    expect(screen.getByRole("button", { name: "Apply roster" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Discard changes" })).toBeEnabled();
+  });
+
+  it("ignores a stale apply result after leaving and returning to its room", async () => {
+    const client = new FixtureHenosisClient();
+    const initial = await client.getRoomAgentRoster("server-henosis");
+    const staleApply = deferred<AgentRosterSnapshot>();
+    vi.spyOn(client, "applyRoomAgentRoster").mockImplementation(
+      () => staleApply.promise,
+    );
+    const firstRoom = primaryRoom();
+    const secondRoom = createFixtureRooms().find(
+      (candidate) => candidate.serverId === "server-trust",
+    );
+    if (!secondRoom) {
+      throw new Error("The stale Apply test requires the Trust Lab fixture room.");
+    }
+    const { rerender } = render(
+      <RoomDashboard
+        client={client}
+        room={firstRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    await screen.findByRole("combobox", { name: "Reasoning effort for Mira" });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+
+    rerender(
+      <RoomDashboard
+        client={client}
+        room={secondRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    await screen.findByText("No agents in this room yet.");
+    rerender(
+      <RoomDashboard
+        client={client}
+        room={firstRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    await screen.findByRole("combobox", { name: "Reasoning effort for Mira" });
+    await act(async () => {
+      staleApply.resolve({
+        ...initial,
+        desiredRevision: 3,
+        runtimeActivation: "pending",
+        seats: initial.seats.map((seat) => ({
+          ...seat,
+          settings:
+            seat.seatId === "seat-mira"
+              ? { ...seat.settings, effort: "high" }
+              : seat.settings,
+          configurationRevision: 3,
+          runtimeActivation: "pending",
+        })),
+      });
+      await staleApply.promise;
+    });
+
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+    ).toHaveValue("medium");
+    expect(screen.queryByText("Activating revision 3")).not.toBeInTheDocument();
+    expect(screen.getByText("Bridge active")).toBeInTheDocument();
+  });
+
+  it("cancels pending activation polling when the selected room changes", async () => {
+    const client = new FixtureHenosisClient();
+    const originalApply = client.applyRoomAgentRoster.bind(client);
+    const originalStatus = client.getRoomBridgeStatus.bind(client);
+    let holdPrimaryPending = false;
+    vi.spyOn(client, "applyRoomAgentRoster").mockImplementation(
+      async (serverId, request) => {
+        const snapshot = await originalApply(serverId, request);
+        holdPrimaryPending = true;
+        return snapshot;
+      },
+    );
+    const statusSpy = vi
+      .spyOn(client, "getRoomBridgeStatus")
+      .mockImplementation(async (serverId) => {
+        if (serverId !== "server-henosis" || !holdPrimaryPending) {
+          return originalStatus(serverId);
+        }
+        const roster = await client.getRoomAgentRoster(serverId);
+        return {
+          paused: false,
+          desiredRevision: roster.desiredRevision,
+          activeRevision: roster.activeRevision,
+          lastGoodRevision: roster.lastGoodRevision,
+          runtimeActivation: "pending",
+          runtimeErrorCode: null,
+          runtimeErrorMessage: null,
+        };
+      });
+    const secondRoom = createFixtureRooms().find(
+      (candidate) => candidate.serverId === "server-trust",
+    );
+    if (!secondRoom) {
+      throw new Error("The polling cancellation test requires the Trust Lab room.");
+    }
+    const { rerender } = render(
+      <RoomDashboard
+        client={client}
+        room={primaryRoom()}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    await screen.findByRole("combobox", { name: "Reasoning effort for Mira" });
+    vi.useFakeTimers();
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Reasoning effort for Mira" }),
+      { target: { value: "high" } },
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Apply roster" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const primaryCallsBeforeSwitch = statusSpy.mock.calls.filter(
+      ([serverId]) => serverId === "server-henosis",
+    ).length;
+
+    rerender(
+      <RoomDashboard
+        client={client}
+        room={secondRoom}
+        currentUserId="fixture-user"
+        onReconnect={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(
+      statusSpy.mock.calls.filter(([serverId]) => serverId === "server-henosis"),
+    ).toHaveLength(primaryCallsBeforeSwitch);
   });
 });
 

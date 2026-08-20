@@ -3,6 +3,7 @@ import { useRef, useState } from "react";
 import type {
   AgentControlAction,
   AgentControlState,
+  AgentControlValidationIssue,
   OwnedAgentIdentity,
   UnownedAgentIdentity,
 } from "../domain/agentControl";
@@ -15,6 +16,10 @@ export interface AgentRosterMapProps {
   readonly control: AgentControlState;
   /** Send one user intent through the authoritative reducer. */
   readonly onAction: (action: AgentControlAction) => void;
+  /** Latest local validation failures keyed by stable seat identifiers. */
+  readonly validationIssues?: readonly AgentControlValidationIssue[];
+  /** Whether roster editing is frozen during one complete mutation. */
+  readonly editingDisabled?: boolean;
   /** Create one server-owned identity for the signed-in human. */
   readonly onCreateIdentity: (
     username: string,
@@ -71,6 +76,8 @@ function visibleUnownedIdentities(control: AgentControlState): UnownedAgentIdent
 export function AgentRosterMap({
   control,
   onAction,
+  validationIssues = [],
+  editingDisabled = false,
   onCreateIdentity,
   onClaimIdentity,
   onIdentityMutated,
@@ -116,7 +123,15 @@ export function AgentRosterMap({
         <ol className="agent-roster-map__list" aria-label="Room agent seats">
           {control.draft.map((seat) => (
             <li key={seat.seatId}>
-              <AgentSeatCard control={control} seat={seat} onAction={onAction} />
+              <AgentSeatCard
+                control={control}
+                seat={seat}
+                onAction={onAction}
+                validationIssues={validationIssues.filter(
+                  (issue) => issue.seatId === seat.seatId,
+                )}
+                editingDisabled={editingDisabled}
+              />
             </li>
           ))}
         </ol>
@@ -132,6 +147,7 @@ export function AgentRosterMap({
           ref={identityTriggerRef}
           className="button button-secondary"
           type="button"
+          disabled={editingDisabled}
           onClick={() => setIdentityDialogOpen(true)}
         >
           Add agent identity

@@ -234,6 +234,20 @@ export interface AgentRevisionConflict {
   readonly attemptedRevision: number | null;
   /** Current desired revision returned after the conflict. */
   readonly serverRevision: number | null;
+  /** Seat-level field names changed locally or by the server from the same base. */
+  readonly seats: readonly AgentRevisionConflictSeat[];
+}
+
+/** Three-way field summary for one seat involved in a revision conflict. */
+export interface AgentRevisionConflictSeat {
+  /** Stable seat identifier used to correlate local and server changes. */
+  readonly seatId: string;
+  /** Best-known persistent identity occupying the seat. */
+  readonly agentIdentityId: string;
+  /** Human-readable fields changed by the retained local draft. */
+  readonly localFields: readonly string[];
+  /** Human-readable fields changed by the newer server revision. */
+  readonly serverFields: readonly string[];
 }
 
 /** Complete immutable React state for room agent configuration. */
@@ -388,6 +402,7 @@ export type AgentControlAction =
 
 /** Stable validation codes rendered without parsing human-readable messages. */
 export type AgentControlValidationCode =
+  | "revision_conflict"
   | "too_many_seats"
   | "duplicate_seat"
   | "duplicate_agent"
@@ -570,6 +585,87 @@ function draftIsDirty(
     local.length !== server.length ||
     local.some((seat, index) => !seatsAreSemanticallyEqual(seat, server[index]))
   );
+}
+
+/** Compare one setting value without relying on object property order. */
+function settingValuesAreEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** List submitted field names changed between one base and candidate seat. */
+function changedSeatFields(
+  base: AgentSeatDraft | undefined,
+  candidate: AgentSeatDraft | undefined,
+): string[] {
+  if (!base || !candidate) {
+    return base === candidate ? [] : ["Seat membership"];
+  }
+  const fields: string[] = [];
+  if (base.agentIdentityId !== candidate.agentIdentityId) {
+    fields.push("Agent identity");
+  }
+  if (base.harnessKey !== candidate.harnessKey) {
+    fields.push("Execution harness");
+  }
+  if (base.modelKey !== candidate.modelKey) {
+    fields.push("Model");
+  }
+  const settingIds = new Set([
+    ...Object.keys(base.settings),
+    ...Object.keys(candidate.settings),
+  ]);
+  [...settingIds].sort().forEach((settingId) => {
+    if (!settingValuesAreEqual(base.settings[settingId], candidate.settings[settingId])) {
+      fields.push(`Setting: ${settingId}`);
+    }
+  });
+  if (base.credentialBindingId !== candidate.credentialBindingId) {
+    fields.push("Credential binding");
+  }
+  if (base.enabled !== candidate.enabled) {
+    fields.push("Participation");
+  }
+  if (base.position !== candidate.position) {
+    fields.push("Position");
+  }
+  return fields;
+}
+
+/** Build a value-free three-way summary before replacing the original base. */
+function summarizeRevisionConflict(
+  baseSnapshot: AgentRosterSnapshot,
+  localDraft: readonly AgentSeatDraft[],
+  serverSnapshot: AgentRosterSnapshot,
+): AgentRevisionConflictSeat[] {
+  const baseBySeat = new Map(
+    baseSnapshot.seats.map((seat) => [seat.seatId, draftFromSnapshot(seat)]),
+  );
+  const localBySeat = new Map(localDraft.map((seat) => [seat.seatId, seat]));
+  const serverBySeat = new Map(
+    serverSnapshot.seats.map((seat) => [seat.seatId, draftFromSnapshot(seat)]),
+  );
+  const seatIds = new Set([
+    ...baseBySeat.keys(),
+    ...localBySeat.keys(),
+    ...serverBySeat.keys(),
+  ]);
+  return [...seatIds]
+    .sort()
+    .map((seatId) => {
+      const base = baseBySeat.get(seatId);
+      const local = localBySeat.get(seatId);
+      const server = serverBySeat.get(seatId);
+      return {
+        seatId,
+        agentIdentityId:
+          local?.agentIdentityId ?? server?.agentIdentityId ?? base?.agentIdentityId ?? seatId,
+        localFields: changedSeatFields(base, local),
+        serverFields: changedSeatFields(base, server),
+      };
+    })
+    .filter(
+      (seat) => seat.localFields.length > 0 || seat.serverFields.length > 0,
+    );
 }
 
 /** Build bridge status fields from one authoritative roster snapshot. */
@@ -932,6 +1028,11 @@ function retainRevisionConflict(
   }
   const attemptedRevision = state.serverSnapshot.desiredRevision;
   const serverSnapshot = cloneSnapshot(snapshot);
+  const seats = summarizeRevisionConflict(
+    state.serverSnapshot,
+    state.draft,
+    serverSnapshot,
+  );
   const dirty = draftIsDirty(state.draft, serverSnapshot, state.identities);
   return {
     ...state,
@@ -939,7 +1040,7 @@ function retainRevisionConflict(
     bridgeStatus: bridgeStatusFromSnapshot(serverSnapshot, state.bridgeStatus.paused),
     dirty,
     revisionConflict: dirty
-      ? { attemptedRevision, serverRevision: serverSnapshot.desiredRevision }
+      ? { attemptedRevision, serverRevision: serverSnapshot.desiredRevision, seats }
       : null,
   };
 }
@@ -1001,6 +1102,9 @@ function updateIdentityContext(
   const draft = state.draft.map(cloneDraftSeat);
   const dirty = draftIsDirty(draft, serverSnapshot, nextIdentities);
   const revisionChanged = attemptedRevision !== serverSnapshot.desiredRevision;
+  const conflictSeats = revisionChanged
+    ? summarizeRevisionConflict(state.serverSnapshot, draft, serverSnapshot)
+    : [];
   return {
     ...state,
     identities: nextIdentities,
@@ -1010,7 +1114,11 @@ function updateIdentityContext(
     dirty,
     revisionConflict: dirty
       ? revisionChanged
-        ? { attemptedRevision, serverRevision: serverSnapshot.desiredRevision }
+        ? {
+            attemptedRevision,
+            serverRevision: serverSnapshot.desiredRevision,
+            seats: conflictSeats,
+          }
         : state.revisionConflict
       : null,
   };
@@ -1310,6 +1418,14 @@ export function validateAgentControlDraft(
   state: AgentControlState,
 ): AgentControlValidationIssue[] {
   const issues: AgentControlValidationIssue[] = [];
+  if (state.revisionConflict) {
+    issues.push(
+      validationIssue(
+        "revision_conflict",
+        "The room changed on the server. Review or discard this draft before applying again.",
+      ),
+    );
+  }
   if (state.draft.length > MAX_AGENT_SEATS) {
     issues.push(
       validationIssue(

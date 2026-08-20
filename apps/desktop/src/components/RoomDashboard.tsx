@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type {
   AgentControlAction,
   AgentControlState,
+  AgentControlValidationIssue,
   AgentIdentity,
   AgentRosterSnapshot,
   OwnedAgentIdentity,
@@ -12,6 +13,7 @@ import type {
 import {
   applyAgentControlAction,
   createAgentControlState,
+  serializeAgentControlDraft,
 } from "../domain/agentControl";
 import type { RoomSummary } from "../domain/rooms";
 import type {
@@ -26,6 +28,7 @@ import {
 } from "./DashboardTabs";
 import type { DashboardTabId } from "./DashboardTabs";
 import { AgentRosterMap } from "./AgentRosterMap";
+import { DashboardApplyBar } from "./DashboardApplyBar";
 import { RoomPeoplePanel } from "./RoomPeoplePanel";
 import { RoomSettingsPanel } from "./RoomSettingsPanel";
 
@@ -78,6 +81,34 @@ type DashboardLoadState =
   | FailedDashboardState
   | ReadyDashboardState;
 
+/** Local request and recovery feedback layered over the pure roster reducer. */
+interface ApplyWorkflowState {
+  /** Local validation failures from the latest attempted apply. */
+  readonly validationIssues: readonly AgentControlValidationIssue[];
+  /** Sanitized transport failure retained while the draft remains editable. */
+  readonly errorMessage: string | null;
+  /** Whether one atomic roster replacement is currently in flight. */
+  readonly saving: boolean;
+  /** Whether activation stayed pending through the bounded polling window. */
+  readonly activationTimedOut: boolean;
+}
+
+/** Activation polling intervals with a ten-second maximum delay. */
+const ACTIVATION_POLL_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 10_000] as const;
+
+/** Maximum time spent polling one exact desired roster revision. */
+const ACTIVATION_POLL_LIMIT_MS = 60_000;
+
+/** Create isolated empty workflow feedback for one room dashboard generation. */
+function createApplyWorkflowState(): ApplyWorkflowState {
+  return {
+    validationIssues: [],
+    errorMessage: null,
+    saving: false,
+    activationTimedOut: false,
+  };
+}
+
 /** Compose owned and roster-visible identities without duplicate stable IDs. */
 export function composeDashboardIdentities(
   owned: readonly OwnedAgentIdentity[],
@@ -110,17 +141,33 @@ export function RoomDashboard({
   const [activeTab, setActiveTab] = useState<DashboardTabId>("agents");
   const [retryGeneration, setRetryGeneration] = useState(0);
   const bridgeMutationGeneration = useRef(0);
+  const applyWorkflowGeneration = useRef(0);
+  const [applyWorkflow, setApplyWorkflow] = useState<ApplyWorkflowState>(
+    createApplyWorkflowState,
+  );
   const [loadState, setLoadState] = useState<DashboardLoadState>(() =>
     currentUserId ? { status: "loading" } : { status: "disconnected" },
   );
+  /** Exact server currently eligible for activation polling. */
+  const pollingServerId =
+    loadState.status === "ready" ? loadState.control.serverSnapshot.serverId : null;
+  /** Exact desired revision currently eligible for activation polling. */
+  const pollingDesiredRevision =
+    loadState.status === "ready" ? loadState.control.bridgeStatus.desiredRevision : null;
+  /** Runtime state used to start and stop the bounded polling loop. */
+  const pollingActivation =
+    loadState.status === "ready" ? loadState.control.bridgeStatus.runtimeActivation : null;
 
   /** Invalidate every in-flight bridge mutation when the room context changes. */
   useEffect(() => {
     bridgeMutationGeneration.current += 1;
+    applyWorkflowGeneration.current += 1;
+    setApplyWorkflow(createApplyWorkflowState());
     return () => {
       bridgeMutationGeneration.current += 1;
+      applyWorkflowGeneration.current += 1;
     };
-  }, [room.serverId]);
+  }, [client, room.serverId]);
 
   useEffect(() => {
     if (!currentUserId) {
@@ -178,6 +225,120 @@ export function RoomDashboard({
     onDirtyChange(loadState.status === "ready" && loadState.control.dirty);
   }, [loadState, onDirtyChange]);
 
+  /** Poll one exact pending desired revision with cancellation and a hard time limit. */
+  useEffect(() => {
+    if (
+      pollingServerId === null ||
+      pollingDesiredRevision === null ||
+      pollingActivation !== "pending"
+    ) {
+      return;
+    }
+    const serverId = pollingServerId;
+    const desiredRevision = pollingDesiredRevision;
+    let cancelled = false;
+    let elapsedMs = 0;
+    let delayIndex = 0;
+    let timeoutId: number | undefined;
+
+    /** Project a same-revision status or adopt a newly discovered roster revision. */
+    async function pollOnce(): Promise<void> {
+      try {
+        const status = await client.getRoomBridgeStatus(serverId);
+        if (cancelled) {
+          return;
+        }
+        if (status.desiredRevision !== desiredRevision) {
+          const snapshot = await client.getRoomAgentRoster(serverId);
+          if (cancelled) {
+            return;
+          }
+          setLoadState((current) => {
+            if (
+              current.status !== "ready" ||
+              current.control.serverSnapshot.serverId !== serverId ||
+              current.control.bridgeStatus.desiredRevision !== desiredRevision
+            ) {
+              return current;
+            }
+            return {
+              status: "ready",
+              control: applyAgentControlAction(current.control, {
+                type: current.control.dirty ? "revisionConflict" : "applySucceeded",
+                snapshot,
+              }),
+            };
+          });
+          return;
+        }
+        setLoadState((current) => {
+          if (
+            current.status !== "ready" ||
+            current.control.serverSnapshot.serverId !== serverId ||
+            current.control.bridgeStatus.desiredRevision !== desiredRevision
+          ) {
+            return current;
+          }
+          return {
+            status: "ready",
+            control: applyAgentControlAction(current.control, {
+              type: "runtimeUpdated",
+              status,
+            }),
+          };
+        });
+        if (status.runtimeActivation === "pending") {
+          if (elapsedMs >= ACTIVATION_POLL_LIMIT_MS) {
+            setApplyWorkflow((current) => ({
+              ...current,
+              activationTimedOut: true,
+            }));
+          } else {
+            scheduleNextPoll();
+          }
+        } else {
+          setApplyWorkflow((current) => ({
+            ...current,
+            activationTimedOut: false,
+          }));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setApplyWorkflow((current) => ({
+            ...current,
+            errorMessage: normalizeClientError(error).message,
+            activationTimedOut: true,
+          }));
+        }
+      }
+    }
+
+    /** Schedule the next capped interval without exceeding sixty seconds. */
+    function scheduleNextPoll(): void {
+      const candidateDelay =
+        ACTIVATION_POLL_DELAYS_MS[
+          Math.min(delayIndex, ACTIVATION_POLL_DELAYS_MS.length - 1)
+        ];
+      const delay = Math.min(
+        candidateDelay,
+        ACTIVATION_POLL_LIMIT_MS - elapsedMs,
+      );
+      delayIndex += 1;
+      timeoutId = window.setTimeout(() => {
+        elapsedMs += delay;
+        void pollOnce();
+      }, delay);
+    }
+
+    scheduleNextPoll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [client, pollingActivation, pollingDesiredRevision, pollingServerId]);
+
   /** Retry every read-context request as one consistent snapshot attempt. */
   function retry(): void {
     setRetryGeneration((generation) => generation + 1);
@@ -185,6 +346,11 @@ export function RoomDashboard({
 
   /** Apply one UI intent through the immutable agent-control reducer. */
   function dispatchControl(action: AgentControlAction): void {
+    setApplyWorkflow((current) => ({
+      ...current,
+      validationIssues: [],
+      errorMessage: null,
+    }));
     setLoadState((current) =>
       current.status === "ready"
         ? {
@@ -193,6 +359,223 @@ export function RoomDashboard({
           }
         : current,
     );
+  }
+
+  /** Test whether one async roster workflow still belongs to the selected room. */
+  function workflowIsCurrent(serverId: string, generation: number): boolean {
+    return (
+      applyWorkflowGeneration.current === generation &&
+      room.serverId === serverId
+    );
+  }
+
+  /** Apply the complete validated roster with optimistic revision protection. */
+  async function applyRoster(): Promise<void> {
+    if (loadState.status !== "ready") {
+      return;
+    }
+    const serialized = serializeAgentControlDraft(loadState.control);
+    if (!serialized.ok) {
+      setApplyWorkflow((current) => ({
+        ...current,
+        validationIssues: serialized.issues,
+        errorMessage: null,
+      }));
+      return;
+    }
+    const serverId = loadState.control.serverSnapshot.serverId;
+    const generation = ++applyWorkflowGeneration.current;
+    setApplyWorkflow((current) => ({
+      ...current,
+      validationIssues: [],
+      errorMessage: null,
+      saving: true,
+      activationTimedOut: false,
+    }));
+    try {
+      const snapshot = await client.applyRoomAgentRoster(
+        serverId,
+        serialized.request,
+      );
+      if (!workflowIsCurrent(serverId, generation)) {
+        return;
+      }
+      setLoadState((current) =>
+        current.status === "ready" &&
+        current.control.serverSnapshot.serverId === serverId
+          ? {
+              status: "ready",
+              control: applyAgentControlAction(current.control, {
+                type: "applySucceeded",
+                snapshot,
+              }),
+            }
+          : current,
+      );
+    } catch (error) {
+      const normalized = normalizeClientError(error);
+      if (
+        normalized.kind === "conflict" &&
+        normalized.code === "revision_conflict"
+      ) {
+        try {
+          const snapshot = await client.getRoomAgentRoster(serverId);
+          if (!workflowIsCurrent(serverId, generation)) {
+            return;
+          }
+          setLoadState((current) =>
+            current.status === "ready" &&
+            current.control.serverSnapshot.serverId === serverId
+              ? {
+                  status: "ready",
+                  control: applyAgentControlAction(current.control, {
+                    type: "revisionConflict",
+                    snapshot,
+                  }),
+                }
+              : current,
+          );
+        } catch (refreshError) {
+          if (workflowIsCurrent(serverId, generation)) {
+            setApplyWorkflow((current) => ({
+              ...current,
+              errorMessage: normalizeClientError(refreshError).message,
+            }));
+          }
+        }
+      } else if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({
+          ...current,
+          errorMessage: normalized.message,
+        }));
+      }
+    } finally {
+      if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({ ...current, saving: false }));
+      }
+    }
+  }
+
+  /** Restore current server truth and invalidate any in-flight roster mutation. */
+  function discardRoster(): void {
+    applyWorkflowGeneration.current += 1;
+    setApplyWorkflow(createApplyWorkflowState());
+    dispatchControl({ type: "discard" });
+  }
+
+  /** Retry activation of the current desired revision without applying a new one. */
+  async function retryActivation(): Promise<void> {
+    if (loadState.status !== "ready") {
+      return;
+    }
+    const serverId = loadState.control.serverSnapshot.serverId;
+    const generation = ++applyWorkflowGeneration.current;
+    setApplyWorkflow((current) => ({
+      ...current,
+      errorMessage: null,
+      saving: true,
+      activationTimedOut: false,
+    }));
+    try {
+      const snapshot = await client.reconcileRoomBridge(serverId);
+      if (!workflowIsCurrent(serverId, generation)) {
+        return;
+      }
+      setLoadState((current) =>
+        current.status === "ready" &&
+        current.control.serverSnapshot.serverId === serverId
+          ? {
+              status: "ready",
+              control: applyAgentControlAction(current.control, {
+                type: "applySucceeded",
+                snapshot,
+              }),
+            }
+          : current,
+      );
+    } catch (error) {
+      if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({
+          ...current,
+          errorMessage: normalizeClientError(error).message,
+        }));
+      }
+    } finally {
+      if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({ ...current, saving: false }));
+      }
+    }
+  }
+
+  /** Refresh bridge status once after bounded polling stops. */
+  async function refreshActivation(): Promise<void> {
+    if (loadState.status !== "ready") {
+      return;
+    }
+    const serverId = loadState.control.serverSnapshot.serverId;
+    const desiredRevision = loadState.control.bridgeStatus.desiredRevision;
+    const generation = ++applyWorkflowGeneration.current;
+    setApplyWorkflow((current) => ({
+      ...current,
+      errorMessage: null,
+      saving: true,
+    }));
+    try {
+      const status = await client.getRoomBridgeStatus(serverId);
+      if (!workflowIsCurrent(serverId, generation)) {
+        return;
+      }
+      if (status.desiredRevision !== desiredRevision) {
+        const snapshot = await client.getRoomAgentRoster(serverId);
+        if (!workflowIsCurrent(serverId, generation)) {
+          return;
+        }
+        setLoadState((current) => {
+          if (
+            current.status !== "ready" ||
+            current.control.serverSnapshot.serverId !== serverId
+          ) {
+            return current;
+          }
+          return {
+            status: "ready",
+            control: applyAgentControlAction(current.control, {
+              type: current.control.dirty ? "revisionConflict" : "applySucceeded",
+              snapshot,
+            }),
+          };
+        });
+      } else {
+        setLoadState((current) =>
+          current.status === "ready" &&
+          current.control.serverSnapshot.serverId === serverId
+            ? {
+                status: "ready",
+                control: applyAgentControlAction(current.control, {
+                  type: "runtimeUpdated",
+                  status,
+                }),
+              }
+            : current,
+        );
+      }
+      setApplyWorkflow((current) => ({
+        ...current,
+        activationTimedOut: status.runtimeActivation === "pending",
+      }));
+    } catch (error) {
+      if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({
+          ...current,
+          errorMessage: normalizeClientError(error).message,
+          activationTimedOut: true,
+        }));
+      }
+    } finally {
+      if (workflowIsCurrent(serverId, generation)) {
+        setApplyWorkflow((current) => ({ ...current, saving: false }));
+      }
+    }
   }
 
   /** Create one persistent identity through the authenticated client boundary. */
@@ -296,10 +679,7 @@ export function RoomDashboard({
       "Discard unsaved agent changes and leave the Agents tab? Choose Cancel to remain.",
     );
     if (discard) {
-      setLoadState({
-        status: "ready",
-        control: applyAgentControlAction(loadState.control, { type: "discard" }),
-      });
+      discardRoster();
     }
     return discard;
   }
@@ -372,7 +752,22 @@ export function RoomDashboard({
         onIdentityMutated={refreshIdentityContext}
         onPauseBridge={pauseBridge}
         onResumeBridge={resumeBridge}
+        validationIssues={applyWorkflow.validationIssues}
+        editingDisabled={applyWorkflow.saving}
       />
+      {activeTab === "agents" ? (
+        <DashboardApplyBar
+          control={loadState.control}
+          validationIssues={applyWorkflow.validationIssues}
+          errorMessage={applyWorkflow.errorMessage}
+          saving={applyWorkflow.saving}
+          activationTimedOut={applyWorkflow.activationTimedOut}
+          onApply={() => void applyRoster()}
+          onDiscard={discardRoster}
+          onRetryActivation={() => void retryActivation()}
+          onRefreshActivation={() => void refreshActivation()}
+        />
+      ) : null}
     </div>
   );
 }
@@ -428,6 +823,10 @@ interface DashboardPanelProps {
   readonly onPauseBridge: () => Promise<void>;
   /** Resume the authoritative bridge for the selected room. */
   readonly onResumeBridge: () => Promise<void>;
+  /** Latest local validation failures attached to roster or seat controls. */
+  readonly validationIssues: readonly AgentControlValidationIssue[];
+  /** Whether roster controls must remain stable during one mutation. */
+  readonly editingDisabled: boolean;
 }
 
 /** Render the selected room-control panel. */
@@ -441,6 +840,8 @@ function DashboardPanel({
   onIdentityMutated,
   onPauseBridge,
   onResumeBridge,
+  validationIssues,
+  editingDisabled,
 }: DashboardPanelProps) {
   return (
     <section
@@ -457,6 +858,8 @@ function DashboardPanel({
           onCreateIdentity={onCreateIdentity}
           onClaimIdentity={onClaimIdentity}
           onIdentityMutated={onIdentityMutated}
+          validationIssues={validationIssues}
+          editingDisabled={editingDisabled}
         />
       ) : null}
       {tab === "people" ? (

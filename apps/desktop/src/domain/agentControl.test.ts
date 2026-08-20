@@ -464,7 +464,12 @@ describe("applyAgentControlAction", () => {
       desiredRevision: 9,
       seats: snapshot().seats.map((entry) =>
         entry.seatId === "seat-alpha"
-          ? { ...entry, modelKey: "gpt-5.6-terra", configurationRevision: 9 }
+          ? {
+              ...entry,
+              modelKey: "gpt-5.6-terra",
+              enabled: false,
+              configurationRevision: 9,
+            }
           : { ...entry, configurationRevision: 9 },
       ),
     });
@@ -481,11 +486,19 @@ describe("applyAgentControlAction", () => {
     expect(conflicted.revisionConflict).toEqual({
       attemptedRevision: 8,
       serverRevision: 9,
+      seats: [
+        {
+          seatId: "seat-alpha",
+          agentIdentityId: "agent-alpha",
+          localFields: ["Model"],
+          serverFields: ["Participation"],
+        },
+      ],
     });
     expect(conflicted.dirty).toBe(true);
     expect(serializeAgentControlDraft(conflicted)).toMatchObject({
-      ok: true,
-      request: { expectedRevision: 9 },
+      ok: false,
+      issues: [expect.objectContaining({ code: "revision_conflict" })],
     });
   });
 
@@ -559,6 +572,14 @@ describe("applyAgentControlAction", () => {
     expect(refreshed.revisionConflict).toEqual({
       attemptedRevision: 7,
       serverRevision: 9,
+      seats: [
+        {
+          seatId: "seat-alpha",
+          agentIdentityId: "agent-alpha",
+          localFields: ["Model"],
+          serverFields: [],
+        },
+      ],
     });
   });
 

@@ -3,6 +3,7 @@ import { useId } from "react";
 import type {
   AgentControlAction,
   AgentControlState,
+  AgentControlValidationIssue,
   AgentIdentity,
   AgentSeatDraft,
   AgentSeatSnapshot,
@@ -19,6 +20,10 @@ export interface AgentSeatCardProps {
   readonly seat: AgentSeatDraft;
   /** Send one intent through the authoritative room-agent reducer. */
   readonly onAction: (action: AgentControlAction) => void;
+  /** Local validation failures attached to this stable seat. */
+  readonly validationIssues?: readonly AgentControlValidationIssue[];
+  /** Whether every roster edit is frozen during one complete mutation. */
+  readonly editingDisabled?: boolean;
 }
 
 /** Inputs for one catalog-defined setting control. */
@@ -222,20 +227,28 @@ function AgentSettingControl({
 }
 
 /** Render one room seat with controls bounded by identity ownership and manager policy. */
-export function AgentSeatCard({ control, seat, onAction }: AgentSeatCardProps) {
+export function AgentSeatCard({
+  control,
+  seat,
+  onAction,
+  validationIssues = [],
+  editingDisabled = false,
+}: AgentSeatCardProps) {
   const idPrefix = useId();
   const identity = findIdentity(control, seat);
   const baseline = findBaseline(control, seat.seatId);
   const owner = ownerId(identity, baseline);
   const agentName = identity?.displayName?.trim() || identity?.username || seat.agentIdentityId;
   const username = identity?.username || baseline?.agentUsername || seat.agentIdentityId;
-  const mayConfigure = owner === control.currentHumanId;
-  const mayRemove = mayConfigure || control.canManageRoom;
+  const mayConfigure = !editingDisabled && owner === control.currentHumanId;
+  const mayRemove = !editingDisabled && (mayConfigure || control.canManageRoom);
   const toggleRestoresBaseline =
     baseline !== undefined && baseline.enabled !== seat.enabled;
   const managerMayDisable =
     control.canManageRoom && baseline?.enabled === true && seat.enabled;
-  const mayToggle = mayConfigure || toggleRestoresBaseline || managerMayDisable;
+  const mayToggle =
+    !editingDisabled &&
+    (mayConfigure || toggleRestoresBaseline || managerMayDisable);
   const harness = control.catalog.harnesses.find(
     (candidate) => candidate.id === seat.harnessKey,
   );
@@ -266,6 +279,17 @@ export function AgentSeatCard({ control, seat, onAction }: AgentSeatCardProps) {
           {runtime.secondary ? <small>{runtime.secondary}</small> : null}
         </div>
       </div>
+
+      {validationIssues.length > 0 ? (
+        <div className="agent-seat-card__validation" role="alert">
+          <strong>Configuration needs attention</strong>
+          <ul>
+            {validationIssues.map((issue) => (
+              <li key={`${issue.code}-${issue.field ?? "seat"}`}>{issue.message}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       <div className="agent-seat-card__controls">
         <CapabilitySelect
