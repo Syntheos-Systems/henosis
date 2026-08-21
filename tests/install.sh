@@ -135,6 +135,9 @@ test_verified_install() {
     grep -F '"ok":true' "$case_root/result.json" >/dev/null || fail 'headless install did not report success'
     [ -x "$case_root/bin/henosis" ] || fail 'henosis was not installed'
     [ -x "$case_root/bin/crucible" ] || fail 'Crucible was not installed'
+    [ "$(cat "$case_root/bin/.henosis-installation")" = "format=1
+experience=cli
+version=$version" ] || fail 'installer ownership marker was not written'
     [ "$(cat "$case_root/init.log")" = 'init --quick' ] || fail 'installer did not run henosis init --quick'
 }
 
@@ -217,10 +220,12 @@ test_rollback() {
     cp "$release/$version"/* "$case_root/remote/$version/"
     printf '#!/bin/sh\nprintf previous\n' > "$case_root/bin/henosis"; chmod 755 "$case_root/bin/henosis"
     printf '#!/bin/sh\nprintf previous-crucible\n' > "$case_root/bin/crucible"; chmod 755 "$case_root/bin/crucible"
+    printf 'format=1\nexperience=cli\nversion=v0.0.9\n' > "$case_root/bin/.henosis-installation"
     if HENOSIS_FIXTURE_RELEASE="$case_root/remote/$version" HENOSIS_INIT_LOG="$case_root/init.log" PATH="$case_root/tools:$ORIGINAL_PATH" \
         "$REPOSITORY_DIR/install.sh" --version "$version" --install-dir "$case_root/bin" --headless > "$case_root/result.json" 2>&1; then fail 'failed initialization succeeded'; fi
     [ "$("$case_root/bin/henosis")" = previous ] || fail 'previous executable was not restored'
     [ "$("$case_root/bin/crucible")" = previous-crucible ] || fail 'previous Crucible executable was not restored'
+    [ "$(sed -n '3p' "$case_root/bin/.henosis-installation")" = 'version=v0.0.9' ] || fail 'previous ownership marker was not restored'
     grep -F '"ok":false' "$case_root/result.json" >/dev/null || fail 'headless rollback did not report failure'
 }
 

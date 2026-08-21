@@ -38,7 +38,9 @@ use syntheos_dispatch::Dispatcher;
 use syntheos_identity::{PrincipalDirectory, SqliteDirectory};
 use syntheos_server::authority::{AuditBoundary, AuditExecutionGuard, AuthorityState};
 use syntheos_server::billing::BillingState;
-use syntheos_server::cli::{CliPaths, CliRunner, Command, HttpControlApi, RunResult};
+use syntheos_server::cli::{
+    CliPaths, CliRunner, Command, HttpControlApi, LocalLifecycleApi, RunResult,
+};
 use syntheos_server::operator::OperatorState;
 use syntheos_server::{
     eidolon_gate, public_gate_chain, runtime_router, spawn_action_reactor, AppState,
@@ -399,6 +401,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             CliRunner::local(cli_paths.clone())
                 .with_control_api(&control_api)
                 .run(command)?
+        } else if lifecycle_command(&command) {
+            let lifecycle_api = LocalLifecycleApi::from_environment(&cli_paths)?;
+            CliRunner::local(cli_paths.clone())
+                .with_lifecycle_api(&lifecycle_api)
+                .run(command)?
         } else {
             CliRunner::local(cli_paths.clone()).run(command)?
         };
@@ -425,12 +432,16 @@ fn control_command(command: &Command) -> bool {
     matches!(
         command,
         Command::Status
-            | Command::Update
-            | Command::Uninstall
             | Command::Token(_)
             | Command::Approvals(_)
+            | Command::Executions(_)
             | Command::AuditVerify
     )
+}
+
+/// Identify commands that mutate only the locally marked package installation.
+fn lifecycle_command(command: &Command) -> bool {
+    matches!(command, Command::Update { .. } | Command::Uninstall { .. })
 }
 
 /// Validate the explicit container-oriented quick-initialization switch.
@@ -2040,6 +2051,9 @@ mod auto_init_tests {
         assert!(control_command(&Command::Status));
         assert!(control_command(&Command::Token(
             syntheos_server::cli::TokenCommand::List
+        )));
+        assert!(control_command(&Command::Executions(
+            syntheos_server::cli::ExecutionCommand::List
         )));
         assert!(!control_command(&Command::Init(
             syntheos_server::cli::InitMode::Quick

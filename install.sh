@@ -579,27 +579,60 @@ archive_binary() {
     ARCHIVE_CRUCIBLE=$crucible_candidate
 }
 
-# Restore both previous executables after a failed transactional activation.
+# Restore one backup through a same-directory candidate so cross-device temp
+# directories cannot break rollback.
+restore_backup() {
+    backup=$1
+    destination=$2
+    restore_candidate="${destination}.restore.$$"
+    cp -p "$backup" "$restore_candidate" || return 1
+    mv -f "$restore_candidate" "$destination" || {
+        rm -f "$restore_candidate"
+        return 1
+    }
+}
+
+# Restore all previous installer-owned files after a failed transactional activation.
 rollback() {
+    ROLLBACK_FAILED=0
     if [ "${HENOSIS_ACTIVATED:-0}" -eq 1 ]; then
         if [ -n "${HENOSIS_BACKUP:-}" ] && [ -f "$HENOSIS_BACKUP" ]; then
-            mv -f "$HENOSIS_BACKUP" "$HENOSIS_DESTINATION"
+            if ! restore_backup "$HENOSIS_BACKUP" "$HENOSIS_DESTINATION"; then
+                info "CRITICAL: could not restore $HENOSIS_DESTINATION"
+                ROLLBACK_FAILED=1
+            fi
         else
-            rm -f "$HENOSIS_DESTINATION"
+            if ! rm -f "$HENOSIS_DESTINATION"; then ROLLBACK_FAILED=1; fi
         fi
     fi
     if [ "${CRUCIBLE_ACTIVATED:-0}" -eq 1 ]; then
         if [ -n "${CRUCIBLE_BACKUP:-}" ] && [ -f "$CRUCIBLE_BACKUP" ]; then
-            mv -f "$CRUCIBLE_BACKUP" "$CRUCIBLE_DESTINATION"
+            if ! restore_backup "$CRUCIBLE_BACKUP" "$CRUCIBLE_DESTINATION"; then
+                info "CRITICAL: could not restore $CRUCIBLE_DESTINATION"
+                ROLLBACK_FAILED=1
+            fi
         else
-            rm -f "$CRUCIBLE_DESTINATION"
+            if ! rm -f "$CRUCIBLE_DESTINATION"; then ROLLBACK_FAILED=1; fi
+        fi
+    fi
+    if [ "${MANIFEST_ACTIVATED:-0}" -eq 1 ]; then
+        if [ -n "${MANIFEST_BACKUP:-}" ] && [ -f "$MANIFEST_BACKUP" ]; then
+            if ! restore_backup "$MANIFEST_BACKUP" "$MANIFEST_DESTINATION"; then
+                info "CRITICAL: could not restore $MANIFEST_DESTINATION"
+                ROLLBACK_FAILED=1
+            fi
+        else
+            if ! rm -f "$MANIFEST_DESTINATION"; then ROLLBACK_FAILED=1; fi
         fi
     fi
     if [ "${DESKTOP_ACTIVATED:-0}" -eq 1 ]; then
         if [ -n "${DESKTOP_BACKUP:-}" ] && [ -f "$DESKTOP_BACKUP" ]; then
-            mv -f "$DESKTOP_BACKUP" "$DESKTOP_DESTINATION"
+            if ! restore_backup "$DESKTOP_BACKUP" "$DESKTOP_DESTINATION"; then
+                info "CRITICAL: could not restore $DESKTOP_DESTINATION"
+                ROLLBACK_FAILED=1
+            fi
         else
-            rm -f "$DESKTOP_DESTINATION"
+            if ! rm -f "$DESKTOP_DESTINATION"; then ROLLBACK_FAILED=1; fi
         fi
     fi
 }
@@ -611,12 +644,13 @@ install_desktop_candidate() {
     if [ "$DESKTOP_KIND" = appimage ]; then
         DESKTOP_DESTINATION="$INSTALL_DIR/henosis-desktop"
         DESKTOP_BACKUP="$WORK_DIR/henosis-desktop.previous"
+        DESKTOP_STAGE="$INSTALL_DIR/.henosis-desktop.new.$$"
         DESKTOP_ACTIVATED=0
         mkdir -p "$INSTALL_DIR"
         [ -d "$INSTALL_DIR" ] || die "install directory is not a directory: $INSTALL_DIR"
         if [ -f "$DESKTOP_DESTINATION" ]; then cp -p "$DESKTOP_DESTINATION" "$DESKTOP_BACKUP"; fi
-        install -m 755 "$candidate" "$WORK_DIR/henosis-desktop.new"
-        mv -f "$WORK_DIR/henosis-desktop.new" "$DESKTOP_DESTINATION"
+        install -m 755 "$candidate" "$DESKTOP_STAGE"
+        mv -f "$DESKTOP_STAGE" "$DESKTOP_DESTINATION"
         DESKTOP_ACTIVATED=1
         write_desktop_preference
         DESKTOP_ACTIVATED=0
@@ -670,7 +704,15 @@ install_desktop() {
 # Remove only the private temporary workspace created by this installer.
 cleanup() {
     rollback
-    [ -n "${WORK_DIR:-}" ] && rm -rf "$WORK_DIR"
+    [ -n "${HENOSIS_STAGE:-}" ] && rm -f "$HENOSIS_STAGE"
+    [ -n "${CRUCIBLE_STAGE:-}" ] && rm -f "$CRUCIBLE_STAGE"
+    [ -n "${MANIFEST_STAGE:-}" ] && rm -f "$MANIFEST_STAGE"
+    [ -n "${DESKTOP_STAGE:-}" ] && rm -f "$DESKTOP_STAGE"
+    if [ "${ROLLBACK_FAILED:-0}" -eq 1 ]; then
+        info "CRITICAL: rollback backups preserved at $WORK_DIR"
+    elif [ -n "${WORK_DIR:-}" ]; then
+        rm -rf "$WORK_DIR"
+    fi
 }
 
 # Activate both verified executables and initialize Henosis as one transaction.
@@ -680,24 +722,36 @@ install_candidate() {
     target=$3
     HENOSIS_DESTINATION="$INSTALL_DIR/henosis"
     CRUCIBLE_DESTINATION="$INSTALL_DIR/crucible"
+    MANIFEST_DESTINATION="$INSTALL_DIR/.henosis-installation"
     HENOSIS_BACKUP="$WORK_DIR/henosis.previous"
     CRUCIBLE_BACKUP="$WORK_DIR/crucible.previous"
+    MANIFEST_BACKUP="$WORK_DIR/manifest.previous"
+    HENOSIS_STAGE="$INSTALL_DIR/.henosis.new.$$"
+    CRUCIBLE_STAGE="$INSTALL_DIR/.crucible.new.$$"
+    MANIFEST_STAGE="$INSTALL_DIR/.henosis-installation.new.$$"
     HENOSIS_ACTIVATED=0
     CRUCIBLE_ACTIVATED=0
+    MANIFEST_ACTIVATED=0
     if [ -f "$HENOSIS_DESTINATION" ]; then cp -p "$HENOSIS_DESTINATION" "$HENOSIS_BACKUP"; fi
     if [ -f "$CRUCIBLE_DESTINATION" ]; then cp -p "$CRUCIBLE_DESTINATION" "$CRUCIBLE_BACKUP"; fi
-    install -m 755 "$henosis_candidate" "$WORK_DIR/henosis.new"
-    install -m 755 "$crucible_candidate" "$WORK_DIR/crucible.new"
-    mv -f "$WORK_DIR/henosis.new" "$HENOSIS_DESTINATION"
+    if [ -f "$MANIFEST_DESTINATION" ]; then cp -p "$MANIFEST_DESTINATION" "$MANIFEST_BACKUP"; fi
+    install -m 755 "$henosis_candidate" "$HENOSIS_STAGE"
+    install -m 755 "$crucible_candidate" "$CRUCIBLE_STAGE"
+    mv -f "$HENOSIS_STAGE" "$HENOSIS_DESTINATION"
     HENOSIS_ACTIVATED=1
-    mv -f "$WORK_DIR/crucible.new" "$CRUCIBLE_DESTINATION"
+    mv -f "$CRUCIBLE_STAGE" "$CRUCIBLE_DESTINATION"
     CRUCIBLE_ACTIVATED=1
+    printf 'format=1\nexperience=cli\nversion=%s\n' "$VERSION" > "$MANIFEST_STAGE"
+    chmod 600 "$MANIFEST_STAGE"
+    mv -f "$MANIFEST_STAGE" "$MANIFEST_DESTINATION"
+    MANIFEST_ACTIVATED=1
     if ! "$HENOSIS_DESTINATION" init --quick; then
-        die 'henosis init --quick failed; restored the previous Henosis and Crucible installation'
+        die 'henosis init --quick failed; the installer is rolling back the previous Henosis installation'
     fi
     HENOSIS_ACTIVATED=0
     CRUCIBLE_ACTIVATED=0
-    rm -f "$HENOSIS_BACKUP" "$CRUCIBLE_BACKUP"
+    MANIFEST_ACTIVATED=0
+    rm -f "$HENOSIS_BACKUP" "$CRUCIBLE_BACKUP" "$MANIFEST_BACKUP"
     if [ "$HEADLESS" -eq 1 ]; then
         printf '{"ok":true,"experience":"cli","binary":"%s","crucible":"%s","version":"%s","target":"%s"}\n' "$HENOSIS_DESTINATION" "$CRUCIBLE_DESTINATION" "$VERSION" "$target"
     else

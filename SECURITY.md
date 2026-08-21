@@ -40,3 +40,10 @@ The CI dependency gate rejects RustSec advisories except for two narrow, reviewe
 ## Release integrity
 
 Verify the SHA-256 entry in the release `SHA256SUMS` file before installation. The installers reject absent, ambiguous, malformed, or mismatched checksums and roll back an installation when initialization fails.
+
+On Unix, `henosis update` reuses the installer embedded in the running binary
+and requires an explicit version tag. Update and uninstall reject unmarked,
+malformed, renamed, or symlinked CLI layouts. Uninstall is plan-only unless the
+operator supplies `--confirm-quarantine`; confirmation moves exactly the three
+installer-owned CLI files into a same-directory quarantine and never removes
+the operator home, configuration, databases, credentials, or quarantine.

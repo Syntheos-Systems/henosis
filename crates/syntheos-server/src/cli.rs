@@ -8,6 +8,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -56,6 +57,15 @@ const MAX_LOCAL_TOKEN_BYTES: usize = 16 * 1024;
 /// Maximum accepted local environment configuration size in bytes.
 const MAX_LOCAL_CONFIG_BYTES: usize = 64 * 1024;
 
+/// Installer-owned marker required before local lifecycle operations may mutate files.
+const INSTALLATION_MARKER_FILE: &str = ".henosis-installation";
+
+/// Same-directory holding area used for recoverable CLI removal.
+const UNINSTALL_QUARANTINE_DIRECTORY: &str = ".henosis-uninstall-quarantine";
+
+/// Maximum accepted installer ownership marker size in bytes.
+const MAX_INSTALLATION_MARKER_BYTES: usize = 256;
+
 /// Fixed timeout for each live-control request.
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -91,7 +101,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (not implemented)\n  henosis uninstall (not implemented)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis executions list\n  henosis executions resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update --version <v-prefixed-tag>\n  henosis uninstall [--confirm-quarantine]\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis executions list\n  henosis executions resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>\n  henosis audit verify\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -111,10 +121,16 @@ pub enum Command {
     Version,
     /// Fetch the live control plane's status.
     Status,
-    /// Request an update through the live control plane.
-    Update,
-    /// Request a managed uninstall through the live control plane.
-    Uninstall,
+    /// Update this marked CLI installation to one explicit immutable release.
+    Update {
+        /// V-prefixed immutable release tag selected by the operator.
+        version: String,
+    },
+    /// Plan or confirm recoverable quarantine of this marked CLI installation.
+    Uninstall {
+        /// Whether the operator explicitly authorized the reported quarantine step.
+        confirm_quarantine: bool,
+    },
     /// Manage operator tokens through the live control plane.
     Token(TokenCommand),
     /// Resolve pending approvals through the live control plane.
@@ -213,10 +229,6 @@ pub enum ExecutionCommand {
 pub enum ControlRequest {
     /// Retrieve the live control-plane status.
     Status,
-    /// Ask the control plane to perform its supported update procedure.
-    Update,
-    /// Ask the control plane to perform its supported uninstall procedure.
-    Uninstall,
     /// Forward a token-management request.
     Token(TokenCommand),
     /// Forward an approval-management request.
@@ -225,6 +237,311 @@ pub enum ControlRequest {
     Executions(ExecutionCommand),
     /// Ask the live audit authority to verify its chain.
     AuditVerify,
+}
+
+/// A typed local lifecycle request emitted after strict argument validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleRequest {
+    /// Install one explicit immutable release over the marked CLI installation.
+    Update {
+        /// V-prefixed immutable release tag selected by the operator.
+        version: String,
+    },
+    /// Inspect or quarantine the exact installer-owned CLI artifacts.
+    Uninstall {
+        /// Whether to perform the same-directory quarantine after reporting its scope.
+        confirm_quarantine: bool,
+    },
+}
+
+/// A local lifecycle result safe to render directly to the operator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleOutput {
+    /// Human-readable result containing exact paths but no secret contents.
+    pub message: String,
+}
+
+/// Integration seam for local package lifecycle operations.
+pub trait LifecycleApi {
+    /// Executes one validated lifecycle request without contacting the control plane.
+    fn execute(&self, request: LifecycleRequest) -> Result<LifecycleOutput, CliError>;
+}
+
+/// Local lifecycle implementation bound to the running executable and operator home.
+pub struct LocalLifecycleApi {
+    /// Running executable that must match an installer-owned CLI layout.
+    executable: PathBuf,
+    /// Operator state root that uninstall must explicitly preserve.
+    operator_home: PathBuf,
+}
+
+/// Performs verified installer updates and recoverable uninstall quarantine.
+impl LocalLifecycleApi {
+    /// Binds lifecycle operations to the current executable and resolved operator home.
+    pub fn from_environment(paths: &CliPaths) -> Result<Self, CliError> {
+        let executable = env::current_exe().map_err(|source| CliError::Filesystem {
+            path: PathBuf::from("current executable"),
+            source,
+        })?;
+        Ok(Self {
+            executable,
+            operator_home: paths.home.clone(),
+        })
+    }
+
+    /// Creates a lifecycle implementation for one explicit executable and state root.
+    #[cfg(test)]
+    fn for_test(executable: PathBuf, operator_home: PathBuf) -> Self {
+        Self {
+            executable,
+            operator_home,
+        }
+    }
+}
+
+/// Exact installer-owned paths authorized for one CLI lifecycle operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstalledCliLayout {
+    /// Directory containing all installer-owned CLI artifacts.
+    install_dir: PathBuf,
+    /// Running Henosis executable.
+    henosis: PathBuf,
+    /// Adjacent Crucible sandbox executable.
+    crucible: PathBuf,
+    /// Bounded ownership marker created transactionally by `install.sh`.
+    marker: PathBuf,
+}
+
+/// Executes lifecycle operations against one validated installer-owned layout.
+impl LifecycleApi for LocalLifecycleApi {
+    /// Updates through the embedded trusted installer or performs reversible quarantine.
+    fn execute(&self, request: LifecycleRequest) -> Result<LifecycleOutput, CliError> {
+        let layout = installed_cli_layout(&self.executable)?;
+        match request {
+            LifecycleRequest::Update { version } => {
+                validate_release_tag(&version)?;
+                run_embedded_update(&layout, &version)?;
+                Ok(LifecycleOutput {
+                    message: format!(
+                        "updated the marked Henosis CLI installation at {} to {version}",
+                        layout.install_dir.display()
+                    ),
+                })
+            }
+            LifecycleRequest::Uninstall { confirm_quarantine } => {
+                quarantine_installation(&layout, &self.operator_home, confirm_quarantine)
+            }
+        }
+    }
+}
+
+/// Validates the exact non-symlink CLI layout marked by the release installer.
+fn installed_cli_layout(executable: &Path) -> Result<InstalledCliLayout, CliError> {
+    #[cfg(unix)]
+    let expected_name = "henosis";
+    #[cfg(windows)]
+    let expected_name = "henosis.exe";
+    #[cfg(not(any(unix, windows)))]
+    let expected_name = "henosis";
+
+    if executable.file_name().and_then(|name| name.to_str()) != Some(expected_name) {
+        return Err(CliError::InvalidInstallation {
+            message: "the running executable is not named as an installed Henosis CLI binary",
+        });
+    }
+    require_path_state(executable, LocalPathState::File, "regular file")?;
+    let canonical = fs::canonicalize(executable).map_err(|source| CliError::Filesystem {
+        path: executable.to_path_buf(),
+        source,
+    })?;
+    if canonical != executable {
+        return Err(CliError::InvalidInstallation {
+            message: "the running executable path contains a symlink or non-canonical component",
+        });
+    }
+    let install_dir = executable
+        .parent()
+        .ok_or(CliError::InvalidInstallation {
+            message: "the running executable has no installation directory",
+        })?
+        .to_path_buf();
+    require_path_state(&install_dir, LocalPathState::Directory, "directory")?;
+    let crucible = install_dir.join(if cfg!(windows) {
+        "crucible.exe"
+    } else {
+        "crucible"
+    });
+    let marker = install_dir.join(INSTALLATION_MARKER_FILE);
+    require_path_state(&crucible, LocalPathState::File, "regular file")?;
+    require_path_state(&marker, LocalPathState::File, "regular file")?;
+    let contents = read_bounded_string(
+        &marker,
+        open_regular_config(&marker)?,
+        MAX_INSTALLATION_MARKER_BYTES,
+    )?;
+    validate_installation_marker(&contents)?;
+    Ok(InstalledCliLayout {
+        install_dir,
+        henosis: executable.to_path_buf(),
+        crucible,
+        marker,
+    })
+}
+
+/// Accepts only the exact bounded marker grammar emitted by the Unix installer.
+fn validate_installation_marker(contents: &str) -> Result<(), CliError> {
+    let lines = contents.lines().collect::<Vec<_>>();
+    if lines.len() != 3 || lines[0] != "format=1" || lines[1] != "experience=cli" {
+        return Err(CliError::InvalidInstallation {
+            message: "the installer ownership marker is malformed or not for the CLI experience",
+        });
+    }
+    let version = lines[2]
+        .strip_prefix("version=")
+        .ok_or(CliError::InvalidInstallation {
+            message: "the installer ownership marker has no release version",
+        })?;
+    validate_release_tag(version)
+}
+
+/// Validates the release-tag subset accepted by both lifecycle parsing and `install.sh`.
+fn validate_release_tag(version: &str) -> Result<(), CliError> {
+    let mut characters = version.chars();
+    let valid_prefix = characters.next() == Some('v')
+        && characters
+            .next()
+            .is_some_and(|value| value.is_ascii_digit());
+    let valid_tail = characters.all(|value| value.is_ascii_alphanumeric() || "._-".contains(value));
+    if valid_prefix && valid_tail {
+        Ok(())
+    } else {
+        Err(CliError::Usage {
+            message: "release version must be a v-prefixed tag containing only letters, digits, dot, underscore, or hyphen".to_string(),
+        })
+    }
+}
+
+/// Runs the compile-time installer through `/bin/sh` using typed arguments.
+#[cfg(unix)]
+fn run_embedded_update(layout: &InstalledCliLayout, version: &str) -> Result<(), CliError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_path = layout
+        .install_dir
+        .join(format!(".henosis-update-installer.{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut script = options
+        .open(&script_path)
+        .map_err(|source| CliError::Filesystem {
+            path: script_path.clone(),
+            source,
+        })?;
+    let write_result = script
+        .write_all(include_bytes!("../../../install.sh"))
+        .and_then(|_| script.sync_all());
+    drop(script);
+    if let Err(source) = write_result {
+        let _ = fs::remove_file(&script_path);
+        return Err(CliError::Filesystem {
+            path: script_path,
+            source,
+        });
+    }
+    let status = ProcessCommand::new("/bin/sh")
+        .arg(&script_path)
+        .arg("--version")
+        .arg(version)
+        .arg("--install-dir")
+        .arg(&layout.install_dir)
+        .arg("--experience")
+        .arg("cli")
+        .arg("--headless")
+        .status();
+    let cleanup = fs::remove_file(&script_path);
+    let status = status.map_err(|source| CliError::LifecycleProcess { source })?;
+    cleanup.map_err(|source| CliError::Filesystem {
+        path: script_path,
+        source,
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::LifecycleInstallerFailed {
+            status: status.code(),
+        })
+    }
+}
+
+/// Fails closed where replacing a running executable needs a detached platform helper.
+#[cfg(not(unix))]
+fn run_embedded_update(_layout: &InstalledCliLayout, _version: &str) -> Result<(), CliError> {
+    Err(CliError::UnsupportedLifecyclePlatform)
+}
+
+/// Reports or performs exact same-directory quarantine while preserving operator state.
+fn quarantine_installation(
+    layout: &InstalledCliLayout,
+    operator_home: &Path,
+    confirm: bool,
+) -> Result<LifecycleOutput, CliError> {
+    if !cfg!(unix) {
+        return Err(CliError::UnsupportedLifecyclePlatform);
+    }
+    let quarantine = layout.install_dir.join(UNINSTALL_QUARANTINE_DIRECTORY);
+    if inspect_path(&quarantine)? != LocalPathState::Missing {
+        return Err(CliError::InvalidInstallation {
+            message: "the uninstall quarantine path already exists; restore or relocate it before retrying",
+        });
+    }
+    if !confirm {
+        return Ok(LifecycleOutput {
+            message: format!(
+                "uninstall plan (no files changed):\n  quarantine: {}\n  move: {}\n  move: {}\n  move: {}\n  preserve operator state: {}\nrun `henosis uninstall --confirm-quarantine` to perform these exact moves",
+                quarantine.display(),
+                layout.henosis.display(),
+                layout.crucible.display(),
+                layout.marker.display(),
+                operator_home.display()
+            ),
+        });
+    }
+    fs::create_dir(&quarantine).map_err(|source| CliError::Filesystem {
+        path: quarantine.clone(),
+        source,
+    })?;
+    let sources = [&layout.crucible, &layout.marker, &layout.henosis];
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for source in sources {
+        let destination =
+            quarantine.join(source.file_name().ok_or(CliError::InvalidInstallation {
+                message: "an installer-owned path has no filename",
+            })?);
+        if let Err(source_error) = fs::rename(source, &destination) {
+            for (original, quarantined) in moved.iter().rev() {
+                fs::rename(quarantined, original).map_err(|rollback_error| {
+                    CliError::LifecycleRollbackFailed {
+                        original: original.clone(),
+                        source: rollback_error,
+                    }
+                })?;
+            }
+            let _ = fs::remove_dir(&quarantine);
+            return Err(CliError::Filesystem {
+                path: source.clone(),
+                source: source_error,
+            });
+        }
+        moved.push((source.clone(), destination));
+    }
+    Ok(LifecycleOutput {
+        message: format!(
+            "Henosis CLI artifacts quarantined at {}; operator state preserved at {}. Keep the quarantine until the installation absence has been verified and restore by moving its three files back to {}.",
+            quarantine.display(),
+            operator_home.display(),
+            layout.install_dir.display()
+        ),
+    })
 }
 
 /// A typed control-plane response safe for the CLI renderer to display.
@@ -432,12 +749,6 @@ impl ControlApi for HttpControlApi {
                     message: self.response_text(response, operation)?,
                 })
             }
-            ControlRequest::Update => Err(CliError::UnsupportedControlOperation {
-                operation: "henosis update",
-            }),
-            ControlRequest::Uninstall => Err(CliError::UnsupportedControlOperation {
-                operation: "henosis uninstall",
-            }),
             ControlRequest::Token(TokenCommand::Create { label, output }) => {
                 self.create_token(&label, output)
             }
@@ -812,6 +1123,8 @@ pub enum RunResult {
     Version,
     /// A typed live control-plane request completed.
     Control(ControlOutput),
+    /// A local package lifecycle operation completed.
+    Lifecycle(LifecycleOutput),
     /// The binary entry point must continue into its integrated server runtime.
     Serve,
 }
@@ -847,6 +1160,7 @@ impl RunResult {
             Self::Help => Ok(HELP_TEXT.to_string()),
             Self::Version => Ok(VERSION_TEXT.to_string()),
             Self::Control(output) => Ok(output.message.clone()),
+            Self::Lifecycle(output) => Ok(output.message.clone()),
             Self::Serve => Ok(String::new()),
         }
     }
@@ -858,6 +1172,8 @@ pub struct CliRunner<'a> {
     paths: CliPaths,
     /// Optional authenticated client supplied by the binary integration layer.
     control_api: Option<&'a dyn ControlApi>,
+    /// Optional local package lifecycle integration supplied by the binary entry point.
+    lifecycle_api: Option<&'a dyn LifecycleApi>,
 }
 
 /// Parses command lines and executes only explicitly authorized local work.
@@ -867,12 +1183,19 @@ impl<'a> CliRunner<'a> {
         Self {
             paths,
             control_api: None,
+            lifecycle_api: None,
         }
     }
 
     /// Attaches an authenticated typed control-plane client to a local runner.
     pub fn with_control_api(mut self, control_api: &'a dyn ControlApi) -> Self {
         self.control_api = Some(control_api);
+        self
+    }
+
+    /// Attaches a local package lifecycle implementation to this runner.
+    pub fn with_lifecycle_api(mut self, lifecycle_api: &'a dyn LifecycleApi) -> Self {
+        self.lifecycle_api = Some(lifecycle_api);
         self
     }
 
@@ -901,8 +1224,10 @@ impl<'a> CliRunner<'a> {
             Command::Version => Ok(RunResult::Version),
             Command::Serve => Ok(RunResult::Serve),
             Command::Status => self.run_control(ControlRequest::Status),
-            Command::Update => self.run_control(ControlRequest::Update),
-            Command::Uninstall => self.run_control(ControlRequest::Uninstall),
+            Command::Update { version } => self.run_lifecycle(LifecycleRequest::Update { version }),
+            Command::Uninstall { confirm_quarantine } => {
+                self.run_lifecycle(LifecycleRequest::Uninstall { confirm_quarantine })
+            }
             Command::Token(command) => self.run_control(ControlRequest::Token(command)),
             Command::Approvals(command) => self.run_control(ControlRequest::Approvals(command)),
             Command::Executions(command) => self.run_control(ControlRequest::Executions(command)),
@@ -920,6 +1245,20 @@ impl<'a> CliRunner<'a> {
             })?;
         client.execute(request).map(RunResult::Control)
     }
+
+    /// Delegates a local lifecycle request only when binary integration supplied the implementation.
+    fn run_lifecycle(&self, request: LifecycleRequest) -> Result<RunResult, CliError> {
+        let operation = match &request {
+            LifecycleRequest::Update { .. } => "henosis update",
+            LifecycleRequest::Uninstall { .. } => "henosis uninstall",
+        };
+        let lifecycle = self
+            .lifecycle_api
+            .ok_or_else(|| CliError::LifecycleApiUnavailable {
+                operation: operation.to_string(),
+            })?;
+        lifecycle.execute(request).map(RunResult::Lifecycle)
+    }
 }
 
 /// Parses the top-level CLI grammar without a shell or string-command construction.
@@ -935,8 +1274,8 @@ impl Command {
             "help" | "--help" | "-h" => parse_empty(tail, Self::Help),
             "version" | "--version" | "-V" => parse_empty(tail, Self::Version),
             "status" => parse_empty(tail, Self::Status),
-            "update" => parse_empty(tail, Self::Update),
-            "uninstall" => parse_empty(tail, Self::Uninstall),
+            "update" => parse_update(tail),
+            "uninstall" => parse_uninstall(tail),
             "token" => parse_token(tail).map(Self::Token),
             "approvals" => parse_approvals(tail).map(Self::Approvals),
             "executions" => parse_executions(tail).map(Self::Executions),
@@ -1060,6 +1399,43 @@ pub enum CliError {
         /// Stable operation name that needs live control-plane integration.
         operation: String,
     },
+    /// A local lifecycle command was run without binary integration supplying its implementation.
+    #[error("`{operation}` requires the local package lifecycle integration")]
+    LifecycleApiUnavailable {
+        /// Stable operation name that needs lifecycle integration.
+        operation: String,
+    },
+    /// The running executable is not part of a safely marked CLI installation.
+    #[error("invalid Henosis CLI installation: {message}")]
+    InvalidInstallation {
+        /// Non-secret reason that package ownership could not be established.
+        message: &'static str,
+    },
+    /// The platform cannot safely replace or quarantine its running executable in-process.
+    #[error("Henosis self-update and quarantine uninstall are currently supported on Unix CLI installations only")]
+    UnsupportedLifecyclePlatform,
+    /// The embedded installer process could not be started or observed.
+    #[error("cannot run the embedded Henosis installer: {source}")]
+    LifecycleProcess {
+        /// Underlying process creation or waiting error.
+        #[source]
+        source: io::Error,
+    },
+    /// The embedded verified installer rejected or failed the selected release.
+    #[error("the embedded Henosis installer failed with exit status {status:?}; the installer rollback contract preserved the previous installation")]
+    LifecycleInstallerFailed {
+        /// Process exit code when the operating system supplied one.
+        status: Option<i32>,
+    },
+    /// A failed quarantine could not restore one already moved artifact.
+    #[error("failed to restore {original} after an incomplete uninstall quarantine: {source}")]
+    LifecycleRollbackFailed {
+        /// Original installer-owned path that could not be restored.
+        original: PathBuf,
+        /// Underlying rename failure.
+        #[source]
+        source: io::Error,
+    },
     /// Live HTTP control configuration was malformed or unsafe before a request was sent.
     #[error("invalid live-control configuration: {message}")]
     ControlConfiguration {
@@ -1111,12 +1487,6 @@ pub enum CliError {
     #[error("{operation} returned an invalid live-control response")]
     InvalidControlResponse {
         /// Stable command name that received the malformed success response.
-        operation: &'static str,
-    },
-    /// The selected command is intentionally not implemented by the control surface.
-    #[error("{operation} is not implemented")]
-    UnsupportedControlOperation {
-        /// Stable command name that is deliberately unavailable.
         operation: &'static str,
     },
 }
@@ -1297,6 +1667,36 @@ fn parse_doctor(arguments: &[String]) -> Result<Command, CliError> {
     }
 }
 
+/// Parses an explicit immutable update target without accepting mutable channels.
+fn parse_update(arguments: &[String]) -> Result<Command, CliError> {
+    match arguments {
+        [flag, version] if flag == "--version" => {
+            validate_release_tag(version)?;
+            Ok(Command::Update {
+                version: version.clone(),
+            })
+        }
+        _ => Err(CliError::Usage {
+            message: "usage: henosis update --version <v-prefixed-tag>".to_string(),
+        }),
+    }
+}
+
+/// Parses plan-only uninstall or its explicit reversible-quarantine confirmation.
+fn parse_uninstall(arguments: &[String]) -> Result<Command, CliError> {
+    match arguments {
+        [] => Ok(Command::Uninstall {
+            confirm_quarantine: false,
+        }),
+        [flag] if flag == "--confirm-quarantine" => Ok(Command::Uninstall {
+            confirm_quarantine: true,
+        }),
+        _ => Err(CliError::Usage {
+            message: "usage: henosis uninstall [--confirm-quarantine]".to_string(),
+        }),
+    }
+}
+
 /// Parses a command that accepts no additional arguments.
 fn parse_empty(arguments: &[String], command: Command) -> Result<Command, CliError> {
     if arguments.is_empty() {
@@ -1442,8 +1842,6 @@ fn nonempty_argument(kind: &str, value: &str) -> Result<String, CliError> {
 fn control_operation_name(request: &ControlRequest) -> &'static str {
     match request {
         ControlRequest::Status => "henosis status",
-        ControlRequest::Update => "henosis update",
-        ControlRequest::Uninstall => "henosis uninstall",
         ControlRequest::Token(_) => "henosis token",
         ControlRequest::Approvals(_) => "henosis approvals",
         ControlRequest::Executions(_) => "henosis executions",
@@ -2351,22 +2749,6 @@ mod tests {
         assert_eq!(output.message, "[]");
     }
 
-    /// Rejects unimplemented maintenance commands before issuing a network request.
-    #[test]
-    fn maintenance_commands_are_explicitly_unsupported() {
-        let client = test_http_client(
-            validate_control_url("http://127.0.0.1:8088").expect("validate loopback URL"),
-        );
-        assert!(matches!(
-            client.execute(ControlRequest::Update),
-            Err(CliError::UnsupportedControlOperation { .. })
-        ));
-        assert!(matches!(
-            client.execute(ControlRequest::Uninstall),
-            Err(CliError::UnsupportedControlOperation { .. })
-        ));
-    }
-
     /// Parses every required top-level command without accepting implicit shell syntax.
     #[test]
     fn parses_supported_commands() {
@@ -2399,12 +2781,24 @@ mod tests {
             Command::Status
         );
         assert_eq!(
-            Command::parse(&["update".into()]).expect("parse update"),
-            Command::Update
+            Command::parse(&["update".into(), "--version".into(), "v0.2.0-beta.1".into()])
+                .expect("parse update"),
+            Command::Update {
+                version: "v0.2.0-beta.1".into()
+            }
         );
         assert_eq!(
             Command::parse(&["uninstall".into()]).expect("parse uninstall"),
-            Command::Uninstall
+            Command::Uninstall {
+                confirm_quarantine: false
+            }
+        );
+        assert_eq!(
+            Command::parse(&["uninstall".into(), "--confirm-quarantine".into()])
+                .expect("parse confirmed uninstall"),
+            Command::Uninstall {
+                confirm_quarantine: true
+            }
         );
         assert_eq!(
             Command::parse(&["token".into(), "create".into(), "operator".into()])
@@ -2451,6 +2845,95 @@ mod tests {
             Command::parse(&["serve".into()]).expect("parse serve"),
             Command::Serve
         );
+    }
+
+    /// Requires an explicit immutable tag and the exact quarantine confirmation flag.
+    #[test]
+    fn lifecycle_parser_rejects_ambiguous_requests() {
+        assert!(Command::parse(&["update".into()]).is_err());
+        assert!(Command::parse(&["update".into(), "--version".into(), "latest".into()]).is_err());
+        assert!(Command::parse(&["uninstall".into(), "--force".into()]).is_err());
+    }
+
+    /// Plans without mutation, then quarantines only marked CLI files while preserving state.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_quarantines_exact_owned_files_and_preserves_operator_home() {
+        let root = temporary_home();
+        let install_dir = root.join("bin");
+        let operator_home = root.join("state");
+        fs::create_dir_all(&install_dir).expect("create install directory");
+        fs::create_dir_all(&operator_home).expect("create operator home");
+        let executable = install_dir.join("henosis");
+        let crucible = install_dir.join("crucible");
+        let marker = install_dir.join(INSTALLATION_MARKER_FILE);
+        fs::write(&executable, b"henosis").expect("write Henosis fixture");
+        fs::write(&crucible, b"crucible").expect("write Crucible fixture");
+        fs::write(
+            &marker,
+            b"format=1\nexperience=cli\nversion=v0.1.0-beta.1\n",
+        )
+        .expect("write marker fixture");
+        fs::write(operator_home.join("keep.sqlite"), b"state").expect("write state fixture");
+        let lifecycle = LocalLifecycleApi::for_test(executable.clone(), operator_home.clone());
+
+        let plan = lifecycle
+            .execute(LifecycleRequest::Uninstall {
+                confirm_quarantine: false,
+            })
+            .expect("plan uninstall");
+        assert!(plan.message.contains("no files changed"));
+        assert!(executable.exists());
+        assert!(crucible.exists());
+        assert!(marker.exists());
+
+        let result = lifecycle
+            .execute(LifecycleRequest::Uninstall {
+                confirm_quarantine: true,
+            })
+            .expect("quarantine installation");
+        let quarantine = install_dir.join(UNINSTALL_QUARANTINE_DIRECTORY);
+        assert!(result.message.contains(&quarantine.display().to_string()));
+        assert_eq!(
+            fs::read(quarantine.join("henosis")).expect("read quarantined Henosis"),
+            b"henosis"
+        );
+        assert_eq!(
+            fs::read(quarantine.join("crucible")).expect("read quarantined Crucible"),
+            b"crucible"
+        );
+        assert!(quarantine.join(INSTALLATION_MARKER_FILE).is_file());
+        assert_eq!(
+            fs::read(operator_home.join("keep.sqlite")).expect("read preserved state"),
+            b"state"
+        );
+        remove_temporary_home(&root);
+    }
+
+    /// Rejects a symlinked ownership marker before creating a quarantine directory.
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_rejects_symlinked_installation_marker() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_home();
+        let install_dir = root.join("bin");
+        fs::create_dir_all(&install_dir).expect("create install directory");
+        let executable = install_dir.join("henosis");
+        fs::write(&executable, b"henosis").expect("write Henosis fixture");
+        fs::write(install_dir.join("crucible"), b"crucible").expect("write Crucible fixture");
+        let outside = root.join("marker");
+        fs::write(&outside, b"format=1\nexperience=cli\nversion=v0.1.0\n")
+            .expect("write outside marker");
+        symlink(&outside, install_dir.join(INSTALLATION_MARKER_FILE)).expect("link marker fixture");
+        let lifecycle = LocalLifecycleApi::for_test(executable, root.join("state"));
+        assert!(lifecycle
+            .execute(LifecycleRequest::Uninstall {
+                confirm_quarantine: false,
+            })
+            .is_err());
+        assert!(!install_dir.join(UNINSTALL_QUARANTINE_DIRECTORY).exists());
+        remove_temporary_home(&root);
     }
 
     /// Parses strict execution listing and resolution forms while rejecting unsafe evidence data.

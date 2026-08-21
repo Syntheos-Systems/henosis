@@ -76,6 +76,35 @@ to install the shared graphical application with that initial experience.
 Graphical installation requires a desktop package published for the current
 operating system and architecture.
 
+Unix CLI installations include a versioned ownership marker for local
+lifecycle commands. Update to one explicit immutable release tag with:
+
+```sh
+henosis update --version v0.1.0-beta.2
+```
+
+The command runs the installer embedded in the current binary, preserving its
+release-metadata, checksum, provenance, and rollback checks. It does not use a
+mutable `latest` channel.
+
+Removal is reversible and keeps all operator configuration and databases. First
+inspect the exact paths without changing anything:
+
+```sh
+henosis uninstall
+```
+
+Then move only the marked `henosis`, `crucible`, and ownership-marker files into
+the reported same-directory quarantine:
+
+```sh
+henosis uninstall --confirm-quarantine
+```
+
+Keep that quarantine until you have verified the installation is no longer
+needed. Windows CLI self-update and quarantine uninstall are not yet supported;
+graphical distributions use their platform package lifecycle.
+
 Start the loopback service after a CLI installation:
 
 ```sh
