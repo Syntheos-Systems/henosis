@@ -477,18 +477,21 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // quota, and rate-limit checks.
     let (plutus, plutus_store): (Arc<dyn PolicyBackend>, Option<Arc<PlutusStore>>) =
         if let Some(config) = local_config.as_ref() {
+            let local_policy_db = local_policy_db_path()?;
             tracing::info!(
                 tenant = %config.tenant,
                 principal = %config.principal,
+                path = %local_policy_db.display(),
                 "local Plutus policy authority enabled (single operator, loopback only)"
             );
             (
-                Arc::new(LocalPolicyBackend::new(
+                Arc::new(LocalPolicyBackend::open(
+                    &local_policy_db,
                     config.tenant,
                     config.principal,
                     Role::Owner,
                     QuotaTier::Free,
-                )),
+                )?),
                 None,
             )
         } else {
@@ -1593,6 +1596,24 @@ fn db_path(var: &str, default: &str) -> Result<String, Box<dyn std::error::Error
     Ok(syntheos_env::resolve_name(var)?.unwrap_or_else(|| default.to_string()))
 }
 
+/// Resolve the dedicated local policy database, deriving an upgrade-safe sibling of identity state.
+fn local_policy_db_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let configured = optional_env("SYNTHEOS_PLUTUS_LOCAL_DB")?;
+    let identity = db_path("SYNTHEOS_IDENTITY_DB", "data/identity.sqlite")?;
+    Ok(selected_local_policy_db_path(
+        configured.as_deref(),
+        &identity,
+    ))
+}
+
+/// Select an explicit local policy path or derive one beside the configured identity database.
+fn selected_local_policy_db_path(configured: Option<&str>, identity: &str) -> std::path::PathBuf {
+    configured.map_or_else(
+        || Path::new(identity).with_file_name("plutus-local.sqlite"),
+        std::path::PathBuf::from,
+    )
+}
+
 /// Read and validate the Plutus pool acquisition deadline from the process environment.
 fn plutus_acquire_timeout_from_env() -> Result<Duration, String> {
     let raw = match std::env::var("SYNTHEOS_PLUTUS_ACQUIRE_TIMEOUT_SECS") {
@@ -2223,6 +2244,22 @@ mod local_policy_tests {
             TenantId::new().to_string(),
             syntheos_contracts::PrincipalId::new().to_string(),
         )
+    }
+
+    /// Existing local configurations derive durable policy state beside identity storage.
+    #[test]
+    fn legacy_local_policy_path_follows_identity_database() {
+        assert_eq!(
+            selected_local_policy_db_path(None, "/var/lib/henosis/identity.sqlite"),
+            Path::new("/var/lib/henosis/plutus-local.sqlite")
+        );
+        assert_eq!(
+            selected_local_policy_db_path(
+                Some("/srv/henosis/policy.sqlite"),
+                "/var/lib/henosis/identity.sqlite",
+            ),
+            Path::new("/srv/henosis/policy.sqlite")
+        );
     }
 
     /// An absent opt-in leaves the production PostgreSQL selection untouched.

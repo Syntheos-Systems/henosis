@@ -23,6 +23,10 @@ uuid.workspace = true
 sqlx = { workspace = true }
 # Structured logging for store operations and bootstrap.
 tracing.workspace = true
+# Protected local SQLite path opening for restart-durable loopback policy state.
+henosis-sqlite = { path = "../henosis-sqlite" }
+# Transactional daily quota and token-bucket persistence for local policy mode.
+rusqlite = { workspace = true, features = ["bundled"] }
 # DateTime<Utc> for rate-limit token-bucket clock injection.
 chrono = "0.4"
 # Stripe webhook signature verification: keyed HMAC over the raw request body.

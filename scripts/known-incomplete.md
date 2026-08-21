@@ -2,7 +2,6 @@
 
 | Limitation | Status |
 | --- | --- |
-| Local policy is single-operator, loopback-only, and resets counters on restart. | Open |
 | Local credential operations need a separately running loopback `phylaxd`; the quick initializer does not manufacture broker credentials. | Open |
 | The embedded compatibility store's allowlisted exec mode is POSIX-only; non-Unix platforms deny it before loading secret material. | Open |
 | The full proprietary Pistis service is not distributed here. Production starts with an empty room-state source, while loopback local mode authorizes only the signed `henosis.probe` compatibility action. | Open |

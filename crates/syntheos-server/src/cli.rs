@@ -71,6 +71,7 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Local database environment keys and filenames written by `henosis init --quick`.
 const LOCAL_DATABASES: &[(&str, &str)] = &[
+    ("SYNTHEOS_PLUTUS_LOCAL_DB", "plutus-local.sqlite"),
     ("SYNTHEOS_IDENTITY_DB", "identity.sqlite"),
     ("SYNTHEOS_APPROVAL_DB", "approval.sqlite"),
     ("SYNTHEOS_AUDIT_DB", "audit.sqlite"),
@@ -2466,8 +2467,13 @@ fn local_configuration_ready(
         .is_some_and(|value| Path::new(&value).is_absolute());
     let mut databases_ready = true;
     for (key, _) in LOCAL_DATABASES {
-        let absolute =
-            resolve_config_value(values, key)?.is_some_and(|value| Path::new(&value).is_absolute());
+        let configured = resolve_config_value(values, key)?;
+        let absolute = configured
+            .as_ref()
+            .is_some_and(|value| Path::new(value).is_absolute());
+        if *key == "SYNTHEOS_PLUTUS_LOCAL_DB" && configured.is_none() {
+            continue;
+        }
         databases_ready = databases_ready && absolute;
     }
     Ok(room_mode == Some(RoomMode::Disabled) && jwt_ready && local_token_ready && databases_ready)
@@ -3314,6 +3320,34 @@ mod tests {
                 0o600
             );
         }
+        remove_temporary_home(&home);
+    }
+
+    /// A pre-upgrade quick configuration without the new policy path remains complete.
+    #[test]
+    fn quick_init_accepts_legacy_configuration_without_local_policy_database_key() {
+        let home = temporary_home();
+        let paths = CliPaths::from_home(&home);
+        initialize_quick(&paths, &Harness::Synapse).expect("initial configuration");
+        let original = fs::read_to_string(&paths.config).expect("read initial configuration");
+        let legacy = original
+            .lines()
+            .filter(|line| !line.starts_with("SYNTHEOS_PLUTUS_LOCAL_DB="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&paths.config, legacy.as_bytes()).expect("write legacy fixture");
+
+        assert!(
+            doctor(&paths)
+                .expect("inspect legacy configuration")
+                .local_ready
+        );
+        initialize_quick(&paths, &Harness::Synapse).expect("repeat quick initialization");
+        assert_eq!(
+            fs::read_to_string(&paths.config).expect("read preserved configuration"),
+            legacy
+        );
         remove_temporary_home(&home);
     }
 

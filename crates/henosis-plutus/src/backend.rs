@@ -6,14 +6,21 @@
 //! gate tests run without a live Postgres connection -- satisfying D1 rule 6.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use henosis_sqlite::OpenedDatabase;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use syntheos_contracts::{PrincipalId, TenantId};
 
 use crate::quota::{QuotaConfig, QuotaDimension, QuotaOutcome, QuotaTier};
 use crate::rbac::Role;
 use crate::{PlutusError, Result};
+
+/// Append-only schema migrations for restart-durable local policy state.
+const LOCAL_POLICY_MIGRATIONS: &[(i64, &str)] =
+    &[(1, include_str!("../local-migrations/0001_local_policy_state.sql"))];
 
 /// The lifecycle status of an org.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,9 +119,10 @@ pub trait PolicyBackend: Send + Sync {
 /// A loopback-only, single-operator policy authority for local development.
 ///
 /// This backend preserves the same org, membership, RBAC, quota, and token-bucket reads used by
-/// [`crate::PlutusGate`] without requiring PostgreSQL. Its counters live in process memory, so
-/// production and multi-tenant deployments must use [`crate::PlutusStore`]. The server owns the
-/// loopback and billing restrictions that keep this backend inside its development boundary.
+/// [`crate::PlutusGate`] without requiring PostgreSQL. The server selects protected SQLite state
+/// for real local installs; focused tests may retain in-memory state. Production and multi-tenant
+/// deployments must use [`crate::PlutusStore`]. The server owns the loopback and billing
+/// restrictions that keep this backend inside its development boundary.
 pub struct LocalPolicyBackend {
     /// The only tenant recognized by this local authority.
     tenant: TenantId,
@@ -124,13 +132,27 @@ pub struct LocalPolicyBackend {
     role: Role,
     /// Quota and rate-limit values selected from the configured tier.
     quota: QuotaConfig,
-    /// Daily counters keyed by stable quota dimension and UTC date.
-    usage: Mutex<HashMap<(String, String), i64>>,
-    /// Token-bucket state initialized on the first request.
-    rate_bucket: Mutex<Option<LocalRateBucket>>,
+    /// Serialized in-memory or protected SQLite counter state.
+    state: Mutex<LocalPolicyState>,
 }
 
-/// Mutable token-bucket state protected by [`LocalPolicyBackend::rate_bucket`].
+/// Storage modes supported by the bounded local policy authority.
+enum LocalPolicyState {
+    /// Ephemeral state retained for focused tests and injected test callers.
+    Memory {
+        /// Daily counters keyed by stable quota dimension and UTC date.
+        usage: HashMap<(String, String), i64>,
+        /// Token-bucket state initialized on the first request.
+        rate_bucket: Option<LocalRateBucket>,
+    },
+    /// Restart-durable state retained by the guarded SQLite connection.
+    Sqlite {
+        /// Protected database and its retained filesystem path guards.
+        database: OpenedDatabase,
+    },
+}
+
+/// Mutable token-bucket state protected by [`LocalPolicyBackend::state`].
 struct LocalRateBucket {
     /// Tokens available after the most recent request.
     tokens: f64,
@@ -140,16 +162,38 @@ struct LocalRateBucket {
 
 /// Constructs the bounded local authority used by explicit development installs.
 impl LocalPolicyBackend {
-    /// Create a local authority for one tenant and principal.
+    /// Create an in-memory local authority for focused tests and injected test callers.
     pub fn new(tenant: TenantId, principal: PrincipalId, role: Role, tier: QuotaTier) -> Self {
         Self {
             tenant,
             principal,
             role,
             quota: tier.defaults(),
-            usage: Mutex::new(HashMap::new()),
-            rate_bucket: Mutex::new(None),
+            state: Mutex::new(LocalPolicyState::Memory {
+                usage: HashMap::new(),
+                rate_bucket: None,
+            }),
         }
+    }
+
+    /// Open a restart-durable local authority at one protected SQLite path.
+    pub fn open(
+        path: impl AsRef<Path>,
+        tenant: TenantId,
+        principal: PrincipalId,
+        role: Role,
+        tier: QuotaTier,
+    ) -> Result<Self> {
+        let mut database = henosis_sqlite::open_database(path)
+            .map_err(|error| PlutusError::Store(error.to_string()))?;
+        apply_local_policy_migrations(&mut database)?;
+        Ok(Self {
+            tenant,
+            principal,
+            role,
+            quota: tier.defaults(),
+            state: Mutex::new(LocalPolicyState::Sqlite { database }),
+        })
     }
 
     /// Reject policy mutations for an unknown tenant before touching local counters.
@@ -162,6 +206,66 @@ impl LocalPolicyBackend {
             ))
         }
     }
+
+    /// Lock local counter state and convert poisoning into a fail-closed store error.
+    fn lock_state(&self) -> Result<MutexGuard<'_, LocalPolicyState>> {
+        self.state
+            .lock()
+            .map_err(|_| PlutusError::Store("local policy state lock poisoned".to_string()))
+    }
+}
+
+/// Apply every pending local policy migration in one immediate transaction.
+fn apply_local_policy_migrations(database: &mut OpenedDatabase) -> Result<()> {
+    let current: i64 = database
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(local_store_error)?;
+    for &(version, sql) in LOCAL_POLICY_MIGRATIONS {
+        if version <= current {
+            continue;
+        }
+        let transaction = database
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(local_store_error)?;
+        transaction.execute_batch(sql).map_err(local_store_error)?;
+        transaction
+            .pragma_update(None, "user_version", version)
+            .map_err(local_store_error)?;
+        transaction.commit().map_err(local_store_error)?;
+    }
+    Ok(())
+}
+
+/// Convert a SQLite failure into the opaque policy-store error exposed by Plutus.
+fn local_store_error(error: rusqlite::Error) -> PlutusError {
+    PlutusError::Store(error.to_string())
+}
+
+/// Refill and consume one local token bucket without minting capacity on clock rollback.
+fn consume_local_rate_token(
+    bucket: &mut Option<LocalRateBucket>,
+    rpm: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let state = bucket.get_or_insert(LocalRateBucket {
+        tokens: rpm,
+        last_refill: now,
+    });
+    if !state.tokens.is_finite() || state.tokens < 0.0 || state.tokens > rpm {
+        return Err(PlutusError::Store(
+            "local rate-limit state is invalid".to_string(),
+        ));
+    }
+    if now > state.last_refill {
+        let elapsed = (now - state.last_refill).num_milliseconds() as f64 / 1000.0;
+        state.tokens = (state.tokens + elapsed * rpm / 60.0).min(rpm);
+        state.last_refill = now;
+    }
+    if state.tokens < 1.0 {
+        return Ok(false);
+    }
+    state.tokens -= 1.0;
+    Ok(true)
 }
 
 /// Supplies real single-tenant policy decisions without an external database.
@@ -193,17 +297,30 @@ impl PolicyBackend for LocalPolicyBackend {
         self.require_tenant(tenant)?;
         let limit = dim.limit_from_config(&self.quota);
         let key = (dim.as_str().to_string(), today.to_string());
-        let mut usage = self
-            .usage
-            .lock()
-            .map_err(|_| PlutusError::Store("local usage lock poisoned".to_string()))?;
-        let used = usage.entry(key).or_insert(0);
-        *used = used
-            .checked_add(amount)
-            .ok_or_else(|| PlutusError::Store("local usage counter overflow".to_string()))?;
+        let mut state = self.lock_state()?;
+        let used = match &mut *state {
+            LocalPolicyState::Memory { usage, .. } => {
+                let used = usage.entry(key).or_insert(0);
+                *used = used.checked_add(amount).ok_or_else(|| {
+                    PlutusError::Store("local usage counter overflow".to_string())
+                })?;
+                *used
+            }
+            LocalPolicyState::Sqlite { database } => database
+                .query_row(
+                    "INSERT INTO local_usage_counter (tenant_id, dimension, day, used) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT (tenant_id, dimension, day) \
+                     DO UPDATE SET used = local_usage_counter.used + excluded.used \
+                     RETURNING used",
+                    params![tenant.to_string(), dim.as_str(), today, amount],
+                    |row| row.get(0),
+                )
+                .map_err(local_store_error)?,
+        };
         Ok(QuotaOutcome {
-            allowed: *used <= limit,
-            used: *used,
+            allowed: used <= limit,
+            used,
             limit,
         })
     }
@@ -216,22 +333,56 @@ impl PolicyBackend for LocalPolicyBackend {
     ) -> Result<bool> {
         self.require_tenant(tenant)?;
         let rpm = self.quota.rate_limit_rpm as f64;
-        let mut bucket = self
-            .rate_bucket
-            .lock()
-            .map_err(|_| PlutusError::Store("local rate-limit lock poisoned".to_string()))?;
-        let state = bucket.get_or_insert(LocalRateBucket {
-            tokens: rpm,
-            last_refill: now,
-        });
-        let elapsed = (now - state.last_refill).num_milliseconds().max(0) as f64 / 1000.0;
-        state.tokens = (state.tokens + elapsed * rpm / 60.0).min(rpm);
-        state.last_refill = now;
-        if state.tokens < 1.0 {
-            return Ok(false);
+        let mut state = self.lock_state()?;
+        match &mut *state {
+            LocalPolicyState::Memory { rate_bucket, .. } => {
+                consume_local_rate_token(rate_bucket, rpm, now)
+            }
+            LocalPolicyState::Sqlite { database } => {
+                let transaction = database
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(local_store_error)?;
+                let stored = transaction
+                    .query_row(
+                        "SELECT tokens, last_refill_ms FROM local_rate_bucket WHERE tenant_id = ?1",
+                        params![tenant.to_string()],
+                        |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .map_err(local_store_error)?;
+                let mut bucket = match stored {
+                    Some((tokens, last_refill_ms)) => Some(LocalRateBucket {
+                        tokens,
+                        last_refill: chrono::DateTime::from_timestamp_millis(last_refill_ms)
+                            .ok_or_else(|| {
+                                PlutusError::Store(
+                                    "local rate-limit timestamp is invalid".to_string(),
+                                )
+                            })?,
+                    }),
+                    None => None,
+                };
+                let allowed = consume_local_rate_token(&mut bucket, rpm, now)?;
+                let bucket = bucket.ok_or_else(|| {
+                    PlutusError::Store("local rate-limit state was not initialized".to_string())
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO local_rate_bucket (tenant_id, tokens, last_refill_ms) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT (tenant_id) DO UPDATE SET \
+                         tokens = excluded.tokens, last_refill_ms = excluded.last_refill_ms",
+                        params![
+                            tenant.to_string(),
+                            bucket.tokens,
+                            bucket.last_refill.timestamp_millis()
+                        ],
+                    )
+                    .map_err(local_store_error)?;
+                transaction.commit().map_err(local_store_error)?;
+                Ok(allowed)
+            }
         }
-        state.tokens -= 1.0;
-        Ok(true)
     }
 }
 
@@ -434,6 +585,43 @@ impl PolicyBackend for MockPolicyBackend {
 mod tests {
     use super::*;
 
+    /// Exact temporary database path and directory owned by one persistence test.
+    struct TemporaryPolicyDatabase {
+        /// Unique private directory created for the test.
+        directory: std::path::PathBuf,
+        /// SQLite database path inside the private directory.
+        path: std::path::PathBuf,
+    }
+
+    /// Creates and cleans one unique private database location.
+    impl TemporaryPolicyDatabase {
+        /// Allocate a unique private directory without opening the database yet.
+        fn new(label: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "henosis-plutus-{label}-{}-{}",
+                std::process::id(),
+                TenantId::new()
+            ));
+            henosis_sqlite::ensure_private_directory(&directory)
+                .expect("create private test directory");
+            let path = directory.join("policy.sqlite");
+            Self { directory, path }
+        }
+    }
+
+    /// Removes only the exact temporary files created by this test helper.
+    impl Drop for TemporaryPolicyDatabase {
+        /// Remove the database, known SQLite sidecars, and their exact private directory.
+        fn drop(&mut self) {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = self.directory.join(format!("policy.sqlite{suffix}"));
+                let _ = std::fs::remove_file(sidecar);
+            }
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
     /// `OrgStatus` round-trips through its text form.
     #[test]
     fn org_status_roundtrip() {
@@ -530,5 +718,125 @@ mod tests {
             assert!(backend.rate_limit_ok(tenant, now).await.unwrap());
         }
         assert!(!backend.rate_limit_ok(tenant, now).await.unwrap());
+    }
+
+    /// Disk-backed local policy retains daily usage across backend reconstruction.
+    #[tokio::test]
+    async fn local_policy_persists_daily_quota_across_reopen() {
+        let database = TemporaryPolicyDatabase::new("quota-reopen");
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        {
+            let backend = LocalPolicyBackend::open(
+                &database.path,
+                tenant,
+                principal,
+                Role::Owner,
+                QuotaTier::Free,
+            )
+            .expect("open durable local policy");
+            for _ in 0..10 {
+                assert!(
+                    backend
+                        .check_and_increment(tenant, QuotaDimension::Tasks, 1, "2026-08-21")
+                        .await
+                        .expect("increment persisted quota")
+                        .allowed
+                );
+            }
+        }
+
+        let reopened = LocalPolicyBackend::open(
+            &database.path,
+            tenant,
+            principal,
+            Role::Owner,
+            QuotaTier::Free,
+        )
+        .expect("reopen durable local policy");
+        let denied = reopened
+            .check_and_increment(tenant, QuotaDimension::Tasks, 1, "2026-08-21")
+            .await
+            .expect("increment reopened quota");
+        assert!(!denied.allowed);
+        assert_eq!(denied.used, 11);
+    }
+
+    /// Disk-backed local policy retains an exhausted token bucket across reconstruction.
+    #[tokio::test]
+    async fn local_policy_persists_rate_limit_across_reopen() {
+        let database = TemporaryPolicyDatabase::new("rate-reopen");
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-21T00:00:00Z")
+            .expect("parse fixed time")
+            .with_timezone(&chrono::Utc);
+        {
+            let backend = LocalPolicyBackend::open(
+                &database.path,
+                tenant,
+                principal,
+                Role::Owner,
+                QuotaTier::Free,
+            )
+            .expect("open durable local policy");
+            for _ in 0..10 {
+                assert!(backend.rate_limit_ok(tenant, now).await.unwrap());
+            }
+        }
+
+        let reopened = LocalPolicyBackend::open(
+            &database.path,
+            tenant,
+            principal,
+            Role::Owner,
+            QuotaTier::Free,
+        )
+        .expect("reopen durable local policy");
+        assert!(!reopened.rate_limit_ok(tenant, now).await.unwrap());
+        let earlier = now - chrono::Duration::hours(1);
+        assert!(!reopened.rate_limit_ok(tenant, earlier).await.unwrap());
+    }
+
+    /// Persisted rate state outside the configured bucket range fails closed.
+    #[tokio::test]
+    async fn local_policy_rejects_malformed_persisted_rate_state() {
+        let database = TemporaryPolicyDatabase::new("invalid-rate");
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-21T00:00:00Z")
+            .expect("parse fixed time")
+            .with_timezone(&chrono::Utc);
+        {
+            let backend = LocalPolicyBackend::open(
+                &database.path,
+                tenant,
+                principal,
+                Role::Owner,
+                QuotaTier::Free,
+            )
+            .expect("open durable local policy");
+            assert!(backend.rate_limit_ok(tenant, now).await.unwrap());
+        }
+        {
+            let database_handle = henosis_sqlite::open_database(&database.path)
+                .expect("open exact test database for corruption fixture");
+            database_handle
+                .execute(
+                    "UPDATE local_rate_bucket SET tokens = 1000.0 WHERE tenant_id = ?1",
+                    params![tenant.to_string()],
+                )
+                .expect("write malformed fixture");
+        }
+
+        let reopened = LocalPolicyBackend::open(
+            &database.path,
+            tenant,
+            principal,
+            Role::Owner,
+            QuotaTier::Free,
+        )
+        .expect("reopen durable local policy");
+        assert!(reopened.rate_limit_ok(tenant, now).await.is_err());
     }
 }

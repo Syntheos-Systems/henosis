@@ -3754,8 +3754,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "henosis-sqlite",
  "hex",
  "hmac",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
