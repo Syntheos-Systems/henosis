@@ -24,6 +24,8 @@ Model-supplied paths for `read`, `write`, `edit`, `ls`, `grep`, and `glob` are c
 
 Production startup requires synchronous audit witnessing regardless of listen address. Henosis obtains an off-host receipt for intent before execution and for a successful outcome before making its result replayable. If execution may have occurred but a safe completion cannot be established, the request is marked indeterminate and is never executed automatically on retry.
 
+Only a live human owner or administrator can conclude an indeterminate execution. The resolution records `executed` or `not_executed`, the resolving principal, and a lowercase SHA-256 digest of evidence retained outside Henosis. It is appended to the tenant audit chain and witnessed before finalization in production. The conclusion is immutable, does not supply a result, and never reopens the original idempotency key. A deliberate retry requires a new key and a fresh approval when policy requires one. A blocked witnessed stream must be recovered before it accepts a resolution.
+
 ## Scope
 
 Review [scripts/known-incomplete.md](scripts/known-incomplete.md) before deployment. The Wasmtime component host is present, but extension loading is not yet connected to the production dispatcher. Existing in-process adapters therefore remain inside the Henosis process boundary.

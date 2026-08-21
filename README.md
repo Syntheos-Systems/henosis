@@ -114,6 +114,23 @@ curl --fail-with-body http://127.0.0.1:8088/api/v1/dispatch \
 
 Repeating the same key and request returns the stored filtered result. Reusing the key with different content returns a conflict. An action that needs approval returns `202 Accepted`; approve its ID with `henosis approvals approve <approval-id>`, then repeat the request with the original key and `X-Henosis-Approval-Id`.
 
+If a side effect may have occurred but its outcome could not be committed safely,
+Henosis keeps the execution indeterminate and refuses to replay its key. A human
+owner or administrator can inspect the tenant-scoped queue and record an
+evidence-backed conclusion:
+
+```sh
+henosis executions list
+henosis executions resolve <principal-id> <idempotency-key> \
+  --not-executed --evidence-sha256 <digest>
+```
+
+Use `--executed` when the retained evidence establishes that the side effect
+occurred. The digest must be the lowercase SHA-256 of evidence retained outside
+Henosis. A conclusion is immutable and audit-linked; it never makes the original
+key replayable. Any deliberate retry needs a new key and any approval required
+by the current policy.
+
 ## Desktop
 
 The Tauri application offers chat, complete desktop, and spatial room

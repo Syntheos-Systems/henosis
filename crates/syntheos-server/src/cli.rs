@@ -8,8 +8,10 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
+use henosis_audit::ExecutionResolutionKind;
 use reqwest::{
     blocking::{Client as BlockingHttpClient, Response as BlockingHttpResponse},
     Method, Url,
@@ -89,7 +91,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (not implemented)\n  henosis uninstall (not implemented)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update (not implemented)\n  henosis uninstall (not implemented)\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis executions list\n  henosis executions resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>\n  henosis audit verify\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -117,6 +119,8 @@ pub enum Command {
     Token(TokenCommand),
     /// Resolve pending approvals through the live control plane.
     Approvals(ApprovalCommand),
+    /// Inspect and conclude indeterminate executions through the live control plane.
+    Executions(ExecutionCommand),
     /// Verify the live audit trail.
     AuditVerify,
     /// Start the server using the binary's integrated runtime.
@@ -186,6 +190,24 @@ pub enum ApprovalCommand {
     },
 }
 
+/// A typed indeterminate-execution operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionCommand {
+    /// List unresolved or pending-resolution indeterminate executions.
+    List,
+    /// Conclude one indeterminate execution using externally retained evidence.
+    Resolve {
+        /// Principal whose original execution became indeterminate.
+        principal_id: PrincipalId,
+        /// Opaque retry key of the original execution.
+        idempotency_key: String,
+        /// Evidence-backed conclusion about whether the side effect occurred.
+        resolution: ExecutionResolutionKind,
+        /// Lowercase SHA-256 digest of the externally retained evidence.
+        evidence_sha256: String,
+    },
+}
+
 /// A typed request emitted only after parsing and local validation complete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlRequest {
@@ -199,6 +221,8 @@ pub enum ControlRequest {
     Token(TokenCommand),
     /// Forward an approval-management request.
     Approvals(ApprovalCommand),
+    /// Forward an indeterminate-execution management request.
+    Executions(ExecutionCommand),
     /// Ask the live audit authority to verify its chain.
     AuditVerify,
 }
@@ -463,6 +487,46 @@ impl ControlApi for HttpControlApi {
                         Method::POST,
                         &["api", "v1", "approvals", &approval_id, "deny"],
                         Some(json!({})),
+                        operation,
+                    )?,
+                    operation,
+                )
+            }
+            ControlRequest::Executions(ExecutionCommand::List) => {
+                let operation = "henosis executions list";
+                self.json_output(
+                    self.request(
+                        Method::GET,
+                        &["api", "v1", "executions", "indeterminate"],
+                        None,
+                        operation,
+                    )?,
+                    operation,
+                )
+            }
+            ControlRequest::Executions(ExecutionCommand::Resolve {
+                principal_id,
+                idempotency_key,
+                resolution,
+                evidence_sha256,
+            }) => {
+                let operation = "henosis executions resolve";
+                let principal_id = principal_id.to_string();
+                self.json_output(
+                    self.request(
+                        Method::POST,
+                        &[
+                            "api",
+                            "v1",
+                            "executions",
+                            &principal_id,
+                            &idempotency_key,
+                            "resolve",
+                        ],
+                        Some(json!({
+                            "resolution": resolution,
+                            "evidence_sha256": evidence_sha256,
+                        })),
                         operation,
                     )?,
                     operation,
@@ -841,6 +905,7 @@ impl<'a> CliRunner<'a> {
             Command::Uninstall => self.run_control(ControlRequest::Uninstall),
             Command::Token(command) => self.run_control(ControlRequest::Token(command)),
             Command::Approvals(command) => self.run_control(ControlRequest::Approvals(command)),
+            Command::Executions(command) => self.run_control(ControlRequest::Executions(command)),
             Command::AuditVerify => self.run_control(ControlRequest::AuditVerify),
         }
     }
@@ -874,6 +939,7 @@ impl Command {
             "uninstall" => parse_empty(tail, Self::Uninstall),
             "token" => parse_token(tail).map(Self::Token),
             "approvals" => parse_approvals(tail).map(Self::Approvals),
+            "executions" => parse_executions(tail).map(Self::Executions),
             "audit" => parse_audit(tail),
             "serve" => parse_empty(tail, Self::Serve),
             value => Err(CliError::Usage {
@@ -1288,6 +1354,70 @@ fn parse_approvals(arguments: &[String]) -> Result<ApprovalCommand, CliError> {
     }
 }
 
+/// Parses the bounded indeterminate-execution operator grammar.
+fn parse_executions(arguments: &[String]) -> Result<ExecutionCommand, CliError> {
+    match arguments {
+        [subcommand] if subcommand == "list" => Ok(ExecutionCommand::List),
+        [subcommand, principal_id, idempotency_key, resolution_flag, evidence_flag, evidence_sha256]
+            if subcommand == "resolve" && evidence_flag == "--evidence-sha256" =>
+        {
+            let principal_id =
+                PrincipalId::from_str(principal_id).map_err(|_| CliError::Usage {
+                    message: "principal identifier must be a valid Henosis principal id"
+                        .to_string(),
+                })?;
+            let resolution = match resolution_flag.as_str() {
+                "--executed" => ExecutionResolutionKind::Executed,
+                "--not-executed" => ExecutionResolutionKind::NotExecuted,
+                _ => return Err(execution_usage()),
+            };
+            Ok(ExecutionCommand::Resolve {
+                principal_id,
+                idempotency_key: bounded_idempotency_key(idempotency_key)?,
+                resolution,
+                evidence_sha256: lowercase_sha256(evidence_sha256)?,
+            })
+        }
+        _ => Err(execution_usage()),
+    }
+}
+
+/// Returns the stable usage error for an invalid execution command.
+fn execution_usage() -> CliError {
+    CliError::Usage {
+        message: "usage: henosis executions list | resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>".to_string(),
+    }
+}
+
+/// Validates the bounded public retry-key grammar before constructing a URL.
+fn bounded_idempotency_key(value: &str) -> Result<String, CliError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(CliError::Usage {
+            message: "idempotency key must be a bounded opaque identifier".to_string(),
+        });
+    }
+    Ok(value.to_string())
+}
+
+/// Validates one lowercase SHA-256 digest without accepting ambiguous encodings.
+fn lowercase_sha256(value: &str) -> Result<String, CliError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CliError::Usage {
+            message: "evidence digest must be 64 lowercase hexadecimal characters".to_string(),
+        });
+    }
+    Ok(value.to_string())
+}
+
 /// Parses the narrow audit grammar supported by this public operator surface.
 fn parse_audit(arguments: &[String]) -> Result<Command, CliError> {
     match arguments {
@@ -1316,6 +1446,7 @@ fn control_operation_name(request: &ControlRequest) -> &'static str {
         ControlRequest::Uninstall => "henosis uninstall",
         ControlRequest::Token(_) => "henosis token",
         ControlRequest::Approvals(_) => "henosis approvals",
+        ControlRequest::Executions(_) => "henosis executions",
         ControlRequest::AuditVerify => "henosis audit verify",
     }
 }
@@ -2177,6 +2308,49 @@ mod tests {
         assert_eq!(output.message, "ok");
     }
 
+    /// Maps an evidence-backed conclusion to the exact authenticated execution route and body.
+    #[test]
+    fn execution_resolution_maps_to_authenticated_http_request() {
+        let (base_url, requests) = one_response_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let principal_id = PrincipalId::new();
+        let output = test_http_client(base_url)
+            .execute(ControlRequest::Executions(ExecutionCommand::Resolve {
+                principal_id,
+                idempotency_key: "retry-key.one".to_string(),
+                resolution: ExecutionResolutionKind::NotExecuted,
+                evidence_sha256: "a".repeat(64),
+            }))
+            .expect("execute resolution request");
+        let request =
+            String::from_utf8(requests.recv().expect("receive request")).expect("request is ASCII");
+        assert!(request.starts_with(&format!(
+            "POST /api/v1/executions/{principal_id}/retry-key.one/resolve HTTP/1.1\r\n"
+        )));
+        assert!(request.contains("authorization: Bearer test-bearer-token\r\n"));
+        assert!(request.contains("\"resolution\":\"not_executed\""));
+        assert!(request.contains(&format!("\"evidence_sha256\":\"{}\"", "a".repeat(64))));
+        assert_eq!(output.operation, "henosis executions resolve");
+    }
+
+    /// Maps the unresolved execution queue to its exact authenticated tenant route.
+    #[test]
+    fn execution_list_maps_to_authenticated_http_request() {
+        let (base_url, requests) = one_response_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+        );
+        let output = test_http_client(base_url)
+            .execute(ControlRequest::Executions(ExecutionCommand::List))
+            .expect("execute indeterminate execution list");
+        let request =
+            String::from_utf8(requests.recv().expect("receive request")).expect("request is ASCII");
+        assert!(request.starts_with("GET /api/v1/executions/indeterminate HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer test-bearer-token\r\n"));
+        assert_eq!(output.operation, "henosis executions list");
+        assert_eq!(output.message, "[]");
+    }
+
     /// Rejects unimplemented maintenance commands before issuing a network request.
     #[test]
     fn maintenance_commands_are_explicitly_unsupported() {
@@ -2277,6 +2451,54 @@ mod tests {
             Command::parse(&["serve".into()]).expect("parse serve"),
             Command::Serve
         );
+    }
+
+    /// Parses strict execution listing and resolution forms while rejecting unsafe evidence data.
+    #[test]
+    fn parses_execution_commands_with_strict_evidence_validation() {
+        let principal_id = PrincipalId::new();
+        assert_eq!(
+            Command::parse(&["executions".into(), "list".into()]).expect("parse execution list"),
+            Command::Executions(ExecutionCommand::List)
+        );
+        assert_eq!(
+            Command::parse(&[
+                "executions".into(),
+                "resolve".into(),
+                principal_id.to_string(),
+                "retry-key".into(),
+                "--executed".into(),
+                "--evidence-sha256".into(),
+                "b".repeat(64),
+            ])
+            .expect("parse execution resolution"),
+            Command::Executions(ExecutionCommand::Resolve {
+                principal_id,
+                idempotency_key: "retry-key".to_string(),
+                resolution: ExecutionResolutionKind::Executed,
+                evidence_sha256: "b".repeat(64),
+            })
+        );
+        assert!(Command::parse(&[
+            "executions".into(),
+            "resolve".into(),
+            principal_id.to_string(),
+            "retry-key".into(),
+            "--not-executed".into(),
+            "--evidence-sha256".into(),
+            "A".repeat(64),
+        ])
+        .is_err());
+        assert!(Command::parse(&[
+            "executions".into(),
+            "resolve".into(),
+            principal_id.to_string(),
+            "../unsafe".into(),
+            "--not-executed".into(),
+            "--evidence-sha256".into(),
+            "c".repeat(64),
+        ])
+        .is_err());
     }
 
     /// Parses the exact trailing token-only flag without changing default token creation.

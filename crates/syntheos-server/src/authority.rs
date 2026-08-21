@@ -19,7 +19,9 @@ use henosis_approval::{
     ApprovalRequest, ApprovalStatus, ApprovalStore, RequestHash,
 };
 use henosis_audit::{
-    AuditEventInput, AuditPhase, AuditStore, ExecutionClaim, ExecutionState, WitnessedAudit,
+    AuditEventInput, AuditPhase, AuditStore, ExecutionClaim, ExecutionResolution,
+    ExecutionResolutionInput, ExecutionResolutionKind, ExecutionState, IndeterminateExecution,
+    WitnessedAudit,
 };
 use henosis_plutus::{can, OrgStatus, Permission, PolicyBackend, Role};
 use henosis_rift::{approval_prompt, requires_human_approval};
@@ -167,6 +169,17 @@ impl AuditBoundary {
     /// Return whether this boundary requires an independent receipt.
     pub fn is_witnessed(&self) -> bool {
         matches!(self, Self::Witnessed(_))
+    }
+
+    /// Conclude one indeterminate execution across the selected witness boundary.
+    async fn resolve_indeterminate_execution(
+        &self,
+        input: ExecutionResolutionInput,
+    ) -> Result<ExecutionResolution, henosis_audit::AuditError> {
+        match self {
+            Self::Local(store) => store.resolve_indeterminate_execution(input),
+            Self::Witnessed(audit) => audit.resolve_indeterminate_execution(input).await,
+        }
     }
 }
 
@@ -435,6 +448,16 @@ pub struct ApprovalResponse {
     pub decided_at: Option<i64>,
     /// Stable request fingerprint for operator comparison.
     pub request_hash: String,
+}
+
+/// Human operator conclusion submitted for an indeterminate execution.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionResolutionBody {
+    /// Evidence-backed conclusion about whether the side effect occurred.
+    pub resolution: ExecutionResolutionKind,
+    /// Lowercase SHA-256 digest of evidence retained outside Henosis.
+    pub evidence_sha256: String,
 }
 
 /// Converts an approval record to its metadata-only public representation.
@@ -842,6 +865,14 @@ pub fn authority_router(state: AuthorityState) -> Router {
         .route("/api/v1/approvals/{id}", get(get_approval))
         .route("/api/v1/approvals/{id}/approve", post(approve))
         .route("/api/v1/approvals/{id}/deny", post(deny))
+        .route(
+            "/api/v1/executions/indeterminate",
+            get(list_indeterminate_executions),
+        )
+        .route(
+            "/api/v1/executions/{principal_id}/{idempotency_key}/resolve",
+            post(resolve_indeterminate_execution),
+        )
         .route("/api/v1/audit/verify", get(verify_audit))
         .with_state(state)
 }
@@ -1093,6 +1124,65 @@ async fn decide_approval(
         .map_err(|_| AuthorityError::Unavailable)?
         .ok_or(AuthorityError::Conflict)?;
     Ok(Json(approval.into()))
+}
+
+/// List bounded tenant-scoped indeterminate executions for a human administrator.
+async fn list_indeterminate_executions(
+    State(state): State<AuthorityState>,
+    identity: AuthenticatedIdentity,
+) -> Result<Json<Vec<IndeterminateExecution>>, AuthorityError> {
+    identity.require_operator_administrator()?;
+    let executions = state
+        .audit
+        .store()
+        .indeterminate_executions(&identity.tenant.to_string())
+        .map_err(map_execution_resolution_error)?;
+    Ok(Json(executions))
+}
+
+/// Persist one human evidence-backed conclusion without reopening the original retry key.
+async fn resolve_indeterminate_execution(
+    State(state): State<AuthorityState>,
+    identity: AuthenticatedIdentity,
+    Path((principal_id, idempotency_key)): Path<(String, String)>,
+    Json(body): Json<ExecutionResolutionBody>,
+) -> Result<Json<ExecutionResolution>, AuthorityError> {
+    identity.require_operator_administrator()?;
+    let principal_id = PrincipalId::from_str(&principal_id)
+        .map_err(|_| AuthorityError::InvalidRequest("invalid principal id".to_string()))?;
+    if !valid_idempotency_key(&idempotency_key) {
+        return Err(AuthorityError::InvalidRequest(
+            "idempotency key must be a bounded opaque identifier".to_string(),
+        ));
+    }
+    let resolution = state
+        .audit
+        .resolve_indeterminate_execution(ExecutionResolutionInput {
+            tenant_id: identity.tenant.to_string(),
+            principal_id: principal_id.to_string(),
+            idempotency_key,
+            resolved_by_principal_id: identity.principal.to_string(),
+            resolution: body.resolution,
+            evidence_sha256: body.evidence_sha256,
+        })
+        .await
+        .map_err(map_execution_resolution_error)?;
+    Ok(Json(resolution))
+}
+
+/// Convert audit-ledger failures into stable resolution API errors.
+fn map_execution_resolution_error(error: henosis_audit::AuditError) -> AuthorityError {
+    match error {
+        henosis_audit::AuditError::ExecutionNotFound => AuthorityError::NotFound,
+        henosis_audit::AuditError::ExecutionStateConflict
+        | henosis_audit::AuditError::IdempotencyConflict
+        | henosis_audit::AuditError::StreamBlocked { .. } => AuthorityError::Conflict,
+        henosis_audit::AuditError::InvalidInput(message) => AuthorityError::InvalidRequest(message),
+        other => {
+            tracing::error!(%other, "execution resolution failed");
+            AuthorityError::Unavailable
+        }
+    }
 }
 
 /// Verify the authenticated tenant's complete local audit hash chain.
@@ -1371,6 +1461,24 @@ mod tests {
         }
     }
 
+    /// Construct a local authority state for resolution tests that must finalize without a witness.
+    fn local_state(approvals: Arc<ApprovalStore>) -> AuthorityState {
+        let dispatcher = Dispatcher::new(
+            deny_gate_chain(),
+            Box::new(DenyExecutor),
+            Arc::new(AxonBus::new()),
+        )
+        .expect("dispatcher");
+        AuthorityState {
+            dispatcher: Arc::new(dispatcher),
+            accounts: Arc::new(SqliteDirectory::open_in_memory().expect("accounts")),
+            policy: Arc::new(MockPolicyBackend::with_role(Role::Admin)),
+            jwt_secret: Arc::new(vec![9_u8; 32]),
+            approvals,
+            audit: AuditBoundary::Local(AuditStore::open_in_memory().expect("local audit store")),
+        }
+    }
+
     /// Construct an authenticated administrator identity for one tenant and principal.
     fn administrator_identity(tenant: TenantId, principal: PrincipalId) -> AuthenticatedIdentity {
         AuthenticatedIdentity {
@@ -1444,6 +1552,90 @@ mod tests {
         )
         .await;
         assert!(matches!(decision, Err(AuthorityError::Forbidden)));
+    }
+
+    /// Human administrators can list and resolve only their tenant's indeterminate executions.
+    #[tokio::test]
+    async fn execution_resolution_handlers_enforce_human_tenant_authority() {
+        let state = local_state(Arc::new(
+            ApprovalStore::open_in_memory().expect("approval store"),
+        ));
+        let tenant = TenantId::new();
+        let target_principal = PrincipalId::new();
+        let operator_principal = PrincipalId::new();
+        let request = json!({"tool": "documents", "action": "create"});
+        let idempotency_key = "operator-resolution";
+        state
+            .audit
+            .store()
+            .claim_execution(AuditEventInput {
+                tenant_id: tenant.to_string(),
+                principal_id: target_principal.to_string(),
+                action: "documents.create".to_string(),
+                phase: AuditPhase::Intent,
+                request: request.clone(),
+                payload: json!({"tool": "documents"}),
+                idempotency_key: Some(idempotency_key.to_string()),
+            })
+            .expect("execution claim");
+        state
+            .audit
+            .store()
+            .mark_execution_indeterminate(
+                &tenant.to_string(),
+                &target_principal.to_string(),
+                idempotency_key,
+                &request,
+            )
+            .expect("indeterminate transition");
+
+        let machine_list = list_indeterminate_executions(
+            State(state.clone()),
+            administrator_machine_identity(tenant, operator_principal),
+        )
+        .await;
+        assert!(matches!(machine_list, Err(AuthorityError::Forbidden)));
+
+        let listed = list_indeterminate_executions(
+            State(state.clone()),
+            administrator_identity(tenant, operator_principal),
+        )
+        .await
+        .expect("human execution list");
+        assert_eq!(listed.0.len(), 1);
+        assert!(listed.0[0].resolution.is_none());
+
+        let resolution = resolve_indeterminate_execution(
+            State(state.clone()),
+            administrator_identity(tenant, operator_principal),
+            Path((target_principal.to_string(), idempotency_key.to_string())),
+            Json(ExecutionResolutionBody {
+                resolution: ExecutionResolutionKind::NotExecuted,
+                evidence_sha256: "a".repeat(64),
+            }),
+        )
+        .await
+        .expect("human execution resolution");
+        assert!(resolution.0.finalized);
+        assert_eq!(
+            resolution.0.resolved_by_principal_id,
+            operator_principal.to_string()
+        );
+        let concluded = list_indeterminate_executions(
+            State(state.clone()),
+            administrator_identity(tenant, operator_principal),
+        )
+        .await
+        .expect("concluded tenant list");
+        assert!(concluded.0.is_empty());
+
+        let foreign = list_indeterminate_executions(
+            State(state),
+            administrator_identity(TenantId::new(), PrincipalId::new()),
+        )
+        .await
+        .expect("foreign tenant list");
+        assert!(foreign.0.is_empty());
     }
 
     /// A clock before the Unix epoch fails closed instead of authenticating at timestamp zero.

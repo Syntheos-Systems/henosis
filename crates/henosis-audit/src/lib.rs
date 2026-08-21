@@ -51,6 +51,27 @@ const CREATE_EXECUTION_RECORDS_TABLE: &str = "
         )
     );
 ";
+/// Canonical schema for immutable operator conclusions over indeterminate executions.
+const CREATE_EXECUTION_RESOLUTIONS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS execution_resolutions (
+        tenant_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        resolution TEXT NOT NULL CHECK (resolution IN ('executed', 'not_executed')),
+        evidence_sha256 TEXT NOT NULL,
+        resolved_by_principal_id TEXT NOT NULL,
+        audit_sequence INTEGER NOT NULL,
+        finalized INTEGER NOT NULL CHECK (finalized IN (0, 1)),
+        resolved_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, principal_id, idempotency_key),
+        FOREIGN KEY (tenant_id, principal_id, idempotency_key)
+            REFERENCES execution_records (tenant_id, principal_id, idempotency_key),
+        FOREIGN KEY (tenant_id, audit_sequence)
+            REFERENCES audit_events (tenant_id, sequence)
+    );
+";
+/// Maximum indeterminate executions returned by one bounded operator listing.
+const MAX_INDETERMINATE_EXECUTIONS: i64 = 200;
 
 /// A failure while appending, verifying, or witnessing an audit event.
 #[derive(Debug, thiserror::Error)]
@@ -230,6 +251,65 @@ pub enum ExecutionClaim {
     Existing(ExecutionRecord),
 }
 
+/// Human conclusion applied to one execution whose side-effect outcome was unknown.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResolutionKind {
+    /// External evidence establishes that the governed side effect occurred.
+    Executed,
+    /// External evidence establishes that the governed side effect did not occur.
+    NotExecuted,
+}
+
+/// Validated request to conclude one tenant-scoped indeterminate execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionResolutionInput {
+    /// Tenant derived from the authenticated human operator.
+    pub tenant_id: String,
+    /// Principal that owns the original idempotency key.
+    pub principal_id: String,
+    /// Original caller retry key, which remains permanently non-replayable.
+    pub idempotency_key: String,
+    /// Human owner or administrator making the conclusion.
+    pub resolved_by_principal_id: String,
+    /// Evidence-backed conclusion about the side effect.
+    pub resolution: ExecutionResolutionKind,
+    /// Lowercase SHA-256 digest of evidence retained outside Henosis.
+    pub evidence_sha256: String,
+}
+
+/// Immutable audit-linked conclusion over one indeterminate execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutionResolution {
+    /// Tenant that owns the original execution.
+    pub tenant_id: String,
+    /// Principal that owns the original idempotency key.
+    pub principal_id: String,
+    /// Original caller retry key.
+    pub idempotency_key: String,
+    /// Evidence-backed operator conclusion.
+    pub resolution: ExecutionResolutionKind,
+    /// Digest of externally retained evidence.
+    pub evidence_sha256: String,
+    /// Human principal that made the immutable conclusion.
+    pub resolved_by_principal_id: String,
+    /// Audit-chain sequence recording the conclusion.
+    pub audit_sequence: u64,
+    /// True only after every configured witness boundary accepted the audit event.
+    pub finalized: bool,
+    /// Server-assigned resolution timestamp in milliseconds.
+    pub resolved_at_ms: i64,
+}
+
+/// Indeterminate execution plus any pending or finalized operator conclusion.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IndeterminateExecution {
+    /// Original non-replayable execution record.
+    pub execution: ExecutionRecord,
+    /// Resolution reservation, when an operator has started or completed one.
+    pub resolution: Option<ExecutionResolution>,
+}
+
 /// A signed statement asking a witness to preserve an audit stream head.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WitnessCheckpoint {
@@ -363,6 +443,7 @@ impl AuditStore {
             ",
         )?;
         apply_principal_idempotency_schema(&mut database)?;
+        database.execute_batch(CREATE_EXECUTION_RESOLUTIONS_TABLE)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(database)),
         })
@@ -592,6 +673,181 @@ impl AuditStore {
         load_execution_record(&connection, tenant_id, principal_id, idempotency_key)
     }
 
+    /// List a bounded oldest-first view of indeterminate executions and resolution progress.
+    pub fn indeterminate_executions(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<IndeterminateExecution>, AuditError> {
+        validate_identifier("tenant id", tenant_id)?;
+        let connection = self.lock_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT execution_records.tenant_id, execution_records.principal_id,
+                    execution_records.idempotency_key, execution_records.request_hash,
+                    execution_records.state, execution_records.sanitized_result_json,
+                    execution_records.intent_sequence, execution_records.claimed_at_ms,
+                    execution_records.updated_at_ms
+             FROM execution_records
+             LEFT JOIN execution_resolutions
+               ON execution_resolutions.tenant_id = execution_records.tenant_id
+              AND execution_resolutions.principal_id = execution_records.principal_id
+              AND execution_resolutions.idempotency_key = execution_records.idempotency_key
+             WHERE execution_records.tenant_id = ?1
+               AND execution_records.state = 'indeterminate'
+               AND COALESCE(execution_resolutions.finalized, 0) = 0
+             ORDER BY execution_records.updated_at_ms ASC,
+                      execution_records.principal_id ASC,
+                      execution_records.idempotency_key ASC
+             LIMIT ?2",
+        )?;
+        let executions = statement
+            .query_map(
+                params![tenant_id, MAX_INDETERMINATE_EXECUTIONS],
+                execution_record_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        executions
+            .into_iter()
+            .map(|execution| {
+                let resolution = load_execution_resolution(
+                    &connection,
+                    &execution.tenant_id,
+                    &execution.principal_id,
+                    &execution.idempotency_key,
+                )?;
+                Ok(IndeterminateExecution {
+                    execution,
+                    resolution,
+                })
+            })
+            .collect()
+    }
+
+    /// Reserve an immutable resolution and append its metadata-only audit event atomically.
+    fn begin_execution_resolution(
+        &self,
+        input: &ExecutionResolutionInput,
+    ) -> Result<(ExecutionResolution, AuditRecord), AuditError> {
+        validate_execution_resolution_input(input)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_execution_resolution(
+            &transaction,
+            &input.tenant_id,
+            &input.principal_id,
+            &input.idempotency_key,
+        )? {
+            ensure_resolution_match(&existing, input)?;
+            let audit_record =
+                load_record(&transaction, &input.tenant_id, existing.audit_sequence)?
+                    .ok_or(AuditError::ExecutionNotFound)?;
+            transaction.commit()?;
+            return Ok((existing, audit_record));
+        }
+        ensure_stream_writable_in(&transaction, &input.tenant_id)?;
+        let execution = load_execution_record(
+            &transaction,
+            &input.tenant_id,
+            &input.principal_id,
+            &input.idempotency_key,
+        )?
+        .ok_or(AuditError::ExecutionNotFound)?;
+        if execution.state != ExecutionState::Indeterminate {
+            return Err(AuditError::ExecutionStateConflict);
+        }
+        let event = execution_resolution_event(input, &execution);
+        validate_input(&event)?;
+        validate_metadata_payload(&event.payload)?;
+        let event_request_hash = hash_canonical_json(&event.request)?;
+        let event_payload_json = canonical_json_string(&event.payload)?;
+        let audit_record = append_in_transaction(
+            &transaction,
+            &event,
+            &event_request_hash,
+            &event_payload_json,
+        )?;
+        let resolved_at_ms = unix_timestamp_ms()?;
+        transaction.execute(
+            "INSERT INTO execution_resolutions (
+                tenant_id, principal_id, idempotency_key, resolution, evidence_sha256,
+                resolved_by_principal_id, audit_sequence, finalized, resolved_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+            params![
+                input.tenant_id,
+                input.principal_id,
+                input.idempotency_key,
+                execution_resolution_name(input.resolution),
+                input.evidence_sha256,
+                input.resolved_by_principal_id,
+                audit_record.sequence,
+                resolved_at_ms,
+            ],
+        )?;
+        let resolution = load_execution_resolution(
+            &transaction,
+            &input.tenant_id,
+            &input.principal_id,
+            &input.idempotency_key,
+        )?
+        .ok_or(AuditError::ExecutionNotFound)?;
+        transaction.commit()?;
+        Ok((resolution, audit_record))
+    }
+
+    /// Finalize one reserved resolution after the configured witness boundary succeeds.
+    fn finalize_execution_resolution(
+        &self,
+        input: &ExecutionResolutionInput,
+        require_witness: bool,
+    ) -> Result<ExecutionResolution, AuditError> {
+        validate_execution_resolution_input(input)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = load_execution_resolution(
+            &transaction,
+            &input.tenant_id,
+            &input.principal_id,
+            &input.idempotency_key,
+        )?
+        .ok_or(AuditError::ExecutionNotFound)?;
+        ensure_resolution_match(&existing, input)?;
+        if existing.finalized {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let audit_record = load_record(&transaction, &input.tenant_id, existing.audit_sequence)?
+            .ok_or(AuditError::ExecutionNotFound)?;
+        if require_witness && audit_record.witness_receipt.is_none() {
+            return Err(AuditError::ExecutionStateConflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE execution_resolutions SET finalized = 1
+             WHERE tenant_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3
+               AND finalized = 0",
+            params![input.tenant_id, input.principal_id, input.idempotency_key],
+        )?;
+        if changed != 1 {
+            return Err(AuditError::ExecutionStateConflict);
+        }
+        let finalized = load_execution_resolution(
+            &transaction,
+            &input.tenant_id,
+            &input.principal_id,
+            &input.idempotency_key,
+        )?
+        .ok_or(AuditError::ExecutionNotFound)?;
+        transaction.commit()?;
+        Ok(finalized)
+    }
+
+    /// Resolve one local indeterminate execution without reopening its original retry key.
+    pub fn resolve_indeterminate_execution(
+        &self,
+        input: ExecutionResolutionInput,
+    ) -> Result<ExecutionResolution, AuditError> {
+        self.begin_execution_resolution(&input)?;
+        self.finalize_execution_resolution(&input, false)
+    }
+
     /// Returns the current fail-closed state for one tenant stream.
     pub fn stream_state(&self, tenant_id: &str) -> Result<Option<AuditStreamState>, AuditError> {
         validate_identifier("tenant id", tenant_id)?;
@@ -815,6 +1071,18 @@ impl WitnessedAudit {
         let outcome_record = self.store.append(outcome.clone())?;
         self.witness_record(outcome_record).await?;
         self.store.complete_execution(outcome, sanitized_result)
+    }
+
+    /// Witness and finalize one immutable operator conclusion over an indeterminate execution.
+    pub async fn resolve_indeterminate_execution(
+        &self,
+        input: ExecutionResolutionInput,
+    ) -> Result<ExecutionResolution, AuditError> {
+        let (resolution, audit_record) = self.store.begin_execution_resolution(&input)?;
+        if !resolution.finalized {
+            self.witness_record(audit_record).await?;
+        }
+        self.store.finalize_execution_resolution(&input, true)
     }
 
     /// Returns the underlying local store for verification and stream blocking.
@@ -1055,6 +1323,10 @@ const SELECT_EXECUTION_RECORD: &str = "SELECT tenant_id, principal_id, idempoten
     request_hash, state, sanitized_result_json, intent_sequence, claimed_at_ms, updated_at_ms
     FROM execution_records";
 
+const SELECT_EXECUTION_RESOLUTION: &str = "SELECT tenant_id, principal_id, idempotency_key,
+    resolution, evidence_sha256, resolved_by_principal_id, audit_sequence, finalized,
+    resolved_at_ms FROM execution_resolutions";
+
 /// Appends or reloads one idempotent audit event inside the caller's immediate transaction.
 fn append_in_transaction(
     transaction: &Transaction<'_>,
@@ -1191,6 +1463,25 @@ fn load_execution_record(
         .map_err(AuditError::from)
 }
 
+/// Loads one immutable execution resolution through a connection or transaction.
+fn load_execution_resolution(
+    connection: &Connection,
+    tenant_id: &str,
+    principal_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ExecutionResolution>, AuditError> {
+    connection
+        .query_row(
+            &format!(
+                "{SELECT_EXECUTION_RESOLUTION} WHERE tenant_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3"
+            ),
+            params![tenant_id, principal_id, idempotency_key],
+            execution_resolution_from_row,
+        )
+        .optional()
+        .map_err(AuditError::from)
+}
+
 /// Loads persistent stream state through either a connection or transaction.
 fn load_stream_state(
     connection: &Connection,
@@ -1271,6 +1562,22 @@ fn execution_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Execut
     })
 }
 
+/// Decodes one SQLite row into an immutable execution resolution.
+fn execution_resolution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionResolution> {
+    let resolution: String = row.get(3)?;
+    Ok(ExecutionResolution {
+        tenant_id: row.get(0)?,
+        principal_id: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        resolution: parse_execution_resolution(&resolution).map_err(to_sql_conversion_error)?,
+        evidence_sha256: row.get(4)?,
+        resolved_by_principal_id: row.get(5)?,
+        audit_sequence: row.get(6)?,
+        finalized: row.get::<_, i64>(7)? != 0,
+        resolved_at_ms: row.get(8)?,
+    })
+}
+
 /// Adapts a decoding failure to rusqlite's row-conversion error.
 fn to_sql_conversion_error(
     error: impl std::error::Error + Send + Sync + 'static,
@@ -1304,6 +1611,80 @@ fn ensure_execution_hash(existing: &ExecutionRecord, request_hash: &str) -> Resu
         Ok(())
     } else {
         Err(AuditError::IdempotencyConflict)
+    }
+}
+
+/// Reject a retry that attempts to alter an existing immutable conclusion.
+fn ensure_resolution_match(
+    existing: &ExecutionResolution,
+    input: &ExecutionResolutionInput,
+) -> Result<(), AuditError> {
+    if existing.tenant_id == input.tenant_id
+        && existing.principal_id == input.principal_id
+        && existing.idempotency_key == input.idempotency_key
+        && existing.resolution == input.resolution
+        && existing.evidence_sha256 == input.evidence_sha256
+        && existing.resolved_by_principal_id == input.resolved_by_principal_id
+    {
+        Ok(())
+    } else {
+        Err(AuditError::ExecutionStateConflict)
+    }
+}
+
+/// Validate tenant bindings and the external evidence digest before any durable write.
+fn validate_execution_resolution_input(input: &ExecutionResolutionInput) -> Result<(), AuditError> {
+    validate_identifier("tenant id", &input.tenant_id)?;
+    validate_identifier("principal id", &input.principal_id)?;
+    validate_identifier("idempotency key", &input.idempotency_key)?;
+    validate_identifier("resolver principal id", &input.resolved_by_principal_id)?;
+    if input.evidence_sha256.len() != 64
+        || !input
+            .evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AuditError::InvalidInput(
+            "evidence SHA-256 must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the deterministic metadata-only event reserved with one resolution.
+fn execution_resolution_event(
+    input: &ExecutionResolutionInput,
+    execution: &ExecutionRecord,
+) -> AuditEventInput {
+    let target_digest = hex_digest(Sha256::digest(
+        format!(
+            "{}\0{}\0{}",
+            input.tenant_id, input.principal_id, input.idempotency_key
+        )
+        .as_bytes(),
+    ));
+    AuditEventInput {
+        tenant_id: input.tenant_id.clone(),
+        principal_id: input.resolved_by_principal_id.clone(),
+        action: "audit.execution_resolution".to_string(),
+        phase: AuditPhase::Outcome,
+        request: serde_json::json!({
+            "target_principal_id": input.principal_id,
+            "target_idempotency_key": input.idempotency_key,
+            "target_request_hash": execution.request_hash,
+            "resolution": execution_resolution_name(input.resolution),
+            "evidence_sha256": input.evidence_sha256,
+        }),
+        payload: serde_json::json!({
+            "decision": execution_resolution_name(input.resolution),
+            "outcome": "indeterminate_resolved",
+            "reason_code": "external_evidence_digest",
+            "target_request_hash": execution.request_hash,
+            "evidence_sha256": input.evidence_sha256,
+            "intent_sequence": execution.intent_sequence,
+            "policy_version": "henosis-execution-resolution-v1",
+        }),
+        idempotency_key: Some(format!("execution-resolution-{target_digest}")),
     }
 }
 
@@ -1384,6 +1765,9 @@ fn allowed_metadata_key(key: &str) -> bool {
             | "component_id"
             | "policy_version"
             | "witness_mode"
+            | "target_request_hash"
+            | "evidence_sha256"
+            | "intent_sequence"
     )
 }
 
@@ -1540,6 +1924,25 @@ fn parse_execution_state(value: &str) -> Result<ExecutionState, AuditError> {
         "indeterminate" => Ok(ExecutionState::Indeterminate),
         _ => Err(AuditError::InvalidInput(
             "stored execution state is invalid".into(),
+        )),
+    }
+}
+
+/// Maps an execution resolution to its stable database and wire representation.
+fn execution_resolution_name(resolution: ExecutionResolutionKind) -> &'static str {
+    match resolution {
+        ExecutionResolutionKind::Executed => "executed",
+        ExecutionResolutionKind::NotExecuted => "not_executed",
+    }
+}
+
+/// Parses one stored execution-resolution discriminator.
+fn parse_execution_resolution(value: &str) -> Result<ExecutionResolutionKind, AuditError> {
+    match value {
+        "executed" => Ok(ExecutionResolutionKind::Executed),
+        "not_executed" => Ok(ExecutionResolutionKind::NotExecuted),
+        _ => Err(AuditError::InvalidInput(
+            "stored execution resolution is invalid".to_string(),
         )),
     }
 }
@@ -1831,6 +2234,134 @@ mod tests {
         assert!(matches!(
             store.complete_execution(input(AuditPhase::Outcome, key), json!({"safe": true})),
             Err(AuditError::ExecutionStateConflict)
+        ));
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 1);
+    }
+
+    /// Lists only unresolved tenant records and concludes without reopening the retry key.
+    #[test]
+    fn execution_resolution_lists_and_concludes_without_reopening_key() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let key = "operator-resolution";
+        let request = input(AuditPhase::Intent, key).request;
+        store
+            .claim_execution(input(AuditPhase::Intent, key))
+            .unwrap();
+        let indeterminate = store
+            .mark_execution_indeterminate("tenant-a", "machine:test", key, &request)
+            .unwrap();
+
+        let before = store.indeterminate_executions("tenant-a").unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].resolution.is_none());
+
+        let resolution_input = ExecutionResolutionInput {
+            tenant_id: "tenant-a".into(),
+            principal_id: "machine:test".into(),
+            idempotency_key: key.into(),
+            resolved_by_principal_id: "human:operator".into(),
+            resolution: ExecutionResolutionKind::NotExecuted,
+            evidence_sha256: "a".repeat(64),
+        };
+        let resolved = store
+            .resolve_indeterminate_execution(resolution_input.clone())
+            .unwrap();
+        assert!(resolved.finalized);
+        assert_eq!(resolved.resolution, ExecutionResolutionKind::NotExecuted);
+        assert_eq!(resolved.evidence_sha256, "a".repeat(64));
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 2);
+
+        let after = store.indeterminate_executions("tenant-a").unwrap();
+        assert!(after.is_empty());
+        assert_eq!(
+            store
+                .claim_execution(input(AuditPhase::Intent, key))
+                .unwrap(),
+            ExecutionClaim::Existing(indeterminate)
+        );
+        assert!(store
+            .indeterminate_executions("tenant-b")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Exact retries are idempotent while changed conclusions or evidence remain conflicts.
+    #[test]
+    fn execution_resolution_is_immutable_and_idempotent() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let key = "immutable-resolution";
+        let request = input(AuditPhase::Intent, key).request;
+        store
+            .claim_execution(input(AuditPhase::Intent, key))
+            .unwrap();
+        store
+            .mark_execution_indeterminate("tenant-a", "machine:test", key, &request)
+            .unwrap();
+        let resolution_input = ExecutionResolutionInput {
+            tenant_id: "tenant-a".into(),
+            principal_id: "machine:test".into(),
+            idempotency_key: key.into(),
+            resolved_by_principal_id: "human:operator".into(),
+            resolution: ExecutionResolutionKind::Executed,
+            evidence_sha256: "b".repeat(64),
+        };
+
+        let first = store
+            .resolve_indeterminate_execution(resolution_input.clone())
+            .unwrap();
+        let retry = store
+            .resolve_indeterminate_execution(resolution_input.clone())
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 2);
+
+        let mut changed = resolution_input;
+        changed.resolution = ExecutionResolutionKind::NotExecuted;
+        assert!(matches!(
+            store.resolve_indeterminate_execution(changed),
+            Err(AuditError::ExecutionStateConflict | AuditError::IdempotencyConflict)
+        ));
+        assert_eq!(store.verify_tenant("tenant-a").unwrap(), 2);
+    }
+
+    /// Rejects malformed digests, non-indeterminate records, and blocked audit streams.
+    #[test]
+    fn execution_resolution_rejects_unsafe_boundaries() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let claimed_key = "still-claimed";
+        store
+            .claim_execution(input(AuditPhase::Intent, claimed_key))
+            .unwrap();
+        let base = ExecutionResolutionInput {
+            tenant_id: "tenant-a".into(),
+            principal_id: "machine:test".into(),
+            idempotency_key: claimed_key.into(),
+            resolved_by_principal_id: "human:operator".into(),
+            resolution: ExecutionResolutionKind::Executed,
+            evidence_sha256: "c".repeat(64),
+        };
+        assert!(matches!(
+            store.resolve_indeterminate_execution(base.clone()),
+            Err(AuditError::ExecutionStateConflict)
+        ));
+
+        let mut malformed = base.clone();
+        malformed.evidence_sha256 = "C".repeat(64);
+        assert!(matches!(
+            store.resolve_indeterminate_execution(malformed),
+            Err(AuditError::InvalidInput(_))
+        ));
+
+        let request = input(AuditPhase::Intent, claimed_key).request;
+        store
+            .mark_execution_indeterminate("tenant-a", "machine:test", claimed_key, &request)
+            .unwrap();
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+        assert!(matches!(
+            store.resolve_indeterminate_execution(base),
+            Err(AuditError::StreamBlocked { .. })
         ));
         assert_eq!(store.verify_tenant("tenant-a").unwrap(), 1);
     }
