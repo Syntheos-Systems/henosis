@@ -19,7 +19,7 @@ use henosis_approval::{
     ApprovalRequest, ApprovalStatus, ApprovalStore, RequestHash,
 };
 use henosis_audit::{
-    AuditEventInput, AuditPhase, AuditStore, ExecutionClaim, ExecutionResolution,
+    AuditEventInput, AuditPhase, AuditRecovery, AuditStore, ExecutionClaim, ExecutionResolution,
     ExecutionResolutionInput, ExecutionResolutionKind, ExecutionState, IndeterminateExecution,
     WitnessedAudit,
 };
@@ -179,6 +179,19 @@ impl AuditBoundary {
         match self {
             Self::Local(store) => store.resolve_indeterminate_execution(input),
             Self::Witnessed(audit) => audit.resolve_indeterminate_execution(input).await,
+        }
+    }
+
+    /// Restore a blocked stream only when this boundary has an independent witness.
+    async fn recover_stream(
+        &self,
+        tenant_id: &str,
+    ) -> Result<AuditRecovery, henosis_audit::AuditError> {
+        match self {
+            Self::Local(_) => Err(henosis_audit::AuditError::InvalidInput(
+                "audit recovery requires witnessed mode".to_string(),
+            )),
+            Self::Witnessed(audit) => audit.recover_stream(tenant_id).await,
         }
     }
 }
@@ -874,6 +887,7 @@ pub fn authority_router(state: AuthorityState) -> Router {
             post(resolve_indeterminate_execution),
         )
         .route("/api/v1/audit/verify", get(verify_audit))
+        .route("/api/v1/audit/recover", post(recover_audit))
         .with_state(state)
 }
 
@@ -1211,6 +1225,41 @@ async fn verify_audit(
     })))
 }
 
+/// Exact-retry and verify the authenticated tenant's blocked witnessed audit head.
+async fn recover_audit(
+    State(state): State<AuthorityState>,
+    identity: AuthenticatedIdentity,
+) -> Result<Json<AuditRecovery>, AuthorityError> {
+    identity.require_operator_administrator()?;
+    let recovery = state
+        .audit
+        .recover_stream(&identity.tenant.to_string())
+        .await
+        .map_err(map_audit_recovery_error)?;
+    Ok(Json(recovery))
+}
+
+/// Convert witnessed recovery failures into stable public statuses without backend details.
+fn map_audit_recovery_error(error: henosis_audit::AuditError) -> AuthorityError {
+    match error {
+        henosis_audit::AuditError::InvalidInput(message) => AuthorityError::InvalidRequest(message),
+        henosis_audit::AuditError::WitnessRejected(status)
+            if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS =>
+        {
+            AuthorityError::Unavailable
+        }
+        henosis_audit::AuditError::ChainVerification { .. }
+        | henosis_audit::AuditError::InvalidSignature
+        | henosis_audit::AuditError::ReceiptMismatch
+        | henosis_audit::AuditError::WitnessRejected(_)
+        | henosis_audit::AuditError::StreamBlocked { .. } => AuthorityError::Conflict,
+        other => {
+            tracing::error!(%other, "audit recovery failed");
+            AuthorityError::Unavailable
+        }
+    }
+}
+
 /// Extract a case-sensitive bearer credential from an HTTP header map.
 fn bearer_credential(headers: &HeaderMap) -> Result<&str, AuthorityError> {
     let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
@@ -1423,20 +1472,25 @@ mod tests {
     use std::time::Duration;
 
     use ed25519_dalek::SigningKey;
-    use henosis_audit::{OriginSigner, WitnessClient};
+    use henosis_audit::{sign_witness_receipt, OriginSigner, WitnessClient};
     use henosis_plutus::MockPolicyBackend;
     use syntheos_axon::AxonBus;
     use syntheos_dispatch::{deny_gate_chain, DenyExecutor};
 
     /// Construct a witnessed authority state without contacting the inert witness endpoint.
     fn witnessed_state(approvals: Arc<ApprovalStore>) -> AuthorityState {
+        witnessed_state_with_signer(approvals).0
+    }
+
+    /// Construct witnessed authority state together with its deterministic test witness signer.
+    fn witnessed_state_with_signer(approvals: Arc<ApprovalStore>) -> (AuthorityState, SigningKey) {
         let origin_signer = OriginSigner::new("origin-test", SigningKey::from_bytes(&[7_u8; 32]))
             .expect("origin signer");
-        let witness_key = SigningKey::from_bytes(&[8_u8; 32]).verifying_key();
+        let witness_signer = SigningKey::from_bytes(&[8_u8; 32]);
         let witness_client = WitnessClient::new(
             "https://127.0.0.1:1",
             "witness-test",
-            witness_key,
+            witness_signer.verifying_key(),
             Duration::from_secs(1),
         )
         .expect("witness client");
@@ -1451,14 +1505,17 @@ mod tests {
             Arc::new(AxonBus::new()),
         )
         .expect("dispatcher");
-        AuthorityState {
-            dispatcher: Arc::new(dispatcher),
-            accounts: Arc::new(SqliteDirectory::open_in_memory().expect("accounts")),
-            policy: Arc::new(MockPolicyBackend::with_role(Role::Admin)),
-            jwt_secret: Arc::new(vec![9_u8; 32]),
-            approvals,
-            audit,
-        }
+        (
+            AuthorityState {
+                dispatcher: Arc::new(dispatcher),
+                accounts: Arc::new(SqliteDirectory::open_in_memory().expect("accounts")),
+                policy: Arc::new(MockPolicyBackend::with_role(Role::Admin)),
+                jwt_secret: Arc::new(vec![9_u8; 32]),
+                approvals,
+                audit,
+            },
+            witness_signer,
+        )
     }
 
     /// Construct a local authority state for resolution tests that must finalize without a witness.
@@ -1544,14 +1601,125 @@ mod tests {
         assert!(matches!(revoke, Err(AuthorityError::Forbidden)));
 
         let decision = decide_approval(
-            state,
-            identity,
+            state.clone(),
+            identity.clone(),
             Uuid::new_v4().to_string(),
             ApprovalDecisionBody { reason: None },
             ApprovalDecision::Approve,
         )
         .await;
         assert!(matches!(decision, Err(AuthorityError::Forbidden)));
+
+        let recovery = recover_audit(State(state), identity).await;
+        assert!(matches!(recovery, Err(AuthorityError::Forbidden)));
+    }
+
+    /// Human recovery is tenant-bound, receipt-verified, and leaves other tenants blocked.
+    #[tokio::test]
+    async fn audit_recovery_handler_enforces_human_tenant_authority() {
+        let (state, witness_signer) = witnessed_state_with_signer(Arc::new(
+            ApprovalStore::open_in_memory().expect("approval store"),
+        ));
+        let tenant = TenantId::new();
+        let other_tenant = TenantId::new();
+        let operator = PrincipalId::new();
+        for selected_tenant in [tenant, other_tenant] {
+            let record = state
+                .audit
+                .store()
+                .append(AuditEventInput {
+                    tenant_id: selected_tenant.to_string(),
+                    principal_id: PrincipalId::new().to_string(),
+                    action: "documents.create".to_string(),
+                    phase: AuditPhase::Outcome,
+                    request: json!({"tool": "documents", "action": "create"}),
+                    payload: json!({"tool": "documents", "outcome": "indeterminate"}),
+                    idempotency_key: Some(format!("recovery-{selected_tenant}")),
+                })
+                .expect("audit record");
+            let receipt = sign_witness_receipt(
+                record.tenant_id.clone(),
+                record.sequence,
+                record.event_hash,
+                "witness-test".to_string(),
+                42,
+                &witness_signer,
+            );
+            state
+                .audit
+                .store()
+                .attach_witness_receipt(&receipt, &witness_signer.verifying_key())
+                .expect("witness receipt");
+            state
+                .audit
+                .store()
+                .mark_stream_ambiguous(&selected_tenant.to_string(), "outcome_completion_failed")
+                .expect("stream block");
+        }
+
+        let recovery = recover_audit(
+            State(state.clone()),
+            administrator_identity(tenant, operator),
+        )
+        .await
+        .expect("audit recovery");
+        assert_eq!(recovery.0.verified_records, 1);
+        assert_eq!(recovery.0.recovered_sequence, 1);
+        assert!(
+            !state
+                .audit
+                .store()
+                .stream_state(&tenant.to_string())
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
+        assert!(
+            state
+                .audit
+                .store()
+                .stream_state(&other_tenant.to_string())
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
+    }
+
+    /// Local audit mode rejects witnessed recovery before changing its stream state.
+    #[tokio::test]
+    async fn audit_recovery_handler_rejects_local_mode() {
+        let state = local_state(Arc::new(
+            ApprovalStore::open_in_memory().expect("approval store"),
+        ));
+        let identity = administrator_identity(TenantId::new(), PrincipalId::new());
+
+        let recovery = recover_audit(State(state), identity).await;
+        assert!(matches!(recovery, Err(AuthorityError::InvalidRequest(_))));
+    }
+
+    /// Recovery conflict classes remain distinct from unavailable transport or storage failures.
+    #[test]
+    fn audit_recovery_error_mapping_is_fail_closed() {
+        assert!(matches!(
+            map_audit_recovery_error(henosis_audit::AuditError::ReceiptMismatch),
+            AuthorityError::Conflict
+        ));
+        assert!(matches!(
+            map_audit_recovery_error(henosis_audit::AuditError::WitnessRejected(
+                StatusCode::CONFLICT
+            )),
+            AuthorityError::Conflict
+        ));
+        assert!(matches!(
+            map_audit_recovery_error(henosis_audit::AuditError::WitnessRejected(
+                StatusCode::SERVICE_UNAVAILABLE
+            )),
+            AuthorityError::Unavailable
+        ));
+        assert!(matches!(
+            map_audit_recovery_error(henosis_audit::AuditError::LockPoisoned),
+            AuthorityError::Unavailable
+        ));
     }
 
     /// Human administrators can list and resolve only their tenant's indeterminate executions.

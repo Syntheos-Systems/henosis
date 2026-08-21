@@ -207,6 +207,15 @@ pub struct AuditStreamState {
     pub updated_at_ms: i64,
 }
 
+/// Verified result of restoring one previously blocked witnessed audit stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditRecovery {
+    /// Number of immutable rows verified before the block was cleared.
+    pub verified_records: u64,
+    /// Sequence of the exact local head accepted by the witness.
+    pub recovered_sequence: u64,
+}
+
 /// Durable lifecycle state for one idempotent execution.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -911,6 +920,55 @@ impl AuditStore {
         Ok(())
     }
 
+    /// Clears a stream block only when a valid witness receipt binds the unchanged verified head.
+    fn recover_witnessed_stream(
+        &self,
+        tenant_id: &str,
+        expected_sequence: u64,
+        expected_event_hash: &str,
+        expected_key_id: &str,
+        witness_key: &VerifyingKey,
+    ) -> Result<AuditRecovery, AuditError> {
+        validate_identifier("tenant id", tenant_id)?;
+        validate_identifier("witness key id", expected_key_id)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let verified_records = verify_tenant_in(&transaction, tenant_id)?;
+        let current_head = load_head(&transaction, tenant_id)?.ok_or_else(|| {
+            AuditError::InvalidInput("audit stream has no recoverable head".to_string())
+        })?;
+        if current_head.sequence != expected_sequence
+            || current_head.event_hash != expected_event_hash
+        {
+            return Err(AuditError::ReceiptMismatch);
+        }
+        let receipt = current_head
+            .witness_receipt
+            .as_ref()
+            .ok_or(AuditError::ReceiptMismatch)?;
+        verify_receipt_for_record(receipt, &current_head, expected_key_id, witness_key)?;
+
+        let state = load_stream_state(&transaction, tenant_id)?.ok_or_else(|| {
+            AuditError::InvalidInput("audit stream has not been blocked".to_string())
+        })?;
+        if state.blocked {
+            let changed = transaction.execute(
+                "UPDATE audit_stream_state
+                 SET blocked = 0, reason_code = NULL, updated_at_ms = ?1
+                 WHERE tenant_id = ?2 AND blocked = 1",
+                params![unix_timestamp_ms()?, tenant_id],
+            )?;
+            if changed != 1 {
+                return Err(AuditError::ReceiptMismatch);
+            }
+        }
+        transaction.commit()?;
+        Ok(AuditRecovery {
+            verified_records,
+            recovered_sequence: current_head.sequence,
+        })
+    }
+
     /// Loads one record from a tenant stream.
     pub fn get(&self, tenant_id: &str, sequence: u64) -> Result<Option<AuditRecord>, AuditError> {
         let connection = self.lock_connection()?;
@@ -919,59 +977,16 @@ impl AuditStore {
 
     /// Returns the current tenant stream head, if the stream is non-empty.
     pub fn head(&self, tenant_id: &str) -> Result<Option<AuditRecord>, AuditError> {
+        validate_identifier("tenant id", tenant_id)?;
         let connection = self.lock_connection()?;
-        connection
-            .query_row(
-                &format!("{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence DESC LIMIT 1"),
-                [tenant_id],
-                record_from_row,
-            )
-            .optional()
-            .map_err(AuditError::from)
+        load_head(&connection, tenant_id)
     }
 
     /// Verifies every link and event hash in a tenant stream, returning the verified row count.
     pub fn verify_tenant(&self, tenant_id: &str) -> Result<u64, AuditError> {
         validate_identifier("tenant id", tenant_id)?;
         let connection = self.lock_connection()?;
-        let mut statement = connection.prepare(&format!(
-            "{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence ASC"
-        ))?;
-        let records = statement
-            .query_map([tenant_id], record_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut expected_previous = GENESIS_HASH.to_owned();
-        for (expected_sequence, record) in (1_u64..).zip(records.iter()) {
-            if record.sequence != expected_sequence {
-                return Err(verification_error(record.sequence, "sequence gap"));
-            }
-            if record.previous_hash != expected_previous {
-                return Err(verification_error(
-                    record.sequence,
-                    "previous hash mismatch",
-                ));
-            }
-            let payload_json = canonical_json_string(&record.payload)?;
-            let expected_hash = compute_event_hash(
-                &record.tenant_id,
-                record.sequence,
-                &record.event_id,
-                &record.principal_id,
-                &record.action,
-                record.phase,
-                &record.request_hash,
-                &payload_json,
-                &record.previous_hash,
-                record.created_at_ms,
-                record.idempotency_key.as_deref(),
-            );
-            if record.event_hash != expected_hash {
-                return Err(verification_error(record.sequence, "event hash mismatch"));
-            }
-            expected_previous.clone_from(&record.event_hash);
-        }
-        Ok(records.len() as u64)
+        verify_tenant_in(&connection, tenant_id)
     }
 
     /// Acquires the SQLite connection or reports poison without panicking.
@@ -1085,6 +1100,25 @@ impl WitnessedAudit {
         self.store.finalize_execution_resolution(&input, true)
     }
 
+    /// Restore a blocked tenant stream by exact-retrying and verifying its current local head.
+    pub async fn recover_stream(&self, tenant_id: &str) -> Result<AuditRecovery, AuditError> {
+        validate_identifier("tenant id", tenant_id)?;
+        self.store.stream_state(tenant_id)?.ok_or_else(|| {
+            AuditError::InvalidInput("audit stream has not been blocked".to_string())
+        })?;
+        let head = self.store.head(tenant_id)?.ok_or_else(|| {
+            AuditError::InvalidInput("audit stream has no recoverable head".to_string())
+        })?;
+        let witnessed = self.witness_record(head).await?;
+        self.store.recover_witnessed_stream(
+            tenant_id,
+            witnessed.sequence,
+            &witnessed.event_hash,
+            &self.witness_client.expected_key_id,
+            &self.witness_client.expected_key,
+        )
+    }
+
     /// Returns the underlying local store for verification and stream blocking.
     pub fn store(&self) -> &AuditStore {
         &self.store
@@ -1092,16 +1126,34 @@ impl WitnessedAudit {
 
     /// Obtains and persists the independent receipt for one local audit row.
     async fn witness_record(&self, record: AuditRecord) -> Result<AuditRecord, AuditError> {
-        if record.witness_receipt.is_some() {
+        if let Some(receipt) = record.witness_receipt.as_ref() {
+            verify_receipt_for_record(
+                receipt,
+                &record,
+                &self.witness_client.expected_key_id,
+                &self.witness_client.expected_key,
+            )?;
             return Ok(record);
         }
         let checkpoint = self.origin_signer.checkpoint(&record);
         let receipt = self.witness_client.checkpoint(&checkpoint).await?;
         self.store
             .attach_witness_receipt(&receipt, &self.witness_client.expected_key)?;
-        self.store
+        let witnessed = self
+            .store
             .get(&record.tenant_id, record.sequence)?
-            .ok_or(AuditError::ReceiptMismatch)
+            .ok_or(AuditError::ReceiptMismatch)?;
+        let receipt = witnessed
+            .witness_receipt
+            .as_ref()
+            .ok_or(AuditError::ReceiptMismatch)?;
+        verify_receipt_for_record(
+            receipt,
+            &witnessed,
+            &self.witness_client.expected_key_id,
+            &self.witness_client.expected_key,
+        )?;
+        Ok(witnessed)
     }
 }
 
@@ -1423,6 +1475,60 @@ fn load_record(
         .map_err(AuditError::from)
 }
 
+/// Loads the current tenant stream head through either a connection or transaction.
+fn load_head(connection: &Connection, tenant_id: &str) -> Result<Option<AuditRecord>, AuditError> {
+    connection
+        .query_row(
+            &format!("{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence DESC LIMIT 1"),
+            [tenant_id],
+            record_from_row,
+        )
+        .optional()
+        .map_err(AuditError::from)
+}
+
+/// Verifies every immutable row while preserving the caller's connection or transaction lock.
+fn verify_tenant_in(connection: &Connection, tenant_id: &str) -> Result<u64, AuditError> {
+    let mut statement = connection.prepare(&format!(
+        "{SELECT_RECORD} WHERE tenant_id = ?1 ORDER BY sequence ASC"
+    ))?;
+    let records = statement
+        .query_map([tenant_id], record_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut expected_previous = GENESIS_HASH.to_owned();
+    for (expected_sequence, record) in (1_u64..).zip(records.iter()) {
+        if record.sequence != expected_sequence {
+            return Err(verification_error(record.sequence, "sequence gap"));
+        }
+        if record.previous_hash != expected_previous {
+            return Err(verification_error(
+                record.sequence,
+                "previous hash mismatch",
+            ));
+        }
+        let payload_json = canonical_json_string(&record.payload)?;
+        let expected_hash = compute_event_hash(
+            &record.tenant_id,
+            record.sequence,
+            &record.event_id,
+            &record.principal_id,
+            &record.action,
+            record.phase,
+            &record.request_hash,
+            &payload_json,
+            &record.previous_hash,
+            record.created_at_ms,
+            record.idempotency_key.as_deref(),
+        );
+        if record.event_hash != expected_hash {
+            return Err(verification_error(record.sequence, "event hash mismatch"));
+        }
+        expected_previous.clone_from(&record.event_hash);
+    }
+    Ok(records.len() as u64)
+}
+
 /// Loads an audit record by retry key.
 fn load_by_idempotency(
     transaction: &Transaction<'_>,
@@ -1517,6 +1623,23 @@ fn ensure_stream_writable_in(connection: &Connection, tenant_id: &str) -> Result
         }
     }
     Ok(())
+}
+
+/// Verifies that one receipt was issued for the exact record by the configured witness key.
+fn verify_receipt_for_record(
+    receipt: &WitnessReceipt,
+    record: &AuditRecord,
+    expected_key_id: &str,
+    witness_key: &VerifyingKey,
+) -> Result<(), AuditError> {
+    if receipt.tenant_id != record.tenant_id
+        || receipt.sequence != record.sequence
+        || receipt.event_hash != record.event_hash
+        || receipt.witness_key_id != expected_key_id
+    {
+        return Err(AuditError::ReceiptMismatch);
+    }
+    verify_witness_receipt(receipt, witness_key)
 }
 
 /// Decodes one SQLite row into its immutable audit representation.
@@ -1985,6 +2108,18 @@ mod tests {
         event
     }
 
+    /// Signs a deterministic witness receipt for one test audit record.
+    fn receipt_for(record: &AuditRecord, signer: &SigningKey) -> WitnessReceipt {
+        sign_witness_receipt(
+            record.tenant_id.clone(),
+            record.sequence,
+            record.event_hash.clone(),
+            "witness-test".into(),
+            42,
+            signer,
+        )
+    }
+
     /// Proves that append builds a tenant-local verifiable chain.
     #[test]
     fn append_and_verify_chain() {
@@ -2436,6 +2571,221 @@ mod tests {
         assert_eq!(record.state, ExecutionState::Claimed);
         assert!(record.sanitized_result.is_none());
         assert_eq!(store.verify_tenant("tenant-a").unwrap(), 1);
+    }
+
+    /// Proves a valid receipt clears exactly one block and repeated recovery is idempotent.
+    #[test]
+    fn witnessed_stream_recovery_is_verified_and_idempotent() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let record = store
+            .append(input(AuditPhase::Intent, "recoverable"))
+            .unwrap();
+        let witness_signer = SigningKey::from_bytes(&[7_u8; 32]);
+        let receipt = receipt_for(&record, &witness_signer);
+        store
+            .attach_witness_receipt(&receipt, &witness_signer.verifying_key())
+            .unwrap();
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+
+        assert!(matches!(
+            store.recover_witnessed_stream(
+                "tenant-a",
+                record.sequence,
+                &record.event_hash,
+                "unexpected-witness",
+                &witness_signer.verifying_key(),
+            ),
+            Err(AuditError::ReceiptMismatch)
+        ));
+        assert!(store.stream_state("tenant-a").unwrap().unwrap().blocked);
+        let recovered = store
+            .recover_witnessed_stream(
+                "tenant-a",
+                record.sequence,
+                &record.event_hash,
+                "witness-test",
+                &witness_signer.verifying_key(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered,
+            AuditRecovery {
+                verified_records: 1,
+                recovered_sequence: 1,
+            }
+        );
+        assert!(!store.stream_state("tenant-a").unwrap().unwrap().blocked);
+        assert_eq!(
+            store
+                .recover_witnessed_stream(
+                    "tenant-a",
+                    record.sequence,
+                    &record.event_hash,
+                    "witness-test",
+                    &witness_signer.verifying_key(),
+                )
+                .unwrap(),
+            recovered
+        );
+    }
+
+    /// Proves a receipt with an invalid signature cannot clear a persistent stream block.
+    #[test]
+    fn witnessed_stream_recovery_rejects_tampered_receipt() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let record = store
+            .append(input(AuditPhase::Intent, "tampered-receipt"))
+            .unwrap();
+        let witness_signer = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut receipt = receipt_for(&record, &witness_signer);
+        receipt.signature_b64 = BASE64.encode([0_u8; 64]);
+        {
+            let connection = store.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE audit_events SET witness_receipt_json = ?1
+                     WHERE tenant_id = ?2 AND sequence = ?3",
+                    params![
+                        serde_json::to_string(&receipt).unwrap(),
+                        record.tenant_id,
+                        record.sequence,
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+
+        assert!(matches!(
+            store.recover_witnessed_stream(
+                "tenant-a",
+                record.sequence,
+                &record.event_hash,
+                "witness-test",
+                &witness_signer.verifying_key(),
+            ),
+            Err(AuditError::InvalidSignature)
+        ));
+        assert!(store.stream_state("tenant-a").unwrap().unwrap().blocked);
+    }
+
+    /// Proves neither a stale expected head nor a corrupt local chain can clear the block.
+    #[test]
+    fn witnessed_stream_recovery_binds_verified_current_head() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let stale = store
+            .append(input(AuditPhase::Intent, "stale-head"))
+            .unwrap();
+        let current = store
+            .append(input(AuditPhase::Outcome, "current-head"))
+            .unwrap();
+        let witness_signer = SigningKey::from_bytes(&[7_u8; 32]);
+        let receipt = receipt_for(&current, &witness_signer);
+        store
+            .attach_witness_receipt(&receipt, &witness_signer.verifying_key())
+            .unwrap();
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+
+        assert!(matches!(
+            store.recover_witnessed_stream(
+                "tenant-a",
+                stale.sequence,
+                &stale.event_hash,
+                "witness-test",
+                &witness_signer.verifying_key(),
+            ),
+            Err(AuditError::ReceiptMismatch)
+        ));
+        {
+            let connection = store.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE audit_events SET payload_json = '{\"outcome\":\"changed\"}'
+                     WHERE tenant_id = 'tenant-a' AND sequence = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.recover_witnessed_stream(
+                "tenant-a",
+                current.sequence,
+                &current.event_hash,
+                "witness-test",
+                &witness_signer.verifying_key(),
+            ),
+            Err(AuditError::ChainVerification { sequence: 1, .. })
+        ));
+        assert!(store.stream_state("tenant-a").unwrap().unwrap().blocked);
+    }
+
+    /// Proves a blocked stream without an audit head remains blocked.
+    #[test]
+    fn witnessed_stream_recovery_rejects_missing_head() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let witness_signer = SigningKey::from_bytes(&[7_u8; 32]);
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+
+        assert!(matches!(
+            store.recover_witnessed_stream(
+                "tenant-a",
+                1,
+                &"0".repeat(64),
+                "witness-test",
+                &witness_signer.verifying_key(),
+            ),
+            Err(AuditError::InvalidInput(_))
+        ));
+        assert!(store.stream_state("tenant-a").unwrap().unwrap().blocked);
+    }
+
+    /// Proves recovery does not reopen an indeterminate execution key.
+    #[test]
+    fn witnessed_stream_recovery_preserves_indeterminate_execution() {
+        let store = AuditStore::open_in_memory().unwrap();
+        let key = "indeterminate-recovery";
+        store
+            .claim_execution(input(AuditPhase::Intent, key))
+            .unwrap();
+        let request = input(AuditPhase::Intent, key).request;
+        store
+            .mark_execution_indeterminate("tenant-a", "machine:test", key, &request)
+            .unwrap();
+        let record = store.head("tenant-a").unwrap().unwrap();
+        let witness_signer = SigningKey::from_bytes(&[7_u8; 32]);
+        let receipt = receipt_for(&record, &witness_signer);
+        store
+            .attach_witness_receipt(&receipt, &witness_signer.verifying_key())
+            .unwrap();
+        store
+            .mark_stream_ambiguous("tenant-a", "outcome_witness_failed")
+            .unwrap();
+
+        store
+            .recover_witnessed_stream(
+                "tenant-a",
+                record.sequence,
+                &record.event_hash,
+                "witness-test",
+                &witness_signer.verifying_key(),
+            )
+            .unwrap();
+        let execution = store
+            .execution_record("tenant-a", "machine:test", key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.state, ExecutionState::Indeterminate);
+        assert!(matches!(
+            store.claim_execution(input(AuditPhase::Intent, key)).unwrap(),
+            ExecutionClaim::Existing(existing) if existing.state == ExecutionState::Indeterminate
+        ));
     }
 
     /// Proves production witness clients reject plaintext and credential-bearing URLs.

@@ -26,6 +26,19 @@ Production startup requires synchronous audit witnessing regardless of listen ad
 
 Only a live human owner or administrator can conclude an indeterminate execution. The resolution records `executed` or `not_executed`, the resolving principal, and a lowercase SHA-256 digest of evidence retained outside Henosis. It is appended to the tenant audit chain and witnessed before finalization in production. The conclusion is immutable, does not supply a result, and never reopens the original idempotency key. A deliberate retry requires a new key and a fresh approval when policy requires one. A blocked witnessed stream must be recovered before it accepts a resolution.
 
+Only a live human owner or administrator can invoke `henosis audit recover`.
+The server derives the tenant from authentication and exact-retries the current
+local head through the configured witness. If the witness accepted the
+checkpoint but its response was lost, the witness returns the original receipt
+for the exact tenant, sequence, and event hash. Henosis clears the block only
+after verifying the complete local chain, the unchanged current head, the
+configured witness key identifier, and the receipt signature inside one storage
+transaction. A missing head, local corruption, mismatched or invalid receipt,
+witness conflict, transport failure, or concurrent head change leaves the
+stream blocked. Local audit mode rejects this operation. Audit recovery does
+not resolve an indeterminate execution, make its result replayable, or reopen
+its original idempotency key.
+
 ## Scope
 
 Review [scripts/known-incomplete.md](scripts/known-incomplete.md) before deployment. The Wasmtime component host is present, but extension loading is not yet connected to the production dispatcher. Existing in-process adapters therefore remain inside the Henosis process boundary.

@@ -436,6 +436,7 @@ fn control_command(command: &Command) -> bool {
             | Command::Approvals(_)
             | Command::Executions(_)
             | Command::AuditVerify
+            | Command::AuditRecover
     )
 }
 
@@ -2055,6 +2056,7 @@ mod auto_init_tests {
         assert!(control_command(&Command::Executions(
             syntheos_server::cli::ExecutionCommand::List
         )));
+        assert!(control_command(&Command::AuditRecover));
         assert!(!control_command(&Command::Init(
             syntheos_server::cli::InitMode::Quick
         )));

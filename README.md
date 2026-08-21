@@ -160,6 +160,22 @@ Henosis. A conclusion is immutable and audit-linked; it never makes the original
 key replayable. Any deliberate retry needs a new key and any approval required
 by the current policy.
 
+In witnessed mode, an ambiguous checkpoint also blocks later audit writes. Once
+the configured witness is healthy, a human owner or administrator can restore
+the tenant stream explicitly:
+
+```sh
+henosis audit verify
+henosis audit recover
+```
+
+Recovery exact-retries only the current local head through the witness's
+idempotent checkpoint protocol. Henosis verifies the complete local chain and a
+receipt signed for that unchanged head before clearing the block. A transport
+failure, witness conflict, invalid receipt, local chain failure, or concurrent
+head change leaves the stream blocked. Recovery never concludes the related
+indeterminate execution; inspect and resolve that record separately.
+
 ## Desktop
 
 The Tauri application offers chat, complete desktop, and spatial room
@@ -179,7 +195,7 @@ development instructions live in [apps/desktop](apps/desktop/README.md).
 | Execution | The Wasmtime Component Model host enforces fuel, memory, time, output, and network limits. Third-party extension loading remains disconnected. |
 | Filesystem | Built-in file tools accept task-root-relative paths and reject traversal and symlink escapes. `bash` is a separate capability with the operating-system access of the Henosis process. |
 | Credentials | Tools request named broker operations without receiving raw secrets. Production uses the external `phylaxd` broker. |
-| Audit | Henosis writes synchronous hash-chained records and supports an independent witness. Production requires off-host intent and outcome receipts. |
+| Audit | Henosis writes synchronous hash-chained records and supports an independent witness. Production requires off-host intent and outcome receipts. A blocked stream can be restored only by exact receipt-verified head recovery. |
 
 ```text
 operator or agent

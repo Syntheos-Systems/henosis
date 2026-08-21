@@ -101,7 +101,7 @@ const PRODUCTION_REQUIRED_KEYS: &[&str] = &[
 ];
 
 /// Stable human-readable usage text for `henosis --help` and `henosis help`.
-pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update --version <v-prefixed-tag>\n  henosis uninstall [--confirm-quarantine]\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis executions list\n  henosis executions resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>\n  henosis audit verify\n  henosis --help | --version";
+pub const HELP_TEXT: &str = "Henosis operator commands:\n  henosis init --quick [--harness <name|path>]\n  henosis init --production\n  henosis doctor [--json]\n  henosis serve\n  henosis status\n  henosis update --version <v-prefixed-tag>\n  henosis uninstall [--confirm-quarantine]\n  henosis token create <label> [--token-only] | list | revoke <token-id>\n  henosis approvals list | approve <approval-id> | deny <approval-id>\n  henosis executions list\n  henosis executions resolve <principal-id> <idempotency-key> (--executed | --not-executed) --evidence-sha256 <digest>\n  henosis audit verify | recover\n  henosis --help | --version";
 
 /// Stable version text for `henosis --version` and `henosis version`.
 pub const VERSION_TEXT: &str = concat!("henosis ", env!("CARGO_PKG_VERSION"));
@@ -139,6 +139,8 @@ pub enum Command {
     Executions(ExecutionCommand),
     /// Verify the live audit trail.
     AuditVerify,
+    /// Restore a blocked witnessed audit stream after exact receipt verification.
+    AuditRecover,
     /// Start the server using the binary's integrated runtime.
     Serve,
 }
@@ -237,6 +239,8 @@ pub enum ControlRequest {
     Executions(ExecutionCommand),
     /// Ask the live audit authority to verify its chain.
     AuditVerify,
+    /// Ask the live audit authority to recover its blocked witnessed head.
+    AuditRecover,
 }
 
 /// A typed local lifecycle request emitted after strict argument validation.
@@ -855,6 +859,18 @@ impl ControlApi for HttpControlApi {
                     operation,
                 )
             }
+            ControlRequest::AuditRecover => {
+                let operation = "henosis audit recover";
+                self.json_output(
+                    self.request(
+                        Method::POST,
+                        &["api", "v1", "audit", "recover"],
+                        None,
+                        operation,
+                    )?,
+                    operation,
+                )
+            }
         }
     }
 }
@@ -1232,6 +1248,7 @@ impl<'a> CliRunner<'a> {
             Command::Approvals(command) => self.run_control(ControlRequest::Approvals(command)),
             Command::Executions(command) => self.run_control(ControlRequest::Executions(command)),
             Command::AuditVerify => self.run_control(ControlRequest::AuditVerify),
+            Command::AuditRecover => self.run_control(ControlRequest::AuditRecover),
         }
     }
 
@@ -1822,8 +1839,9 @@ fn lowercase_sha256(value: &str) -> Result<String, CliError> {
 fn parse_audit(arguments: &[String]) -> Result<Command, CliError> {
     match arguments {
         [subcommand] if subcommand == "verify" => Ok(Command::AuditVerify),
+        [subcommand] if subcommand == "recover" => Ok(Command::AuditRecover),
         _ => Err(CliError::Usage {
-            message: "usage: henosis audit verify".to_string(),
+            message: "usage: henosis audit verify | recover".to_string(),
         }),
     }
 }
@@ -1846,6 +1864,7 @@ fn control_operation_name(request: &ControlRequest) -> &'static str {
         ControlRequest::Approvals(_) => "henosis approvals",
         ControlRequest::Executions(_) => "henosis executions",
         ControlRequest::AuditVerify => "henosis audit verify",
+        ControlRequest::AuditRecover => "henosis audit recover",
     }
 }
 
@@ -2749,6 +2768,26 @@ mod tests {
         assert_eq!(output.message, "[]");
     }
 
+    /// Maps witnessed audit recovery to the exact authenticated bodyless mutation route.
+    #[test]
+    fn audit_recovery_maps_to_authenticated_http_request() {
+        let (base_url, requests) = one_response_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"verified_records\":2,\"recovered_sequence\":2}",
+        );
+        let output = test_http_client(base_url)
+            .execute(ControlRequest::AuditRecover)
+            .expect("execute audit recovery request");
+        let request =
+            String::from_utf8(requests.recv().expect("receive request")).expect("request is ASCII");
+        assert!(request.starts_with("POST /api/v1/audit/recover HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer test-bearer-token\r\n"));
+        assert!(!request.contains("content-type: application/json\r\n"));
+        assert_eq!(output.operation, "henosis audit recover");
+        let response: Value = serde_json::from_str(&output.message).expect("parse response JSON");
+        assert_eq!(response["verified_records"], 2);
+        assert_eq!(response["recovered_sequence"], 2);
+    }
+
     /// Parses every required top-level command without accepting implicit shell syntax.
     #[test]
     fn parses_supported_commands() {
@@ -2840,6 +2879,10 @@ mod tests {
         assert_eq!(
             Command::parse(&["audit".into(), "verify".into()]).expect("parse audit"),
             Command::AuditVerify
+        );
+        assert_eq!(
+            Command::parse(&["audit".into(), "recover".into()]).expect("parse audit recovery"),
+            Command::AuditRecover
         );
         assert_eq!(
             Command::parse(&["serve".into()]).expect("parse serve"),
