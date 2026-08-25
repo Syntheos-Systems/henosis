@@ -352,6 +352,7 @@ pub struct MediatedCapabilities<'a> {
 impl<'a> MediatedCapabilities<'a> {
     /// Sends an HTTPS request only when the manifest granted mediated HTTP authority.
     pub fn http_request(&self, request: HttpRequest) -> Result<HttpResponse, SandboxError> {
+        require_capability(self.granted, Capability::MediatedHttp)?;
         let mediator = self
             .http
             .clone()
@@ -1078,7 +1079,8 @@ impl bindings::henosis::component::broker::Host for SandboxState {
 
 /// Converts a security-boundary error into a Component Model trap.
 fn host_failure(error: SandboxError) -> wasmtime::Error {
-    wasmtime::Error::msg(error.to_string())
+    tracing::debug!(error = %error, "component host operation failed");
+    wasmtime::Error::msg("component host operation failed")
 }
 
 /// All failures intentionally exposed by the component-host security boundary.
@@ -1652,6 +1654,38 @@ mod tests {
             require_capability(&BTreeSet::new(), Capability::Broker),
             Err(SandboxError::CapabilityDenied)
         ));
+    }
+
+    /// Hides whether the embedding application configured an HTTP mediator from an unauthorized caller.
+    #[test]
+    fn unauthorized_http_hides_mediator_availability() {
+        let capabilities = MediatedCapabilities {
+            granted: &BTreeSet::new(),
+            http: None,
+            broker: None,
+            deadline: Instant::now() + Duration::from_secs(1),
+            max_response_bytes: 1024,
+        };
+        let result = capabilities.http_request(HttpRequest {
+            scheme: "https".into(),
+            host: "service.example".into(),
+            path_and_query: "/".into(),
+            body: Vec::new(),
+        });
+
+        assert!(matches!(result, Err(SandboxError::CapabilityDenied)));
+    }
+
+    /// Prevents internal runtime details from crossing into a guest-visible trap message.
+    #[test]
+    fn guest_trap_message_is_opaque() {
+        let trap = host_failure(SandboxError::RuntimeUnavailable(
+            "sensitive runtime detail".to_string(),
+        ));
+        let message = trap.to_string();
+
+        assert_eq!(message, "component host operation failed");
+        assert!(!message.contains("sensitive runtime detail"));
     }
 
     /// Rejects private and loopback destinations before a mediator can connect.
