@@ -17,8 +17,12 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wasmtime::component::{Component, HasSelf, Linker};
+use wasmtime::component::{Component, HasSelf, Instance, Linker, WasmList};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+
+/// Executes binary-component regressions for bounded return allocation and cleanup.
+#[cfg(test)]
+mod output_tests;
 
 /// Default signed ceiling for one component binary.
 const DEFAULT_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
@@ -850,18 +854,53 @@ impl ComponentSandbox {
         let mut linker = Linker::new(&self.engine);
         bindings::Extension::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(SandboxError::Wasmtime)?;
-        let result = (|| {
-            let extension = bindings::Extension::instantiate(&mut store, &component, &linker)?;
-            extension.call_invoke(&mut store, payload)
+        let result = (|| -> Result<Vec<u8>, SandboxError> {
+            let pre = linker
+                .instantiate_pre(&component)
+                .map_err(SandboxError::Wasmtime)?;
+            let checked = bindings::ExtensionPre::new(pre).map_err(SandboxError::Wasmtime)?;
+            let instance = checked
+                .instance_pre()
+                .instantiate(&mut store)
+                .map_err(SandboxError::Wasmtime)?;
+            call_component_output(&mut store, &instance, payload)
         })();
-        if store.data().budget.check_deadline().is_err() {
-            return Err(SandboxError::DeadlineExceeded);
-        }
-        let result = result.map_err(SandboxError::Wasmtime)?;
-        store.data_mut().budget.charge_output(result.len())?;
         store.data().budget.check_deadline()?;
-        Ok(result)
+        result
     }
+}
+
+/// Calls the borrowed export and always completes post-return after a successful guest call.
+fn call_component_output(
+    store: &mut Store<SandboxState>,
+    instance: &Instance,
+    payload: &[u8],
+) -> Result<Vec<u8>, SandboxError> {
+    let invoke = instance
+        .get_typed_func::<(&[u8],), (WasmList<u8>,)>(&mut *store, "invoke")
+        .map_err(SandboxError::Wasmtime)?;
+    let (returned,) = invoke
+        .call(&mut *store, (payload,))
+        .map_err(SandboxError::Wasmtime)?;
+    let output = copy_component_output(store, &returned);
+    // A successful call requires cleanup even when output accounting rejects it.
+    let cleanup = invoke.post_return(store).map_err(SandboxError::Wasmtime);
+    output.and_then(|bytes| cleanup.map(|()| bytes))
+}
+
+/// Charges the borrowed guest result before reserving host memory or copying its bytes.
+fn copy_component_output(
+    store: &mut Store<SandboxState>,
+    returned: &WasmList<u8>,
+) -> Result<Vec<u8>, SandboxError> {
+    store.data().budget.check_deadline()?;
+    store.data_mut().budget.charge_output(returned.len())?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(returned.len())
+        .map_err(|error| SandboxError::Wasmtime(error.into()))?;
+    output.extend_from_slice(returned.as_le_slice(&*store));
+    Ok(output)
 }
 
 /// Store data containing all invocation-local authority and resource accounting.
@@ -1524,7 +1563,7 @@ mod tests {
     }
 
     /// Builds a trusted manifest and its signing key for boundary tests.
-    fn signed_fixture(component: &[u8]) -> (TrustStore, SignedManifest, SigningKey) {
+    pub(super) fn signed_fixture(component: &[u8]) -> (TrustStore, SignedManifest, SigningKey) {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let mut trust = TrustStore::new();
         trust
