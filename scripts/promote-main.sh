@@ -67,6 +67,7 @@ wait_for_checks() {
         for required in \
             'Rust quality' \
             'Desktop quality' \
+            'Live desktop conversation' \
             'Cognition quality' \
             'Dependency audit' \
             'Secret scan' \

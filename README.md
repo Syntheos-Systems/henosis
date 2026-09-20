@@ -52,7 +52,7 @@ On Linux or macOS, copy and run this command:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/Syntheos-Systems/henosis/4f6ac581c39667b14cec013e25346d234d15433b/install.sh \
+  https://raw.githubusercontent.com/Syntheos-Systems/henosis/e457be5087101e6f426b4998d54aa3bad2c4b538/install.sh \
   | sh -s -- --version v0.1.0-beta.1 --experience cli
 ```
 
@@ -61,7 +61,7 @@ On Windows, open PowerShell, copy this command, and press Enter:
 ```powershell
 $installer = Join-Path ([IO.Path]::GetTempPath()) "henosis-install-$([guid]::NewGuid().ToString('N')).ps1"
 try {
-  irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/4f6ac581c39667b14cec013e25346d234d15433b/install.ps1' -OutFile $installer
+  irm 'https://raw.githubusercontent.com/Syntheos-Systems/henosis/e457be5087101e6f426b4998d54aa3bad2c4b538/install.ps1' -OutFile $installer
   $powerShell = (Get-Process -Id $PID).Path
   & $powerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'v0.1.0-beta.1' -Experience 'cli'
   if ($LASTEXITCODE -ne 0) { throw "Henosis installer exited with code $LASTEXITCODE" }

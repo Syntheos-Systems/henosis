@@ -8,7 +8,7 @@ WORKFLOW="$REPOSITORY_DIR/.github/workflows/ci.yml"
 README="$REPOSITORY_DIR/README.md"
 ALLOWED_SIGNERS="$REPOSITORY_DIR/security/release-allowed-signers"
 EXPECTED_SIGNER='ghostframe@girbox.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA8RT1QrONYawdO9XOD1sjgy0cOewtktEBm7gZniJ0/o'
-BOOTSTRAP_COMMIT=1a9ff0730f36e9a3af537e09177d36e3be204229
+BOOTSTRAP_COMMIT=e457be5087101e6f426b4998d54aa3bad2c4b538
 
 # Stop the release trust contract with a diagnostic.
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -24,6 +24,13 @@ require_line() { grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"; }
 [ "$(grep -Fc 'git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main' "$WORKFLOW")" -eq 2 ] ||
     fail 'release ancestry must be verified before build and publication'
 require_line "$WORKFLOW" 'environment: release'
+# Bind the promotion display name and publication dependency to the live job.
+require_line "$WORKFLOW" '    name: Live desktop conversation'
+publication_job=$(sed -n '/^  release-publish:/,/^    steps:/p' "$WORKFLOW")
+printf '%s\n' "$publication_job" | grep -Fx '    needs: [release-build, desktop-release-build, release-version, live-conversation]' >/dev/null ||
+    fail 'publication must require successful live desktop validation'
+printf '%s\n' "$publication_job" | grep -Fx "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" >/dev/null ||
+    fail 'publication must retain normal dependency success gating'
 [ "$(grep -Fc "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" "$WORKFLOW")" -eq 4 ] ||
     fail 'release jobs must run only for v-tag push events'
 if grep -F 'workflow_dispatch:' "$WORKFLOW" >/dev/null; then
