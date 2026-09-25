@@ -935,6 +935,10 @@ mod tests {
     async fn direct_executor_parent_death_setup_closes_the_fork_race() {
         let mode = std::env::var_os("SYNTHEOS_PROCESS_SECURITY_TEST_MODE");
         if mode.as_deref() == Some(OsStr::new("pdeath-race-authority")) {
+            // Match the production authority before forking. Rust may abort when
+            // reporting the rejected spawn to its dead parent; core-dump handling
+            // must not delay this test's observation of the orphan's exit.
+            protect_authority_process().expect("race authority becomes non-dumpable");
             let mut command = Command::new("/bin/sleep");
             command.arg("60");
             // SAFETY: this test-only hook uses async-signal-safe signal operations
