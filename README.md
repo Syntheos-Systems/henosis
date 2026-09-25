@@ -218,6 +218,10 @@ Model providers sit behind a shared interface. Capability authorization stays on
 
 The full Pistis service is private and does not ship in this repository. Production capability requests fail closed until the deployment supplies trusted room state from Pistis. See [SECURITY.md](SECURITY.md), [`containers/production.env.example`](containers/production.env.example), and the [`containers/agents.production.example.toml`](containers/agents.production.example.toml) starter roster for the full contract.
 
+Production Compose configuration requires Docker Compose 5.1.4, the version
+verified in CI. Older versions that eagerly evaluate nested interpolation can
+reject valid single-prefix configuration.
+
 Run local mode with Compose:
 
 ```sh

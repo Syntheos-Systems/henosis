@@ -19,8 +19,10 @@ use crate::rbac::Role;
 use crate::{PlutusError, Result};
 
 /// Append-only schema migrations for restart-durable local policy state.
-const LOCAL_POLICY_MIGRATIONS: &[(i64, &str)] =
-    &[(1, include_str!("../local-migrations/0001_local_policy_state.sql"))];
+const LOCAL_POLICY_MIGRATIONS: &[(i64, &str)] = &[(
+    1,
+    include_str!("../local-migrations/0001_local_policy_state.sql"),
+)];
 
 /// The lifecycle status of an org.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

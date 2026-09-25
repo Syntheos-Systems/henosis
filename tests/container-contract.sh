@@ -114,6 +114,22 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 digest_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 digest_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# Valid single-prefix inputs must resolve an image, not merely fail for another guard.
+assert_compose_image() {
+    expected=$1
+    shift
+    if ! output=$(env "$@" docker compose -f "$production_compose" config --images 2>&1); then
+        fail "valid Compose inputs failed: $output"
+    fi
+    printf '%s\n' "$output" | grep -Fx "$expected" >/dev/null ||
+        fail "valid Compose inputs resolved the wrong image: $output"
+}
+assert_compose_image "canonical.example/henosis@sha256:$digest_a" \
+    SYNTHEOS_IMAGE_REPOSITORY=canonical.example/henosis \
+    SYNTHEOS_IMAGE_DIGEST="$digest_a" SYNTHEOS_ENV_FILE=production.env.example
+assert_compose_image "legacy.example/henosis@sha256:$digest_b" \
+    HENOSIS_IMAGE_REPOSITORY=legacy.example/henosis \
+    HENOSIS_IMAGE_DIGEST="$digest_b" HENOSIS_ENV_FILE=production.env.example
 assert_compose_conflict 'SYNTHEOS_IMAGE_REPOSITORY and HENOSIS_IMAGE_REPOSITORY' \
     SYNTHEOS_IMAGE_REPOSITORY=canonical.example/henosis \
     HENOSIS_IMAGE_REPOSITORY=legacy.example/henosis \
