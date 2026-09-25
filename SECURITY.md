@@ -52,6 +52,22 @@ The CI dependency gate rejects RustSec advisories except for two narrow, reviewe
 
 ## Release integrity
 
+### Desktop dependency limitations
+
+The desktop test-tool dependency tree still includes `extract-zip` 2.0.1,
+affected by GHSA-jmr9-qjv8-65gv and GHSA-7pqw-9j4j-h8q3. There is no published
+patched release. These packages are development dependencies; the Henosis live
+E2E configuration connects to an explicit loopback Tauri driver and skips
+automatic browser and driver downloads. Reassess this boundary before enabling
+browser downloads or processing externally supplied archives in test tooling.
+
+Tauri's Linux GTK dependency tree retains `glib` 0.18.5, which RustSec reports
+under RUSTSEC-2024-0429 for unsound `VariantStrIter` methods. A compatible
+upstream GTK/Tauri dependency update is still needed. Passing the root dependency
+gate does not mean the desktop dependency tree has no outstanding advisories.
+
+### Installer verification
+
 Verify the SHA-256 entry in the release `SHA256SUMS` file before installation. The installers reject absent, ambiguous, malformed, or mismatched checksums and roll back an installation when initialization fails.
 
 On Unix, `henosis update` reuses the installer embedded in the running binary
